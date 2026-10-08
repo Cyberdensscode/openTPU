@@ -85,6 +85,7 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
         r = lambda x, k=3: None if x is None else round(x, k)      # noqa: E731
         out["turns"].append(dict(
             text=text, reply=reply, tokens=list(chat._reply), end=tr.end, fed_before=n0,
+            fed=[int(t) for t in chat.fed],
             prompt_tokens=tr.prefill_tokens, context=tr.context, ttft_s=r(tr.ttft_s),
             prefill_s=r(tr.prefill_s), prefill_tok_s=r(tr.prefill_tok_s, 2),
             prefill_dev_tok_s=r(tr.prefill_dev_tok_s, 2), gen_tokens=tr.gen_tokens,

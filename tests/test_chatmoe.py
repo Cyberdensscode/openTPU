@@ -368,6 +368,8 @@ def test_the_scripted_chat_checks_a_run_against_its_reference(tmp_path, monkeypa
     t1, t2 = ref["turns"]
     assert t1["tokens"] and t1["prompt_tokens"] == 6 and t1["prefill_misses"] > 0
     assert t2["fed_before"] == 6 + len(t1["tokens"]) - (t1["end"] != "eos")
+    assert t1["fed"][:6] == [11, 22, 33, 44, 55, 66]   # (the conversation's ids: a turn's
+    assert t2["fed"][:len(t1["fed"])] == t1["fed"]       # prompt for moe_card)
     assert chatmoe.main(argv + ["--check", str(tmp_path / "ref.json")]) == 0
     assert "[PASS]" in capsys.readouterr().out
     ref["turns"][1]["tokens"][0] += 1
