@@ -1,7 +1,9 @@
 """Quantize models into the image cache (opentpu/qcache.py) before a card session, outside the
 card lock, so that the session's tools (tools/qual/perf.py, refs.py card, decode_profile.py,
 otpu-chat) build their images from the cache in about a minute instead of quantizing under the
-lock (a 4-bit Qwen3.5-4B: ~20 minutes on the card host).
+lock (a 4-bit Qwen3.5-4B: ~20 minutes on the card host). The image each run builds is otpu-chat's
+(its default KV capacity, CAP), which goes into the whole-image cache too (opentpu/imgcache.py):
+the chat then opens the model in seconds.
 
     python3 -m opentpu.host.prebuild [--cfg CFG.pkl] MODEL:WF:HF ...   (HF '-': the head in WF)
     otpu-lock --prebuild MODEL:WF:HF ... -- CMD...      the same at nice 19, then the lock, CMD
@@ -10,7 +12,8 @@ tools/qual/qual.sh does it for its 4-bit runs when it is started without the loc
 builds the image the way the card tools do, through Engine with the card's configuration and
 those formats (resident: the superset with the lookup tables), and hands it to a backend that
 drops it, so every 4-bit matrix they quantize is in the cache. Runs with no 4-bit format are
-skipped: int8 is not cached.
+skipped: int8 is not cached. The matrices are quantized in worker processes (qcache.Batch;
+OTPU_BUILD_JOBS, default the host's CPUs).
 
 --cfg is the card's configuration (tools/qual/refs.py cfg). Default: OTPU_PREBUILD_CFG, else
 the production deploy's (~/otpu-build/production/qual/cfg.pkl), else the newest card
@@ -41,7 +44,8 @@ from pathlib import Path
 from .. import qcache
 from .runstate import pid_alive
 
-CAP = 256               # the KV capacity does not change the matrices (refs.py's)
+CAP = 2048              # otpu-chat's --cap (the matrices are those of every capacity)
+SMALL_CAP = 256         # where the chat's image does not fit the card: the matrices only
 MIN_GB = 20.0
 QUIET_WAIT = 3600.0     # s: the longest a prebuild waits for the quiet file to go
 POLL = 10.0             # s between looks at it
@@ -57,12 +61,19 @@ class _Drop:
 
 def prebuild(cfg, spec, W, wformat: str, head_format: str | None, cap: int = CAP) -> dict:
     """Build (and drop) the image an Engine with this configuration and these formats builds;
-    the cache's counts over it."""
+    the cache's counts over it, and how the image came (imgcache.last: "hit", "miss": built and
+    stored, "skip", "off")."""
+    from .. import imgcache
     from ..llm.qwen3 import Engine
     s0 = dict(qcache.stats)
-    Engine(spec, W, cap=cap, cfg=cfg, backend=_Drop, wformat=wformat, head_format=head_format,
-           resident=True, pipeline=False)
-    return {k: qcache.stats[k] - s0[k] for k in s0}
+    try:
+        Engine(spec, W, cap=cap, cfg=cfg, backend=_Drop, wformat=wformat,
+               head_format=head_format, resident=True, pipeline=False)
+    except MemoryError:
+        if cap <= SMALL_CAP:
+            raise
+        return prebuild(cfg, spec, W, wformat, head_format, SMALL_CAP)
+    return {**{k: qcache.stats[k] - s0[k] for k in s0}, "image": imgcache.last[0]}
 
 
 def default_cfg() -> Path | None:
@@ -149,8 +160,10 @@ def _build_one(cfg, run: str) -> int:
     p = model_dir(m)
     n = prebuild(cfg, load_spec(p), load_weights(p), wf, None if hf == "-" else hf)
     skip = f", {n['skip']} not written (disk space)" if n["skip"] else ""
-    print(f"{run}: {n['hit']} cached, {n['miss']} quantized, {n['write']} written{skip} "
-          f"({time.time() - t0:.0f} s)", flush=True)
+    img = {"hit": "in the image cache already", "miss": "image cached",
+           "skip": "image not cached", "off": "no image cache"}[n["image"]]
+    print(f"{run}: {n['hit']} cached, {n['miss']} quantized, {n['write']} written{skip}; "
+          f"{img} ({time.time() - t0:.0f} s)", flush=True)
     return 0
 
 

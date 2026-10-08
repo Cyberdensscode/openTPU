@@ -38,6 +38,7 @@ from pathlib import Path
 
 import numpy as np
 
+from opentpu import imgcache as IC
 from opentpu.host.runstate import busy_exits
 from opentpu.llm import MODELS, load_spec, model_dir
 from opentpu.llm import formats as FM
@@ -55,6 +56,9 @@ SAMPLING = {"qwen3": dict(temperature=0.7, top_k=20, top_p=0.8, repetition_penal
             "gemma4": dict(temperature=1.0, top_k=64, top_p=0.95, repetition_penalty=1.0)}
 # Hugging Face's defaults for the keys a generation_config.json leaves out
 HF_SAMPLING = dict(temperature=1.0, top_k=50, top_p=1.0, repetition_penalty=1.0)
+# how the model image came (imgcache.last), for the "loaded in" line
+LOADS = {"hit": "read from the image cache", "miss": "built and cached", "skip": "built",
+         "off": "built"}
 
 
 def sampler(temperature: float, top_k: int, top_p: float, seed: int | None,
@@ -814,6 +818,7 @@ def main(argv=None):
                                              1, PREFILL_ROWS, wformat, a.head_format,
                                              lookup=True).nbytes
         cfg = board_config(DRAM_BYTES=1 << max(20, (need - 1).bit_length()), **flags)
+    t0 = time.perf_counter()
     try:
         if a.mtp:
             from opentpu.llm.mtp import mtp_engine
@@ -829,6 +834,9 @@ def main(argv=None):
         raise SystemExit(f"otpu-chat: {e}") from None
     weights = weights_label(eng.image, wformat)
     print(f"weights: {weights}", flush=True)
+    how, secs = IC.last                     # (the image cache: opentpu/imgcache.py)
+    print(f"loaded in {time.perf_counter() - t0:.1f} s (the image {LOADS[how]} in {secs:.1f} s)",
+          flush=True)
     if getattr(eng.backend, "status", None) is not None:
         eng.backend.status.update(weights=weights)      # for otpu-smi
     sp = sampling(spec, a, path)

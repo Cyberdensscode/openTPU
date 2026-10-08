@@ -29,6 +29,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from .. import fp32 as F
+from .. import imgcache as IC
 from .. import isa as I
 from .. import progcache as PC
 from .. import qcache as QC
@@ -2099,7 +2100,7 @@ class Engine:
             from .moe import open_pool, pool_key    # its read into the page cache runs during
             pool_file = open_pool(self.image.offload, pool_file, mapped=pool_map,  # the build
                                   key=pool_key(self.image, getattr(W, "model_dir", None)))
-        images = self.image.build(W)
+        images = IC.build(self.image, W, self.layout)     # (opentpu/imgcache.py)
         self.backend = IsaBackend(self.cfg, images, adopt=True) if backend == "isa" else backend(
             self.cfg, images)
         self.resident = bool(resident) and lookup and bool(getattr(self.backend, "args", False))
