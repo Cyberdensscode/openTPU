@@ -62,18 +62,18 @@ def copy_programs(pairs, cfg) -> list[list]:
 
 
 class Snapshots:
-    """An Engine's snapshots: `n` slots of the image's state regions, in a device area at
-    `base` (copy programs), or on the host with base None; `at` maps a slot to its position.
-    The regions are per DeltaNet state slot (Spec.mtp: two; the decoder's committed one is
-    saved and restored)."""
+    """An Engine's snapshots of the image's state regions: room for `n`, in a device area at
+    `base` (snapshot j at base + j * nbytes, copied by programs) or on the host (base None);
+    `at` maps a snapshot to its position. The regions are a DeltaNet state slot's (`slot`:
+    Spec.mtp's images have two, the decoder's committed one is saved and restored)."""
 
     def __init__(self, image, cfg, n: int, base: int | None):
         self.image, self.cfg, self.n, self.base = image, cfg, n, base
         self._regions: dict = {}
         self._progs: dict = {}
-        self.host: dict = {}                    # host snapshots: slot -> [per slice bytes]
-        self.at: dict = {}                      # slot -> position
-        self._age: dict = {}                    # slot -> when taken (the oldest is replaced)
+        self.host: dict = {}                    # on the host: j -> [per slice, the bytes]
+        self.at: dict = {}                      # j -> position
+        self._age: dict = {}                    # j -> when taken (the oldest is replaced)
         self._clock = 0
         self.nbytes = sum(n for _, n in self.regions(0))
 
@@ -98,10 +98,10 @@ class Snapshots:
         """The device area's end (bytes): the image arrays grow to it."""
         return self.base + self.n * self.nbytes
 
-    def _programs(self, save: bool, k: int, slot: int):
-        key = (save, k, slot)
+    def _programs(self, save: bool, j: int, slot: int):
+        key = (save, j, slot)
         if key not in self._progs:
-            a, pairs = self.base + k * self.nbytes, []
+            a, pairs = self.base + j * self.nbytes, []
             for src, n in self.regions(slot):
                 pairs.append((src, a, n) if save else (a, src, n))
                 a += n
@@ -109,21 +109,21 @@ class Snapshots:
         return self._progs[key]
 
     def save(self, eng, pos: int, slot: int = 0) -> dict:
-        """Take a snapshot at `pos` (the context's state now) in the slot already at `pos`, a
+        """Take a snapshot at `pos` (the context's state now) in place of the one at `pos`, a
         free one, or the oldest; returns the copy's stats (device: the runs' counters)."""
-        k = next((j for j, p in self.at.items() if p == pos), None)
-        if k is None:
-            free = [j for j in range(self.n) if j not in self.at]
-            k = free[0] if free else min(self.at, key=self._age.get)
-        self.at.pop(k, None)
-        st = self._copy(eng, True, k, slot)
-        self.at[k] = pos
+        j = next((i for i, p in self.at.items() if p == pos), None)
+        if j is None:
+            free = [i for i in range(self.n) if i not in self.at]
+            j = free[0] if free else min(self.at, key=self._age.get)
+        self.at.pop(j, None)
+        st = self._copy(eng, True, j, slot)
+        self.at[j] = pos
         self._clock += 1
-        self._age[k] = self._clock
+        self._age[j] = self._clock
         return st
 
     def best(self, k: int) -> int | None:
-        """The slot of the latest snapshot at a position <= k."""
+        """The latest snapshot at a position <= k (its j), or None."""
         ok = [j for j, p in self.at.items() if p <= k]
         return max(ok, key=self.at.get) if ok else None
 
@@ -137,18 +137,21 @@ class Snapshots:
             del self.at[j]
             self.host.pop(j, None)
 
-    def _copy(self, eng, save: bool, k: int, slot: int) -> dict:
+    def _copy(self, eng, save: bool, j: int, slot: int) -> dict:
         be, S = eng.backend, self.cfg.S
         if self.base is None:
             regs = self.regions(slot)
             if save:
-                self.host[k] = [[be.read(s, a, n) for a, n in regs] for s in range(S)]
+                self.host[j] = [np.concatenate([be.read(s, a, n) for a, n in regs])
+                                for s in range(S)]
             else:
                 for s in range(S):
-                    for (a, _), v in zip(regs, self.host[k][s]):
-                        be.write(s, a, v)
+                    o = 0
+                    for a, n in regs:
+                        be.write(s, a, self.host[j][s][o:o + n])
+                        o += n
             return {"bytes": self.nbytes * S}
-        stats = [be.run(p) for p in self._programs(save, k, slot)]
+        stats = [be.run(p) for p in self._programs(save, j, slot)]
         return {"bytes": self.nbytes * S, "runs": len(stats),
                 "cycles": sum((x or {}).get("cycles", 0) for x in stats)}
 

@@ -252,25 +252,34 @@ def test_gemma4_rollback_inside_and_beyond_the_slack(gemma):
 
 
 # --------------------------------------------------------------------------------- MTP
-def test_mtp_rollback_is_plain_greedy():
+@pytest.mark.parametrize("where", ["device", "host"])
+def test_mtp_rollback_is_plain_greedy(where, monkeypatch):
     """MTPDecoder.rollback / snapshot (the committed slot; one token before the change, so that
     the MTP layer's row there takes the new token) with its prefill in two parts (follow: the
-    token after the first, the MTP layer's input there) and the loop on the device: each
-    turn's first token and draft, the MTP layer's KV cache and the committed states and windows
-    equal a fresh MTP prefill's of the turn's rendering, and its tokens plain greedy decode's."""
+    token after the first, the MTP layer's input there) and the loop on the device, its drafts
+    all right (each iteration commits the other slot: a turn's restore goes to the slot its
+    snapshot did not come from): each turn's first token and draft, the MTP layer's KV cache
+    and the committed states and windows equal a fresh MTP prefill's of the turn's rendering,
+    and its tokens plain greedy decode's; the snapshots on the device and on the host."""
+    if where == "host":
+        monkeypatch.setattr(SN.Snapshots, "area", staticmethod(lambda image, cfg, n: None))
     _, W, spec = _tiny_model(8, init=0.2)
     W = _mtp_weights(W, spec)
     eng = mtp_engine(spec, W, cap=512, cfg=CFG, snapshots=1)
+    assert (eng._snaps.base is None) == (where == "host")
     dec = MTPDecoder(eng)
     r = np.random.default_rng(2)
-    ctx, snap = [], None
-    for keep, new, at, gen in [(0, 30, 20, 8), (21, 7, 26, 8), (28, 9, 33, 6)]:
-        t = dec.rollback(keep) if ctx else 0
-        assert t == (snap if ctx else 0)
+    ctx, snap, slots = [], None, []
+    for keep, new, at, gen in [(0, 30, 20, 8), (21, 7, 26, 9), (28, 9, 33, 6)]:
+        if ctx:
+            assert dec.rollback(keep) == snap
+            slots[-1] += (dec.slot,)
+        t = snap if ctx else 0
         ids = ctx[:keep] + [int(x) for x in r.integers(0, 1000, new)]
         st = MTPStats()
         dec.prefill(ids[t:at], st, follow=ids[at])
         assert eng.pos == at and dec.snapshot()
+        slots.append((dec.slot,))
         a0, d = dec.prefill(ids[at:], st)
         fresh = MTPDecoder(mtp_engine(spec, W, cap=512, cfg=CFG))
         assert fresh.prefill(ids, MTPStats()) == (a0, d)
@@ -278,11 +287,14 @@ def test_mtp_rollback_is_plain_greedy():
                                                         _mtp_kv(fresh.eng, len(ids))))
         assert all(np.array_equal(x, y) for x, y in zip(_states(eng, spec, dec.slot),
                                                         _states(fresh.eng, spec, fresh.slot)))
-        out = dec.loop_card(a0, d, gen).tokens
-        ref = Engine(spec, W, cap=512, cfg=CFG, resident=True)
-        assert out == ref.generate(ids, max_new=gen)
+        want = Engine(spec, W, cap=512, cfg=CFG, resident=True).generate(ids, max_new=gen)
+        drafts = [0] * (eng.cap + 2)
+        drafts[len(ids):len(ids) + gen] = want
+        out = dec.loop_card(a0, d, gen, drafts=drafts).tokens
+        assert out == want
         ctx, snap = ids + out[:-1], at
         assert eng.pos == len(ctx)
+    assert any(a != b for a, b in slots[:-1])       # a restore into the other slot
 
 
 # --------------------------------------------------------------------------------- Chat
