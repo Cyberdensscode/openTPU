@@ -1,6 +1,8 @@
 """The program cache (opentpu/progcache.py): an engine with prog_cache compiles a bucket's programs
 once per process and image layout, and a later process reads them from the disk cache; the programs
 read back run as the compiled ones."""
+import os
+
 import numpy as np
 import pytest
 
@@ -50,8 +52,12 @@ def test_the_key_sees_the_layout_the_environment_and_what(monkeypatch):
     assert k != PC.key(("spec", 1024), ("gen", 1)) != PC.key(("spec", 512), ("gen", 2))
     monkeypatch.setenv("OTPU_FORMATS", "attn=fp4")
     assert PC.key(("spec", 512), ("gen", 1)) != k
-    monkeypatch.setenv("OTPU_QUIET", "/tmp/q")          # read by the host's tools only
-    assert PC.key(("spec", 512), ("gen", 1)) == PC.key(("spec", 512), ("gen", 1))
+    k = PC.key(("spec", 512), ("gen", 1))
+    for var, val in (("OTPU_QUIET", "/tmp/q"), ("OTPU_BUILD_JOBS", "3"),
+                     ("OTPU_IMG_CACHE", "/tmp/i"), ("OTPU_LOCK_HELD", "xdma0"),
+                     ("OTPU_LOCK_PID", str(os.getpid()))):
+        monkeypatch.setenv(var, val)        # read by the host's tools only (otpu-lock sets its
+        assert PC.key(("spec", 512), ("gen", 1)) == k, var  # pid: each session's misses)
 
 
 def test_the_key_sees_the_host_modules_the_programs_take(monkeypatch):
