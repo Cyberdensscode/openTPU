@@ -394,6 +394,39 @@ def test_chat_turns_roll_back_to_the_reply(case, card, think):
     assert len(rec) == len(MESSAGES) and (rollbacks == 4 if not think else rollbacks < 4)
 
 
+@pytest.mark.parametrize("case", ["qwen3", "qwen35"])
+def test_chat_thinking_on_drops_the_reply_thinking(case):
+    """Thinking on: each reply holds a thinking block's end (scripted picks), which the next
+    turn's rendering drops with the thinking before it: the context rolls back to the reply's
+    start (Qwen3.5: the snapshot there) and feeds the answer and the new message; each turn's
+    logits equal a fresh engine's on its rendering, bit for bit."""
+    W, spec, cfg = _model(case)
+    tok = _QwenTok()
+    reply = [ord(c) for c in f"ab{tok.T1}\ncd"] + [min(spec.eos)]
+    firsts, k = [], [0]
+
+    def pick(logits, context=()):
+        if k[0] == 0:
+            firsts.append(np.array(logits, np.float32))
+        t, k[0] = reply[k[0]], (k[0] + 1) % len(reply)
+        return t
+    chat = Chat(Engine(spec, W, cap=512, cfg=cfg, snapshots=1), tok, True, pick, 16)
+    assert not chat.on_card
+    start = None
+    for i, msg in enumerate(MESSAGES[:4]):
+        fed = list(chat.fed)
+        _, turn = chat.ask(msg)
+        assert turn.end == "eos" and chat._reply == reply[:-1]
+        ids = tok.apply_chat_template(chat.history[:-1], True, True, True)
+        assert not turn.restarted, i
+        if i:
+            assert _common(ids, fed) == start < len(fed) and turn.reused == start, i
+        assert turn.prefill_tokens == len(ids) - (start if i else 0)
+        want = Engine(spec, W, cap=512, cfg=cfg).prefill(ids)
+        assert np.array_equal(_bits(firsts[-1]), _bits(want)), i
+        start = len(ids)
+
+
 def test_chat_stops_continues_and_resets():
     """A turn stopped inside its prefill (before the reply's start: no snapshot there) is
     continued by the next turn from where it stopped; /continue after max_new resumes the

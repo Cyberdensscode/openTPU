@@ -7,7 +7,8 @@ and fed the rest; then each turn's rendering again from position 0, as the chat 
 split of a prompt into runs gives the same rows), and whose greedy reply the turn's. Per turn:
 the rendering's tokens, the tokens reused and fed, the prefill's runs, device Mcycles and wall
 seconds against the restart's, the snapshot's and the restore's device cycles (the ISA
-simulator counts no cycles: tokens and runs).
+simulator counts no cycles: tokens and runs). --mtp: the turns' prefill is MTP's (its rows and
+the MTP layer's runs), the restart a plain prefill of the rows.
 
     otpu-lock -- python3 tools/qual/chatkv.py --model qwen35 [--mtp] [--dev /dev/xdma0]
     python3 tools/qual/chatkv.py --model qwen3 --backend isa --turns 3 --max-new 8   (dry run)
@@ -163,7 +164,8 @@ def main(argv=None) -> int:
               f"{'equal' if out == want else 'differs'}; restart: {len(x['ids'])} tokens in "
               f"{runs} runs {wall:.3f} s{_mc(cyc, cyc_on)}, rollback: {t.prefill_tokens} "
               f"tokens{rb_runs} {t.prefill_s:.3f} s{_mc(cyc_rb, cyc_on)}", flush=True)
-    print(f"tokens fed {int(tot[1])} (restart {int(tot[0])}), runs {int(tot[5])} (restart "
+    runs = "" if chat.use_mtp else f"{int(tot[5])} "       # MTP: its rows and layer runs
+    print(f"tokens fed {int(tot[1])} (restart {int(tot[0])}), runs {runs}(restart "
           f"{int(tot[4])})" + (f", device Mcycles {tot[3] / 1e6:.1f} (restart "
                                f"{tot[2] / 1e6:.1f})" if cyc_on else ""))
     print("CHATKV PASS" if ok else "CHATKV FAIL")
