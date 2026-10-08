@@ -588,6 +588,22 @@ def test_tiny_vt_tiles_bit_exact(tiny, monkeypatch):
     assert all(np.array_equal(a.view(np.uint32), b.view(np.uint32)) for a, b in zip(tiled, plain))
 
 
+@pytest.mark.parametrize("wf", ["fp4", "int8"])
+def test_tiny_image_built_in_workers(tiny, wf, monkeypatch):
+    """The image with its matrices quantized in worker processes (opentpu.qcache.Batch: every
+    matrix there, in jobs of a few rows) is the one-process build's, byte for byte."""
+    from opentpu import qcache
+    _, W, spec = tiny
+    eng = Engine(spec, W, cap=256, wformat=wf, head_format="int8", resident=True)
+    monkeypatch.setenv("OTPU_BUILD_JOBS", "1")
+    want = eng.image.build(W)
+    monkeypatch.setenv("OTPU_BUILD_JOBS", "2")
+    monkeypatch.setattr(qcache, "INLINE", 0)
+    monkeypatch.setattr(qcache, "JOB", 3 * 256)
+    got = eng.image.build(W)
+    assert all(np.array_equal(a, b) for a, b in zip(got, want))
+
+
 def test_tiny_image_from_the_quantization_cache(tiny, tmp_path, monkeypatch):
     """Image.build through the 4-bit quantization cache (opentpu/qcache.py) gives the uncached
     image, byte for byte, and a second build quantizes nothing."""

@@ -885,10 +885,11 @@ class Image(EmbedHost):
             v = np.ascontiguousarray(a).view(np.uint8).reshape(-1)
             imgs[s][addr:addr + v.size] = v
 
+        qb = QC.Batch()                 # the matrices, quantized in worker processes
+
         def put_q1(s, addr_pair, a, fmt):
-            q, sc = QC.quantize_mxu(a, fmt, D)
-            put(s, addr_pair[0], q)
-            put(s, addr_pair[1], sc)
+            qb.submit(a, fmt, D, lambda q, sc: (put(s, addr_pair[0], q),
+                                                put(s, addr_pair[1], sc)))
 
         def put_q(addr_pair, parts, fmt):
             for s, p in enumerate(parts):
@@ -1002,6 +1003,7 @@ class Image(EmbedHost):
             put_q(mo["fc"], [W["mtp.fc.weight"]], self.mtp_fc)
             put_q(mo["dh"], [head[:self.nd]], "fp4")
         put_q(self.head, rows(head, self.v_loc), self.head_format)
+        qb.wait()
         if self.lookup:
             _lookup_build(put, S, W, spec, self.cap, self.lookup)
         if "mtpgen" in self.lookup:

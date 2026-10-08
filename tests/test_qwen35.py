@@ -416,6 +416,26 @@ def tiny_pairs(request):
     return _tiny_model(nk, nv)[1:]
 
 
+@pytest.mark.parametrize("grouped", [False, True], ids=["array", "group"])
+def test_tiny_image_built_in_workers(tiny_pairs, grouped, monkeypatch):
+    """The image with its matrices quantized in worker processes (opentpu.qcache.Batch: every
+    matrix there, in jobs of a few rows) is the one-process build's, byte for byte, in both
+    DeltaNet layouts (the group-major one quantizes each pair's rows on its own)."""
+    from opentpu import qcache
+    W, spec = tiny_pairs
+    cfg = board_config(DRAM_BYTES=1 << 25, PAIR=True)
+    eng = Engine(dataclasses.replace(spec, pair_loop=grouped), W, cap=256, cfg=cfg,
+                 wformat="fp4", head_format="int8", resident=True)
+    assert eng.image.grouped == grouped
+    monkeypatch.setenv("OTPU_BUILD_JOBS", "1")
+    want = eng.image.build(W)
+    monkeypatch.setenv("OTPU_BUILD_JOBS", "2")
+    monkeypatch.setattr(qcache, "INLINE", 0)
+    monkeypatch.setattr(qcache, "JOB", 3 * 256)
+    got = eng.image.build(W)
+    assert all(np.array_equal(a, b) for a, b in zip(got, want))
+
+
 def _pair_parts(eng, li, q):
     """Pair q's taps and window, and its two states, in layer li (either layout)."""
     im, d = eng.image, eng.backend.machine.slices[0].dram
