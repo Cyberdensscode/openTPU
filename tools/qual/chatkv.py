@@ -5,8 +5,9 @@ from the snapshot of their state each turn takes at its reply's start, copied on
 and fed the rest; then each turn's rendering again from position 0, as the chat fed it before
 (the restart), whose logits must equal the turn's first logits bit for bit (int8 weights: any
 split of a prompt into runs gives the same rows), and whose greedy reply the turn's. Per turn:
-the rendering's tokens, the tokens reused and fed, the prefill's device Mcycles and wall
-seconds against the restart's, the snapshot's and the restore's device cycles.
+the rendering's tokens, the tokens reused and fed, the prefill's runs, device Mcycles and wall
+seconds against the restart's, the snapshot's and the restore's device cycles (the ISA
+simulator counts no cycles: tokens and runs).
 
     otpu-lock -- python3 tools/qual/chatkv.py --model qwen35 [--mtp] [--dev /dev/xdma0]
     python3 tools/qual/chatkv.py --model qwen3 --backend isa --turns 3 --max-new 8   (dry run)
@@ -69,6 +70,10 @@ def _cycles(stats) -> int:
     return sum((s or {}).get("cycles", 0) for s in stats)
 
 
+def _mc(c: int, on: bool) -> str:
+    return f" {c / 1e6:.1f} Mcycles" if on else ""
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--model", default="qwen35",
@@ -109,6 +114,7 @@ def main(argv=None) -> int:
         eng = Engine(spec, load_weights(path), resident=True, **kw)
     khz = (getattr(eng.backend, "info", None) or {}).get("core_khz")
     mhz = khz / 1e3 if khz else 0.0
+    cyc_on = a.backend != "isa"            # the ISA simulator counts no cycles
     rec: list = []
     chat = Chat(eng, tok, a.think, recording(rec, eng), a.max_new, clock_mhz=mhz)
     print(f"{path.name} {eng.image.wformat} head {eng.image.head_format}, {a.backend}"
@@ -128,10 +134,11 @@ def main(argv=None) -> int:
                           runs=runs))
         print(f"turn {len(turns)}: {len(ids)} tokens, reused {t.reused}, fed {t.prefill_tokens}"
               f"{'' if runs is None else f' in {runs} runs'}"
-              f"{' (restarted)' if t.restarted else ''}; prefill {t.prefill_s:.3f} s "
-              f"{t.prefill_cycles / 1e6:.1f} Mcycles, TTFT {t.ttft_s or 0:.3f} s; snapshot "
-              f"{ops['snapshot'] / 1e6:.2f} restore {ops['restore'] / 1e6:.2f} Mcycles; reply "
-              f"{t.gen_tokens} tokens ({t.end})", flush=True)
+              f"{' (restarted)' if t.restarted else ''}; prefill {t.prefill_s:.3f} s"
+              f"{_mc(t.prefill_cycles, cyc_on)}, TTFT {t.ttft_s or 0:.3f} s; "
+              + (f"snapshot {ops['snapshot'] / 1e6:.2f} restore {ops['restore'] / 1e6:.2f} "
+                 f"Mcycles; " if cyc_on else "")
+              + f"reply {t.gen_tokens} tokens ({t.end})", flush=True)
     ok, tot = True, np.zeros(6)
     for i, x in enumerate(turns):                   # the restart: the rendering from 0
         eng.reset()
@@ -154,10 +161,11 @@ def main(argv=None) -> int:
         rb_runs = "" if x["runs"] is None else f" in {x['runs']} runs"
         print(f"[{'PASS' if good else 'FAIL'}] turn {i + 1}: logits {lgs}, reply "
               f"{'equal' if out == want else 'differs'}; restart: {len(x['ids'])} tokens in "
-              f"{runs} runs {wall:.3f} s {cyc / 1e6:.1f} Mcycles, rollback: {t.prefill_tokens} "
-              f"tokens{rb_runs} {t.prefill_s:.3f} s {cyc_rb / 1e6:.1f} Mcycles", flush=True)
+              f"{runs} runs {wall:.3f} s{_mc(cyc, cyc_on)}, rollback: {t.prefill_tokens} "
+              f"tokens{rb_runs} {t.prefill_s:.3f} s{_mc(cyc_rb, cyc_on)}", flush=True)
     print(f"tokens fed {int(tot[1])} (restart {int(tot[0])}), runs {int(tot[5])} (restart "
-          f"{int(tot[4])}), device Mcycles {tot[3] / 1e6:.1f} (restart {tot[2] / 1e6:.1f})")
+          f"{int(tot[4])})" + (f", device Mcycles {tot[3] / 1e6:.1f} (restart "
+                               f"{tot[2] / 1e6:.1f})" if cyc_on else ""))
     print("CHATKV PASS" if ok else "CHATKV FAIL")
     return 0 if ok else 1
 
