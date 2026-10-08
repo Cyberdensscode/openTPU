@@ -574,6 +574,31 @@ decode's for the 0.8B / 2B / 4B, greedy ([mtp.md](mtp.md) 10.2).
 otpu-chat --backend board --model qwen35-2b --wformat fp4 --head-format int8 --mtp
 ```
 
+**Mixture-of-experts models bigger than the card** (`--model lfm2-8b`, `qwen35-35b`,
+`gemma4-26b`: LFM2.5-8B-A1B, Qwen3.5-35B-A3B, gemma-4-26B-A4B) stream their experts from a pool
+file on the host into slots in the card's DRAM. The card routes and computes every expert, and
+the host only copies the experts it asks for ([offload.md](offload.md) section 14).
+
+```
+otpu-chat --backend board --model qwen35-35b                     # its pool: models/Qwen3.5-35B-A3B/pool-fp4.bin
+otpu-chat --backend board --model lfm2-8b --pool /data/lfm8b.bin  # a pool elsewhere
+```
+
+- The pool is packed once from the whole checkpoint (`tools/offload/pack_pool.py`, offload.md
+  14.1). The chat checks it before it builds the image, and stops with the commands to pack it
+  when it is missing, of another model or format, or stale (its key).
+- `--wformat auto` takes the formats each model ran with on the card. The slots fill the DRAM
+  (`--experts`), replaced by least decayed use (`--policy`). Qwen3.5-35B and Gemma 4 26B run
+  their prompts layer by layer (`--layer-major`).
+- Each turn's line adds the reply's expert hits, MB streamed a token and the prompt's misses.
+  The status line shows the first two, and the panel and `/stats` the slots.
+- The card's loop decodes when it takes the sampling (top-k 1 to 64). LFM2.5-8B-A1B's
+  generation_config.json asks for top-k 80, so its tokens are sampled on the host unless you
+  pass `--top-k 64` or `--greedy`.
+- Loading the 35B builds its image for about 9 minutes, with a peak of about 13 GB of host
+  memory. The pool then sits in the page cache (17.1 GB for the 35B).
+- `--mtp`, `--per-position` and `--backend board-sim` are not supported.
+
 `--backend board-sim` runs the same driver against the Verilator board model (bit-exact, but
 minutes per token for the real model; use it with small models).
 

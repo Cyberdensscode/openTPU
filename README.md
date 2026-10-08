@@ -102,6 +102,11 @@ experts, int8 head:
   (section 10.3).
 - Both match the simulator bit for bit.
 
+otpu-chat chats with both, and with gemma-4-26B-A4B (`--model lfm2-8b`, `qwen35-35b`,
+`gemma4-26b`), with the same engine and settings. Each model's experts are packed once into a
+pool file beside its checkpoint, and the chat checks the pool before it loads
+([docs/offload.md](docs/offload.md), section 14).
+
 4-bit weights ([docs/quant.md](docs/quant.md)) use FP4 values with two-level block scales, 4.25
 bits per weight, and keep the LM head in int8 for accuracy. They cut the bytes per token by about
 a third and raise decode speed by 40% (Qwen3.5) to 45% (Qwen3, LFM2), at a measurable cost in
@@ -182,7 +187,7 @@ it over JTAG, then run `sudo otpu-setup` and `otpu-chat --backend board`.
 
 | Command | What it does |
 |:--|:--|
-| `otpu-chat` | chat with Qwen3-0.6B, LFM2.5-230M (`--model lfm2`), Qwen3.5-0.8B (`--model qwen35`), LFM2-2.6B (`lfm2-2.6b`), SmolLM3-3B (`smollm3`), Phi-4-mini (`phi4-mini`) or Qwen3.5-2B / 4B (`qwen35-2b`, `qwen35-4b`) |
+| `otpu-chat` | chat with Qwen3-0.6B, LFM2.5-230M (`--model lfm2`), Qwen3.5-0.8B (`--model qwen35`), LFM2-2.6B (`lfm2-2.6b`), SmolLM3-3B (`smollm3`), Phi-4-mini (`phi4-mini`) or Qwen3.5-2B / 4B (`qwen35-2b`, `qwen35-4b`); MoE models bigger than the card with their experts streamed: LFM2.5-8B-A1B (`lfm2-8b`), Qwen3.5-35B-A3B (`qwen35-35b`), gemma-4-26B-A4B (`gemma4-26b`) |
 | `otpu-smi` | temperature, power, DRAM bandwidth and per-unit utilization |
 | `otpu-lens` | record a run and open it in the profiler |
 | `otpu-selftest`, `otpu-diag` | check that the card works |
