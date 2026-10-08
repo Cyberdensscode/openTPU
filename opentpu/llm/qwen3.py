@@ -2522,9 +2522,20 @@ class Engine:
         Without `chunk` a run of more than MCOLS rows takes whole passes of MCOLS rows (each
         pass streams every weight: fit_chunk).
         With the pipeline, the next run's program (after the last run: the first decode
-        step's) is compiled while the device runs the current one."""
+        step's) is compiled while the device runs the current one. With layer_major (a MoE
+        model) sequence 0's prompt goes layer by layer (prefill_layers), in one part: its runs'
+        stats are one entry, their cycles summed."""
         from . import prefill as PF
         tokens = [int(t) for t in tokens]
+        if self.layer_major and seq == 0 and chunk is None:
+            if tokens:                                  # (docs/offload.md 13)
+                k = len(self.stats)
+                lg = self.prefill_layers(tokens, logits)
+                runs = self.stats[k:]
+                self.stats[k:] = [{"cycles": sum((s or {}).get("cycles") or 0 for s in runs),
+                                   "runs": len(runs), "rows": len(tokens)}]
+                yield tokens, lg
+            return
         if self.prompt_runs and seq == 0 and chunk is None and PF.supported(self) \
                 and PF.covers(self, self.poss[0], self.poss[0] + len(tokens)):
             yield from PF.chunks(self, tokens, logits)  # docs/prefill.md
@@ -2594,12 +2605,14 @@ class Engine:
             pass
         return logits
 
-    def prefill_layers(self, tokens) -> np.ndarray:
+    def prefill_layers(self, tokens, logits: bool = True) -> np.ndarray | None:
         """A MoE model's prompt layer by layer (docs/offload.md, layer-major prefill): each
         chunk of the image's prefill rows passes a layer before the next, in runs of
         `layer_major` rows (the image's compile_layer_run: the first row's position and chunk
         row as run arguments; a run stays in one attention block), so that the expert slots
-        serve one layer at a time; then the LM head of the last row. Runs of more than one row
+        serve one layer at a time; then the LM head of the last row (none without `logits`: a
+        part of a prompt that goes on later; returns None). It starts at any position (a chat's
+        next turn continues the context). Runs of more than one row
         start from the chunk's embedding rows (one embed run a token). A model with
         convolutions (conv_k > 1) runs its rows before position conv_k - 1 at compile-time
         positions, from their embedding rows too. With the embedding rows from the host's table
@@ -2648,11 +2661,11 @@ class Engine:
         host = bool(getattr(img, "embed_host", False)) and not self.embed_runs
         if host and self.pos < K - 1:   # the rows before conv_k - 1 token by token (no embed
             n = min(len(tokens), K - 1 - self.pos)          # or compile-time-position runs)
-            for _, lg in self.prefill_chunks(tokens[:n], 0, None):
+            for _, lg in self.prefill_chunks(tokens[:n], 0, 1, logits and n == len(tokens)):
                 pass
             tokens = tokens[n:]
             if not tokens:
-                return lg
+                return lg if logits else None
         em = self.expert_major
         mo = getattr(self.spec, "moe", None)
         chunks, p0 = [], self.pos       # each chunk's runs: (key, run arguments, the host's rows
@@ -2681,7 +2694,8 @@ class Engine:
                                  None))
             chunks.append((part, runs))
             p0 += len(part)
-        self._precompile_layers([k for _, runs in chunks for k, _, _ in runs] + ["head"])
+        self._precompile_layers([k for _, runs in chunks for k, _, _ in runs] +
+                                (["head"] if logits else []))
         srv = self.server if self.pooled else None
         send = getattr(srv, "ahead_layer", None) if self.layer_ahead else None
         if srv is not None and hasattr(srv, "begin_prefill"):
@@ -2715,11 +2729,13 @@ class Engine:
                     raise RuntimeError(f"expert run of layer {key[1]}: {e} "
                                        f"({srv.need_report()})") from e
             self.pos += len(part)
-        if em:                              # (the head reads the scratch: before it goes)
+        if em and logits:                   # (the head reads the scratch: before it goes)
             run("head", {"row": len(part) - 1})
         if srv is not None and hasattr(srv, "end_prefill"):    # (the last run has halted; an
             srv.end_prefill(self.restore)                       # all-hit request it posted is
                                                                 # served first: settle)
+        if not logits:
+            return None
         if not em:
             run("head", {"row": len(part) - 1})
         io, S, v_loc = img.io, self.cfg.S, img.v_loc

@@ -484,7 +484,10 @@ LFM2.5-230M: 0.1, top-k 50, penalty 1.05), else to the model family's (LFM2-2.6B
 LFM2.5-230M's), else to greedy decoding, as Hugging Face's generate (Phi-4-mini). Qwen3 and
 Qwen3.5 take their model cards' non-thinking settings (0.7, top-k 20, top-p 0.8): their
 generation_config.json holds the thinking mode's. `--greedy` decodes greedily. Gemma's final
-soft cap applies before sampling, on the host as on the card.
+soft cap applies before sampling, on the host as on the card. A default top-k above 64, the
+most the card's decode loop samples from (or none), becomes 64, so that the loop stays on the
+card, and a line at startup says so (LFM2.5-8B-A1B's generation_config.json asks for 80). An
+explicit `--top-k` is kept, and above 64 the host samples each token.
 
 The first call writes the model image (at the default `--cap 2048`: 0.69 GiB for Qwen3-0.6B,
 0.27 GiB for LFM2.5-230M, 0.77 GiB for Qwen3.5-0.8B) to the card; every token then writes the
@@ -573,6 +576,33 @@ decode's for the 0.8B / 2B / 4B, greedy ([mtp.md](mtp.md) 10.2).
 ```
 otpu-chat --backend board --model qwen35-2b --wformat fp4 --head-format int8 --mtp
 ```
+
+**Mixture-of-experts models bigger than the card** (`--model lfm2-8b`, `qwen35-35b`,
+`gemma4-26b`: LFM2.5-8B-A1B, Qwen3.5-35B-A3B, gemma-4-26B-A4B) stream their experts from a pool
+file on the host into slots in the card's DRAM. The card routes and computes every expert, and
+the host only copies the experts it asks for ([offload.md](offload.md) section 14).
+
+```
+otpu-chat --backend board --model qwen35-35b                     # its pool: models/Qwen3.5-35B-A3B/pool-fp4.bin
+otpu-chat --backend board --model lfm2-8b --pool /data/lfm8b.bin  # a pool elsewhere
+```
+
+- The pool is packed once from the whole checkpoint (`tools/offload/pack_pool.py`, offload.md
+  14.1). The chat checks it before it builds the image, and stops with the commands to pack it
+  when it is missing, of another model or format, or stale (its key).
+- `--wformat auto` takes the formats each model ran with on the card. The slots fill the DRAM
+  (`--experts`), replaced by least decayed use (`--policy`). Qwen3.5-35B and Gemma 4 26B run
+  their prompts layer by layer (`--layer-major`).
+- Each turn's line adds the reply's expert hits, MB streamed a token and the prompt's misses.
+  The status line shows the first two, and the panel and `/stats` the slots.
+- The card's loop decodes when it takes the sampling (top-k 1 to 64). LFM2.5-8B-A1B's
+  generation_config.json asks for top-k 80, which otpu-chat clamps to 64 (above); with
+  `--top-k 80` the host samples each token, the expert server serving each step.
+- Loading the 35B builds its image for about 9 minutes, with a peak of about 13 GB of host
+  memory. The pool then sits in the page cache (17.1 GB for the 35B).
+- Turns keep the context as a dense model's do (the KV cache across turns, below). The slots fill
+  the DRAM, so the snapshots sit on the host.
+- `--mtp`, `--per-position` and `--backend board-sim` are not supported.
 
 `--backend board-sim` runs the same driver against the Verilator board model (bit-exact, but
 minutes per token for the real model; use it with small models).

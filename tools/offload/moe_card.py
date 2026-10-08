@@ -24,8 +24,10 @@ from pathlib import Path
 
 import numpy as np
 
+from opentpu.host import streamed as ST
+
 PROMPT = "What is the capital of France? Answer in one sentence."
-IDLE_PARTS = ("v1", "ra", "halt", "v2")      # --idle-parts (docs/offload.md 13.12)
+IDLE_PARTS = ST.IDLE_PARTS                  # --idle-parts (docs/offload.md 13.12)
 
 
 def hf_greedy(model: str, n: int, max_memory: str | None, prompt: str = PROMPT) -> dict:
@@ -56,42 +58,6 @@ def hf_greedy(model: str, n: int, max_memory: str | None, prompt: str = PROMPT) 
                 top=top, seconds=round(time.time() - t, 1))
 
 
-def host_mem() -> dict | None:
-    """The host's memory now, GB (Linux /proc): this process's resident (rss, its peak hwm;
-    rss_file the mapped files' pages, which the page cache holds and may drop) and swapped, its
-    children's resident and swapped, the system's available, page cache, anonymous and swap
-    used."""
-    def kb(path, keys):
-        try:
-            with open(path) as f:
-                return {k: int(v.split()[0]) for k, _, v in (ln.partition(":") for ln in f)
-                        if k in keys}
-        except OSError:
-            return {}
-    me = kb("/proc/self/status", ("VmRSS", "VmHWM", "VmSwap", "RssFile"))
-    if not me:
-        return None
-    kids = {"VmRSS": 0, "VmSwap": 0}
-    for d in Path("/proc").iterdir():           # (the Engine's compile worker)
-        try:
-            if d.name.isdigit() and int((d / "stat").read_text().rsplit(")", 1)[1].split()[1]) \
-                    == os.getpid():
-                for k, v in kb(d / "status", ("VmRSS", "VmSwap")).items():
-                    kids[k] += v
-        except (OSError, ValueError, IndexError):
-            continue
-    m = kb("/proc/meminfo", ("MemTotal", "MemAvailable", "Cached", "AnonPages", "SwapTotal",
-                             "SwapFree"))
-    gb = lambda v: round(v / 1e6, 2)            # noqa: E731 (kB)
-    return dict(rss=gb(me.get("VmRSS", 0)), hwm=gb(me.get("VmHWM", 0)),
-                rss_file=gb(me.get("RssFile", 0)), swap=gb(me.get("VmSwap", 0)),
-                children_rss=gb(kids["VmRSS"]),
-                children_swap=gb(kids["VmSwap"]), total=gb(m.get("MemTotal", 0)),
-                available=gb(m.get("MemAvailable", 0)), cached=gb(m.get("Cached", 0)),
-                anon=gb(m.get("AnonPages", 0)),
-                swap_used=gb(m.get("SwapTotal", 0) - m.get("SwapFree", 0)))
-
-
 def ahead_order(value: str, spec):
     """--layer-ahead's order: "index" (True: each layer's experts in index order), "hint" (the
     card's own guess: each layer run's hint for the next layer, docs/offload.md 13.9), or router
@@ -111,14 +77,6 @@ def ahead_order(value: str, spec):
     return [np.argsort(-c, kind="stable").tolist() for c in cnt]
 
 
-def fit_experts(spec, cfg, cap: int, **kw) -> int:
-    """The expert slots per MoE layer that fill the card's DRAM beside the rest of the image."""
-    from dataclasses import replace
-    probe = spec.image(replace(cfg, DRAM_BYTES=1 << 40), cap, rows=1, experts=spec.moe.k, **kw)
-    L = probe.offload
-    return min(spec.moe.E, (cfg.DRAM_BYTES - L.slots[0][0]) // (L.layers * L.pitch))
-
-
 def card(model: str, ref: dict, n: int, experts: int, cap: int, pool: str | None,
          host_loop: bool = False, embed: str | None = None, trace: str | None = None,
          cfg_file: str | None = None, on_card: bool = False, policy: str = "lfu",
@@ -134,24 +92,11 @@ def card(model: str, ref: dict, n: int, experts: int, cap: int, pool: str | None
          idle_parts: str = "v2", expert_major: bool = False) -> dict:
     import hashlib
     import pickle
-    from dataclasses import replace
     from opentpu.isasim import board_config
     from opentpu.llm import load_spec
-    from opentpu.llm.qwen3 import Engine, LazyWeights
     if formats is not None:                     # per-kind formats (Gemma 4: "experts=fp4"
         os.environ["OTPU_FORMATS"] = formats    # beside int8 layers; opentpu/llm/formats.py)
-    spec = load_spec(model)                     # a MoE's Spec.embed: "int8" (from_hf)
-    if embed is not None:
-        spec = replace(spec, embed=embed)
-    if hints is not None:                       # (default: the Spec's, Qwen3.5-MoE's on)
-        spec = replace(spec, moe=replace(spec.moe, hint=hints))
-    W = LazyWeights(model)
     cfg = pickle.loads(Path(cfg_file).read_bytes()) if cfg_file else board_config()
-    ekw = {} if embed_host is None else {"embed_host": embed_host}   # (default: the image's)
-    if not experts:
-        experts = fit_experts(spec, cfg, cap, wformat=wformat, head_format=head_format,
-                              lookup=True,
-                              **ekw)
     backend = "isa"
     if on_card:
         from opentpu.host.board import BoardBackend, XdmaTransport
@@ -159,25 +104,21 @@ def card(model: str, ref: dict, n: int, experts: int, cap: int, pool: str | None
         backend = lambda c, imgs: BoardBackend(c, imgs, transport=tr,      # noqa: E731
                                                model=Path(model).name)
     t = time.time()
-    if layer_major:                             # the prompt a layer at a time, runs of R rows
-        ekw.update(layer_major=layer_major, pooled=pooled,  # (docs/offload.md 13)
-                   embed_runs=embed_runs)           # (13.6: a bitstream with port A's fix)
-        if layer_ahead:                             # the next layer's experts during a layer's
-            ekw.update(layer_ahead=ahead_order(layer_ahead, spec))     # runs (13.7)
-        if expert_major:                            # a layer's experts in one run a chunk
-            ekw.update(expert_major=True)           # (13.11, 13.13)
-    eng = Engine(spec, W, cap=cap, cfg=cfg, rows=1, wformat=wformat, head_format=head_format,
-                 resident=True, experts=experts, pool_file=pool, backend=backend,
-                 release_weights=release_weights, pool_map=pool_map,  # (10.6, 10.7)
-                 **ekw)
+    # the engine, the pool and the server as otpu-chat's (opentpu/host/streamed.py): the
+    # prompt layer by layer only with --layer-major (docs/offload.md 13), each expert packed
+    # into the pool on its first use (create)
+    eng = ST.engine(model, cfg, backend, cap, pool, experts=experts, policy=policy,
+                    wformat=wformat, head_format=head_format, embed=embed,
+                    embed_host=embed_host, hints=hints, layer_major=layer_major,
+                    pooled=pooled, embed_runs=embed_runs,     # (13.6: port A's fix)
+                    layer_ahead=ahead_order(layer_ahead, load_spec(model))     # (13.7)
+                    if layer_major and layer_ahead else None,
+                    expert_major=expert_major, ahead_part=ahead_part,      # (13.11, 13.13)
+                    idle_parts=idle_parts, willneed=willneed, pool_map=pool_map,
+                    release_weights=release_weights, create=True)  # (10.6, 10.7)
     load_s = time.time() - t
-    srv = eng.server
-    if eng.layer_ahead and not (pooled and hasattr(srv, "ahead_layer")):
-        raise SystemExit("--layer-ahead needs pooled slots and a server that streams ahead "
-                         "(ExpertServer.ahead_layer)")
-    if ahead_part:                              # (the hints' and needs' idle-poll part)
-        eng.ahead_part = ahead_part
-    srv.policy = policy                         # the slots' replacement (ExpertServer)
+    spec, srv = eng.spec, eng.server
+    experts = eng.image.offload.slots[0][1]     # (slots per layer: 0 filled the DRAM)
     srv.history, per_req = [], []               # each request's ids and misses
     serve, pool_of, mem = srv.serve, srv.pool, srv.mem
     tm = dict(serve=0.0, pool=0.0, write=0.0, read=0.0, stage=0.0, flush=0.0,   # host's s
@@ -205,9 +146,6 @@ def card(model: str, ref: dict, n: int, experts: int, cap: int, pool: str | None
         srv.part = hint_part
     srv.drop = hint_drop
     srv.hint_n, srv.hint_top = hint_n, hint_top
-    if idle_parts not in IDLE_PARTS:            # idle parts (docs/offload.md 13.12): read
-        raise ValueError(f"idle parts {idle_parts!r}")  # ahead, one call; halt-aware
-    srv.read_ahead, srv.halt_aware = idle_parts in ("ra", "v2"), idle_parts in ("halt", "v2")
     srv.pool = timed("pool", pool_of)
     mem.write, mem.read = timed("write", mem.write), timed("read", mem.read)
     if hasattr(mem, "write_slot"):              # BoardDram: staging (the main thread), and
@@ -226,8 +164,6 @@ def card(model: str, ref: dict, n: int, experts: int, cap: int, pool: str | None
             return r
         eng.backend.host = served
     warm, pf = getattr(srv, "pool_warm", None), getattr(srv, "pool_file", None)
-    if willneed and pf is not None:             # a request's misses read from the disk at once
-        srv.ahead = pf.willneed
     if legacy_serve:                            # the serving of docs/offload.md 10.7 (A/B, 10.8):
         from opentpu.host import board as brd   # halves, buffer lists, the victims' entries
         mem.lead, srv.clear_late = None, False  # first, a 50 us sleep between polls, out[] read
@@ -347,7 +283,7 @@ def card(model: str, ref: dict, n: int, experts: int, cap: int, pool: str | None
     wait0 = getattr(mem, "wait_s", 0.0)         # staging's waits for the DMA thread
     if pf is not None:                          # the decode's pool reads: page cache or disk
         pf.io = {}
-    snap0, mem_decode = snap() if snap else None, host_mem()
+    snap0, mem_decode = snap() if snap else None, ST.host_mem()
     t = time.time()
     top = []                    # host loop: the device's 8 best (id, logit) per step
 
@@ -362,7 +298,7 @@ def card(model: str, ref: dict, n: int, experts: int, cap: int, pool: str | None
     else:                       # the prompt's last token fed by the card's loop: every pick
         got = eng.generate_card(ids[-1], n, stop_ids=[])        # on the card
     gen_s = time.time() - t
-    snap1, mem_end, warm_end = snap() if snap0 else None, host_mem(), warm_at()
+    snap1, mem_end, warm_end = snap() if snap0 else None, ST.host_mem(), warm_at()
     if hint_trace:
         Path(hint_trace).write_text(json.dumps(srv.events))
         srv.events = None

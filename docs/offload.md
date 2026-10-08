@@ -75,6 +75,9 @@ host fp4 kernel.
     card caches only 1-4% of them.
 - **Next (section 9).** LFM2.5-8B-A1B end to end on the ISA simulator, with the card's 4 GiB,
   the router on the card, per-layer LRU slots and a host DMA daemon.
+- **otpu-chat (section 14).** The chat runs LFM2.5-8B-A1B, Qwen3.5-35B-A3B and gemma-4-26B-A4B
+  with moe_card's engine and settings (opentpu/host/streamed.py). Each model's pool is packed
+  once beside its checkpoint and checked before the image is built.
 
 The tools:
 
@@ -3721,3 +3724,175 @@ Tests (test_offload_server):
 
 Each test fails with its rule removed: the victims' guard, the scratch's removal from the free
 lists, the drain, the disarm, the tag zeroing.
+
+## 14. Chatting with a streamed MoE (otpu-chat)
+
+otpu-chat runs the three MoE models bigger than the card's 4 GiB. Their experts stream from a pool
+file on the host into per-layer slots in the card's DRAM. The card routes every token and computes
+every expert; the host reads the pool file and writes DRAM, nothing else.
+
+```sh
+otpu-chat --backend board --model lfm2-8b       # LFM2.5-8B-A1B
+otpu-chat --backend board --model qwen35-35b    # Qwen3.5-35B-A3B
+otpu-chat --backend board --model gemma4-26b    # gemma-4-26B-A4B
+otpu-chat --backend board --model qwen35-35b --pool /data/pools/q35.bin
+otpu-chat --backend isa --model lfm2-8b         # the ISA simulator, with the card's 4 GiB
+```
+
+The engine is moe_card's: `opentpu/host/streamed.py` builds it for both tools, with the settings
+measured best on the card. tools/offload/moe_card.py stays the tool for measurements; its options
+reach every setting.
+
+### 14.1 The pool
+
+Each model's experts are packed once into a pool file in the card's slot format (split, 10.4).
+otpu-chat looks for it in the checkpoint's directory, as `pool-<the experts' format>.bin`: all
+three models stream fp4 experts, so `models/<checkpoint>/pool-fp4.bin`. Its `.packed`, `.format`
+and `.key` sit beside it. `--pool PATH` names another file. A symbolic link with no `.packed`
+beside it is followed: the companions then sit beside the file it names.
+
+Packing takes the whole checkpoint (the card's host may keep one without the experts,
+strip_experts.py) and runs on any host:
+
+```sh
+python3 tools/offload/pack_pool.py MODEL POOL init                 # the sparse file and its companions
+python3 tools/offload/pack_pool.py MODEL POOL pack I N             # worker I of N (each in its own process)
+OTPU_FORMATS=experts=fp4 python3 tools/offload/pack_pool.py MODEL POOL init --wformat int8   # gemma-4-26B-A4B
+```
+
+Gemma 4 26B's pool needs `OTPU_FORMATS=experts=fp4` and `--wformat int8` on every command (its
+layers are int8, its experts fp4). The pools are 4.1 GB (LFM2.5-8B-A1B, 704 experts), 17.1 GB
+(Qwen3.5-35B-A3B, 10240) and 12.1 GB (gemma-4-26B-A4B, 3840). LFM2.5-8B-A1B's packed in 15
+minutes with three workers on omarchy (2026-10-08).
+
+otpu-chat checks the pool before it builds the image, so a bad pool costs seconds rather than the
+build's minutes. It stops with the reason and the commands to fix it when the pool:
+- is missing (the message gives the pack commands);
+- has another size (another model or format; the runtime would take it for a new pool and
+  truncate it);
+- has another key (moe.pool_key: the quantizer's code, the format, D, the layout, the
+  checkpoint's config.json): packed by an older quantizer or from another checkpoint. Repack it;
+- is not whole, beside a checkpoint without the experts to pack the rest.
+
+A pool packed before keys has none. It is served with a warning until `pack_pool.py MODEL POOL
+stamp` writes its key. Stamp a pool only once it is known current: `pack_pool.py MODEL POOL sums
+32` prints the sha256 of 32 of its experts, and `pack_pool.py MODEL - sums 32` (on a host with
+the whole checkpoint) the same experts as this tree packs them. The lists must be equal.
+
+### 14.2 What runs
+
+- **Formats.** `--wformat auto` (the default) takes the formats each model ran with on the card:
+  LFM2.5-8B-A1B and Qwen3.5-35B-A3B fp4 with an int8 LM head (10), Gemma 4 26B int8 layers with
+  fp4 experts and an fp4 head (11.5). `--wformat` and `--head-format` override them; the pool
+  must hold the experts' format.
+- **Slots.** As many a layer as fill the DRAM beside the rest of the image (`--experts N` sets
+  them), replaced by least decayed use (`--policy lru` for least recently used).
+- **The prompt.** Qwen3.5-MoE and Gemma 4 MoE run it layer by layer in runs of two rows, every
+  slot serving the running layer (13; `--layer-major R`, 0 for token by token). LFM2-MoE runs it
+  token by token.
+- **Turns** keep the context as a dense model's do (docs/host.md 6): a later turn rolls back to
+  where its rendering and what was fed part and feeds the rest, the recurrent and windowed
+  state from the snapshot the turn before took at its reply's start. The slots fill the DRAM,
+  so a streamed MoE's snapshots sit on the host and each copy crosses PCIe. A layer-major
+  prompt's part up to the snapshot runs no LM head.
+- **The embedding table.** Qwen3.5-35B-A3B's untied int8 table stays on the host, which writes
+  each token's row, so more slots fit (`--embed-table card` puts it on the card).
+- **Decode.** The card's decode loop picks every token, greedy or sampled, when the card takes
+  the sampling settings (top-k 1 to 64). A default top-k above 64 is clamped to 64 with a note
+  (LFM2.5-8B-A1B's generation_config.json asks for 80; docs/host.md 6). With an explicit
+  `--top-k` above 64 the host samples each step from its logits.
+- **The server.** The expert server is polled while every run is in flight: the prompt's runs,
+  the decode loop, and each step the host samples. `--poll-idle` sets its idle polls (10.10).
+- **Not supported:** `--mtp`, `--per-position`, `--backend board-sim` and `rtl`.
+
+The other settings are the defaults of 10-13: a request's disk reads queued at once, the idle
+parts read ahead and halt-aware, the pool mapped, the checkpoint released once the image is
+written, no hints, no layer-ahead, no expert-major prefill.
+
+### 14.3 What it shows
+
+At load, LFM2.5-8B-A1B at the default `--cap 2048`: `experts: 638 slots of 704 experts (91%),
+5.85 MB each; pool models/LFM2.5-8B-A1B/pool-fp4.bin`.
+
+Each turn's numbers add the experts (LFM2.5-8B-A1B's first turn in 14.5):
+- the status line: `· 99% hit · 6.6 MB/tok` after the decode rate;
+- `--plain` and `--prompt`: `; experts 98.7% hits, 6.6 MB/token, 76 misses in the prompt`;
+- the side panel and `/stats`: the slots, and the turn's hits, MB a token and the prompt's
+  misses.
+
+The hits and misses are those of the reply's expert uses (each token's top-k per layer). MB a
+token is what the reply streamed over the link, divided by its tokens after the first. The
+prompt's misses are counted apart.
+
+### 14.4 What to expect
+
+Measured with moe_card and these settings (the chat's own runs on the card: 14.5):
+
+| Model | Decode | Streamed a token | Prompt | Source |
+|:--|--:|--:|--:|:--|
+| LFM2.5-8B-A1B | 13.5 tok/s (16 tokens), 15.0 (160); the pool in /dev/shm | 5.2 MB (98.5% hits) | token by token | 12.9, README |
+| Qwen3.5-35B-A3B | 5.3 tok/s (128 tokens) | 103 misses, about 170 MB | 134 tokens in 14.6 s | 12.9, 13.7 |
+| gemma-4-26B-A4B | 3.7 tok/s (128 tokens) | 88 misses, about 280 MB | 124 tokens in 17.3 s | 12.9, 13.7 |
+
+- **Loading** builds the image on the host, then writes it: about 9 minutes for the 35B (10.4).
+  The pool's read into the page cache runs during the build.
+- **Host memory.** The process peaks at about 13 GB during the 35B's image build, then holds
+  about 1.3 GB (10.7). The pool lives in the page cache. Nothing is pinned, so the kernel can
+  reclaim it, at the cost of disk reads for the experts it drops. On opentpu (31 GB) the 35B's
+  17.1 GB pool and the chat fit together once the build is done. Other large files in the page
+  cache (other checkpoints) cost speed: 3.05 against 3.79 tok/s in 10.7.
+- **Speed.** Decode depends on the conversation: a new topic's first tokens miss more. The first
+  reply after a load also warms the slots.
+
+### 14.5 The check on the card
+
+`tools/qual/chatmoe.py` scripts a conversation through otpu-chat's own Chat, engine and settings:
+two turns (a question, then one about its answer), greedy, 16 tokens a reply, with the chat
+template's date pinned. It writes each turn's tokens, the ids fed so far, TTFT, prefill and
+decode rates, hits and MB a token as JSON. The run on the ISA simulator with the card's
+configuration (`tools/qual/refs.py cfg`) is the card's reference bit for bit, and `--check`
+compares each turn's tokens with it.
+
+```sh
+python3 tools/qual/chatmoe.py CHECKPOINT --cfg cfg.pkl --pool POOL --out ref.json      # ISA simulator
+python3 tools/qual/chatmoe.py CHECKPOINT --backend board --cfg dev.pkl --pool POOL --check ref.json
+```
+
+`tools/qual/chatmoe.sh` is the card session, under otpu-lock and with the offload sessions'
+paths (tools/offload/sessions/env.sh). It runs a selftest and checks that the device's
+configuration is the references'. Then, for each staged model, it drops the other large files
+from the page cache, reads the pool in, and runs the scripted chat against its reference.
+
+On the ISA simulator with the card's configuration (omarchy, 2026-10-08, tree 21402a25),
+LFM2.5-8B-A1B with the repacked pool:
+- Turn 1 (21 prompt tokens, 16 generated): the tokens equal moe_card's on the same ids and pool,
+  and the card's reference from session 17 (its ref16, the same prompt).
+- The slots: 638 of 704 experts (29 a layer). Turn 1 hit 98.7% of its decode's expert uses
+  (6.6 MB a token) with 76 misses in its prompt. Turn 2 hit 99.8% (0.8 MB a token) with 22.
+- The process peaked at 10.7 GB, the simulator's 4 GiB DRAM included.
+
+Not run on the card yet.
+
+### 14.6 Tests
+
+`tests/test_chatmoe.py` runs tiny random MoEs of the three families (Qwen3.5-MoE with an untied
+head, LFM2-MoE, Gemma 4 MoE) on the ISA simulator with 2 slots a layer:
+- `test_a_chat_turn_is_moe_cards_run`: a greedy chat turn gives moe_card's tokens on the same
+  prompt and pool;
+- `test_the_next_turn_continues_the_context`: the second turn feeds only what the conversation
+  added (layer by layer from the context's position for Qwen3.5 and Gemma 4), and its reply is,
+  bit for bit, that of an engine with every expert resident fed the whole conversation;
+- `test_a_streamed_chat_rolls_back_to_the_reply`: with a template that renders a past reply
+  otherwise than it was fed, the later turns roll back to the reply's start (reused > 0, not
+  restarted; the snapshots on the host or the device), and each turn's logits and reply equal a
+  fresh streamed engine's on the turn's rendering, bit for bit;
+- `test_a_sampled_reply_streams_its_experts`: sampled replies, picked on the host (top-k 80)
+  and by the card's loop (top-k 20), equal those of an engine with every expert resident, and
+  the turn counts the steps' experts;
+- `test_the_pool_is_checked_before_the_image`, `test_pack_pool_sums_tell_a_current_pool`;
+- `test_otpu_chat_runs_a_streamed_moe` (otpu-chat's main), `test_the_interface_shows_the_streaming`,
+  `test_the_scripted_chat_checks_a_run_against_its_reference` (chatmoe.py).
+
+test_qwen35_moe's `test_layer_major_prompts_as_prefill_chunks` covers the Engine's part: a
+layer-major prompt through prefill_chunks is one part with its runs' stats in one entry, and
+`prefill_layers(logits=False)` runs no head.

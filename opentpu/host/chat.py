@@ -11,6 +11,9 @@
     otpu-chat --model qwen35-2b --mtp         # Qwen3.5 with its MTP drafter (docs/mtp.md)
     otpu-chat --model phi4-mini --wformat fp4 # the weights' format (default auto: the model's
                                               # recommended mix, else int8; docs/formats.md)
+    otpu-chat --model qwen35-35b --backend board  # a MoE bigger than the card's DRAM: its
+                                              # experts streamed from a pool file into slots
+                                              # (opentpu/host/streamed.py, docs/offload.md 14)
 
 The interactive mode is a full-screen interface (opentpu/host/chat_tui.py): the conversation,
 and under the input a status line with TTFT, prefill and decode tokens/s (wall and device) and
@@ -42,6 +45,7 @@ from pathlib import Path
 
 import numpy as np
 
+from opentpu.host import streamed as ST
 from opentpu.host.runstate import busy_exits
 from opentpu.llm import MODELS, load_spec, model_dir
 from opentpu.llm import formats as FM
@@ -238,13 +242,16 @@ class _Seen:
         return self.ids
 
 
-def sampling(spec, args, path=None) -> dict:
+def sampling(spec, args, path=None, note=lambda s: None) -> dict:
     """The model's sampling defaults, overridden by the flags given on the command line (None
     when not given): the checkpoint's generation_config.json at `path` when it samples
     (do_sample; Hugging Face's defaults for the keys it leaves out), else its family's
     SAMPLING, else greedy (temperature 0) as Hugging Face's generate. Qwen3 and Qwen3.5 always
     take SAMPLING's: their generation_config.json holds the thinking mode's settings. The
-    Llama-likes (llama.py: Qwen3's Spec without the q / k norms) have no family."""
+    Llama-likes (llama.py: Qwen3's Spec without the q / k norms) have no family. A default
+    top-k above the device sampler's (generate.K_MAX, 64; 0: none) is clamped to it, so the
+    decode loop stays on the device (LFM2.5-8B-A1B's 80); `note` gets a line saying so when
+    the settings sample. --top-k still sets any."""
     fam = type(spec).__module__.rsplit(".", 1)[-1]
     if fam == "qwen3" and not spec.qk_norm:
         fam = None
@@ -256,7 +263,14 @@ def sampling(spec, args, path=None) -> dict:
         d = {k: v if g.get(k) is None else g[k] for k, v in HF_SAMPLING.items()}
     else:
         d = dict(SAMPLING.get(fam, dict(HF_SAMPLING, temperature=0.0)))
+    top_k = d["top_k"]
+    if not 0 < top_k <= G.K_MAX:
+        d["top_k"] = G.K_MAX
     d.update({k: getattr(args, k) for k in d if getattr(args, k, None) is not None})
+    if d["top_k"] != top_k and getattr(args, "top_k", None) is None and d["temperature"] > 0 \
+            and not getattr(args, "greedy", False):
+        note(f"top-k {top_k or 'none'} (the model's default) clamped to {G.K_MAX}, the most the "
+             f"card's decode loop samples from; --top-k {top_k} keeps it (sampled on the host)")
     return d
 
 
@@ -289,6 +303,21 @@ class Turn:
     end: str = ""
     mtp_iters: int = 0                # MTP's verify iterations (--mtp)
     mtp_accepted: int = 0             # ... whose draft was accepted
+    experts: bool = False             # a streamed MoE (opentpu/host/streamed.py): its expert
+    expert_hits: int = 0              # requests' slot hits and misses while the reply decoded,
+    expert_misses: int = 0            # the bytes streamed for them, and the prompt's misses
+    streamed: int = 0
+    prefill_misses: int = 0
+
+    @property
+    def expert_hit_rate(self) -> float | None:
+        n = self.expert_hits + self.expert_misses
+        return self.expert_hits / n if n else None
+
+    @property
+    def streamed_mb_per_token(self) -> float | None:
+        return self.streamed / 1e6 / self.decode_steps if self.experts and self.decode_steps \
+            else None
 
     def _dev(self, n: int, cycles: int) -> float | None:
         return n * self.clock_mhz * 1e6 / cycles if self.clock_mhz and cycles else None
@@ -331,7 +360,17 @@ class Turn:
         return (f"[TTFT {ttft}; prefill {self.prefill_tokens} tokens{reused}, "
                 f"{r(self.prefill_tok_s, self.prefill_dev_tok_s)} tok/s; decode "
                 f"{self.gen_tokens} tokens, {r(self.decode_tok_s, self.decode_dev_tok_s)} tok/s"
-                f"{mc}{mtp}; context {self.context}/{self.cap}{end}]")
+                f"{mc}{mtp}{self.experts_note()}; context {self.context}/{self.cap}{end}]")
+
+    def experts_note(self) -> str:
+        """A streamed MoE's part of line(): the decode's slot hits and MB streamed a token, the
+        prompt's misses."""
+        if not self.experts:
+            return ""
+        hit, mb = self.expert_hit_rate, self.streamed_mb_per_token
+        return ("; experts " + ("-" if hit is None else f"{100 * hit:.1f}% hits") +
+                ("" if mb is None else f", {mb:.1f} MB/token") +
+                f", {self.prefill_misses} misses in the prompt")
 
 
 class Detok:
@@ -406,6 +445,7 @@ class Chat:
         self._next = None                   # logits after a reply cut at max_new (resume())
         self._reply: list[int] = []         # the last reply's tokens
         self.mtp = None                     # an MTP engine's decoder (opentpu/llm/mtp.py)
+        self._served = self._expert_counts()    # a streamed MoE's server's counts (_experts)
         cap = getattr(engine.spec, "softcap", None)
         if getattr(pick, "softcap", cap) != cap:    # it gets the engine's raw logits
             raise ValueError(f"the sampler's softcap {pick.softcap} is not the model's {cap} "
@@ -597,9 +637,30 @@ class Chat:
         turn.mtp_accepted += sum(st.accepted)
         return st.tokens[1:], sum((r or {}).get("cycles", 0) for _, _, r in st.runs)
 
+    def _expert_counts(self) -> tuple | None:
+        srv = getattr(self.eng, "server", None)
+        return None if srv is None else (srv.hits, srv.misses, srv.bytes)
+
+    def _experts(self, turn: Turn, decode: bool) -> None:
+        """A streamed MoE's expert server's counts since the last call into the turn: as the
+        prompt's misses when its decode starts, as the decode's hits, misses and bytes when it
+        ends (nothing runs between turns)."""
+        now = self._expert_counts()
+        if now is None:
+            return
+        h, m, b = (x - y for x, y in zip(now, self._served))
+        self._served, turn.experts = now, True
+        if decode:
+            turn.expert_hits += h
+            turn.expert_misses += m
+            turn.streamed += b
+        else:
+            turn.prefill_misses += m
+
     def _decode(self, logits, out: list[int], turn: Turn, t0: float, on_update, stop) -> str:
         """Generate after `out` (the reply so far) from `logits` (or, after a reply cut on the
         device, from its last token, an int: picked, not fed yet); returns the whole reply."""
+        self._experts(turn, False)
         if self.on_card:
             return self._decode_card(logits, out, turn, t0, on_update, stop)
         if isinstance(logits, int):          # the reply's last token, picked on the device
@@ -656,6 +717,7 @@ class Chat:
         return self._finish(out, shown, turn, on_update)
 
     def _finish(self, out: list[int], shown: str, turn: Turn, on_update) -> str:
+        self._experts(turn, True)
         self._reply = out
         reply = self.tok.decode(out, skip_special_tokens=True)
         if len(reply) > len(shown) and reply.startswith(shown):
@@ -799,6 +861,8 @@ def panel_meta(eng, backend: str, dev: str, model: str, sp: dict, max_new: int,
             "device": {"board": dev, "board-sim": "Verilator board model"}.get(
                 backend, "ISA simulator (host)"), "dram": None,
             "short": f"{backend} {clock_mhz:g} MHz" if clock_mhz else backend}
+    if getattr(eng, "server", None) is not None:        # a streamed MoE
+        meta["experts"] = ST.describe(eng, getattr(eng, "pool_path", None))
     c = eng.cfg
     if info:
         meta["bitstream"] = [f"D={info['D']} MCOLS={info['MCOLS']} LANES={info['LANES']}",
@@ -864,6 +928,29 @@ def main(argv=None):
                     help="Qwen3.5: decode with the model's MTP drafter, the loop on the device "
                          "(docs/mtp.md): the same replies, greedy or sampled, 1.3-1.6x the "
                          "decode tok/s")
+    moe = ap.add_argument_group(
+        "a mixture-of-experts model bigger than the card's DRAM (lfm2-8b, qwen35-35b, "
+        "gemma4-26b): its experts stream from a pool file into slots in the card's DRAM "
+        "(docs/offload.md 14); --wformat auto takes the formats it ran with on the card")
+    moe.add_argument("--pool", help="the expert pool file (default: pool-<the experts' "
+                                    "format>.bin in the checkpoint's directory; "
+                                    "tools/offload/pack_pool.py packs it)")
+    moe.add_argument("--experts", type=int, default=0,
+                     help="expert slots per MoE layer (default 0: as many as fit the DRAM)")
+    moe.add_argument("--policy", choices=("lfu", "lru"), default="lfu",
+                     help="the slots' replacement: least decayed use (the default) or least "
+                          "recently used")
+    moe.add_argument("--layer-major", type=int, metavar="R",
+                     help="the prompt layer by layer in runs of R rows, every slot serving the "
+                          "running layer (default 2 where the model has layer runs: Qwen3.5 "
+                          "and Gemma 4 MoE; 0: token by token, LFM2's)")
+    moe.add_argument("--embed-table", choices=("host", "card"),
+                     help="an untied embedding table on the host (the default: more slots) or "
+                          "on the card")
+    moe.add_argument("--poll-idle", metavar="spin|S|predict",
+                     help="the host's polls while a run is in flight and no expert is asked "
+                          "for: spin (the default), sleep S seconds, or predict each gap "
+                          "(docs/offload.md 10.10): less host CPU, the same speed on Gen2")
     a = ap.parse_args(argv)
     if a.top_p is not None and not 0 <= a.top_p <= 1:     # (Hugging Face's range)
         ap.error(f"--top-p {a.top_p}: 0 .. 1 (0 keeps the most likely token only)")
@@ -872,6 +959,15 @@ def main(argv=None):
     tok = AutoTokenizer.from_pretrained(path)
     spec = load_spec(path)
     wformat = FM.auto(spec, a.wformat)
+    streams = ST.streams(spec)          # a MoE: its experts streamed (opentpu/host/streamed.py)
+    if streams:
+        if a.backend not in ("isa", "board") or a.mtp or a.per_position:
+            raise SystemExit("otpu-chat: a streamed MoE runs on the ISA simulator or the card "
+                             "(--backend isa or board), resident, without --mtp")
+        formats = None
+        if a.wformat == FM.AUTO:        # the formats it ran with on the card
+            wformat, head, formats = ST.defaults(spec)
+            a.head_format = a.head_format or head
     print(f"loading {path.name} onto openTPU ({a.backend}) ...", flush=True)
     from opentpu.host.board import ConfigMismatch
     try:
@@ -893,7 +989,17 @@ def main(argv=None):
                                              lookup=True).nbytes
         cfg = board_config(DRAM_BYTES=1 << max(20, (need - 1).bit_length()), **flags)
     try:
-        if a.mtp:
+        if streams:                     # the card's 4 GiB (the simulator's too: board_config)
+            from opentpu.isasim import board_config
+            eng = ST.engine(path, cfg or board_config(), backend, a.cap, a.pool or ST.DEFAULT,
+                            experts=a.experts, policy=a.policy, wformat=wformat,
+                            head_format=a.head_format, formats=formats,
+                            embed_host=None if a.embed_table is None else a.embed_table == "host",
+                            layer_major=a.layer_major, prog_cache=not a.no_prog_cache,
+                            snapshots=SNAPSHOTS)
+            ST.poll_idle(eng, a.poll_idle)
+            print(f"experts: {ST.describe(eng, eng.pool_path)}", flush=True)
+        elif a.mtp:
             from opentpu.llm.mtp import mtp_engine
             eng = mtp_engine(spec, load_weights(path, mtp=True), cap=a.cap, cfg=cfg,
                              backend=backend, wformat=wformat, head_format=a.head_format,
@@ -904,13 +1010,13 @@ def main(argv=None):
                          wformat=wformat, head_format=a.head_format,
                          resident=not a.per_position, prog_cache=not a.no_prog_cache,
                          prompt_runs=not a.no_prompt_runs, snapshots=SNAPSHOTS)
-    except ConfigMismatch as e:
+    except (ConfigMismatch, ST.PoolError) as e:
         raise SystemExit(f"otpu-chat: {e}") from None
     weights = weights_label(eng.image, wformat)
     print(f"weights: {weights}", flush=True)
     if getattr(eng.backend, "status", None) is not None:
         eng.backend.status.update(weights=weights)      # for otpu-smi
-    sp = sampling(spec, a, path)
+    sp = sampling(spec, a, path, note=lambda s: print(f"otpu-chat: {s}", flush=True))
     pick = sampler(0 if a.greedy else sp["temperature"], sp["top_k"], sp["top_p"], a.seed,
                    sp["repetition_penalty"], getattr(spec, "softcap", None))
     clock = 0.0
