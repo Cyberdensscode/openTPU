@@ -489,6 +489,60 @@ quantizes about as fast as the matrix hashes. Its keys hold no host, so a cache 
 can be copied (`rsync -a ~/otpu-build/qcache/mxu/ opentpu:otpu-build/qcache/mxu/`). The tests
 run without it (`tests/conftest.py`). Gemma 4's build goes through it too ([gemma4.md](gemma4.md)).
 
+### Image builds: in parallel, and cached whole
+
+On 2026-10-08 a cold `otpu-chat --model lfm2-2.6b --wformat fp4 --head-format int8` on the card
+host spent 16 minutes before its first prompt: a change to `opentpu/quant.py` had missed every
+entry of the 4-bit cache, and the build quantized LFM2-2.6B's 556 4-bit matrices (2.43 G
+elements) in numpy on one core. Two changes since:
+
+- **The builds quantize in parallel.** The 4-bit quantizer's scale search runs on a few rows at
+  a time (`qcache.quantize_rows`, PIECE = 32K elements): its float64 temporaries stay in a
+  core's caches, where whole matrices left every core waiting on the memory bus. On omarchy one
+  core quantizes an element in 110 ns instead of 240, and 16 processes in 17 ns instead of 86.
+  Rows are quantized on their own, so the result is the same, bit for bit. The Qwen3, LFM2 and
+  Qwen3.5 builds hand their matrices to a `qcache.Batch`: the build's process converts each
+  matrix, hashes it once and looks it up in the 4-bit cache (on four threads, up to 1 GiB of
+  matrices ahead), and only the misses' rows go to worker processes (`OTPU_BUILD_JOBS`, default
+  the host's CPUs; 1 quantizes in the build's process), in jobs of 4M elements, two queued per
+  worker. Gemma 4's own quantization jobs use the same pool, with as many workers as the free
+  memory holds at 1.5 GiB each (`qcache.build_jobs`). The images are the serial build's, byte
+  for byte.
+- **The finished image is cached** (`opentpu/imgcache.py`). An `Engine` builds its image
+  through `imgcache.build`, keyed by the checkpoint (its files' names, sizes, modification times
+  and safetensors headers), the layout (Spec, configuration, KV capacity, prefill rows, formats,
+  lookup tables), the `OTPU_*` variables the sources read, the source of every module but
+  `opentpu/host` and the numpy and torch versions. A hit reads the image back with what the
+  build left for the host (an int8 embedding table kept on the host, Gemma 4's PLE records), and
+  no weight is converted, hashed or quantized. An entry stores each slice's runs of nonzero
+  4 KiB pages: the KV caches are not stored. The cache is `~/otpu-build/qcache/img` (beside
+  `mxu` and `prog`; `OTPU_IMG_CACHE=<dir>`, `0` turns it off, as `OTPU_IMAGE_CACHE=0` does); it
+  keeps 16 GB (`OTPU_IMG_CACHE_GB`), drops the least recently used entries first and writes
+  nothing that would leave under 20 GB of free disk (`OTPU_IMG_CACHE_FREE_GB`). A new KV
+  capacity, configuration, format or tree builds again, from the 4-bit cache.
+
+LFM2-2.6B fp4 with its int8 head (`--cap 2048`, the card's configuration), on omarchy (16
+threads, shared with other agents' jobs, 2026-10-08):
+
+| build | main (8eaa480) | parallel |
+|---|---|---|
+| cold: no 4-bit cache entry | 721 s, one core | 66-68 s (8 or 16 workers) |
+| every matrix in the 4-bit cache | (the lookups on one thread: 16.6-18.7 s) | 7.0 s |
+| from the image cache | | 0.3-0.7 s (a 1.97 GB entry) |
+
+The images are byte for byte main's (sha256 of LFM2-2.6B's 83e931b2ee248a03...), as are
+Qwen3-0.6B's (108 s on one core, 20 s with 8 workers), Qwen3.5-0.8B's (128 s, 22 s) and
+Qwen3.5-2B's (392 s, 37 s), all fp4 with an int8 head. In an 8-worker cold build the build's
+process waits on the workers for most of its time (38 of 62 s): they are the bottleneck. The
+rows go to them pickled through the pool's pipes at 1.4 GB/s, ten times what they quantize
+(0.15 GB/s), a few core-seconds of the build's 500: shared memory would not gain. With 8
+workers the build's processes peak at 8.5 GiB of anonymous memory for LFM2-2.6B (a worker's
+under 0.1 GiB) and 6.5 GiB for Qwen3.5-4B fp4 (cold in 81 s). An image missing from the image
+cache with its matrices in the 4-bit cache (a new tree) takes 12 s to build and keep, the next
+open 0.3 s to read. `opentpu.host.prebuild` builds otpu-chat's image (its default
+`--cap 2048`), so it fills the image cache for the chat as well as the 4-bit cache for every
+tool.
+
 ### First light (measured on the card, 2026-09-26)
 
 Build 74d48591 (the primary image), Arch Linux 7.1 host, Xilinx dma_ip_drivers XDMA (poll mode),

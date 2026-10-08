@@ -119,11 +119,18 @@ At 2048 tokens the image is 3.636 GiB (372 MiB free). The on-card decode loop's 
 5 to 7 MiB with its three 1 MiB logit vectors) fits in what is free. With an fp4 PLE table
 (`OTPU_PLE_FORMAT=fp4`) the records are 4,864 bytes and int8 layers fit too (3.424 GiB); the
 default picks int8 whenever the image fits 4 GiB. The build
-quantizes the matrices in worker processes (`OTPU_BUILD_JOBS`, default 4), the 4-bit ones through
-the image caches' disk cache (`opentpu/qcache.py`, [board.md](board.md); int8 matrices and the
-PLE records are quantized at each build): 324 s cold on omarchy. An image with the fp4 PLE table
-(explicit int8 layers) spends most of its build on the table's 4-bit search: 697 of 773 s on one
-core, about 10 minutes with four jobs on the card host, at every build. Caching those records
+quantizes the matrices in worker processes (`OTPU_BUILD_JOBS`; by default, since 2026-10-08,
+the host's CPUs, as many as the free memory holds at 1.5 GiB a worker; 4 before), the 4-bit
+ones through the image caches' disk cache (`opentpu/qcache.py`, [board.md](board.md); int8
+matrices and the PLE records are quantized at each build): 324 s cold on omarchy with 4
+workers. On 2026-10-08 (omarchy shared with other jobs) the default E2B image took 192 s cold
+with main's 4 workers and 68 s with 8 and the 4-bit search on row pieces (`qcache.quantize_rows`),
+the same image byte for byte; the build's processes peaked at 7.9 and 10.1 GiB of anonymous
+memory. A built image is kept whole in the image cache (`opentpu/imgcache.py`, with its PLE
+records and the weights the host inputs read), so a later open reads it back. An image with
+the fp4 PLE table (explicit int8 layers) spends most of its build on the table's 4-bit search:
+697 of 773 s on one core, about 10 minutes with four jobs on the card host (before the row
+pieces), at every build the image cache misses. Caching those records
 (branch qcache-ple: `gather.pack_records` through `opentpu/qcache.py`, rows stored without their
 padding, prebuild covering such runs) would take 1.27 GB of the card host's disk; it is parked
 while that disk is at its floor, as only an explicit `--wformat int8` E2B pays it.

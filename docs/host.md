@@ -491,6 +491,24 @@ The first call writes the model image (at the default `--cap 2048`: 0.69 GiB for
 embedding row and the token's program (a few tens of KiB), runs, and reads the logits (0.58 MiB
 for Qwen3, 0.25 MiB for LFM2, 0.95 MiB for Qwen3.5).
 
+**Opening a model.** The image is built from the checkpoint once and kept whole in the image
+cache (`opentpu/imgcache.py`, [board.md](board.md) "Image builds"); a later open reads it back
+and prints how long it took:
+
+```
+loading LFM2-2.6B onto openTPU (board) ...
+weights: fp4, head int8
+loaded in 2.0 s (the image read from the image cache in 0.3 s)
+```
+
+The first open of a model, format and `--cap` builds it, its 4-bit matrices quantized in worker
+processes, one per CPU (`OTPU_BUILD_JOBS`): LFM2-2.6B fp4 in about 70 s on omarchy, where the
+build on one core took 12 minutes (16 on the card host). `opentpu.host.prebuild` builds the
+chat's image ahead (`otpu-lock --prebuild lfm2-2.6b:fp4:int8 -- otpu-chat ...`). The tokenizer
+loads on a thread meanwhile (importing transformers takes about 2.5 s). On omarchy, otpu-chat on
+a fake card (the card's configuration; its upload a copy in memory) reaches the first prompt in
+2.1 to 2.5 s from the image cache, 18 to 20 s before it with every matrix in the 4-bit cache.
+
 **The interface** (Textual, `opentpu/host/chat_tui.py`) keeps the terminal's own background
 and one accent colour. The conversation is a single column: a header box with the model,
 backend, device, bitstream and clock, then each prompt after a dim `>` and each reply after a
@@ -548,7 +566,8 @@ that has `~/otpu-build`, or in `OTPU_PROG_CACHE=<dir>`. A later process then ski
 compile. Without it, a new process compiles before the second token of its first reply in each
 256-position bucket: about 0.1 s for plain decode and 0.5-0.7 s for `--mtp`'s six programs
 (Qwen3.5 on the card, [mtp.md](mtp.md) 11.7). `--no-prog-cache` turns it off;
-`OTPU_PROG_CACHE=0` keeps it in memory only.
+`OTPU_PROG_CACHE=0` keeps it in memory only. (Until 2026-10-08 the key held otpu-lock's pid,
+`OTPU_LOCK_PID`: a chat under otpu-lock never found the programs of the session before.)
 
 A dense Qwen3.5's prompt runs programs at run-time positions ([prefill.md](prefill.md)): its
 tokens go to the device's out[] and each run of up to R_max rows takes its position from the
