@@ -411,7 +411,7 @@ class RunnerStatus:
     """The status file of the process that holds a device. Fields (all optional but pid):
 
     pid, argv, start (unix time), dev, model, weights (otpu-chat: its formats in words), core_khz,
-    dram: {total, image, weights, kv_capacity, kv_used, program, free} (bytes),
+    dram: {total, image, weights, kv_capacity, kv_used, program, snapshots, free} (bytes),
     tokens (device runs so far), last_cycles, tok_s_device (CORE_KHZ / last_cycles),
     tok_s_wall (over the last WALL_WINDOW runs, host work included), updated (unix time).
 

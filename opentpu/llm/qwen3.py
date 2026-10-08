@@ -39,6 +39,7 @@ from ..compiler import (Affine, CompileError, DevVar, KVDesc, QTensor, RunVar, T
 from . import formats as FM
 from . import generate as G
 from . import rope_parameters
+from . import snapshot as SN
 from ..isasim import Config, Machine, design_config
 from ..kernels.attention import Additive, Bucket, _attend_heads
 from ..kernels.layouts import head_parallel_attention_weights
@@ -1857,26 +1858,28 @@ def _worker_layer(key, hint: bool = False, em: bool = False):
 
 
 def _worker_chunk(seq: int, p0: int, n: int, left: int, fit: int, toks=None,
-                  whole: bool = True):
+                  whole: bool = True, logits: bool = True):
     """The worker process: fit_chunk's run, its program assembled (one slice)."""
     from ..isa import assemble
     image, block = _WORKER
-    n, progs, fit = fit_chunk(image, block, seq, p0, n, left, fit, toks, whole)
+    n, progs, fit = fit_chunk(image, block, seq, p0, n, left, fit, toks, whole, logits)
     return n, None if progs is None else np.asarray(assemble(progs[0]), np.uint32), fit
 
 
 def fit_chunk(image, block: int, seq: int, p0: int, n: int, left: int, fit: int,
-              tokens=None, whole: bool = True, **kw):
+              tokens=None, whole: bool = True, logits: bool = True, **kw):
     """The next prefill run of sequence `seq` at position p0: up to n of the `left` remaining
     prompt tokens, as many as fit TMEM and ACT RAM (at most `fit` rows) and the instruction
     memory (attention is unrolled per row, head and block: the program grows with the context).
-    Only the prompt's last run computes logits (its last row). Returns (R, compile_rows'
-    programs or None for R = 1, the rows that fit TMEM as far as known). `tokens` (at least n):
-    the run's inputs come from the image's tables (compile_rows tokens). whole: R is at most
-    MCOLS or a multiple of it (_whole_passes): each weight streams once per MCOLS rows, so 5
-    rows at MCOLS 4 cost what 8 do; and an odd R takes R - 1 rows where they cost less MXU
-    time per row (prefer_rows: PAIR). kw: compile_rows' own (MTP decoding's hidden, slot)."""
+    Only the prompt's last run computes logits (its last row; none without `logits`). Returns
+    (R, compile_rows' programs or None for R = 1, the rows that fit TMEM as far as known).
+    `tokens` (at least n): the run's inputs come from the image's tables (compile_rows tokens).
+    whole: R is at most MCOLS or a multiple of it (_whole_passes): each weight streams once per
+    MCOLS rows, so 5 rows at MCOLS 4 cost what 8 do; and an odd R takes R - 1 rows where they
+    cost less MXU time per row (prefer_rows: PAIR). kw: compile_rows' own (MTP decoding's
+    hidden, slot)."""
     imem, mc = image.cfg.IMEM_WORDS, image.cfg.MCOLS if whole else 1 << 30
+    head = logits
 
     def rows(r, logits):
         return image.compile_rows([(seq, p0 + j) for j in range(r)], [r - 1] if logits else [],
@@ -1885,7 +1888,7 @@ def fit_chunk(image, block: int, seq: int, p0: int, n: int, left: int, fit: int,
     n = _whole_passes(min(n, fit, left), mc)
     while n > 1:
         try:
-            progs = rows(n, n == left)
+            progs = rows(n, head and n == left)
         except CompileError as e:
             if "TMEM" not in str(e) and "ACT RAM full" not in str(e):
                 raise
@@ -2044,6 +2047,14 @@ class Engine:
     bucket and kind, not per prompt. A dense model's resident image (prefill.supported). With
     the pipeline, bucket 1's are loaded or compiled on a thread as the engine starts
     (prefill.warm).
+
+    rollback(k) takes the context back to its first k tokens (a chat's next turn, whose
+    template renders the last reply differently from what was fed: opentpu/llm/snapshot.py).
+    A KV cache goes back to any position; state it does not hold (Qwen3.5's DeltaNet states and
+    windows, LFM2's convolution rings, Gemma 4's sliding rings past rollback_slack) comes from
+    a snapshot (snapshot()): `snapshots` of them kept, in an area of the device's DRAM after the
+    image (the image arrays grow to it) when it fits there, else on the host. Default 0: a
+    rollback of such a model starts over.
     """
 
     def __init__(self, spec: Spec, W: dict, cap: int = 4096, cfg: Config | None = None,
@@ -2054,7 +2065,8 @@ class Engine:
                  embed_host: bool | None = None, layer_major: int = 0, pooled: bool = True,
                  restore: str = "lazy", embed_runs: bool = False, release_weights: bool = True,
                  pool_map: bool = True, prog_cache: bool | None = None,
-                 prompt_runs: bool = False, layer_ahead=None, expert_major: bool = False):
+                 prompt_runs: bool = False, layer_ahead=None, expert_major: bool = False,
+                 snapshots: int = 0):
         self.spec, self.cap, self.block = spec, cap, block
         self.prog_cache = PC.enabled() if prog_cache is None else bool(prog_cache)
         self.prompt_runs = prompt_runs
@@ -2098,6 +2110,15 @@ class Engine:
             pool_file = open_pool(self.image.offload, pool_file, mapped=pool_map,  # the build
                                   key=pool_key(self.image, getattr(W, "model_dir", None)))
         images = self.image.build(W)
+        # rollback's snapshots of the state the KV caches do not hold (snapshot.py)
+        self.stateful = SN.stateful(self.image)
+        self._snaps = None
+        if snapshots and self.stateful:
+            self._snaps = SN.Snapshots(self.image, self.cfg, snapshots,
+                                       SN.Snapshots.area(self.image, self.cfg, snapshots))
+            if self._snaps.base is not None:
+                images = SN.grow(images, self._snaps.end())
+        self.snap_stats: list = []          # the snapshots' and restores' copies (stats)
         self.backend = IsaBackend(self.cfg, images, adopt=True) if backend == "isa" else backend(
             self.cfg, images)
         self.resident = bool(resident) and lookup and bool(getattr(self.backend, "args", False))
@@ -2305,6 +2326,47 @@ class Engine:
         """Forget the context (the KV cache is overwritten from position 0 on)."""
         for s in range(self.batch) if seq is None else [seq]:
             self.poss[s] = 0
+        if self._snaps is not None and (seq is None or seq == 0):
+            self._snaps.drop_above(0)
+
+    @property
+    def snapshot_bytes(self) -> int:
+        """The device area of the snapshots (bytes; 0 on the host or without)."""
+        sn = self._snaps
+        return 0 if sn is None or sn.base is None else sn.n * sn.nbytes
+
+    def snapshot(self, slot: int = 0) -> bool:
+        """Keep the context's state at its position for a later rollback (snapshot.py): a copy
+        of the state regions (`slot`: the DeltaNet states' committed slot, Spec.mtp) replacing
+        the oldest snapshot. False where there is nothing to keep (an image whose KV caches
+        hold the whole context) or no room (snapshots=0)."""
+        if self._snaps is None:
+            return False
+        self.snap_stats.append(dict(self._snaps.save(self, self.pos, slot), op="snapshot",
+                                    pos=self.pos))
+        return True
+
+    def rollback(self, k: int, slot: int = 0) -> int:
+        """Take sequence 0's context back to at most its first k tokens (the tokens from k on
+        are to change): returns the position t <= k it continues from, the KV caches and state
+        then those of a context fed its first t tokens, bit for bit. The KV caches go back to k
+        (the write position moves); with state they do not hold (stateful) and further back
+        than the image's rollback_slack, t is the latest snapshot's at or before k, restored
+        into `slot`, or 0 (a new context) with none. Snapshots after t are dropped."""
+        if k >= self.pos:
+            return self.pos
+        self._drain()
+        t = max(0, k)
+        if self.stateful and self.pos - t > getattr(self.image, "rollback_slack", 0):
+            j = None if self._snaps is None else self._snaps.best(t)
+            t = 0 if j is None else self._snaps.at[j]
+            if t:
+                self.snap_stats.append(dict(self._snaps.restore(self, j, slot), op="restore",
+                                            pos=t))
+        if self._snaps is not None:
+            self._snaps.drop_above(t)
+        self.pos = t
+        return t
 
     def step(self, token: int, on_start=None, sink=None) -> np.ndarray:
         """Feed one token at the next position; returns the logits [vocab] for the next one.
@@ -2432,18 +2494,21 @@ class Engine:
         return np.array(out, np.float32).reshape(len(logit_rows), v)
 
     def _chunk(self, seq: int, p0: int, n: int, left: int, fit: int, toks=None,
-               whole: bool = True):
+               whole: bool = True, logits: bool = True):
         """fit_chunk, its programs prepared for the backend."""
-        n, progs, fit = fit_chunk(self.image, self.block, seq, p0, n, left, fit, toks, whole)
+        n, progs, fit = fit_chunk(self.image, self.block, seq, p0, n, left, fit, toks, whole,
+                                  logits)
         prep = getattr(self.backend, "prepare", None)
         if progs is not None and prep is not None:
             prep(progs)
         return n, progs, fit
 
-    def prefill_chunks(self, tokens, seq: int = 0, chunk: int | None = None):
+    def prefill_chunks(self, tokens, seq: int = 0, chunk: int | None = None,
+                       logits: bool = True):
         """Feed a prompt to sequence `seq` in device runs of up to `chunk` tokens (default:
         the image's rows); yields (the tokens of the run, logits) after each run, the logits
-        after the prompt's last token with the last run and None before.
+        after the prompt's last token with the last run and None before (always None without
+        `logits`: no run computes them, a part of a prompt that goes on later).
 
         A run of R > 1 tokens is one qwen3_rows program (the model's compile_rows): every
         weight streams once for the R rows (ceil(R / MCOLS) MMs), each row attends causally
@@ -2462,7 +2527,7 @@ class Engine:
         tokens = [int(t) for t in tokens]
         if self.prompt_runs and seq == 0 and chunk is None and PF.supported(self) \
                 and PF.covers(self, self.poss[0], self.poss[0] + len(tokens)):
-            yield from PF.chunks(self, tokens)          # docs/prefill.md
+            yield from PF.chunks(self, tokens, logits)  # docs/prefill.md
             return
         whole = chunk is None               # else runs of exactly `chunk` where they fit
         chunk = self.rows if chunk is None else max(1, min(chunk, self.rows))
@@ -2470,28 +2535,29 @@ class Engine:
         while i < len(tokens):
             p0, left = self.poss[seq], len(tokens) - i
             key = ("rows", seq, p0, chunk, left, self._fit_rows,
-                   self._chunk_toks(tokens[i:], chunk), whole)
+                   self._chunk_toks(tokens[i:], chunk), whole, logits)
             n, progs, self._fit_rows = self._take(key, self._chunk, *key[1:])
             part, last = tokens[i:i + n], n == left
+            head = last and logits
             if not last:
                 self._run_rows_n = n
             if progs is None and seq == 0:
                 lg = self.step(part[0])
             else:
-                rows, lr = [(seq, p0 + j) for j in range(n)], [n - 1] if last else []
+                rows, lr = [(seq, p0 + j) for j in range(n)], [n - 1] if head else []
                 if progs is None:
                     progs = self.image.compile_rows(rows, lr, self.block,
                                                     **self._tokens_kw(part))
                 if not last:
                     self._prefetch_chunks(seq, p0 + n, chunk, left - n, tokens[i + n:],
-                                          whole)
-                elif seq == 0:
+                                          whole, logits)
+                elif seq == 0 and logits:
                     self._prefetch(p0 + n)
                 lg = self._run_rows(rows, part, lr, progs)
-                lg = lg[0] if last else None
+                lg = lg[0] if head else None
                 self.poss[seq] += n
             i += n
-            yield part, (lg if last else None)
+            yield part, (lg if head else None)
 
     def _chunk_toks(self, rest, chunk: int):
         """The tokens a prefill run's program is compiled with (device inputs: its first
@@ -2499,7 +2565,7 @@ class Engine:
         return tuple(rest[:chunk]) if self.device_inputs else None
 
     def _prefetch_chunks(self, seq: int, p0: int, chunk: int, left: int, rest=(),
-                         whole: bool = True) -> None:
+                         whole: bool = True, logits: bool = True) -> None:
         """Precompile the runs of a prompt from position p0 on, as many as the pipeline has
         workers (a chunk's trace can take longer than its run: Qwen3.5 on the card), each
         predicted to take as many rows as the last one (TMEM and IMEM limit a run: the program
@@ -2510,7 +2576,7 @@ class Engine:
             if left <= 0:
                 break
             key = ("rows", seq, p0, chunk, left, self._fit_rows, self._chunk_toks(rest, chunk),
-                   whole)
+                   whole, logits)
             if key not in queued:
                 self._submit(key, self._chunk, _worker_chunk, *key[1:])
             n = min(chunk, self._fit_rows, self._run_rows_n, left)

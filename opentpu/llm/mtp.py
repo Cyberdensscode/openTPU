@@ -127,7 +127,8 @@ class MTPDecoder:
         return self._drafts(len(toks))
 
     # ---- generation
-    def prefill(self, tokens, st: MTPStats, chunk: int = MTP_ROWS, pick=None, on_run=None):
+    def prefill(self, tokens, st: MTPStats, chunk: int = MTP_ROWS, pick=None, on_run=None,
+                follow: int | None = None):
         """Feed `tokens` from Engine.pos in plain prefill's runs (qwen3.fit_chunk,
         Engine.prefill's: their rows and so their MMs' pairing are its), each storing its rows'
         hidden, then the MTP layer over them, (h_q, x_(q + 1)), in runs of up to `chunk` rows;
@@ -135,8 +136,9 @@ class MTPDecoder:
         argmax). From Engine.pos 0 a new context; from a later one, the context this decoder
         left (its prefill, or the loop's run: the MTP layer's KV cache holds every position
         before Engine.pos, the committed slot the states). on_run(tokens): after each prefill
-        run; a true return stops the prefill there (-> None, None; a later prefill feeds the
-        rest)."""
+        run (Engine.pos past it); a true return stops the prefill there (-> None, None; a later
+        prefill feeds the rest). follow: the token after `tokens` (a part of a prompt, the rest
+        fed later): the last row's MTP input, no logits, a0 None."""
         toks = [int(t) for t in tokens]
         p0 = p = self.eng.pos
         P = p0 + len(toks)
@@ -146,37 +148,58 @@ class MTPDecoder:
         if p0 == 0:
             self.slot = 0
         if self.eng.prompt_runs and PF.supported(self.eng) and PF.covers(self.eng, p0, P):
-            a0, draft = PF.mtp(self, toks, st, pick, on_run)    # docs/prefill.md
+            a0, draft = PF.mtp(self, toks, st, pick, on_run, follow)    # docs/prefill.md
             self.draft = draft
             return a0, draft
         a0 = draft = None
         fit = self.img.rows
+        head = follow is None
         while p < P:
             left, i = P - p, p - p0
             t0 = time.perf_counter()
             n, progs, fit = fit_chunk(self.img, self.eng.block, 0, p, self.img.rows, left, fit,
-                                      toks[i:], hidden=True, slot=self.slot)
+                                      toks[i:], logits=head, hidden=True, slot=self.slot)
             if progs is None:           # one row: the rows kernel (plain prefill's decode step)
-                progs = self.img.compile_rows([(0, p)], [0] if n == left else [],
+                progs = self.img.compile_rows([(0, p)], [0] if head and n == left else [],
                                               self.eng.block, tokens=toks[i:i + 1],
                                               slot=self.slot, hidden=True)
             st.compile_s += time.perf_counter() - t0
             self._run(progs, "prefill", n, st)
             nxt = toks[i + 1:i + n + 1]
-            if n == left:
+            if n == left and head:
                 lg = self._logits(n)[n - 1]
                 a0 = int(np.argmax(lg)) if pick is None else int(pick(lg))
                 nxt = nxt + [a0]
+            elif n == left:
+                nxt = nxt + [int(follow)]
             for j in range(0, n, chunk):
                 k = min(chunk, n - j)
                 draft = self._draft(p + j, nxt[j:j + k], st, "mtp prefill", h0=j)[k - 1]
             p += n
+            self.eng.pos = p
             if on_run is not None and on_run(toks[i:i + n]) and p < P:
-                self.eng.pos, self.draft = p, None
+                self.draft = None
                 return None, None
         self.eng.pos = P
         self.draft = draft
         return a0, draft
+
+    def snapshot(self) -> bool:
+        """Engine.snapshot of the committed slot's states and windows."""
+        return self.eng.snapshot(self.slot)
+
+    def rollback(self, k: int) -> int:
+        """Engine.rollback for this decoder's context (into the committed slot): the MTP
+        layer's row at q took the token at q + 1 (h_q, x_(q + 1)), so a context going back
+        because the token at k changes goes back to k - 1 at most, where the next prefill's
+        first row computes that row again with the new token. Returns the position."""
+        if k >= self.eng.pos:
+            return self.eng.pos
+        t = self.eng.rollback(max(0, k - 1), self.slot)
+        self.draft = None
+        if t == 0:
+            self.slot = 0
+        return t
 
     def generate(self, prompt, max_new: int = 32, stop=None, drafts=None) -> MTPStats:
         """Greedy generation from an empty context; stops after a stop id (default the

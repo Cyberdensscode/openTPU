@@ -21,7 +21,11 @@ The model runs on the device, the prompt several tokens per run (Engine.prefill_
 dense model's from programs at run-time positions, compiled once per bucket: docs/prefill.md)
 and the reply token by token; the host only tokenizes, looks up the embedding rows, applies the
 chat template and samples from the logits. The KV cache stays in device DRAM
-across turns; only the new turn's tokens are fed. On the card the tool holds the device lock
+across turns; a turn feeds what its rendering of the conversation does not share with what
+the device holds: the new message, and the last reply again where the template renders it
+otherwise than it was generated (Qwen3's and Qwen3.5's drop the thinking block): the context
+rolls back to the common prefix (Engine.rollback, from a snapshot of the recurrent state taken
+at the reply's start: opentpu/llm/snapshot.py). On the card the tool holds the device lock
 and publishes its status (model, DRAM, tokens/s) for otpu-smi; the next token's program is
 compiled while the card runs the current one (Engine pipelining). --mtp (Qwen3.5) decodes with
 the model's MTP drafter, the loop on the device (opentpu/llm/mtp.py: a verify of two rows and a
@@ -55,6 +59,9 @@ SAMPLING = {"qwen3": dict(temperature=0.7, top_k=20, top_p=0.8, repetition_penal
             "gemma4": dict(temperature=1.0, top_k=64, top_p=0.95, repetition_penalty=1.0)}
 # Hugging Face's defaults for the keys a generation_config.json leaves out
 HF_SAMPLING = dict(temperature=1.0, top_k=50, top_p=1.0, repetition_penalty=1.0)
+# snapshots of a model's recurrent / windowed state the engine keeps for the next turn's
+# rollback (Engine(snapshots=); each turn takes one at its reply's start)
+SNAPSHOTS = 1
 
 
 def sampler(temperature: float, top_k: int, top_p: float, seed: int | None,
@@ -208,6 +215,12 @@ def _top_k_f32(logits, k: int, temperature: float, block: int = 64, bm=None):
     return cand[order], lv.astype(np.float64) / temperature
 
 
+def _common(a, b) -> int:
+    """The length of the common prefix of two token lists."""
+    n = min(len(a), len(b))
+    return next((i for i in range(n) if a[i] != b[i]), n)
+
+
 class _Seen:
     """The distinct token ids of a context list that only grows (Chat.fed), kept up to date
     with the tokens appended since the last call instead of converting the whole list."""
@@ -255,10 +268,10 @@ class _Picked(int):
 class Turn:
     """The numbers of one reply. Wall times are seconds from the submit; device numbers come
     from the engine's per-step cycles at `clock_mhz` (0: no device clock, wall only).
-    Prefill: the prompt tokens fed this turn (the KV cache keeps the earlier turns). TTFT:
-    submit -> first generated token. Decode: the tokens after the first, over the time since
-    the first. `end`: why the reply ended ("eos", "max_new", "cap": the KV cache is full,
-    "stopped": by the user; "" while it runs)."""
+    Prefill: the prompt tokens fed this turn (the KV cache keeps the earlier turns: `reused`
+    of them, the rest rolled back). TTFT: submit -> first generated token. Decode: the tokens
+    after the first, over the time since the first. `end`: why the reply ended ("eos",
+    "max_new", "cap": the KV cache is full, "stopped": by the user; "" while it runs)."""
     clock_mhz: float = 0.0
     cap: int = 0
     prefill_total: int = 0            # the prompt tokens this turn has to feed
@@ -271,7 +284,8 @@ class Turn:
     decode_steps: int = 0             # device steps after the prefill
     decode_cycles: int = 0
     context: int = 0                  # KV positions filled
-    restarted: bool = False           # the template changed the history: KV rebuilt
+    reused: int = 0                   # KV positions kept from the earlier turns
+    restarted: bool = False           # nothing kept: the whole history fed again
     end: str = ""
     mtp_iters: int = 0                # MTP's verify iterations (--mtp)
     mtp_accepted: int = 0             # ... whose draft was accepted
@@ -313,7 +327,8 @@ class Turn:
                "stopped": ", stopped"}.get(self.end, "")
         mtp = f", MTP acceptance {self.mtp_accepted / self.mtp_iters:.2f}" \
             if self.mtp_iters else ""
-        return (f"[TTFT {ttft}; prefill {self.prefill_tokens} tokens, "
+        reused = f" (reused {self.reused})" if self.reused else ""
+        return (f"[TTFT {ttft}; prefill {self.prefill_tokens} tokens{reused}, "
                 f"{r(self.prefill_tok_s, self.prefill_dev_tok_s)} tok/s; decode "
                 f"{self.gen_tokens} tokens, {r(self.decode_tok_s, self.decode_dev_tok_s)} tok/s"
                 f"{mc}{mtp}; context {self.context}/{self.cap}{end}]")
@@ -351,11 +366,15 @@ class Session:
     tokens_out: int = 0
     decode_s: float = 0.0
     decode_tokens: int = 0            # tokens counted in decode_s (the first of a turn is not)
+    reused: int = 0                   # KV positions the turns kept
+    restarts: int = 0                 # turns that fed the whole history again (Turn.restarted)
 
     def add(self, t: Turn) -> None:
         self.turns += 1
         self.tokens_in += t.prefill_tokens
         self.tokens_out += t.gen_tokens
+        self.reused += t.reused
+        self.restarts += t.restarted
         if t.gen_tokens > 1:
             self.decode_s += t.decode_s
             self.decode_tokens += t.gen_tokens - 1
@@ -367,9 +386,14 @@ class Session:
 
 class Chat:
     """A conversation on an Engine: the KV cache keeps every fed token across turns, so a turn
-    feeds only what the chat template added since (when the template rewrites the history, it
-    starts over). The engine has no sliding window: a message that does not fit in the cache
-    is refused (end "cap", nothing fed) and a reply that fills it stops; /reset starts over."""
+    feeds only what its rendering of the conversation (the canonical chat template, as Hugging
+    Face renders it) does not share with what was fed: the context rolls back to their common
+    prefix (Engine.rollback) and the rest is fed. A model with recurrent or windowed state
+    (Qwen3.5, LFM2, Gemma 4) rolls back to a snapshot, which each turn takes where the next
+    turn's rendering will start to differ (the reply's start: reply_start); without one there,
+    it starts over (Turn.restarted). The engine has no sliding window: a message that does not
+    fit in the cache is refused (end "cap", nothing fed) and a reply that fills it stops;
+    /reset starts over."""
 
     def __init__(self, engine: Engine, tok, think: bool, pick, max_new: int,
                  clock_mhz: float = 0.0):
@@ -393,10 +417,11 @@ class Chat:
         if warm is not None:                # the first pick then costs what the others do
             warm()
 
-    def _template(self, add_prompt=True) -> list[int]:
+    def _template(self, add_prompt=True, history=None) -> list[int]:
+        history = self.history if history is None else history
         if getattr(self.tok, "chat_template", "") is None:     # a base model: the text as is
-            return list(self.tok("".join(m["content"] for m in self.history))["input_ids"])
-        ids = self.tok.apply_chat_template(self.history, add_generation_prompt=add_prompt,
+            return list(self.tok("".join(m["content"] for m in history))["input_ids"])
+        ids = self.tok.apply_chat_template(history, add_generation_prompt=add_prompt,
                                            enable_thinking=self.think, tokenize=True)
         return list(ids["input_ids"] if hasattr(ids, "keys") else ids)
 
@@ -404,6 +429,35 @@ class Chat:
         """Forget the conversation and the KV cache."""
         self.history, self.fed, self._next = [], [], None
         self.eng.reset()
+
+    def reply_start(self, ids) -> int | None:
+        """Where the next turn's rendering will start to differ from `ids` (this turn's, with
+        the generation prompt) at the earliest: the start of the reply, after the assistant
+        header both share (Qwen3's non-thinking generation prompt adds an empty thinking block
+        there, which the template leaves out of a past reply). The common prefix of `ids` and
+        the history rendered with a stand-in reply and message after it; None where the
+        template refuses that."""
+        stand_in = [{"role": "assistant", "content": "x"}, {"role": "user", "content": "y"}]
+        try:
+            nxt = self._template(add_prompt=False, history=self.history + stand_in)
+        except Exception:
+            return None
+        return _common(ids, nxt)
+
+    def _rollback(self, k: int) -> int:
+        """Take the context back to (at most) the first k fed tokens: Engine.rollback (the MTP
+        decoder's: its committed slot, and one token more). Returns the tokens kept."""
+        t = self.mtp.rollback(k) if self.use_mtp else self.eng.rollback(k)
+        if t == 0:
+            self.eng.reset()
+        del self.fed[t:]
+        return t
+
+    def _snapshot(self) -> None:
+        if self.use_mtp:
+            self.mtp.snapshot()
+        else:
+            self.eng.snapshot()
 
     @property
     def can_resume(self) -> bool:
@@ -426,25 +480,40 @@ class Chat:
             turn.end = "cap"
             return "", turn
         self._next = None
-        n = len(self.fed)
-        if ids[:n] != self.fed:              # template rewrote history: start over
-            self.eng.reset()
-            self.fed, n, turn.restarted = [], 0, True
+        k = _common(ids, self.fed)
+        if k < len(self.fed):               # rendered otherwise than fed: from the common part
+            had = len(self.fed)
+            turn.restarted = self._rollback(k) == 0 and had > 0
+        n = turn.reused = len(self.fed)
         turn.prefill_total = len(ids) - n
+        # the snapshot of the state for the next turn's rollback: at the reply's start (MTP: a
+        # token before, rollback's), within this turn's prompt
+        at = self.reply_start(ids) if getattr(self.eng, "stateful", False) else None
+        if at is not None and self.use_mtp:
+            at -= 1
+        if at is not None and not n < at <= len(ids):
+            at = None
         logits = None
         if self.use_mtp:
-            logits = self._prefill_mtp(ids, n, turn, t0, on_update, stop)
+            logits = self._prefill_mtp(ids, n, turn, t0, on_update, stop, at)
         else:
-            for part, logits in self.eng.prefill_chunks(ids[n:]):   # up to Engine.rows a run
-                self.fed += part
-                turn.prefill_tokens += len(part)
-                turn.prefill_s = time.perf_counter() - t0
-                turn.prefill_cycles += (self.eng.stats[-1] or {}).get("cycles", 0)
-                turn.context = self.eng.pos
-                on_update("", turn)
-                if stop() and len(self.fed) < len(ids):
-                    turn.end = "stopped"
+            cut = [at] if at is not None and at < len(ids) else []
+            for a, b in zip([n] + cut, cut + [len(ids)]):
+                kw = {} if b == len(ids) else {"logits": False}     # up to the snapshot: no head
+                for part, logits in self.eng.prefill_chunks(ids[a:b], **kw):
+                    self.fed += part
+                    turn.prefill_tokens += len(part)
+                    turn.prefill_s = time.perf_counter() - t0
+                    turn.prefill_cycles += (self.eng.stats[-1] or {}).get("cycles", 0)
+                    turn.context = self.eng.pos
+                    on_update("", turn)
+                    if stop() and len(self.fed) < len(ids):
+                        turn.end = "stopped"
+                        break
+                if turn.end:
                     break
+                if self.eng.pos == at:
+                    self._snapshot()
         reply = self._decode(logits, [], turn, t0, on_update, stop)
         self.history.append({"role": "assistant", "content": reply})
         self.session.add(turn)
@@ -481,10 +550,12 @@ class Chat:
         """An MTP engine decodes with its drafter when the loop runs on the device."""
         return self.mtp is not None and self.on_card
 
-    def _prefill_mtp(self, ids, n: int, turn: Turn, t0: float, on_update, stop):
+    def _prefill_mtp(self, ids, n: int, turn: Turn, t0: float, on_update, stop,
+                     at: int | None = None):
         """ids[n:] through the MTP decoder's prefill (each run's rows' hidden, then the MTP
         layer over them): the first token is picked from the last row's logits inside it (the
-        draft after it needs it), so this returns it, _Picked; None when stopped."""
+        draft after it needs it), so this returns it, _Picked; None when stopped. at: the
+        snapshot's position (the prefill parts there, the token after it the MTP's input)."""
         from opentpu.llm.mtp import MTPStats
         st, k = MTPStats(), [0]
 
@@ -500,6 +571,13 @@ class Chat:
                 turn.end = "stopped"
                 return True
             return False
+        if at is not None and at < len(ids):
+            self.mtp.prefill(ids[n:at], st, on_run=on_run, follow=ids[at])
+            if turn.end:
+                return None
+            n = at
+        if at is not None and self.eng.pos == at:
+            self.mtp.snapshot()
         a0, _ = self.mtp.prefill(ids[n:], st, pick=lambda lg: self.pick(lg, ids), on_run=on_run)
         return None if a0 is None else _Picked(a0)
 
@@ -734,7 +812,7 @@ def panel_meta(eng, backend: str, dev: str, model: str, sp: dict, max_new: int,
         from opentpu.host.board import dram_layout
         be = eng.backend
         meta["dram"] = lambda: dram_layout(c, be.image_bytes, be.prog_at, eng.image,
-                                           list(eng.poss))
+                                           list(eng.poss), eng.snapshot_bytes)
     return meta
 
 
@@ -819,12 +897,13 @@ def main(argv=None):
             from opentpu.llm.mtp import mtp_engine
             eng = mtp_engine(spec, load_weights(path, mtp=True), cap=a.cap, cfg=cfg,
                              backend=backend, wformat=wformat, head_format=a.head_format,
-                             prog_cache=not a.no_prog_cache, prompt_runs=not a.no_prompt_runs)
+                             prog_cache=not a.no_prog_cache, prompt_runs=not a.no_prompt_runs,
+                             snapshots=SNAPSHOTS)
         else:
             eng = Engine(spec, load_weights(path), cap=a.cap, cfg=cfg, backend=backend,
                          wformat=wformat, head_format=a.head_format,
                          resident=not a.per_position, prog_cache=not a.no_prog_cache,
-                         prompt_runs=not a.no_prompt_runs)
+                         prompt_runs=not a.no_prompt_runs, snapshots=SNAPSHOTS)
     except ConfigMismatch as e:
         raise SystemExit(f"otpu-chat: {e}") from None
     weights = weights_label(eng.image, wformat)

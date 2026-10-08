@@ -635,6 +635,17 @@ class Image(EmbedHost):
         """The host's expert server on the backend's DRAM (moe.serve)."""
         return MO.serve(self.offload, lambda g: self.expert(W, g), backend, pool_file)
 
+    def state_regions(self, slot: int = 0) -> list:
+        """The context's state that its KV caches do not hold, as DRAM regions (address,
+        bytes; every slice's): each conv layer's state ring (a rollback restores them from a
+        snapshot: opentpu/llm/snapshot.py)."""
+        m, out = self.descriptors(0), []
+        for li in range(self.spec.layers):
+            lw = m.layer(li)
+            if lw.kind == CONV:
+                out.append((Affine.of(lw.state.base).static(), 4 * math.prod(lw.state.shape)))
+        return out
+
     # ---- programs
     def compile_decode(self, blocks: int, lo: int, block: int = ATTN_BLOCK):
         """(programs, run_args): lfm2_step at a run-time position (qwen3.compile_decode); the

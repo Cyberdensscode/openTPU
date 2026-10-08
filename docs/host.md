@@ -515,18 +515,21 @@ the commands (up / down, Tab completes, Enter runs): `/help`, `/continue` (a rep
 `--max-new`, default 1024, goes on where it stopped), `/reset` (forget the conversation and the
 KV cache), `/stats` (the detail inline: the last turn, DRAM for the image and the KV cache, the
 session's turns, tokens in and out and average decode tok/s, the sampling), `/think on|off`
-(thinking mode; the history is re-fed on the next turn), `/quit`.
+(thinking mode; the next turn re-feeds what the template renders otherwise: Qwen3 and
+Qwen3.5 the new generation prompt alone, SmolLM3 nearly the whole history: its system block
+names the mode), `/quit`.
 
 The KV cache holds `--cap` tokens (default 2048) and the engine has no sliding window. A reply
 that fills the cache stops with "context full"; a message that no longer fits is refused
 without touching the cache; `/reset` starts over. The plain REPL takes `/continue` and `/reset`
 too.
 
-Prefill here is the tokens a turn adds: the KV cache keeps every earlier turn, so a turn feeds
-only what the chat template appended since (all of it again when the template rewrote the
-history, e.g. after `/think`). Decode tok/s counts the tokens after the first, over the time
-since the first. `--plain` and `--prompt` print the same numbers after each reply (LFM2.5-230M
-on the card, build 74d48591, measured 2026-09-26):
+Prefill here is the tokens a turn feeds: the KV cache keeps the earlier turns, so a turn feeds
+only what its rendering of the conversation does not share with what the device holds, the new
+message and, with Qwen3 and Qwen3.5, the last reply again ("The KV cache across turns" below;
+`reused` counts the positions kept). Decode tok/s counts the tokens after the first, over the
+time since the first. `--plain` and `--prompt` print the same numbers after each reply
+(LFM2.5-230M on the card, build 74d48591, measured 2026-09-26):
 
 ```
 [TTFT 2.14s; prefill 21 tokens, 9.90 (device 13.0) tok/s; decode 25 tokens, 9.57 (device 13.0) tok/s, 7.72 Mcycles/token at 100 MHz; context 46/2048]
@@ -573,6 +576,98 @@ otpu-chat --backend board --model qwen35-2b --wformat fp4 --head-format int8 --m
 
 `--backend board-sim` runs the same driver against the Verilator board model (bit-exact, but
 minutes per token for the real model; use it with small models).
+
+### The KV cache across turns
+
+Each turn renders the whole conversation with the model's chat template, as Hugging Face renders
+it: the prompts are the canonical ones, and a past reply's thinking is not kept (it would fill
+the context). Qwen3's and Qwen3.5's templates render a past reply otherwise than the turn that
+generated it saw it: their generation prompt opens the reply with a thinking block (thinking
+off: an empty one, `<think>\n\n</think>\n\n`; Qwen3.5 thinking on: `<think>\n`), which a past
+reply does not have, and a reply's own thinking is dropped. The two renderings part at the
+reply's start. LFM2, SmolLM3, Phi-4-mini and Gemma 4 E2B (no chat template: the text as is)
+render a past reply as it was fed (checked on every checkpoint in `models/`, thinking on and
+off, three turns). Until 2026-10-08 the chat restarted from position 0 whenever the rendering
+did not continue what the device held: on Qwen3 and Qwen3.5 every turn re-fed the whole
+conversation (`Prefilling… 432/823 tok`).
+
+Now a turn takes the common prefix k of its rendering and what the device holds, rolls the
+context back to it (`Engine.rollback`, `opentpu/llm/snapshot.py`) and feeds the rest: the last
+reply as the template renders it and the new message. The status line's prefill counts those
+tokens; `reused` (plain line: `prefill 168 tokens (reused 655)`) the positions kept.
+
+- **The KV caches** are positional: going back moves the write position, the next runs'
+  appends overwrite the entries after it, and attention masks the positions past a row (min
+  with a mask row of -inf: they weigh exactly +0), so the context is a fresh cache's, bit for
+  bit. Qwen3 and the Llama-likes need nothing else. What else depends on the position is
+  written per run: the resident decode's and the prompt runs' run arguments and state words
+  (LFM2's ring rotation with them), the RoPE rows, the generate loop's state block and out[];
+  the compile pipeline's programs made ahead for the old positions are dropped.
+- **State the KV caches do not hold**: Qwen3.5's DeltaNet states (fp32) and convolution
+  windows, LFM2's convolution rings, and Gemma 4's sliding K / V rings (window + one block,
+  position q in slot q mod ring: a rollback of up to `rollback_slack` = ring - window + 1 = 257
+  positions finds the window still there; further back its oldest slots hold later positions).
+  Each turn the chat takes a snapshot of these regions (`Image.state_regions`) where the next
+  turn's rendering will part from this one: the reply's start, the common prefix of this
+  turn's rendering and the history rendered with a stand-in reply and message after it
+  (`Chat.reply_start`: found from the template, nothing per model). The turn's prefill runs in
+  two parts with the snapshot between (the first part computes no logits). A rollback to k
+  restores the latest snapshot at or before k and continues from its position; with none, the
+  turn starts over (`Turn.restarted`, the panel's "history re-fed").
+- **`--mtp`**: the MTP layer's row at position q takes the token at q + 1, so the decoder rolls
+  back to k - 1 (its snapshot a token before the reply's start) and recomputes that row with
+  the new token; the prefill's first part gives the MTP layer the token after it
+  (`MTPDecoder.prefill(follow=)`); the snapshot and the restore take the committed state slot.
+
+The snapshots live in an area of the device's DRAM after the image (`Engine(snapshots=1)`,
+otpu-chat's), copied by programs of LD / ST pairs through two TMEM buffers of 64 KiB; where the
+area does not fit the DRAM (sized for the image alone: `--backend board-sim`), on the host
+through the backend's read and write. A turn takes one snapshot and, from the second turn on,
+restores one. Each copy, on the RTL co-sim with the card's memory path (LiteDRAM at DDR3-1066,
+the core at 133.33 MHz; the regions of the chat's layouts at cap 2048, which do not depend on
+the cap):
+
+| model | state | regions | one copy (snapshot or restore) |
+|---|---|---|---|
+| LFM2.5-230M | 0.19 MiB | 8 | 13.0 K cycles, 0.10 ms |
+| Qwen3.5-0.8B (the 2B's are the same size) | 19.27 MiB | 144 | 1.30 M cycles, 9.7 ms |
+| Qwen3.5-4B | 50.25 MiB | 384 | 3.38 M cycles, 25.4 ms |
+| Gemma 4 E2B | 15.79 MiB | 12 | 1.06 M cycles, 7.9 ms |
+
+That is 4.2 GB/s read and written together; the 0.8B's two copies a turn cost 0.4 of a prefill
+run (6.9 M cycles). Chunks of 32 K words would gain 0.8%, of 4 K words lose 5.7%. The area
+grows the device's image by the state's size (`dram_layout`'s `snapshots`).
+
+`tools/qual/chatkv.py` checks it on the card: a scripted conversation through Chat, then each
+turn's rendering again from position 0, whose logits and greedy reply must equal the turn's
+bit for bit (int8; with PAIR a 4-bit run of more than MCOLS / 2 rows sums in another order, so
+a different split of a prompt into runs gives other bits, as before), with the prefill's runs,
+device Mcycles and seconds both ways.
+
+**Measured** (2026-10-08, chatkv.py on the ISA simulator at the card's configuration: int8, cap
+1024, its five messages, greedy replies of up to 24 tokens, thinking off). Every turn's logits
+and reply equal the restart's, bit for bit, for Qwen3-0.6B, Qwen3.5-0.8B (plain and `--mtp`)
+and LFM2.5-230M, and Qwen3-0.6B with thinking on. Tokens fed and runs, rollback / restart:
+
+| turn | rendering | Qwen3-0.6B tokens | runs | Qwen3.5-0.8B tokens | runs |
+|---|---|---|---|---|---|
+| 1 | 24 | 24 / 24 | 3 / 3 | 24 / 24 | 6 / 6 |
+| 2 | 65 | 45 / 65 | 6 / 9 | 45 / 65 | 12 / 17 |
+| 3 | 110 | 49 / 110 | 7 / 14 | 49 / 110 | 13 / 28 |
+| 4 | 149 | 43 / 149 | 6 / 19 | 43 / 149 | 11 / 38 |
+| 5 | 192 (0.8B: 194) | 47 / 192 | 6 / 24 | 49 / 194 | 13 / 49 |
+| all | | 208 / 540 | 28 / 69 | 210 / 542 | 55 / 138 |
+
+The ISA simulator counts no cycles. On the RTL co-sim (as above), a prompt run in bucket 1,
+where the whole conversation is (a prompt run attends whole blocks: its position there does not
+change its cost), measured at position 96 and after: Qwen3-0.6B 9.48 M cycles for 8 rows, 10.79
+M with the LM head, 6.12 M for 4 rows with it; Qwen3.5-0.8B 6.91 M for 4 rows, 9.05 M with the
+head. Pricing each run so (a shorter run as a whole pass), the five turns' prefill takes 656 ->
+263 M cycles on Qwen3-0.6B (4.92 -> 1.97 s at 133.33 MHz, -60%; the fifth turn 229 -> 58 M)
+and 964 -> 402 M on Qwen3.5-0.8B (7.23 -> 3.02 s, -58%; the fifth turn 341 -> 95 M), its five
+snapshots and four restores included (12 M). The restart's cost grows with the conversation,
+the rollback's with the last reply and the new message. LFM2.5-230M's turns continued the
+context before as now (98 tokens in 15 runs; the restart's 523 in 70).
 
 ## 7. Control registers
 

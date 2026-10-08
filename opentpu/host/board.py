@@ -1140,20 +1140,21 @@ def sim_config(spec, cap: int, base=None, rows: int | None = None, lookup: bool 
     return replace(base, DRAM_BYTES=1 << max(22, (need - 1).bit_length()))
 
 
-def dram_layout(cfg, image_bytes: int, prog_at: int, image=None, poss=None) -> dict:
-    """The device DRAM in bytes: the image (weights, norms, I/O area and KV capacity), the
-    program area after it, free; with a model Image also the KV cache capacity (LFM2: with the
-    convolution state; Qwen3.5: with the convolution and DeltaNet state, which do not grow with
-    the position but are counted as if they did) and the part filled at positions `poss` (one
-    per sequence)."""
+def dram_layout(cfg, image_bytes: int, prog_at: int, image=None, poss=None,
+                snapshots: int = 0) -> dict:
+    """The device DRAM in bytes: the image (weights, norms, I/O area and KV capacity, and the
+    Engine's `snapshots` area after it: opentpu/llm/snapshot.py), the program area after it,
+    free; with a model Image also the KV cache capacity (LFM2: with the convolution state;
+    Qwen3.5: with the convolution and DeltaNet state, which do not grow with the position but
+    are counted as if they did) and the part filled at positions `poss` (one per sequence)."""
     prog = 4 * cfg.IMEM_WORDS
-    d = {"total": cfg.DRAM_BYTES, "image": image_bytes, "weights": image_bytes,
-         "kv_capacity": 0, "kv_used": 0, "program": prog,
+    d = {"total": cfg.DRAM_BYTES, "image": image_bytes, "weights": image_bytes - snapshots,
+         "kv_capacity": 0, "kv_used": 0, "program": prog, "snapshots": snapshots,
          "free": max(0, cfg.DRAM_BYTES - prog_at - prog)}
     if image is not None:
         cap, per_seq = image.cap, image.kv_bytes
         d["kv_capacity"] = per_seq * image.batch
-        d["weights"] = image_bytes - d["kv_capacity"]
+        d["weights"] = image_bytes - snapshots - d["kv_capacity"]
         d["kv_used"] = int(sum(per_seq * min(p, cap) / cap for p in (poss or [0])))
     return d
 
@@ -1237,7 +1238,7 @@ class BoardBackend:
         if poss and next_token:
             poss[0] += 1                    # the run in flight fills the next position
         return dram_layout(self.cfg, self.image_bytes, self.prog_at,
-                           getattr(e, "image", None), poss)
+                           getattr(e, "image", None), poss, getattr(e, "snapshot_bytes", 0))
 
     def attach(self, engine) -> None:
         """Called by the Engine once it exists. A model image with 4-bit weights needs a
