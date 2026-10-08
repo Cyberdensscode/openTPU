@@ -109,6 +109,8 @@ def status_line(meta: dict, chat: Chat, turn: Turn | None, width: int = 0) -> Te
             dec = rate("decode", t.decode_tok_s, t.decode_dev_tok_s)
             if t.mcycles_per_token is not None and level < 3:
                 dec += f" · {t.mcycles_per_token:.2f} Mcyc/tok"
+            if t.experts and level < 3:     # a streamed MoE: slot hits, MB streamed a token
+                dec += experts_short(t)
             segs.append(dec)
         parts = []
         for x in segs:
@@ -117,6 +119,13 @@ def status_line(meta: dict, chat: Chat, turn: Turn | None, width: int = 0) -> Te
         if not width or line.cell_len <= width:
             break
     return line
+
+
+def experts_short(t: Turn) -> str:
+    """A streamed MoE's decode in the status line: " · 98% hit · 5.2 MB/tok"."""
+    hit, mb = t.expert_hit_rate, t.streamed_mb_per_token
+    return ("" if hit is None else f" · {100 * hit:.0f}% hit") + \
+        ("" if mb is None else f" · {mb:.1f} MB/tok")
 
 
 def stats_markup(meta: dict, chat: Chat, turn: Turn | None) -> str:
@@ -130,6 +139,8 @@ def stats_markup(meta: dict, chat: Chat, turn: Turn | None) -> str:
     L += [f"         {x}" for x in meta.get("bitstream", [])]
     if meta.get("weights"):
         L.append(f"weights  {meta['weights']}")
+    if meta.get("experts"):
+        L.append(f"experts  {meta['experts']}")
     L += ["", "[b]last turn[/b]"]
     t = turn
     if t is None:
@@ -146,6 +157,8 @@ def stats_markup(meta: dict, chat: Chat, turn: Turn | None) -> str:
             L.append(f"         device {_rate(t.decode_dev_tok_s)}")
             mc = t.mcycles_per_token
             L.append(f"         {'-' if mc is None else f'{mc:.2f}'} Mcycles/token")
+        if t.experts:
+            L.append(f"experts  {_experts(t)}")
         if t.restarted:
             L.append("         (history re-fed)")
     bar, colour = _meter(ctx, cap, 24)
@@ -183,6 +196,8 @@ def stats_inline(meta: dict, chat: Chat, turn: Turn | None) -> str:
                  f"{_rate(t.prefill_tok_s)}{dev(t.prefill_dev_tok_s)} · decode {t.gen_tokens} tok "
                  f"{_rate(t.decode_tok_s)}{dev(t.decode_dev_tok_s)}"
                  + ("" if mc is None else f" · {mc:.2f} Mcycles/token"))
+        if t.experts:
+            L.append(f"[b]experts[/b]    {_experts(t)}")
     bar, colour = _meter(eng.pos, eng.cap, 16)
     L.append(f"[b]context[/b]    {eng.pos} / {eng.cap} tokens "
              f"({100 * eng.pos / eng.cap:.0f}%)  [{colour}]{bar}[/]" if eng.cap else "")
@@ -199,9 +214,19 @@ def stats_inline(meta: dict, chat: Chat, turn: Turn | None) -> str:
     return "\n".join(L)
 
 
+def _experts(t: Turn) -> str:
+    """A streamed MoE's turn: the decode's slot hits and MB streamed a token, the prompt's
+    misses."""
+    hit, mb = t.expert_hit_rate, t.streamed_mb_per_token
+    return (f"{'-' if hit is None else f'{100 * hit:.1f}%'} hits · "
+            f"{'-' if mb is None else f'{mb:.1f}'} MB/token · {t.prefill_misses} misses in the "
+            f"prompt")
+
+
 def welcome(meta: dict) -> Text:
     bits = [meta["model"], meta["backend"], meta["device"]] + list(meta.get("bitstream", [])) \
-        + ([meta["weights"]] if meta.get("weights") else [])
+        + ([meta["weights"]] if meta.get("weights") else []) \
+        + ([meta["experts"]] if meta.get("experts") else [])
     return Text.assemble(("✻ ", ACCENT), ("openTPU chat", "bold"), "\n\n",
                          " · ".join(bits), "\n", ("/help for commands · esc to interrupt", DIM))
 
