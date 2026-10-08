@@ -600,6 +600,8 @@ otpu-chat --backend board --model lfm2-8b --pool /data/lfm8b.bin  # a pool elsew
   `--top-k 80` the host samples each token, the expert server serving each step.
 - Loading the 35B builds its image for about 9 minutes, with a peak of about 13 GB of host
   memory. The pool then sits in the page cache (17.1 GB for the 35B).
+- Turns keep the context as a dense model's do (the KV cache across turns, below). The slots fill
+  the DRAM, so the snapshots sit on the host.
 - `--mtp`, `--per-position` and `--backend board-sim` are not supported.
 
 `--backend board-sim` runs the same driver against the Verilator board model (bit-exact, but

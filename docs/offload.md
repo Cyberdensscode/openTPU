@@ -3789,7 +3789,12 @@ the whole checkpoint) the same experts as this tree packs them. The lists must b
   them), replaced by least decayed use (`--policy lru` for least recently used).
 - **The prompt.** Qwen3.5-MoE and Gemma 4 MoE run it layer by layer in runs of two rows, every
   slot serving the running layer (13; `--layer-major R`, 0 for token by token). LFM2-MoE runs it
-  token by token. A later turn feeds what the conversation added, from the context's position.
+  token by token.
+- **Turns** keep the context as a dense model's do (docs/host.md 6): a later turn rolls back to
+  where its rendering and what was fed part and feeds the rest, the recurrent and windowed
+  state from the snapshot the turn before took at its reply's start. The slots fill the DRAM,
+  so a streamed MoE's snapshots sit on the host and each copy crosses PCIe. A layer-major
+  prompt's part up to the snapshot runs no LM head.
 - **The embedding table.** Qwen3.5-35B-A3B's untied int8 table stays on the host, which writes
   each token's row, so more slots fit (`--embed-table card` puts it on the card).
 - **Decode.** The card's decode loop picks every token, greedy or sampled, when the card takes
@@ -3877,6 +3882,10 @@ head, LFM2-MoE, Gemma 4 MoE) on the ISA simulator with 2 slots a layer:
 - `test_the_next_turn_continues_the_context`: the second turn feeds only what the conversation
   added (layer by layer from the context's position for Qwen3.5 and Gemma 4), and its reply is,
   bit for bit, that of an engine with every expert resident fed the whole conversation;
+- `test_a_streamed_chat_rolls_back_to_the_reply`: with a template that renders a past reply
+  otherwise than it was fed, the later turns roll back to the reply's start (reused > 0, not
+  restarted; the snapshots on the host or the device), and each turn's logits and reply equal a
+  fresh streamed engine's on the turn's rendering, bit for bit;
 - `test_a_sampled_reply_streams_its_experts`: sampled replies, picked on the host (top-k 80)
   and by the card's loop (top-k 20), equal those of an engine with every expert resident, and
   the turn counts the steps' experts;

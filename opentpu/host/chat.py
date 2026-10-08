@@ -995,7 +995,8 @@ def main(argv=None):
                             experts=a.experts, policy=a.policy, wformat=wformat,
                             head_format=a.head_format, formats=formats,
                             embed_host=None if a.embed_table is None else a.embed_table == "host",
-                            layer_major=a.layer_major, prog_cache=not a.no_prog_cache)
+                            layer_major=a.layer_major, prog_cache=not a.no_prog_cache,
+                            snapshots=SNAPSHOTS)
             ST.poll_idle(eng, a.poll_idle)
             print(f"experts: {ST.describe(eng, eng.pool_path)}", flush=True)
         elif a.mtp:

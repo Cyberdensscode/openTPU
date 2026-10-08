@@ -382,8 +382,9 @@ def test_layer_major_runs_compile_in_the_worker_processes(tiny, ready, hint):
 def test_layer_major_prompts_as_prefill_chunks(tiny):
     """Engine.prefill_chunks of a layer-major engine (sequence 0): the prompt in one part,
     prefill_layers' logits, its runs' stats one entry (a chat's prefill cycles: Chat.ask reads
-    the last); prefill_layers(logits=False) runs no head and returns None, and the prompt
-    continued from there gives the logits of the whole prompt in one call."""
+    the last); with logits=False (a chat's part up to its snapshot) prefill_layers runs no head
+    and the part yields None, and the prompt continued from there gives the logits of the whole
+    prompt in one call, also from a part inside the rows before conv_k - 1 (token by token)."""
     from opentpu.isasim import board_config
     spec, W = _untied(tiny)
     cfg = board_config(DRAM_BYTES=1 << 26)
@@ -401,13 +402,16 @@ def test_layer_major_prompts_as_prefill_chunks(tiny):
     assert list(a.prefill_chunks([])) == [] and a.pos == len(toks)
     assert np.array_equal(parts[0][1].view(np.uint32), want.view(np.uint32))
     c = engine()
-    assert c.prefill_layers(toks[:6], logits=False) is None
+    assert list(c.prefill_chunks(toks[:6], logits=False)) == [(toks[:6], None)]
     assert "head" not in c._layer_runs and c.pos == 6
-    got = c.prefill_layers(toks[6:])
+    (_, got), = c.prefill_chunks(toks[6:])
     assert "head" in c._layer_runs
     assert np.array_equal(got.view(np.uint32), want.view(np.uint32))
     for t in toks[:2]:
         assert np.array_equal(c.step(t).view(np.uint32), b.step(t).view(np.uint32))
+    e = engine()
+    assert spec.conv_k > 2 and e.prefill_layers(toks[:2], logits=False) is None
+    assert np.array_equal(e.prefill_layers(toks[2:]).view(np.uint32), want.view(np.uint32))
 
 
 def test_layer_ahead_sends_the_next_layers_experts(tiny, monkeypatch):

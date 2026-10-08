@@ -2530,7 +2530,7 @@ class Engine:
         if self.layer_major and seq == 0 and chunk is None:
             if tokens:                                  # (docs/offload.md 13)
                 k = len(self.stats)
-                lg = self.prefill_layers(tokens)
+                lg = self.prefill_layers(tokens, logits)
                 runs = self.stats[k:]
                 self.stats[k:] = [{"cycles": sum((s or {}).get("cycles") or 0 for s in runs),
                                    "runs": len(runs), "rows": len(tokens)}]
@@ -2661,7 +2661,7 @@ class Engine:
         host = bool(getattr(img, "embed_host", False)) and not self.embed_runs
         if host and self.pos < K - 1:   # the rows before conv_k - 1 token by token (no embed
             n = min(len(tokens), K - 1 - self.pos)          # or compile-time-position runs)
-            for _, lg in self.prefill_chunks(tokens[:n], 0, 1):
+            for _, lg in self.prefill_chunks(tokens[:n], 0, 1, logits and n == len(tokens)):
                 pass
             tokens = tokens[n:]
             if not tokens:

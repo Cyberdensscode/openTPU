@@ -89,7 +89,8 @@ r = json.load(open(sys.argv[1]))
 print(f"  {r['weights']}; {r['experts']}; layer-major {r['layer_major']}, loop on the card "
       f"{r['on_card']}, load {r['load_s']} s, host {r['host_mem']}")
 for i, t in enumerate(r["turns"]):
-    print(f"  turn {i + 1}: prompt {t['prompt_tokens']} tokens in {t['prefill_s']} s "
+    print(f"  turn {i + 1}: prompt {t['prompt_tokens']} tokens (reused {t['reused']}"
+          f"{', restarted' if t['restarted'] else ''}) in {t['prefill_s']} s "
           f"({t['prefill_tok_s']} tok/s, device {t['prefill_dev_tok_s']}), {t['prefill_misses']} "
           f"misses; TTFT {t['ttft_s']} s; decode {t['gen_tokens']} tokens at {t['decode_tok_s']} "
           f"tok/s (device {t['decode_dev_tok_s']}), hits {t['hit_rate']}, "

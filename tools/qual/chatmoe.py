@@ -68,7 +68,7 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
     t = time.time()
     eng = ST.engine(path, cfg or board_config(), be, cap, pool or ST.DEFAULT, experts=experts,
                     wformat=wformat, head_format=head, formats=formats, layer_major=layer_major,
-                    create=create)
+                    create=create, snapshots=C.SNAPSHOTS)     # (otpu-chat's: its turns roll back)
     load_s = time.time() - t
     sp = C.sampling(spec, argparse.Namespace(), path)
     pick = C.sampler(sp["temperature"] if sample else 0, sp["top_k"], sp["top_p"], seed,
@@ -86,7 +86,8 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
         out["turns"].append(dict(
             text=text, reply=reply, tokens=list(chat._reply), end=tr.end, fed_before=n0,
             fed=[int(t) for t in chat.fed],
-            prompt_tokens=tr.prefill_tokens, context=tr.context, ttft_s=r(tr.ttft_s),
+            prompt_tokens=tr.prefill_tokens, reused=tr.reused, restarted=tr.restarted,
+            context=tr.context, ttft_s=r(tr.ttft_s),
             prefill_s=r(tr.prefill_s), prefill_tok_s=r(tr.prefill_tok_s, 2),
             prefill_dev_tok_s=r(tr.prefill_dev_tok_s, 2), gen_tokens=tr.gen_tokens,
             decode_tok_s=r(tr.decode_tok_s, 2), decode_dev_tok_s=r(tr.decode_dev_tok_s, 2),

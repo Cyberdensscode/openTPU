@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 
 from opentpu.host import streamed as ST
-from opentpu.host.chat import Chat, Turn, sampler
+from opentpu.host.chat import Chat, Session, Turn, sampler
 from opentpu.isasim import board_config
 
 torch = pytest.importorskip("torch")
@@ -158,31 +158,93 @@ def test_a_chat_turn_is_moe_cards_run(ckpt, formats, tmp_path):
 def test_the_next_turn_continues_the_context(ckpt, formats, monkeypatch):
     """A second turn feeds only what the conversation added (the last reply's last token and
     the new message) on the streamed engine: layer by layer from its position for Qwen3.5 and
-    Gemma 4 (prefill_layers twice), token by token for LFM2. Its reply is that of an engine
-    with every expert resident fed the whole conversation at once, bit for bit."""
+    Gemma 4 (prefill_layers; a turn's part up to a snapshot inside it without the head), token
+    by token for LFM2. Its reply is that of an engine with every expert resident fed the whole
+    conversation at once, bit for bit."""
     fam, d = ckpt
     wf, hf = formats
     eng = ST.engine(d, CFG, "isa", 256, None, experts=K, wformat=wf, head_format=hf)
     calls = []
     layers = eng.prefill_layers
-    monkeypatch.setattr(eng, "prefill_layers", lambda t, **kw: calls.append(len(t)) or
-                        layers(t, **kw))
+    monkeypatch.setattr(eng, "prefill_layers", lambda t, logits=True: calls.append(
+        (len(t), logits)) or layers(t, logits))
     chat = _greedy_chat(eng)
     rng = np.random.default_rng(2)
     u1, u2 = (" ".join(str(t) for t in rng.integers(10, 1000, n)) for n in (7, 5))
     chat.ask(u1)
-    fed = len(chat.fed)
+    fed, c1 = len(chat.fed), len(calls)
     _, t2 = chat.ask(u2)
     ids2 = Tok().apply_chat_template(chat.history[:3])
     assert chat.fed[:len(ids2)] == ids2 and not t2.restarted
     assert t2.prefill_tokens == len(ids2) - fed and t2.context == eng.pos == len(chat.fed)
-    assert calls == ([] if fam == "lfm2" else [7, len(ids2) - fed])
+    for part, n in ((calls[:c1], 7), (calls[c1:], len(ids2) - fed)):    # (each turn's parts:
+        assert fam == "lfm2" and not part or sum(k for k, _ in part) == n   # the head in the last)
+        assert [lg for _, lg in part] == [False] * (len(part) - 1) + [True] * bool(part)
+    assert (len(calls) == 0) == (fam == "lfm2")
     ref = ST.engine(d, CFG, "isa", 256, None, wformat=wf, head_format=hf, layer_major=0)
     assert ref.image.offload.slots[0][1] == ref.image.offload.E      # (every expert resident)
     t0 = int(np.argmax(ref.prefill(ids2)))
     want = _until_eos([t0] + ref.generate_card(t0, N - 1, stop_ids=[]), eng.spec.eos)
     assert chat._reply == want
     assert eng.server.misses > 0 and ref.server.misses == 0
+
+
+def _recording(rec, softcap=None):
+    """A greedy chat.sampler (with the model's soft cap) whose picks from logits (each turn's
+    first token) record them (test_chatkv's, for any model)."""
+    base = sampler(0, 0, 1.0, None, softcap=softcap)
+
+    def pick(logits, context=()):
+        rec.append(np.array(logits, np.float32))
+        return base(logits, context)
+    for k in ("stream", "warm", "greedy", "params", "softcap", "rng"):
+        setattr(pick, k, getattr(base, k))
+    return pick
+
+
+@pytest.mark.parametrize("where", ["host", "device"])
+def test_a_streamed_chat_rolls_back_to_the_reply(ckpt, formats, where, monkeypatch):
+    """otpu-chat's turns keep the context on a streamed MoE too (snapshots=1 through
+    streamed.engine). With a template shaped as Qwen3's (test_chatkv's: a past reply renders
+    without the generation prompt's thinking block) each later turn rolls back to the last
+    reply's start (Qwen3.5's DeltaNet states, LFM2's convolution rings and Gemma 4's sliding
+    rings from the snapshot the turn before took there) and feeds the reply and the new
+    message: reused > 0, not restarted. Each turn's logits (its first token's pick) equal a
+    fresh streamed engine's prefill of the turn's rendering, bit for bit, and its reply that
+    engine's greedy tokens: Qwen3.5 and Gemma 4 layer by layer (the part up to the snapshot
+    without the head), LFM2 token by token. The snapshots on the host (where: the slots fill
+    the card's DRAM, so the device area does not fit) or on the device. The tiny Gemma 4's
+    sliding windows hold its whole context (no state to keep: its KV caches go back)."""
+    from opentpu.llm import snapshot as SN
+    from test_chatkv import MESSAGES, _bits, _greedy, _QwenTok
+    fam, d = ckpt
+    wf, hf = formats
+    if fam == "gemma4" and where == "device":
+        pytest.skip("the tiny Gemma 4 keeps no state (where: no snapshots)")
+    if where == "host":
+        monkeypatch.setattr(SN.Snapshots, "area", staticmethod(lambda image, cfg, n: None))
+
+    def make(snapshots=0):
+        return ST.engine(d, CFG, "isa", 256, None, experts=K, wformat=wf, head_format=hf,
+                         snapshots=snapshots)
+    eng = make(1)
+    rec, tok = [], _QwenTok()
+    chat = Chat(eng, tok, False, _recording(rec, getattr(eng.spec, "softcap", None)), N)
+    stateful = fam != "gemma4"
+    assert chat.on_card and eng.stateful == stateful
+    assert (eng._snaps.base is None) == (where == "host") if stateful else eng._snaps is None
+    for i, msg in enumerate(MESSAGES[:3]):
+        _, turn = chat.ask(msg)
+        ids = tok.apply_chat_template(chat.history[:-1], True, False, True)
+        assert not turn.restarted and (turn.reused > 0) == (i > 0), (i, turn.reused)
+        assert turn.prefill_tokens == len(ids) - turn.reused and turn.context == len(chat.fed)
+        ref = make()
+        want = ref.prefill(ids)
+        assert np.array_equal(_bits(rec[-1]), _bits(want)), i
+        assert chat._reply == [x for x in _greedy(ref, want, N) if x not in eng.spec.eos], i
+    assert eng.layer_major == (0 if fam == "lfm2" else 2) and eng.server.misses > 0
+    ops = [s["op"] for s in eng.snap_stats]             # (a snapshot each turn, restored by
+    assert ops == (["snapshot", "restore"] * 3)[:5] if stateful else not ops    # the next)
 
 
 @pytest.mark.parametrize("top_k", [80, 20])
@@ -320,7 +382,8 @@ def test_otpu_chat_runs_a_streamed_moe(tmp_path, monkeypatch, capfd):
 def test_otpu_chat_clamps_the_models_top_k(tmp_path, monkeypatch, capfd):
     """otpu-chat on a checkpoint whose generation_config.json samples from the top 80 (as
     LFM2.5-8B-A1B's): top-k 64, the card's decode loop picks the tokens, and a line at startup
-    says so; --top-k 80 keeps 80 (the host samples) without the line."""
+    says so; --top-k 80 keeps 80 (the host samples) without the line. The streamed engine keeps
+    a snapshot for the next turn's rollback (LFM2's convolution rings)."""
     from opentpu.host import chat as C
     d = _checkpoint("lfm2", tmp_path / "model")
     (d / "generation_config.json").write_text(json.dumps(
@@ -330,7 +393,8 @@ def test_otpu_chat_clamps_the_models_top_k(tmp_path, monkeypatch, capfd):
     monkeypatch.setattr("opentpu.isasim.board_config", lambda **kw: CFG)
     plain, on_card = C.Chat.ask_plain, []
     monkeypatch.setattr(C.Chat, "ask_plain", lambda self, text: (
-        on_card.append((self.on_card, self.pick.params["top_k"])), plain(self, text, sys.stdout)))
+        on_card.append((self.on_card, self.pick.params["top_k"], self.eng._snaps is not None)),
+        plain(self, text, sys.stdout)))
     pool = d / "pool-fp4.bin"
     _pack_pool(d, pool, "init", monkeypatch=monkeypatch)
     _pack_pool(d, pool, "pack", 0, 1, monkeypatch=monkeypatch)
@@ -341,7 +405,7 @@ def test_otpu_chat_clamps_the_models_top_k(tmp_path, monkeypatch, capfd):
     assert "otpu-chat: top-k 80 (the model's default) clamped to 64" in out
     C.main(argv + ["--top-k", "80"])
     assert "clamped" not in capfd.readouterr().out
-    assert on_card == [(True, 64), (False, 80)]
+    assert on_card == [(True, 64, True), (False, 80, True)]
 
 
 def test_the_interface_shows_the_streaming():
@@ -357,8 +421,8 @@ def test_the_interface_shows_the_streaming():
     assert "; experts 97.0% hits, 12.5 MB/token, 812 misses in the prompt" in t.line()
     assert "experts" not in Turn(decode_steps=4).line()
     chat = SimpleNamespace(eng=SimpleNamespace(pos=25, cap=2048, backend=None), clock_mhz=133.33,
-                           session=SimpleNamespace(turns=1, tokens_in=20, tokens_out=5,
-                                                   decode_tok_s=4.0), think=False)
+                           session=Session(turns=1, tokens_in=20, tokens_out=5, decode_s=1.0,
+                                           decode_tokens=4), think=False)
     meta = {"model": "Qwen3.5-35B-A3B", "backend": "board", "device": "/dev/xdma0",
             "short": "board 133 MHz", "experts": "1680 slots of 10240 experts (16%)"}
     assert "97% hit · 12.5 MB/tok" in str(status_line(meta, chat, t))
@@ -396,6 +460,7 @@ def test_the_scripted_chat_checks_a_run_against_its_reference(tmp_path, monkeypa
     assert t2["fed_before"] == 6 + len(t1["tokens"]) - (t1["end"] != "eos")
     assert t1["fed"][:6] == [11, 22, 33, 44, 55, 66]   # (the conversation's ids: a turn's
     assert t2["fed"][:len(t1["fed"])] == t1["fed"]       # prompt for moe_card)
+    assert t2["reused"] == t2["fed_before"] and not t2["restarted"]     # (the context kept)
     assert chatmoe.main(argv + ["--check", str(tmp_path / "ref.json")]) == 0
     assert "[PASS]" in capsys.readouterr().out
     ref["turns"][1]["tokens"][0] += 1
