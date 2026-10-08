@@ -791,6 +791,29 @@ def test_chat_wformat_auto_and_weights_label(run_dir, monkeypatch):
         st.remove()
 
 
+def test_chat_loads_the_tokenizer_on_a_thread(monkeypatch):
+    """otpu-chat loads the tokenizer (importing transformers takes seconds) on a thread while
+    the model's image loads: load_tokenizer returns at once, its function waits for the
+    tokenizer and raises what the load raised."""
+    import threading
+
+    import transformers
+    from opentpu.host import chat as C
+    gate = threading.Event()
+
+    def load(path):
+        assert gate.wait(10)
+        if path == "bad":
+            raise OSError("no tokenizer")
+        return path, threading.current_thread().name
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", load)
+    get = C.load_tokenizer("m")
+    gate.set()                                  # (the caller went on meanwhile)
+    assert get() == ("m", "otpu-tokenizer")
+    with pytest.raises(OSError, match="no tokenizer"):
+        C.load_tokenizer("bad")()
+
+
 def test_runner_status_is_atomic(run_dir):
     s = RunnerStatus("fake4", model="m")
     for k in range(50):
