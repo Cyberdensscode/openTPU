@@ -29,6 +29,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from .. import fp32 as F
+from .. import imgcache as IC
 from .. import isa as I
 from .. import progcache as PC
 from .. import qcache as QC
@@ -928,11 +929,12 @@ class Image(EmbedHost):
             v = np.ascontiguousarray(a).view(np.uint8).reshape(-1)
             imgs[s][addr:addr + v.size] = v
 
+        qb = QC.Batch()                 # the matrices, quantized in worker processes
+
         def put_q(addr_pair, parts, fmt):
             for s, p in enumerate(parts):
-                q, sc = QC.quantize_mxu(p, fmt, D)
-                put(s, addr_pair[0], q)
-                put(s, addr_pair[1], sc)
+                qb.submit(p, fmt, D, lambda q, sc, s=s: (put(s, addr_pair[0], q),
+                                                         put(s, addr_pair[1], sc)))
 
         def rows(a, n):
             return [a[s * n:(s + 1) * n] for s in range(S)]
@@ -973,6 +975,7 @@ class Image(EmbedHost):
                                                               self.h_loc)], mf["wd"])
         head = W["model.embed_tokens.weight"] if spec.tied else W["lm_head.weight"]
         put_q(self.head, rows(head, self.v_loc), self.head_format)
+        qb.wait()
         if self.lookup:
             _lookup_build(put, S, W, spec, self.cap, self.lookup)
         return imgs
@@ -2109,7 +2112,7 @@ class Engine:
             from .moe import open_pool, pool_key    # its read into the page cache runs during
             pool_file = open_pool(self.image.offload, pool_file, mapped=pool_map,  # the build
                                   key=pool_key(self.image, getattr(W, "model_dir", None)))
-        images = self.image.build(W)
+        images = IC.build(self.image, W, self.layout)     # (opentpu/imgcache.py)
         # rollback's snapshots of the state the KV caches do not hold (snapshot.py)
         self.stateful = SN.stateful(self.image)
         self._snaps = None

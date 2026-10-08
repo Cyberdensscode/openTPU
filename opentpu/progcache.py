@@ -44,9 +44,13 @@ from .compiler import RunVar
 
 CAP_BYTES = 2 << 30             # the disk cache's size (OTPU_PROG_CACHE_GB overrides)
 FREE_FLOOR = 20 << 30           # free disk a write must leave
+# read by the host's tools only: not in the key (otpu-lock sets OTPU_LOCK_HELD and its pid,
+# OTPU_LOCK_PID, for every command it runs: in the key, no session found the one before's)
 RUNTIME_ENV = ("OTPU_PROG_CACHE", "OTPU_PROG_CACHE_GB", "OTPU_IMAGE_CACHE", "OTPU_IMAGE_CACHE_GB",
+               "OTPU_IMG_CACHE", "OTPU_IMG_CACHE_GB", "OTPU_IMG_CACHE_FREE_GB", "OTPU_BUILD_JOBS",
                "OTPU_QUIET", "OTPU_PREBUILD_CFG", "OTPU_PREBUILD_MIN_GB",
-               "OTPU_PREBUILD_QUIET_WAIT")      # read by the host's tools only: not in the key
+               "OTPU_PREBUILD_QUIET_WAIT", "OTPU_LOCK_HELD", "OTPU_LOCK_PID", "OTPU_LOCK_WAIT",
+               "OTPU_RUN_DIR", "OTPU_STOP_RUN", "OTPU_SIM_TMP", "OTPU_PARENT")
 # the host modules the compiler, kernels and models import: opentpu/host/offload.py's LINE, TAG,
 # RUN, Layout and RowLayout place the mailboxes, slots and tags the programs address
 HOST_KEYED = ("host/offload.py",)
@@ -92,10 +96,14 @@ def source() -> str:
     return _SRC
 
 
+def keyed_env() -> list:
+    """The OTPU_* environment a key holds: every variable but RUNTIME_ENV's."""
+    return sorted((k, v) for k, v in os.environ.items()
+                  if k.startswith("OTPU_") and k not in RUNTIME_ENV)
+
+
 def key(layout, what) -> str:
-    env = sorted((k, v) for k, v in os.environ.items()
-                 if k.startswith("OTPU_") and k not in RUNTIME_ENV)
-    return hashlib.blake2b(repr((layout, what, env, source())).encode(),
+    return hashlib.blake2b(repr((layout, what, keyed_env(), source())).encode(),
                            digest_size=20).hexdigest()
 
 

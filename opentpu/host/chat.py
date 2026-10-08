@@ -45,6 +45,7 @@ from pathlib import Path
 
 import numpy as np
 
+from opentpu import imgcache as IC
 from opentpu.host import streamed as ST
 from opentpu.host.runstate import busy_exits
 from opentpu.llm import MODELS, load_spec, model_dir
@@ -820,6 +821,30 @@ NOTES = {"max_new": "(stopped at max_new={max_new} tokens · {cmd} or raise --ma
          "stopped": "(interrupted)"}
 
 
+def load_tokenizer(path):
+    """AutoTokenizer.from_pretrained(path) on a thread: importing transformers (and torch with
+    it) takes seconds, while the model's image is read and written to the device. A function
+    that waits for the tokenizer and returns it (or raises what the load raised)."""
+    import threading
+    out = {}
+
+    def load():
+        try:
+            from transformers import AutoTokenizer
+            out["tok"] = AutoTokenizer.from_pretrained(path)
+        except BaseException as e:          # (raised in the caller)
+            out["error"] = e
+    t = threading.Thread(target=load, daemon=True, name="otpu-tokenizer")
+    t.start()
+
+    def get():
+        t.join()
+        if "error" in out:
+            raise out["error"]
+        return out["tok"]
+    return get
+
+
 def make_backend(name: str, spec, cap: int, dev: str, model: str | None = None,
                  lookup: bool = False, wformat: str = "int8", head_format: str | None = None):
     """(backend, configuration) for Engine (lookup: room for the resident decode's tables;
@@ -954,9 +979,8 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.top_p is not None and not 0 <= a.top_p <= 1:     # (Hugging Face's range)
         ap.error(f"--top-p {a.top_p}: 0 .. 1 (0 keeps the most likely token only)")
-    from transformers import AutoTokenizer
     path = model_dir(a.model)
-    tok = AutoTokenizer.from_pretrained(path)
+    tokenizer = load_tokenizer(path)        # (on a thread, while the model loads)
     spec = load_spec(path)
     wformat = FM.auto(spec, a.wformat)
     streams = ST.streams(spec)          # a MoE: its experts streamed (opentpu/host/streamed.py)
@@ -988,6 +1012,7 @@ def main(argv=None):
                                              1, PREFILL_ROWS, wformat, a.head_format,
                                              lookup=True).nbytes
         cfg = board_config(DRAM_BYTES=1 << max(20, (need - 1).bit_length()), **flags)
+    t0 = time.perf_counter()
     try:
         if streams:                     # the card's 4 GiB (the simulator's too: board_config)
             from opentpu.isasim import board_config
@@ -1014,8 +1039,13 @@ def main(argv=None):
         raise SystemExit(f"otpu-chat: {e}") from None
     weights = weights_label(eng.image, wformat)
     print(f"weights: {weights}", flush=True)
+    how, secs = IC.last                     # (the image cache: opentpu/imgcache.py)
+    how = {"hit": "read from the image cache", "miss": "built and cached"}.get(how, "built")
+    print(f"loaded in {time.perf_counter() - t0:.1f} s (the image {how} in {secs:.1f} s)",
+          flush=True)
     if getattr(eng.backend, "status", None) is not None:
         eng.backend.status.update(weights=weights)      # for otpu-smi
+    tok = tokenizer()
     sp = sampling(spec, a, path, note=lambda s: print(f"otpu-chat: {s}", flush=True))
     pick = sampler(0 if a.greedy else sp["temperature"], sp["top_k"], sp["top_p"], a.seed,
                    sp["repetition_penalty"], getattr(spec, "softcap", None))

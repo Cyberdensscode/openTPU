@@ -112,6 +112,50 @@ def test_damaged_entry_is_quantized_again(cache):
         assert np.array_equal(z["q"], q)
 
 
+@pytest.mark.parametrize("fmt", ["fp4", "int4", "int8"])
+def test_quantize_rows_is_the_quantizers(fmt, monkeypatch):
+    """quantize_rows, the quantizer on PIECE elements' rows at a time, gives the whole matrix's
+    result bit for bit (rows of one piece, of several, a short last piece; scale ties and
+    zero blocks included)."""
+    W = _w(5, 97, 512)
+    W[3] = 0
+    W[7, :128] = 1.5
+    want = Q.quantize_mxu(W, fmt, 128)
+    for piece in (512, 1500, 4096, 1 << 20):
+        monkeypatch.setattr(qcache, "PIECE", piece)
+        q, s = qcache.quantize_rows(W, fmt, 128)
+        assert q.dtype == want[0].dtype and s.dtype == want[1].dtype
+        assert np.array_equal(q, want[0]) and np.array_equal(s, want[1])
+
+
+def test_batch_quantizes_in_workers_through_the_cache(cache, monkeypatch):
+    """Batch: every matrix's done() gets the quantizer's result, bit for bit, whether it came
+    from the cache, was quantized here (under INLINE elements; int8 small) or in the worker
+    processes, its rows in several jobs; the misses are written; a second batch finds every
+    4-bit matrix in the cache and starts no worker."""
+    monkeypatch.setattr(qcache, "INLINE", 96 * 256 + 1)     # 96 x 256 here, 160 x 256 there
+    monkeypatch.setattr(qcache, "JOB", 7 * 256)         # 7 rows a job
+    mats = [(_w(20 + i, 160 if i % 2 else 96), fmt) for i, fmt in
+            enumerate(("fp4", "int4", "int8", "fp4", "int8", "fp4"))]
+    for n in range(2):
+        got = {}
+        b = qcache.Batch(jobs=2)
+        for i, (W, fmt) in enumerate(mats):
+            b.submit(W, fmt, 128, lambda q, s, i=i: got.setdefault(i, (q, s)))
+        b.wait()
+        assert sorted(got) == list(range(len(mats)))
+        for i, (W, fmt) in enumerate(mats):
+            want = Q.quantize_mxu(W, fmt, 128)
+            assert np.array_equal(got[i][0], want[0]) and np.array_equal(got[i][1], want[1])
+        if n == 0:
+            assert qcache.stats == {"hit": 0, "miss": 4, "write": 4, "skip": 0}
+    assert qcache.stats == {"hit": 4, "miss": 4, "write": 4, "skip": 0}
+    b = qcache.Batch(jobs=2)
+    b.submit(mats[0][0], "fp4", 128, lambda q, s: None)
+    assert b._pool is None
+    b.wait()
+
+
 @pytest.fixture(scope="module")
 def tiny():
     torch = pytest.importorskip("torch")
@@ -146,6 +190,36 @@ def test_card_tools_find_the_prebuilt_image(cache, tiny, head, monkeypatch):
         monkeypatch.setenv("OTPU_IMAGE_CACHE", str(cache))
         assert len(got) == len(want)
         assert all(np.array_equal(a, b) for a, b in zip(got, want))
+
+
+def test_build_jobs_fit_in_memory(monkeypatch):
+    monkeypatch.delenv("OTPU_BUILD_JOBS", raising=False)
+    monkeypatch.setattr(qcache.os, "sched_getaffinity", lambda pid: set(range(8)), raising=False)
+    monkeypatch.setattr(qcache, "mem_gb", lambda: 10.0)
+    assert qcache.build_jobs() == 8             # (workers of no stated size: the CPUs)
+    assert qcache.build_jobs(1.5) == 4          # (10 GiB - RESERVE_GB) / 1.5
+    monkeypatch.setattr(qcache, "mem_gb", lambda: 2.0)
+    assert qcache.build_jobs(1.5) == 1
+    monkeypatch.setattr(qcache, "mem_gb", lambda: None)
+    assert qcache.build_jobs(1.5) == 8          # (no /proc/meminfo)
+    monkeypatch.setenv("OTPU_BUILD_JOBS", "6")
+    monkeypatch.setattr(qcache, "mem_gb", lambda: 2.0)
+    assert qcache.build_jobs(1.5) == 6          # (the variable decides)
+
+
+@pytest.mark.parametrize("wf", ["fp4", "int8"])
+def test_build_in_workers_is_the_serial_build(tiny, wf, monkeypatch):
+    """An image built with its matrices quantized in worker processes (Batch: OTPU_BUILD_JOBS
+    2, every matrix there, in jobs of a few rows) is the build in one process, byte for byte."""
+    W, spec = tiny
+    eng = Engine(spec, W, cap=256, wformat=wf, head_format="int8", resident=True)
+    monkeypatch.setenv("OTPU_BUILD_JOBS", "1")
+    want = eng.image.build(W)
+    monkeypatch.setenv("OTPU_BUILD_JOBS", "2")
+    monkeypatch.setattr(qcache, "INLINE", 0)
+    monkeypatch.setattr(qcache, "JOB", 5 * 256)
+    got = eng.image.build(W)
+    assert len(got) == len(want) and all(np.array_equal(a, b) for a, b in zip(got, want))
 
 
 def test_prebuild_main_picks_runs_configuration_and_memory(tmp_path, monkeypatch, capsys):

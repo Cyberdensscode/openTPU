@@ -288,6 +288,52 @@ def test_build_workers(tiny, tmp_path, monkeypatch):
     assert all(np.array_equal(a, b) for a, b in zip(out, again))
 
 
+def test_image_cache_puts_back_the_weights_and_ple_records(tiny, tmp_path, monkeypatch):
+    """The whole-image cache (opentpu/imgcache.py) of a Gemma 4 image with the PLE table on the
+    host: a hit gives the build's image, byte for byte, its PLE records (ple_store) and the
+    weights the image keeps for host_inputs (the hit's own W); the host inputs and rows of a
+    run are the built image's."""
+    from safetensors.numpy import save_file
+    from opentpu import imgcache as IC
+    from opentpu.llm.qwen3 import load_weights
+    m, W, spec = tiny
+    d = tmp_path / "ckpt"
+    d.mkdir()
+    save_file({"model.language_model." + k[6:]: np.ascontiguousarray(v) for k, v in W.items()
+               if k.startswith("model.")}, str(d / "model.safetensors"))
+    (d / "config.json").write_text(json.dumps(m.config.to_dict()))
+    monkeypatch.setenv("OTPU_IMG_CACHE", str(tmp_path / "img"))
+    monkeypatch.setenv("OTPU_IMG_CACHE_FREE_GB", "0")
+    monkeypatch.setenv("OTPU_PLE_HOST", "1")
+    monkeypatch.setenv("OTPU_BUILD_JOBS", "2")
+    engs = []
+    for how in ("miss", "hit"):
+        Wd = load_weights(d)
+        engs.append(Engine(spec, Wd, cap=1024, cfg=_cfg(), wformat="fp4", head_format="int8"))
+        assert IC.last[0] == how and engs[-1].image._W is Wd
+    a, b = engs
+    assert b.image.ple_host and np.array_equal(a.image.ple_store, b.image.ple_store)
+    assert np.array_equal(a.backend.machine.slices[0].dram, b.backend.machine.slices[0].dram)
+    toks, pos = [3, 999, 0, 17], [0, 1, 2, 3]
+    for (x, u), (y, v) in zip(a.image.host_inputs(toks, pos) + a.image.host_rows(toks),
+                              b.image.host_inputs(toks, pos) + b.image.host_rows(toks)):
+        assert x == y and np.array_equal(u, v)
+
+
+@pytest.mark.parametrize("ple", ["int8", "fp4"])
+def test_records_packed_in_pieces(ple, monkeypatch):
+    """pack_records quantizes its blocks a few rows at a time (opentpu.qcache.quantize_rows):
+    the records are those of the whole table's quantization, byte for byte."""
+    from opentpu import qcache as QC
+    rows = np.random.default_rng(2).standard_normal((300, 896)).astype(np.float32)
+    rows[7] = 0
+    S = GA.record_blocks(7, ple)
+    monkeypatch.setattr(QC, "PIECE", 1 << 30)
+    want = GA.pack_records(rows, ple, 128, S)
+    monkeypatch.setattr(QC, "PIECE", 1000)
+    assert np.array_equal(GA.pack_records(rows, ple, 128, S), want)
+
+
 @pytest.mark.parametrize("ple", ["int8", "fp4"])
 def test_records_roundtrip(ple):
     """pack_records / dequant_records: the device's gather values of a packed table."""

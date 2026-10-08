@@ -558,11 +558,12 @@ class Image(EmbedHost):
             v = np.ascontiguousarray(a).view(np.uint8).reshape(-1)
             imgs[s][addr:addr + v.size] = v
 
+        qb = QC.Batch()                 # the matrices, quantized in worker processes
+
         def put_q(addr_pair, parts, fmt):
             for s, p in enumerate(parts):
-                q, sc = QC.quantize_mxu(p, fmt, D)
-                put(s, addr_pair[0], q)
-                put(s, addr_pair[1], sc)
+                qb.submit(p, fmt, D, lambda q, sc, s=s: (put(s, addr_pair[0], q),
+                                                         put(s, addr_pair[1], sc)))
 
         def rows(a, k):
             return [a[s * k:(s + 1) * k] for s in range(S)]
@@ -620,6 +621,7 @@ class Image(EmbedHost):
                       mf["wd"])
         head = W["model.embed_tokens.weight"] if spec.tied else W["lm_head.weight"]
         put_q(self.head, rows(head, self.v_loc), self.head_format)
+        qb.wait()
         if self.lookup:
             _lookup_build(put, S, W, spec, self.cap, self.lookup)
         return imgs

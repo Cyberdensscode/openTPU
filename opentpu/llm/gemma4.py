@@ -938,8 +938,9 @@ class Image:
     # ---- contents
     def build(self, W, jobs: int | None = None) -> list[np.ndarray]:
         """The DRAM image with every weight quantized in place, KV cache empty. The matrices
-        are quantized by `jobs` worker processes (default: OTPU_BUILD_JOBS, else 4) when W is
-        a checkpoint's Weights, the 4-bit ones through opentpu.qcache (_job)."""
+        are quantized by `jobs` worker processes (default: opentpu.qcache.build_jobs(),
+        OTPU_BUILD_JOBS, else the host's CPUs) when W is a checkpoint's Weights, the 4-bit ones
+        through opentpu.qcache (_job)."""
         spec, cfg = self.spec, self.cfg
         D, H, P, L = cfg.D, spec.hidden, spec.ple_dim, spec.layers
         self._W = W                                     # host_inputs gathers its rows
@@ -1379,6 +1380,7 @@ def _ple_records(rows, cols, fmt: str, D: int, S: int, scale: float) -> np.ndarr
 
 # ---- Image.build's quantization jobs: in worker processes, cached by content
 HEAD_CHUNK = 32768      # LM head rows quantized per job
+JOB_GB = 1.5            # a job worker's peak (E2B: 1.3-1.4 GiB, a PLE chunk's rows and records)
 _JOB_W = None           # the worker process's Weights
 
 
@@ -1428,18 +1430,15 @@ def _worker_job(job) -> tuple:
 
 
 def _run_tasks(W, jobs: list, n: int | None = None):
-    """Results of the jobs, in order: in n worker processes when W is a checkpoint's Weights,
-    else in line."""
-    import os
-    n = int(os.environ.get("OTPU_BUILD_JOBS", 4)) if n is None else n
+    """Results of the jobs, in order: in n worker processes (default opentpu.qcache.build_jobs(),
+    as many as MemAvailable holds at JOB_GB each) when W is a checkpoint's Weights, else in
+    line."""
+    n = QC.build_jobs(JOB_GB) if n is None else n
     if not isinstance(W, Weights) or n <= 1:
         for j in jobs:
             yield _job(W, j)
         return
-    import multiprocessing as mp
-    from concurrent.futures import ProcessPoolExecutor
-    with ProcessPoolExecutor(n, mp_context=mp.get_context("spawn"), initializer=_job_init,
-                             initargs=(str(W.model_dir),)) as pool:
+    with QC.pool(n, initializer=_job_init, initargs=(str(W.model_dir),)) as pool:
         for out, counts in pool.map(_worker_job, jobs):
             for k, v in counts.items():
                 QC.stats[k] += v
