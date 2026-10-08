@@ -10,6 +10,8 @@ the whole checkpoint: in parallel workers on its host, or streamed into a pool o
     python3 tools/offload/pack_pool.py MODEL POOL stamp          # give a pool packed before keys
                                                                   # its key (once it is known current)
     python3 tools/offload/pack_pool.py MODEL POOL info           # its format, layout, packed experts
+    python3 tools/offload/pack_pool.py MODEL POOL sums IDS       # sha256 of the pool's records IDS
+    python3 tools/offload/pack_pool.py MODEL - sums IDS          # ... of the experts packed now
 
 The card's host keeps a checkpoint without the experts (strip_experts.py), so its pool must be
 whole before a run warms more slots than the experts it packed itself: session 5 filled the 35B's
@@ -28,6 +30,11 @@ before keys has none: it is taken with a warning until `stamp` writes the key of
 --wformat (the slot size must be theirs; stamp only a pool known to be current). `info` prints
 the key, or for a pool without one its format as its slot size says (int8, or 4-bit: fp4 and
 int4 have the same size).
+
+`sums` tells whether a pool is current before it is stamped: the sha256 of the records IDS names
+(a file of global ids, one a line, or a number N: N ids spread over the pool) as the pool holds
+them, or as this tree packs them from the whole checkpoint (`-`). The two lists are equal when
+the pool's experts are this tree's (the split format's bytes, as pack writes them).
 """
 from __future__ import annotations
 
@@ -78,11 +85,33 @@ def info(a, key: dict) -> None:
     print(f"no key (packed before keys): slots of {slot} bytes: {what}")
 
 
+def sums(a, img, n: int, slot: int) -> None:
+    """Each record's "g sha256" line: the pool's (POOL), or packed from MODEL now (POOL -)."""
+    import hashlib
+    from opentpu.host.offload import SPLIT, to_split
+    arg = a.args[0]
+    ids = [i * n // int(arg) for i in range(int(arg))] if arg.isdigit() else \
+        [int(x) for x in open(arg).read().split()]
+    if a.pool == "-":
+        from opentpu.llm.qwen3 import LazyWeights
+        W = LazyWeights(a.model)
+        get = lambda g: to_split(img.expert(W, g))                     # noqa: E731
+    else:
+        if os.path.getsize(a.pool) != n * slot:
+            sys.exit(f"{a.pool}: {os.path.getsize(a.pool)} bytes, not {n} experts of {slot}")
+        split = os.path.exists(a.pool + ".format") and \
+            open(a.pool + ".format").read().strip() == SPLIT
+        arr = np.memmap(a.pool, np.uint8, "r", shape=(n, slot))
+        get = lambda g: arr[g] if split else to_split(np.array(arr[g]))  # noqa: E731
+    for g in ids:
+        print(g, hashlib.sha256(np.ascontiguousarray(get(g)).tobytes()).hexdigest(), flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("model")
     ap.add_argument("pool")
-    ap.add_argument("mode", choices=("init", "pack", "send", "recv", "stamp", "info"))
+    ap.add_argument("mode", choices=("init", "pack", "send", "recv", "stamp", "info", "sums"))
     ap.add_argument("args", nargs="*")
     ap.add_argument("--wformat", default="fp4", help="the image's weight format (default fp4)")
     a = ap.parse_args()
@@ -119,6 +148,9 @@ def main():
         open(a.pool + ".key", "w").write(json.dumps(key, indent=1) + "\n")
         print(f"stamped {a.pool}: {key['format']}, D {key['D']}, {n} experts x {slot} bytes, "
               f"{key['model']}")
+        return
+    if a.mode == "sums":
+        sums(a, img, n, slot)
         return
     if a.mode in ("pack", "recv"):
         try:
