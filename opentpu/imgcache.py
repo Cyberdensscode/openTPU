@@ -204,6 +204,8 @@ def _bytes(a) -> np.ndarray:
 
 
 def _store(d: Path, f: Path, images: list, left: dict) -> bool:
+    """Write the entry (True), or not: under the free-disk floor, or a write that failed (the
+    disk full, no permission: the image is built, not kept)."""
     images = [_bytes(img) for img in images]
     slices = [{"nbytes": len(img), "runs": _runs(img)} for img in images]
     arrays = {p: {"dtype": v.dtype.str, "shape": list(v.shape)}
@@ -213,14 +215,14 @@ def _store(d: Path, f: Path, images: list, left: dict) -> bool:
             "weights": [p for p, (kind, _) in left.items() if kind == "weights"]}
     size = sum(n for s in slices for _, n in s["runs"]) + \
         sum(v.nbytes for kind, v in left.values() if kind == "array")
-    f.parent.mkdir(parents=True, exist_ok=True)
     free = float(os.environ.get("OTPU_IMG_CACHE_FREE_GB", FREE_FLOOR / 2**30)) * 2**30
-    if shutil.disk_usage(f.parent).free - size < free:
-        stats["skip"] += 1
-        return False
     head = json.dumps(meta).encode()
     tmp = f.with_name(f".{f.stem}.{os.getpid()}.img")
     try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        if shutil.disk_usage(f.parent).free - size < free:
+            stats["skip"] += 1
+            return False
         with open(tmp, "wb") as out:
             out.write(MAGIC + struct.pack("<Q", len(head)) + head)
             for img, s in zip(images, slices):
@@ -229,9 +231,12 @@ def _store(d: Path, f: Path, images: list, left: dict) -> bool:
             for p in arrays:
                 out.write(memoryview(_bytes(left[p][1])))
         os.replace(tmp, f)
-    except BaseException:
+    except BaseException as e:
         tmp.unlink(missing_ok=True)
-        raise
+        if not isinstance(e, OSError):
+            raise
+        stats["skip"] += 1
+        return False
     stats["write"] += 1
     _evict(d)
     return True
@@ -258,13 +263,16 @@ def _load(f: Path, W):
                 raise ValueError("a long image cache entry")
             left.update(meta["json"])
             left.update({p: W for p in meta["weights"]})
-        os.utime(f)                     # recently used (the eviction order)
-        return images, left
     except FileNotFoundError:
         return None
     except Exception:                   # a damaged entry: build again
         f.unlink(missing_ok=True)
         return None
+    try:
+        os.utime(f)                     # recently used (the eviction order)
+    except OSError:
+        pass
+    return images, left
 
 
 def _read(src, out: np.ndarray) -> None:

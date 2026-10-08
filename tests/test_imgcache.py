@@ -233,6 +233,26 @@ def test_least_recently_used_go_over_the_cap_and_none_under_the_floor(ckpt, cach
     assert IC.last[0] == "skip" and IC.stats["skip"] == 1 and len(_entries(cache)) == 3
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes a read-only directory")
+def test_a_cache_it_cannot_write_is_no_error(ckpt, cache):
+    """A cache directory the process cannot write (another user's, a full disk): its entries
+    still hit, and a new image is built and used, not kept."""
+    a = _engine(ckpt)
+    dirs = [cache] + [p for p in cache.iterdir() if p.is_dir()]
+    try:
+        for p in dirs:
+            p.chmod(0o555)
+        b = _engine(ckpt)
+        assert IC.last[0] == "hit"
+        c = _engine(ckpt, cap=512)
+        assert IC.last[0] == "skip" and IC.stats["skip"] == 1
+    finally:
+        for p in dirs:
+            p.chmod(0o755)
+    assert all(np.array_equal(x, y) for x, y in zip(a.backend.images, b.backend.images))
+    assert len(_entries(cache)) == 1 and c.image.cap == 512
+
+
 def test_cache_directory_and_off_switches(tmp_path, monkeypatch):
     """OTPU_IMG_CACHE=<dir> or 0; else beside the 4-bit matrices' cache (img under
     OTPU_IMAGE_CACHE's directory, ~/otpu-build/qcache/img by default), off with it."""

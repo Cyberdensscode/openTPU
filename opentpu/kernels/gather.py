@@ -28,6 +28,7 @@ import numpy as np
 from .. import fp32 as F
 from .. import isa as I
 from .. import language as ol
+from .. import qcache as QC
 from .. import quant as Q
 from ..compiler import QTensor
 
@@ -149,11 +150,11 @@ def pack_records(rows: np.ndarray, fmt: str, D: int, S: int) -> np.ndarray:
     blk = x.reshape(T, D, S).transpose(0, 2, 1).reshape(T * S, D)     # [T*S, D]: block c
     rec = np.zeros((T, record_bytes(S, fmt, D)), np.uint8)
     if fmt == "int8":
-        q, s = Q.quantize_mxu(blk, fmt, D)                            # [T*S, D], [T*S, 1]
+        q, s = QC.quantize_rows(blk, fmt, D)                          # [T*S, D], [T*S, 1]
         rec[:, :S * D] = q.reshape(T, S * D)
         rec[:, S * D:S * D + 4 * S] = s.reshape(T, S).view(np.uint8).reshape(T, 4 * S)
         return rec
-    b, w = Q.quantize_mxu(blk, fmt, D)                                # [T*S, D/2 padded to D]
+    b, w = QC.quantize_rows(blk, fmt, D)                              # [T*S, D/2 padded to D]
     b = b[:, :D // 2].reshape(T, 2, S // 2, D // 2)                   # (half, chunk)
     rec[:, :S * D // 2] = b.transpose(0, 2, 1, 3).reshape(T, S * D // 2)
     w = w.reshape(T, 2, S // 2).transpose(0, 2, 1)                     # chunk, then half
