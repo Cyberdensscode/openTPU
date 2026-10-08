@@ -465,6 +465,30 @@ def test_chat_stops_continues_and_resets():
     assert chat.last.reused == 0 and not chat.last.restarted
 
 
+@pytest.mark.parametrize("snapshots", [0, 1])
+def test_chat_restarts_without_a_snapshot(snapshots):
+    """Qwen3.5 without snapshots (Engine(snapshots=0)): from the second turn on, the rendering
+    parts from what was fed at the last reply's start, and no snapshot is there: the turn starts
+    over (Turn.restarted, counted in Session.restarts) and feeds its whole rendering. With one,
+    no turn does, and the session counts the positions kept. Every turn's logits a fresh
+    engine's."""
+    W, spec, cfg = _model("qwen35")
+    rec, tok = [], _QwenTok()
+    chat = Chat(Engine(spec, W, cap=512, cfg=cfg, snapshots=snapshots), tok, False,
+                _recording(rec), 4)
+    reused = 0
+    for i, msg in enumerate(MESSAGES[:3]):
+        _, turn = chat.ask(msg)
+        ids = tok.apply_chat_template(chat.history[:-1], True, False, True)
+        assert turn.restarted == (i > 0 and not snapshots), i
+        assert turn.prefill_tokens == len(ids) - turn.reused
+        assert (turn.reused == 0) == (i == 0 or not snapshots), i
+        reused += turn.reused
+        want = Engine(spec, W, cap=512, cfg=cfg).prefill(ids)
+        assert np.array_equal(_bits(rec[-1]), _bits(want)), i
+    assert chat.session.restarts == (0 if snapshots else 2) and chat.session.reused == reused
+
+
 # --------------------------------------------------------------------------------- RTL
 @pytest.mark.parametrize("case", ["qwen35", "lfm2"])
 def test_rollback_on_board_model(have_verilator, case):

@@ -158,7 +158,9 @@ def stats_markup(meta: dict, chat: Chat, turn: Turn | None) -> str:
             L.append(f"KV       {_mib(dr['kv_used'])} / {_mib(dr['kv_capacity'])}")
     s = chat.session
     L += ["", "[b]session[/b]", f"turns    {s.turns}", f"tokens   {s.tokens_in} in, "
-          f"{s.tokens_out} out", f"decode   {_rate(s.decode_tok_s)} avg"]
+          f"{s.tokens_out} out", f"reused   {s.reused} tok" + (f", {s.restarts} turns re-fed"
+                                                             if s.restarts else ""),
+          f"decode   {_rate(s.decode_tok_s)} avg"]
     sp = meta.get("sampling") or {}
     short = {"temperature": "temp", "repetition_penalty": "rep pen"}
     L += ["", "[b]sampling[/b]"] + [f"{short.get(k, k):<8} {v}" for k, v in sp.items()]
@@ -190,7 +192,8 @@ def stats_inline(meta: dict, chat: Chat, turn: Turn | None) -> str:
                  + (f" · KV {_mib(dr['kv_used'])} / {_mib(dr['kv_capacity'])}"
                     if dr.get("kv_capacity") else ""))
     L.append(f"[b]session[/b]    {s.turns} turns · {s.tokens_in} tokens in, {s.tokens_out} out"
-             f" · decode {_rate(s.decode_tok_s)} avg")
+             f" · reused {s.reused}" + (f" ({s.restarts} turns re-fed)" if s.restarts else "")
+             + f" · decode {_rate(s.decode_tok_s)} avg")
     sp = dict(meta.get("sampling") or {}, think="on" if chat.think else "off")
     L.append("[b]sampling[/b]   " + " · ".join(f"{k} {v}" for k, v in sp.items()))
     return "\n".join(L)

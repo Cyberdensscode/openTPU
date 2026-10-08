@@ -366,11 +366,15 @@ class Session:
     tokens_out: int = 0
     decode_s: float = 0.0
     decode_tokens: int = 0            # tokens counted in decode_s (the first of a turn is not)
+    reused: int = 0                   # KV positions the turns kept
+    restarts: int = 0                 # turns that fed the whole history again (Turn.restarted)
 
     def add(self, t: Turn) -> None:
         self.turns += 1
         self.tokens_in += t.prefill_tokens
         self.tokens_out += t.gen_tokens
+        self.reused += t.reused
+        self.restarts += t.restarted
         if t.gen_tokens > 1:
             self.decode_s += t.decode_s
             self.decode_tokens += t.gen_tokens - 1
