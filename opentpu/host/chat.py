@@ -242,13 +242,16 @@ class _Seen:
         return self.ids
 
 
-def sampling(spec, args, path=None) -> dict:
+def sampling(spec, args, path=None, note=lambda s: None) -> dict:
     """The model's sampling defaults, overridden by the flags given on the command line (None
     when not given): the checkpoint's generation_config.json at `path` when it samples
     (do_sample; Hugging Face's defaults for the keys it leaves out), else its family's
     SAMPLING, else greedy (temperature 0) as Hugging Face's generate. Qwen3 and Qwen3.5 always
     take SAMPLING's: their generation_config.json holds the thinking mode's settings. The
-    Llama-likes (llama.py: Qwen3's Spec without the q / k norms) have no family."""
+    Llama-likes (llama.py: Qwen3's Spec without the q / k norms) have no family. A default
+    top-k above the device sampler's (generate.K_MAX, 64; 0: none) is clamped to it, so the
+    decode loop stays on the device (LFM2.5-8B-A1B's 80); `note` gets a line saying so when
+    the settings sample. --top-k still sets any."""
     fam = type(spec).__module__.rsplit(".", 1)[-1]
     if fam == "qwen3" and not spec.qk_norm:
         fam = None
@@ -260,7 +263,14 @@ def sampling(spec, args, path=None) -> dict:
         d = {k: v if g.get(k) is None else g[k] for k, v in HF_SAMPLING.items()}
     else:
         d = dict(SAMPLING.get(fam, dict(HF_SAMPLING, temperature=0.0)))
+    top_k = d["top_k"]
+    if not 0 < top_k <= G.K_MAX:
+        d["top_k"] = G.K_MAX
     d.update({k: getattr(args, k) for k in d if getattr(args, k, None) is not None})
+    if d["top_k"] != top_k and getattr(args, "top_k", None) is None and d["temperature"] > 0 \
+            and not getattr(args, "greedy", False):
+        note(f"top-k {top_k or 'none'} (the model's default) clamped to {G.K_MAX}, the most the "
+             f"card's decode loop samples from; --top-k {top_k} keeps it (sampled on the host)")
     return d
 
 
@@ -1005,7 +1015,7 @@ def main(argv=None):
     print(f"weights: {weights}", flush=True)
     if getattr(eng.backend, "status", None) is not None:
         eng.backend.status.update(weights=weights)      # for otpu-smi
-    sp = sampling(spec, a, path)
+    sp = sampling(spec, a, path, note=lambda s: print(f"otpu-chat: {s}", flush=True))
     pick = sampler(0 if a.greedy else sp["temperature"], sp["top_k"], sp["top_p"], a.seed,
                    sp["repetition_penalty"], getattr(spec, "softcap", None))
     clock = 0.0

@@ -3793,9 +3793,9 @@ the whole checkpoint) the same experts as this tree packs them. The lists must b
 - **The embedding table.** Qwen3.5-35B-A3B's untied int8 table stays on the host, which writes
   each token's row, so more slots fit (`--embed-table card` puts it on the card).
 - **Decode.** The card's decode loop picks every token, greedy or sampled, when the card takes
-  the sampling settings (top-k 1 to 64). Otherwise the host samples each step from its logits:
-  LFM2.5-8B-A1B's generation_config.json asks for top-k 80, so pass `--top-k 64` (or `--greedy`)
-  to keep its loop on the card.
+  the sampling settings (top-k 1 to 64). A default top-k above 64 is clamped to 64 with a note
+  (LFM2.5-8B-A1B's generation_config.json asks for 80; docs/host.md 6). With an explicit
+  `--top-k` above 64 the host samples each step from its logits.
 - **The server.** The expert server is polled while every run is in flight: the prompt's runs,
   the decode loop, and each step the host samples. `--poll-idle` sets its idle polls (10.10).
 - **Not supported:** `--mtp`, `--per-position`, `--backend board-sim` and `rtl`.

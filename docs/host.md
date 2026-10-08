@@ -484,7 +484,10 @@ LFM2.5-230M: 0.1, top-k 50, penalty 1.05), else to the model family's (LFM2-2.6B
 LFM2.5-230M's), else to greedy decoding, as Hugging Face's generate (Phi-4-mini). Qwen3 and
 Qwen3.5 take their model cards' non-thinking settings (0.7, top-k 20, top-p 0.8): their
 generation_config.json holds the thinking mode's. `--greedy` decodes greedily. Gemma's final
-soft cap applies before sampling, on the host as on the card.
+soft cap applies before sampling, on the host as on the card. A default top-k above 64, the
+most the card's decode loop samples from (or none), becomes 64, so that the loop stays on the
+card, and a line at startup says so (LFM2.5-8B-A1B's generation_config.json asks for 80). An
+explicit `--top-k` is kept, and above 64 the host samples each token.
 
 The first call writes the model image (at the default `--cap 2048`: 0.69 GiB for Qwen3-0.6B,
 0.27 GiB for LFM2.5-230M, 0.77 GiB for Qwen3.5-0.8B) to the card; every token then writes the
@@ -593,8 +596,8 @@ otpu-chat --backend board --model lfm2-8b --pool /data/lfm8b.bin  # a pool elsew
 - Each turn's line adds the reply's expert hits, MB streamed a token and the prompt's misses.
   The status line shows the first two, and the panel and `/stats` the slots.
 - The card's loop decodes when it takes the sampling (top-k 1 to 64). LFM2.5-8B-A1B's
-  generation_config.json asks for top-k 80, so its tokens are sampled on the host unless you
-  pass `--top-k 64` or `--greedy`.
+  generation_config.json asks for top-k 80, which otpu-chat clamps to 64 (above); with
+  `--top-k 80` the host samples each token, the expert server serving each step.
 - Loading the 35B builds its image for about 9 minutes, with a peak of about 13 GB of host
   memory. The pool then sits in the page cache (17.1 GB for the 35B).
 - `--mtp`, `--per-position` and `--backend board-sim` are not supported.

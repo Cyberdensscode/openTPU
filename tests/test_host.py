@@ -1391,12 +1391,47 @@ def test_chat_sampling_defaults_from_generation_config(tmp_path):
     assert sampling(q, none, think) == SAMPLING["qwen3"]
     assert sampling(f, none, ckpt("lfm2")) == SAMPLING["lfm2"]          # LFM2-2.6B's: none
     moe = ckpt("lfm2-moe", do_sample=True, temperature=0.2, top_k=80, repetition_penalty=1.05)
-    assert sampling(f, none, moe) == dict(temperature=0.2, top_k=80, top_p=1.0,
-                                          repetition_penalty=1.05)
+    assert sampling(f, none, moe) == dict(temperature=0.2, top_k=64, top_p=1.0,   # (clamped:
+                                          repetition_penalty=1.05)               # the next test)
     flags = types.SimpleNamespace(temperature=0.9, top_k=None, top_p=None, repetition_penalty=None)
     assert sampling(llama, flags, smol)["temperature"] == 0.9
     assert sampling(llama, none) == dict(temperature=0.0, top_k=50, top_p=1.0,
                                          repetition_penalty=1.0)    # no checkpoint: greedy
+
+
+def test_chat_sampling_clamps_a_default_top_k_to_the_cards(tmp_path):
+    """A default top-k above the device sampler's 64 (generate.K_MAX), or none (0), becomes 64,
+    every model alike, so that the decode loop stays on the card (LFM2.5-8B-A1B's
+    generation_config asks for 80); the note says so when the settings sample, and an explicit
+    --top-k (above 64 too) is kept without one."""
+    from opentpu.host.chat import sampling
+    from opentpu.llm import generate as G
+    from opentpu.llm import lfm2, qwen3
+    f = lfm2.Spec(256, ("conv", "attn"), 4, 2, 64, 512, 1000)
+    llama = replace(qwen3.Spec(256, 2, 4, 2, 128, 512, 1000), qk_norm=False)
+
+    def flags(**kw):
+        return types.SimpleNamespace(**dict(dict(temperature=None, top_k=None, top_p=None,
+                                                 repetition_penalty=None), **kw))
+
+    def ckpt(name, **g):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "generation_config.json").write_text(json.dumps(dict(do_sample=True, **g)))
+        return d
+    notes = []
+    k80, k0, k40 = ckpt("k80", top_k=80), ckpt("k0", top_k=0), ckpt("k40", top_k=40)
+    assert G.K_MAX == 64
+    assert sampling(f, flags(), k80, notes.append)["top_k"] == 64
+    assert notes == ["top-k 80 (the model's default) clamped to 64, the most the card's decode "
+                     "loop samples from; --top-k 80 keeps it (sampled on the host)"]
+    assert sampling(llama, flags(), k0, notes.append)["top_k"] == 64 and "top-k none" in notes[1]
+    assert sampling(llama, flags(), k40, notes.append)["top_k"] == 40 and len(notes) == 2
+    assert sampling(f, flags(top_k=80), k80, notes.append)["top_k"] == 80      # --top-k 80
+    assert sampling(f, flags(top_k=64), k80, notes.append)["top_k"] == 64 and len(notes) == 2
+    assert sampling(f, flags(temperature=0.0), k80, notes.append)["top_k"] == 64   # greedy:
+    assert sampling(f, flags(greedy=True), k80, notes.append)["top_k"] == 64       # no note
+    assert len(notes) == 2
 
 
 

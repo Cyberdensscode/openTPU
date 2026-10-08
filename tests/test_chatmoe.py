@@ -187,9 +187,8 @@ def test_the_next_turn_continues_the_context(ckpt, formats, monkeypatch):
 
 @pytest.mark.parametrize("top_k", [80, 20])
 def test_a_sampled_reply_streams_its_experts(ckpt, formats, top_k):
-    """A sampled reply: with a top-k the card's loop does not take (80, LFM2.5-8B's
-    generation_config) the host picks each token from a step's logits, else (20) the card's loop
-    samples. The server serves those steps as it does the loop. The reply is that of the same
+    """A sampled reply: with a top-k the card's loop does not take (--top-k 80) the host picks
+    each token from a step's logits, else (20) the card's loop samples. The server serves those steps as it does the loop. The reply is that of the same
     sampler and seed on an engine with every expert resident, and the turn counts the steps'
     hits, misses and bytes."""
     fam, d = ckpt
@@ -316,6 +315,33 @@ def test_otpu_chat_runs_a_streamed_moe(tmp_path, monkeypatch, capfd):
     assert "% hits" in out and "MB/token" in out and "misses in the prompt" in out
     with pytest.raises(SystemExit, match="runs on the ISA simulator or the card"):
         C.main(argv + ["--backend", "board-sim"])
+
+
+def test_otpu_chat_clamps_the_models_top_k(tmp_path, monkeypatch, capfd):
+    """otpu-chat on a checkpoint whose generation_config.json samples from the top 80 (as
+    LFM2.5-8B-A1B's): top-k 64, the card's decode loop picks the tokens, and a line at startup
+    says so; --top-k 80 keeps 80 (the host samples) without the line."""
+    from opentpu.host import chat as C
+    d = _checkpoint("lfm2", tmp_path / "model")
+    (d / "generation_config.json").write_text(json.dumps(
+        dict(do_sample=True, temperature=0.2, top_k=80, repetition_penalty=1.05)))
+    monkeypatch.delenv("OTPU_FORMATS", raising=False)
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", lambda p: Tok())
+    monkeypatch.setattr("opentpu.isasim.board_config", lambda **kw: CFG)
+    plain, on_card = C.Chat.ask_plain, []
+    monkeypatch.setattr(C.Chat, "ask_plain", lambda self, text: (
+        on_card.append((self.on_card, self.pick.params["top_k"])), plain(self, text, sys.stdout)))
+    pool = d / "pool-fp4.bin"
+    _pack_pool(d, pool, "init", monkeypatch=monkeypatch)
+    _pack_pool(d, pool, "pack", 0, 1, monkeypatch=monkeypatch)
+    argv = ["--model", str(d), "--prompt", "11 22 33", "--max-new", "3", "--experts", str(K)]
+    capfd.readouterr()
+    C.main(argv)
+    out = capfd.readouterr().out
+    assert "otpu-chat: top-k 80 (the model's default) clamped to 64" in out
+    C.main(argv + ["--top-k", "80"])
+    assert "clamped" not in capfd.readouterr().out
+    assert on_card == [(True, 64), (False, 80)]
 
 
 def test_the_interface_shows_the_streaming():
