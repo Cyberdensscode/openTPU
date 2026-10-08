@@ -52,6 +52,7 @@ INLINE = 1 << 20                # Batch: smaller matrices are quantized in the b
 AHEAD = 2                       # Batch: jobs queued per worker besides the one it runs
 LOOKUPS = 4                     # Batch: threads hashing and reading the cache
 LOOKAHEAD = 1 << 30             # Batch: bytes of matrices waiting on them at most
+RESERVE_GB = 4.0                # build_jobs: MemAvailable its workers leave
 stats = {"hit": 0, "miss": 0, "write": 0, "skip": 0}
 _SRC: str | None = None
 
@@ -156,16 +157,32 @@ def _lookup(W: np.ndarray, fmt: str, D: int):
     return f, _read(f)
 
 
-def build_jobs() -> int:
-    """The worker processes an image build quantizes in: OTPU_BUILD_JOBS, else the host's CPUs
-    (1: in the build's process)."""
+def build_jobs(gib: float = 0.0) -> int:
+    """The worker processes an image build quantizes in: OTPU_BUILD_JOBS, else the host's CPUs,
+    and with `gib` (a worker's peak memory, GiB) no more than MemAvailable holds with RESERVE_GB
+    left (1: in the build's process)."""
     v = os.environ.get("OTPU_BUILD_JOBS")
     if v:
         return max(1, int(v))
     try:
-        return len(os.sched_getaffinity(0))
+        n = len(os.sched_getaffinity(0))
     except AttributeError:              # (macOS)
-        return os.cpu_count() or 1
+        n = os.cpu_count() or 1
+    free = mem_gb()
+    if gib and free is not None:
+        n = min(n, max(1, int((free - RESERVE_GB) / gib)))
+    return n
+
+
+def mem_gb() -> float | None:
+    """MemAvailable in GiB (None where /proc/meminfo has none)."""
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) / 2**20
+    except OSError:
+        pass
+    return None
 
 
 def pool(n: int, **kw):

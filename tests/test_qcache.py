@@ -192,6 +192,21 @@ def test_card_tools_find_the_prebuilt_image(cache, tiny, head, monkeypatch):
         assert all(np.array_equal(a, b) for a, b in zip(got, want))
 
 
+def test_build_jobs_fit_in_memory(monkeypatch):
+    monkeypatch.delenv("OTPU_BUILD_JOBS", raising=False)
+    monkeypatch.setattr(qcache.os, "sched_getaffinity", lambda pid: set(range(8)), raising=False)
+    monkeypatch.setattr(qcache, "mem_gb", lambda: 10.0)
+    assert qcache.build_jobs() == 8             # (workers of no stated size: the CPUs)
+    assert qcache.build_jobs(1.5) == 4          # (10 GiB - RESERVE_GB) / 1.5
+    monkeypatch.setattr(qcache, "mem_gb", lambda: 2.0)
+    assert qcache.build_jobs(1.5) == 1
+    monkeypatch.setattr(qcache, "mem_gb", lambda: None)
+    assert qcache.build_jobs(1.5) == 8          # (no /proc/meminfo)
+    monkeypatch.setenv("OTPU_BUILD_JOBS", "6")
+    monkeypatch.setattr(qcache, "mem_gb", lambda: 2.0)
+    assert qcache.build_jobs(1.5) == 6          # (the variable decides)
+
+
 @pytest.mark.parametrize("wf", ["fp4", "int8"])
 def test_build_in_workers_is_the_serial_build(tiny, wf, monkeypatch):
     """An image built with its matrices quantized in worker processes (Batch: OTPU_BUILD_JOBS

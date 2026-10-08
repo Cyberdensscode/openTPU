@@ -95,14 +95,7 @@ def is_4bit(run: str) -> bool:
         any(f in os.environ.get("OTPU_FORMATS", "") for f in FORMATS4)
 
 
-def mem_gb() -> float | None:
-    try:
-        for line in Path("/proc/meminfo").read_text().splitlines():
-            if line.startswith("MemAvailable:"):
-                return int(line.split()[1]) / 2**20
-    except OSError:
-        pass
-    return None
+mem_gb = qcache.mem_gb
 
 
 def sweep_temps(d: Path, age: float = 3600.0) -> int:

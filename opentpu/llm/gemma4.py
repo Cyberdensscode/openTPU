@@ -1355,6 +1355,7 @@ def _ple_records(rows, cols, fmt: str, D: int, S: int, scale: float) -> np.ndarr
 
 # ---- Image.build's quantization jobs: in worker processes, cached by content
 HEAD_CHUNK = 32768      # LM head rows quantized per job
+JOB_GB = 1.5            # a job worker's peak (E2B: 1.3-1.4 GiB, a PLE chunk's rows and records)
 _JOB_W = None           # the worker process's Weights
 
 
@@ -1404,9 +1405,10 @@ def _worker_job(job) -> tuple:
 
 
 def _run_tasks(W, jobs: list, n: int | None = None):
-    """Results of the jobs, in order: in n worker processes (default opentpu.qcache.build_jobs())
-    when W is a checkpoint's Weights, else in line."""
-    n = QC.build_jobs() if n is None else n
+    """Results of the jobs, in order: in n worker processes (default opentpu.qcache.build_jobs(),
+    as many as MemAvailable holds at JOB_GB each) when W is a checkpoint's Weights, else in
+    line."""
+    n = QC.build_jobs(JOB_GB) if n is None else n
     if not isinstance(W, Weights) or n <= 1:
         for j in jobs:
             yield _job(W, j)
