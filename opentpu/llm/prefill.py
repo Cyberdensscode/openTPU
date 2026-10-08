@@ -295,9 +295,9 @@ def logits(eng, R: int) -> np.ndarray:
                                             4 * v_loc).view(np.float32) for s in range(S)])
 
 
-def chunks(eng, tokens):
+def chunks(eng, tokens, head: bool = True):
     """Engine.prefill_chunks's runs this way: yields (the run's tokens, logits after the
-    prompt's last token with the last run, else None)."""
+    prompt's last token with the last run, else None; without `head` every run is a P)."""
     tokens = [int(t) for t in tokens]
     p0 = eng.poss[0]
     P = p0 + len(tokens)
@@ -307,6 +307,7 @@ def chunks(eng, tokens):
         return
     write_tokens(eng, p0, tokens)
     for p, R, kind in split(p0, P, lambda b: r_max(eng, b), eng.block, conv_k(eng)):
+        kind = kind if head else "P"
         progs = programs(eng, p, R, kind)
         if kind == "L":
             eng._prefetch(P)            # the first decode step's, while the device runs
@@ -315,10 +316,11 @@ def chunks(eng, tokens):
         yield tokens[p - p0:p - p0 + R], logits(eng, R) if kind == "L" else None
 
 
-def mtp(dec, tokens, st, pick=None, on_run=None):
+def mtp(dec, tokens, st, pick=None, on_run=None, follow: int | None = None):
     """MTPDecoder.prefill's runs this way: each run's rows (their hidden stored, the states in
     the decoder's slot), then the MTP layer over them (M: the tokens after the rows, out[P] the
-    prompt's last logits' pick a0). Returns (a0, the first draft); on_run as the decoder's."""
+    prompt's last logits' pick a0, or `follow`: a part of a prompt, every run a P). Returns
+    (a0, the first draft); on_run as the decoder's."""
     eng = dec.eng
     toks = [int(t) for t in tokens]
     p0 = eng.pos
@@ -326,8 +328,10 @@ def mtp(dec, tokens, st, pick=None, on_run=None):
     a0 = draft = None
     t0 = time.perf_counter()
     runs = split(p0, P, lambda b: r_max(eng, b), eng.block, conv_k(eng))
+    if follow is not None:
+        runs = [(p, R, "P") for p, R, _ in runs]
     st.compile_s += time.perf_counter() - t0
-    write_tokens(eng, p0, toks)
+    write_tokens(eng, p0, toks if follow is None else toks + [int(follow)])
     for p, R, kind in runs:
         t0 = time.perf_counter()
         rows, mp = programs(eng, p, R, kind, True, dec.slot), programs(eng, p, R, "M")

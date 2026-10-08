@@ -1778,6 +1778,7 @@ def test_chat_tui_shows_the_live_numbers(tmp_path):
     assert "palette" not in r["welcome"] and "esc interrupt" in r["welcome"]
     s = r["status"]
     assert "stub · board 100 MHz" in s and "TTFT" in s and "decode" in s and "(dev 50.0)" in s
+    assert "prefill 2 · " in s
     assert "2.00 Mcyc/tok" in s and "ctx 6/64" in s
     narrow = str(status_line(meta, chat, chat.last, 70))   # drops the rest, keeps the context
     assert len(narrow) <= 70 and "decode" in narrow and "ctx 8/64" in narrow

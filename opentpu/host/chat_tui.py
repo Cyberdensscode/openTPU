@@ -82,10 +82,11 @@ def _meter(ctx: int, cap: int, cells: int = 8) -> tuple[str, str]:
 
 
 def status_line(meta: dict, chat: Chat, turn: Turn | None, width: int = 0) -> Text:
-    """The one line under the input: model and clock, TTFT, prefill and decode tok/s (wall,
-    and device when there is a device clock), Mcycles/token, the KV context meter. In a
-    narrow terminal (width) it drops, in turn, the model, the prefill device rate and the
-    Mcycles/token, then the prefill; the context meter stays."""
+    """The one line under the input: model and clock, TTFT, the prefill's tokens (and those
+    of the KV cache reused) and tok/s, decode tok/s (wall, and device when there is a device
+    clock), Mcycles/token, the KV context meter. In a narrow terminal (width) it drops, in
+    turn, the model, the prefill's tokens and device rate and the Mcycles/token, then the
+    prefill; the context meter stays."""
     ctx, cap = chat.eng.pos, chat.eng.cap
     bar, colour = _meter(ctx, cap)
     tail = [(f"ctx {ctx}/{cap} ", DIM), (bar, colour),
@@ -101,7 +102,9 @@ def status_line(meta: dict, chat: Chat, turn: Turn | None, width: int = 0) -> Te
             t = turn
             segs.append(f"TTFT {'-' if t.ttft_s is None else f'{t.ttft_s:.2f}s'}")
             if level < 4:
-                segs.append(rate("prefill", t.prefill_tok_s,
+                fed = f"prefill {t.prefill_tokens}" + \
+                    (f" (reused {t.reused}) ·" if t.reused else " ·") if level < 2 else "prefill"
+                segs.append(rate(fed, t.prefill_tok_s,
                                  t.prefill_dev_tok_s if level < 2 else None))
             dec = rate("decode", t.decode_tok_s, t.decode_dev_tok_s)
             if t.mcycles_per_token is not None and level < 3:
@@ -134,6 +137,8 @@ def stats_markup(meta: dict, chat: Chat, turn: Turn | None) -> str:
     else:
         L.append(f"TTFT     {'-' if t.ttft_s is None else f'{t.ttft_s:.2f} s'}")
         L.append(f"prefill  {t.prefill_tokens} tok, {_rate(t.prefill_tok_s)}")
+        if t.reused:
+            L.append(f"         reused {t.reused} tok of the KV cache")
         if dev:
             L.append(f"         device {_rate(t.prefill_dev_tok_s)}")
         L.append(f"decode   {t.gen_tokens} tok, {_rate(t.decode_tok_s)}")
@@ -171,7 +176,8 @@ def stats_inline(meta: dict, chat: Chat, turn: Turn | None) -> str:
     if t is not None:
         ttft = "-" if t.ttft_s is None else f"{t.ttft_s:.2f} s"
         mc = t.mcycles_per_token
-        L.append(f"[b]last turn[/b]  TTFT {ttft} · prefill {t.prefill_tokens} tok "
+        reused = f"(reused {t.reused}) " if t.reused else ""
+        L.append(f"[b]last turn[/b]  TTFT {ttft} · prefill {t.prefill_tokens} tok {reused}"
                  f"{_rate(t.prefill_tok_s)}{dev(t.prefill_dev_tok_s)} · decode {t.gen_tokens} tok "
                  f"{_rate(t.decode_tok_s)}{dev(t.decode_dev_tok_s)}"
                  + ("" if mc is None else f" · {mc:.2f} Mcycles/token"))
@@ -390,7 +396,8 @@ class ChatApp(App):
             what = f"Decoding… {t.gen_tokens} tok · {_rate(t.decode_tok_s)}"
         elif t is not None and t.prefill_total:
             what = (f"Prefilling… {t.prefill_tokens}/{t.prefill_total} tok · "
-                    f"{time.perf_counter() - self._t_submit:.1f}s")
+                    + (f"reused {t.reused} · " if t.reused else "")
+                    + f"{time.perf_counter() - self._t_submit:.1f}s")
         else:
             what = f"Working… {time.perf_counter() - self._t_submit:.1f}s"
         sp.update(Text.assemble((SPIN[self._frame % len(SPIN)] + " ", ACCENT), (what, ACCENT),

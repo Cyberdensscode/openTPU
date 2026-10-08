@@ -1020,6 +1020,23 @@ class Image(EmbedHost):
         """The host's expert server on the backend's DRAM (moe.serve)."""
         return MO.serve(self.offload, lambda g: self.expert(W, g), backend, pool_file)
 
+    def state_regions(self, slot: int = 0) -> list:
+        """The context's state that its KV caches do not hold, as DRAM regions (address,
+        bytes; every slice's): each DeltaNet layer's states and convolution windows in `slot`
+        (a rollback restores them from a snapshot: opentpu/llm/snapshot.py)."""
+        m, out = self.descriptors(0, slot), []
+        for li, kind in enumerate(self.spec.kinds):
+            if kind != LIN:
+                continue
+            dn, pairs = m.layer(li).dn, range(self.nl // 2)
+            # in address order (snapshot.merged joins neighbours): group-major, a pair's
+            # window, then its states; array-major, the windows, then the states
+            ts = [t for q in pairs for t in (dn.window(q), dn.state(q, 0), dn.state(q, 1))] \
+                if self.grouped else [dn.window(q) for q in pairs] + \
+                [dn.state(q, a) for q in pairs for a in (0, 1)]
+            out += [(Affine.of(t.base).static(), 4 * math.prod(t.shape)) for t in ts]
+        return out
+
     # ---- programs
     def compile_decode(self, blocks: int, lo: int, block: int = ATTN_BLOCK):
         """(programs, run_args): qwen35_step at a run-time position (qwen3.compile_decode); the

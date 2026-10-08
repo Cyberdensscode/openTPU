@@ -1099,6 +1099,31 @@ class Image:
                                                          self.ple_rec),
                          lambda t: self.ple_store[t])
 
+    def state_regions(self, slot: int = 0) -> list:
+        """The context's state that its positions do not keep, as DRAM regions (address,
+        bytes): the K / V rings of the sliding layers with their own cache, once the ring is
+        shorter than the cache (position q in slot q mod ring: later positions overwrite it). A
+        rollback of up to rollback_slack positions finds the window it goes back to still in
+        the ring; a longer one restores them from a snapshot (opentpu/llm/snapshot.py)."""
+        if self.ring >= self.cap:
+            return []
+        out = []
+        for li in range(self.spec.layers):
+            if self.spec.kinds[li] != SLIDE or self.spec.kv_src[li] != li:
+                continue
+            off, d = self._off(li).const, self.spec.hd(li)
+            for e in self.bofs[self._key(li)]["kv"]:
+                out += [(off + e["k"], self.ring * self.ks[SLIDE]), (off + e["vt"], d * self.ring),
+                        (off + e["vs"], 4 * self.ring)]
+        return out
+
+    @property
+    def rollback_slack(self) -> int:
+        """How far a rollback can go back with the sliding rings as they are: to position t
+        from p, row t reads positions t - window + 1 .. t - 1, still in their slots while
+        t - window + 1 + ring >= p."""
+        return self.ring - self.spec.window + 1
+
     # ---- programs
     def compile_decode(self, blocks: int, lo: int, block: int = ATTN_BLOCK):
         """(programs, run_args): gemma4_step at a run-time position (qwen3.RunPos; the image
