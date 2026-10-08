@@ -50,6 +50,8 @@ PIECE = 1 << 15                 # elements per quantizer call (quantize_rows)
 JOB = 1 << 22                   # Batch: elements per worker job (a matrix's rows)
 INLINE = 1 << 20                # Batch: smaller matrices are quantized in the build's process
 AHEAD = 2                       # Batch: jobs queued per worker besides the one it runs
+LOOKUPS = 4                     # Batch: threads hashing and reading the cache
+LOOKAHEAD = 1 << 30             # Batch: bytes of matrices waiting on them at most
 stats = {"hit": 0, "miss": 0, "write": 0, "skip": 0}
 _SRC: str | None = None
 
@@ -115,28 +117,43 @@ def quantize_rows(W, fmt: str, D: int = 128) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _entry(W: np.ndarray, fmt: str, D: int) -> Path | None:
-    """The cache file of a contiguous fp32 W's result (counted a miss until _load finds it), or
-    None when it is not cached: the cache off, int8, a small matrix."""
-    d = cache_dir()
-    if d is None or fmt not in FORMATS or W.size < MIN_ELEMS:
+    """The cache file of a contiguous fp32 W's result, or None when it is not cached: the cache
+    off, int8, a small matrix."""
+    if not _cached(W, fmt):
         return None
     k = key(W, fmt, D)
-    return d / k[:2] / f"{k}.npz"
+    return cache_dir() / k[:2] / f"{k}.npz"
+
+
+def _cached(W: np.ndarray, fmt: str) -> bool:
+    return fmt in FORMATS and W.size >= MIN_ELEMS and cache_dir() is not None
 
 
 def _load(f: Path):
+    """The entry's result, or None (counted a hit or a miss)."""
+    hit = _read(f)
+    stats["hit" if hit is not None else "miss"] += 1
+    return hit
+
+
+def _read(f: Path):
     try:
         with np.load(f) as z:
             q, s = z["q"], z["s"]
-        stats["hit"] += 1
         os.utime(f)                     # recently used (the eviction order)
         return q, s
     except FileNotFoundError:
         pass
     except Exception:                   # a damaged entry: quantize again
         f.unlink(missing_ok=True)
-    stats["miss"] += 1
     return None
+
+
+def _lookup(W: np.ndarray, fmt: str, D: int):
+    """Batch's lookup of a cached matrix, on a thread (hashlib and the file reads release the
+    GIL): (its entry, the result or None)."""
+    f = _entry(W, fmt, D)
+    return f, _read(f)
 
 
 def build_jobs() -> int:
@@ -162,25 +179,48 @@ def pool(n: int, **kw):
 class Batch:
     """An image build's matrices, quantized in `jobs` worker processes (default build_jobs())
     through the cache: submit(W, fmt, D, done) calls done(q, s) with quantize_mxu(W, fmt, D)'s
-    result, bit for bit, in this process -- at once for a cache hit and a matrix under INLINE
-    elements (quantized here, as everything with one job), else from a later submit() or wait(),
-    once its rows have come back from the workers in jobs of JOB elements. Each matrix is
-    hashed once, here, and only the misses' rows are sent; at most AHEAD jobs wait per worker,
-    so a few matrices' fp32 rows are in flight. wait() returns once every done() has run, and
-    stops the workers (as does dropping the batch)."""
+    result, bit for bit, in this process, from that submit(), a later one or wait(). A cached
+    matrix is hashed and looked up on one of LOOKUPS threads, LOOKAHEAD bytes of them ahead of
+    the build (the build converts the next matrices meanwhile); a miss, and every matrix of a
+    format not cached, is quantized here when it has under INLINE elements (everything with one
+    job), else its rows go to the workers in jobs of JOB elements, AHEAD queued per worker, and
+    its entry is written once they are back. wait() returns once every done() has run, and
+    stops the threads and workers (as does dropping the batch)."""
 
     def __init__(self, jobs: int | None = None):
         self.n = build_jobs() if jobs is None else jobs
-        self._pool = None
+        self._pool = self._threads = None
+        self._looks = deque()           # [Future of a lookup, W, fmt, D, done], in order
+        self._ahead = 0                 # their matrices' bytes
         self._queue = deque()           # (Future of a job's rows, its _Rows, first row)
 
     def submit(self, W, fmt: str, D: int, done) -> None:
         W = np.ascontiguousarray(W, np.float32)
-        f = _entry(W, fmt, D)
-        hit = None if f is None else _load(f)
-        if hit is not None:
-            done(*hit)
+        if not _cached(W, fmt):
+            self._quantize(W, fmt, D, done, None)
             return
+        if self._threads is None:
+            from concurrent.futures import ThreadPoolExecutor
+            self._threads = ThreadPoolExecutor(LOOKUPS, thread_name_prefix="otpu-qcache")
+            weakref.finalize(self, self._threads.shutdown, wait=False, cancel_futures=True)
+        self._looks.append((self._threads.submit(_lookup, W, fmt, D), W, fmt, D, done))
+        self._ahead += W.nbytes
+        self._advance(LOOKAHEAD)
+
+    def _advance(self, ahead: int) -> None:
+        """Take the looked-up matrices at the head of the queue: the finished ones, and the
+        others while more than `ahead` bytes wait."""
+        while self._looks and (self._ahead > ahead or self._looks[0][0].done()):
+            fut, W, fmt, D, done = self._looks.popleft()
+            self._ahead -= W.nbytes
+            f, hit = fut.result()
+            stats["hit" if hit is not None else "miss"] += 1
+            if hit is not None:
+                done(*hit)
+            else:
+                self._quantize(W, fmt, D, done, f)
+
+    def _quantize(self, W, fmt: str, D: int, done, f: Path | None) -> None:
         if self.n <= 1 or W.size < INLINE:
             q, s = quantize_rows(W, fmt, D)
             if f is not None:
@@ -202,10 +242,12 @@ class Batch:
             m.add(i, *fut.result())
 
     def wait(self) -> None:
+        self._advance(-1)
         self._drain(0)
-        if self._pool is not None:
-            self._pool.shutdown()
-            self._pool = None
+        for p in (self._threads, self._pool):
+            if p is not None:
+                p.shutdown()
+        self._pool = self._threads = None
 
 
 class _Rows:
