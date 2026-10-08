@@ -495,7 +495,8 @@ class Chat:
         else:
             cut = [at] if at is not None and at < len(ids) else []
             for a, b in zip([n] + cut, cut + [len(ids)]):
-                for part, logits in self.eng.prefill_chunks(ids[a:b], logits=b == len(ids)):
+                kw = {} if b == len(ids) else {"logits": False}     # up to the snapshot: no head
+                for part, logits in self.eng.prefill_chunks(ids[a:b], **kw):
                     self.fed += part
                     turn.prefill_tokens += len(part)
                     turn.prefill_s = time.perf_counter() - t0

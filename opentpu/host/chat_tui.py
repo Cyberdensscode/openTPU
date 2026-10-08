@@ -483,7 +483,8 @@ class ChatApp(App):
                        "block")
         elif cmd == "/think" and arg in ("on", "off"):
             self.chat.think = arg == "on"
-            self._note(f"⎿ thinking {arg} (the history is re-fed on the next turn)")
+            self._note(f"⎿ thinking {arg} (the next turn re-feeds what the template renders "
+                       f"otherwise)")
         elif cmd == "/continue":
             if self.chat.can_resume and self._reply is not None:
                 if self._marker is not None:
