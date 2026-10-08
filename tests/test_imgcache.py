@@ -1,6 +1,6 @@
 """opentpu/imgcache.py, the disk cache of whole model images: a hit is the build, byte for byte,
-with what the build left on the image for the host (an int8 embedding table on the host); the
-key follows the checkpoint, the layout, the formats and the environment, but not the host's
+with what the build left on the image for the host (an int8 embedding table on the host), and
+a MoE's streamed experts served from a hit's weights; the key follows the checkpoint, the layout, the formats and the environment, but not the host's
 runtime variables (otpu-lock's pid); entries leave the zero pages out; a build that leaves
 something the cache cannot store, a damaged entry, the size cap, the free-disk floor and the
 off switches."""
@@ -133,6 +133,43 @@ def test_a_build_leaving_something_else_is_not_cached(ckpt, cache, monkeypatch):
         _engine(ckpt)
         assert IC.last[0] == "skip"
     assert IC.stats["skip"] == 2 and _entries(cache) == []
+
+
+def test_a_moe_streaming_its_experts_from_a_hit(tmp_path, cache):
+    """A tiny Qwen3.5-MoE checkpoint with two expert slots a layer (the experts stream from the
+    host's server, which reads them from the weights): the hit's image is the build's, and
+    its engine, serving from the hit's own weights, gives the built engine's logits bit for
+    bit."""
+    torch.manual_seed(0)
+    kinds = ("linear", "attn")
+    hc = transformers.Qwen3_5MoeTextConfig(
+        hidden_size=256, num_hidden_layers=2, num_attention_heads=8, num_key_value_heads=2,
+        head_dim=256, vocab_size=1000, layer_types=["full_attention" if k == "attn" else
+                                                    "linear_attention" for k in kinds],
+        linear_num_key_heads=8, linear_num_value_heads=8, linear_key_head_dim=128,
+        linear_value_head_dim=128, linear_conv_kernel_dim=4, tie_word_embeddings=True,
+        max_position_embeddings=4096, rms_norm_eps=1e-6, num_experts=8, num_experts_per_tok=2,
+        moe_intermediate_size=256, shared_expert_intermediate_size=256,
+        rope_parameters={"rope_type": "default", "rope_theta": 1e7, "partial_rotary_factor": 0.25})
+    from safetensors.numpy import save_file
+    m = transformers.Qwen3_5MoeForCausalLM(hc).float().eval()
+    d = tmp_path / "moe"
+    d.mkdir()
+    save_file({k: np.array(v.numpy()) for k, v in m.state_dict().items()},
+              str(d / "model.safetensors"))
+    (d / "config.json").write_text(json.dumps(hc.to_dict()))
+    spec = load_spec(d)
+    cfg = device_config(spec, 256, S=1, experts=2)
+    toks = [int(t) for t in np.random.default_rng(2).integers(0, 1000, 6)]
+    images, logits = [], []
+    for how in ("miss", "hit"):
+        eng = Engine(spec, load_weights(d), cap=256, cfg=cfg, experts=2, wformat="fp4")
+        assert IC.last[0] == how
+        images.append(eng.backend.machine.slices[0].dram.copy())
+        logits.append(np.array([eng.step(t) for t in toks]))
+    assert eng.server.misses > len(toks)
+    assert np.array_equal(images[0], images[1])
+    assert np.array_equal(logits[0].view(np.uint32), logits[1].view(np.uint32))
 
 
 def test_weights_without_a_checkpoint_are_not_cached(ckpt, cache):
