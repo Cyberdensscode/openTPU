@@ -19,6 +19,7 @@ head's, the experts' slots aside); each variant resumes after its last layer don
 ckpt).
 
     python tools/formats_scan.py scan MODEL OUT.json [--tokens 900] [--fmt fp4] [--base F]
+                                  [--ids IDS.json]
         pass 1: float weights (no quantization at all), int8, the 4-bit image (WF --fmt, head
         int8), and int8 with one group of weights in --fmt: a kind in all layers, a kind in a
         quarter of them, the head. pass 2: the uniform mixes (each kind one format in every
@@ -603,13 +604,15 @@ def _finish(rows: dict, nbytes) -> None:
             r["saved"] = rows["int8"]["bytes"] - r["bytes"]
 
 
-def scan(name, out, n_tok: int, f4: str, D: int = 128, cache=None, base: str = "") -> None:
+def scan(name, out, n_tok: int, f4: str, D: int = 128, cache=None, base: str = "",
+         ids_file=None) -> None:
     """base: formats every variant starts from, the "int8" row's (the 26B: experts=fp4,
-    head=fp4, the card's); its rows then put the scan's kinds in f4 on top of it."""
+    head=fp4, the card's); its rows then put the scan's kinds in f4 on top of it. ids_file:
+    the text's token ids (text_ids)."""
     path = model_dir(name)
     spec, run, nbytes, kinds, qs = _open(path, D, cache or f"{out}.xl")
     g4 = isinstance(spec, G.Spec)
-    ids = text_ids(path, n_tok)
+    ids = text_ids(path, n_tok, ids_file)
     t0 = time.time()
     on = lambda fs: ",".join(f for f in (base, fs) if f)           # noqa: E731
 
@@ -778,6 +781,8 @@ def main():
     a.add_argument("--cache", help="Gemma 4: the head inputs' directory (default OUT.json.xl)")
     a.add_argument("--base", default="", help="formats every variant starts from (the int8 "
                    "row's), e.g. experts=fp4,head=fp4 (the 26B's card)")
+    a.add_argument("--ids", help="the text: token ids from this JSON file (tools/chat_text.py's "
+                   "chat) instead of docs/isa.md")
     a = sub.add_parser("ppl")
     a.add_argument("model")
     a.add_argument("formats", nargs="+")
@@ -791,7 +796,7 @@ def main():
     sub.add_parser("check")
     a = ap.parse_args()
     if a.cmd == "scan":
-        scan(a.model, a.out, a.tokens, a.fmt, cache=a.cache, base=a.base)
+        scan(a.model, a.out, a.tokens, a.fmt, cache=a.cache, base=a.base, ids_file=a.ids)
     elif a.cmd == "ppl":
         ppl(a.model, a.formats, a.wformat, a.tokens, out=a.out, cache=a.cache, base=a.base,
             ids_file=a.ids)

@@ -657,6 +657,23 @@ def _tool(name):
     return mod
 
 
+def test_formats_scan_text(tmp_path):
+    """formats_scan's text: docs/isa.md after <bos> for Gemma 4 (checkpoint()'s tokenizer adds
+    none, as the instruct checkpoints'), or --ids' token ids (a list, or tools/chat_text.py's
+    object), refused when shorter than the tokens asked."""
+    import json
+    FS = _tool("formats_scan")
+    d = checkpoint(tmp_path / "g")
+    ids = FS.text_ids(d, 50)
+    assert len(ids) == 50 and ids[0] == 2 and 2 not in ids[1:]
+    (tmp_path / "l.json").write_text(json.dumps(list(range(40))))
+    (tmp_path / "o.json").write_text(json.dumps({"model": "m", "ids": list(range(40))}))
+    assert FS.text_ids(d, 30, tmp_path / "l.json") == FS.text_ids(d, 30, tmp_path / "o.json") \
+        == list(range(30))
+    with pytest.raises(ValueError, match="40 tokens, 41 asked"):
+        FS.text_ids(d, 41, tmp_path / "l.json")
+
+
 def test_formats_scan(tiny, tmp_path, monkeypatch):
     """tools/formats_scan.py's Gemma 4 rows (gemma4_quant_eval.emulate's head inputs, then one
     pass over the soft-capped head in chunks): each variant's NLL, argmax and KL divergence
