@@ -105,6 +105,12 @@ from int8's.
   in each quarter of the layers, and the head; pass 2 every set of whole kinds (and the head),
   and the quarter groups added in order of dKL per byte saved (the scans before Gemma 4's: of
   NLL). `ppl MODEL FORMATS... --tokens 2000`: the given strings.
+- `--ids FILE` (ppl and scan) scores another text's token ids instead (a JSON list, or an object
+  with `ids`): `tools/chat_text.py MODEL OUT.json` makes one from a chat, an instruct model's own
+  replies to 16 questions in one conversation (Hugging Face in bf16, the checkpoint's sampling,
+  seed 0), rendered by its chat template. An instruct model can be far from calibrated on prose
+  (gemma-4-E2B-it's float perplexity on docs/isa.md is 142, its base's 18.6), so its mixes are
+  scored on what a chat feeds it as well.
 
 ## The rule
 
@@ -285,6 +291,14 @@ over its bar; `mlp@15-34=fp4` alone (9.1 SE under, 2% slower) keeps the int8 tab
 about 2048 tokens (10 MiB spare) and takes the fp4 table at 4096, so it is not a default. Against
 int8 with the fp4 table the faster mixes would qualify (`attn@15-34=fp4,mlp=fp4` +4.59% for
 +48.9%); the bar is the accurate int8's, so the degraded table does not loosen it.
+
+**gemma-4-E2B-it**, the instruct checkpoint otpu-chat runs since 2026-10-09 (the same layers and
+image): the fp4 layers cost it about two and a half times the base's, and every mix above fails
+its bar, by 6 to 9 SE ([gemma4.md](gemma4.md), "The instruct checkpoints"). At 2000 tokens,
+against int8 with the PLE table on the host: the default `attn@15-24=fp4,mlp@15-34=fp4` +6.18%
+(SE 0.36) on docs/isa.md and +6.79% (0.58) on a chat of its own (`tools/chat_text.py`, bar
+3.00); `mlp@15-34=fp4` +6.09% (0.57) on the chat (bar 2.75). int8 with the fp4 PLE table, which
+costs the base +2.42%, costs it +0.33% (0.11) on the chat and -0.57% (0.35) on docs/isa.md.
 
 ### Qwen3.5-35B-A3B's head
 

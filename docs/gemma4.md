@@ -1,14 +1,18 @@
-# Gemma 4 on openTPU (gemma-4-E2B)
+# Gemma 4 on openTPU (gemma-4-E2B-it)
 
 openTPU runs a fourth model family: Google's Gemma 4, checked with
 [gemma-4-E2B](https://huggingface.co/google/gemma-4-E2B) (the text decoder; the vision and
-audio encoders are not loaded). It uses the same ISA, bitstream, W8A8 / W4A8 numerics and host
-driver as Qwen3, LFM2 and Qwen3.5. No new hardware op: everything Gemma 4 needs beyond them
-is composed from the existing ones, including the per-layer embeddings, which are gathered on
-the card by the MXU (`opentpu/kernels/gather.py`). The model code is `opentpu/llm/gemma4.py`.
+audio encoders are not loaded) and, since 2026-10-09, its instruct checkpoint
+[gemma-4-E2B-it](https://huggingface.co/google/gemma-4-E2B-it), the one otpu-chat runs ("The
+instruct checkpoints" below). The two have the same architecture and image layout; the
+measurements below are the base checkpoint's where they say so. It uses the same ISA,
+bitstream, W8A8 / W4A8 numerics and host driver as Qwen3, LFM2 and Qwen3.5. No new hardware
+op: everything Gemma 4 needs beyond them is composed from the existing ones, including the
+per-layer embeddings, which are gathered on the card by the MXU (`opentpu/kernels/gather.py`).
+The model code is `opentpu/llm/gemma4.py`.
 
 ```sh
-hf download google/gemma-4-E2B --local-dir models/gemma-4-E2B
+hf download google/gemma-4-E2B-it --local-dir models/gemma-4-E2B-it      # MODELS' gemma4
 python3 -m pytest -q tests/test_gemma4.py                 # tiny random model (+ --runslow: RTL)
 python3 tools/perf_qwen.py --model gemma4 --layers 0,1,2,3,4,5,6,7,8,9,15,16,17,18,19 --pos 600 \
     --wformat fp4 --head-format int8 --resident --ddr 1066 --mhz 133.33 --check
@@ -137,6 +141,9 @@ while that disk is at its floor, as only an explicit `--wformat int8` E2B pays i
 
 ## Accuracy
 
+This section's measurements are the base checkpoint's (gemma-4-E2B); the instruct checkpoint's
+are in "The instruct checkpoints" below.
+
 The numpy reference (`gemma4.reference_logits`) matches Hugging Face's fp32 model (transformers
 5.17) to 6.5e-5 in the logits on three prompts, with the same argmax.
 
@@ -250,13 +257,95 @@ bucket 2 covered the mix would take prompt runs too (estimated 72 s); with atten
 blocks instead of unrolled ([prefill.md](prefill.md) 7), 4 rows in every bucket. The fix, in the
 prompt runs, is in progress.
 
+## The instruct checkpoints
+
+Since 2026-10-09 MODELS' `gemma4`, `gemma4-e4b` and `gemma4-26b` are Google's instruct
+checkpoints, gemma-4-E2B-it, gemma-4-E4B-it and gemma-4-26B-A4B-it (revisions 3e22461f,
+ee0ef602 and 4d7ae498). The base checkpoints have no chat template: otpu-chat fed them the turns
+as plain text, and they continued it (the base 26B answered "What is the capital of France?
+Answer in one sentence." by repeating the question). An instruct checkpoint has its base's
+architecture and tensors, so the same `Spec`, image layout, programs and speeds. What differs:
+
+- **Stop ids.** The -it config.json lists `[1, 106]` at its top level (`<eos>`, `<turn|>`; its
+  text_config 1), and generation_config.json `[1, 106, 50]` (`<|tool_response>` too).
+  `Spec.from_hf` takes all of them, as Hugging Face's generate stops.
+- **No BOS from the tokenizer.** The base tokenizer's post-processor adds `<bos>`, the -it one's
+  does not: the chat template writes it. Plain text (validate.py's prompts without `--chat`,
+  formats_scan's docs/isa.md, qual/perf.py's prompt) goes through `gemma4.text_ids`, which puts
+  `<bos>` first unless the tokenizer did, so an -it checkpoint is measured on its base's inputs.
+- **The pool key.** The 26B's pool key hashes its config, so the base's pool is refused for the
+  -it, which has its own ([offload.md](offload.md) 14).
+- **The template** (`chat_template.jinja`, read by transformers 5.14 and 5.17):
+  `<bos><|turn>user\nHi<turn|>\n<|turn>model\nHello!<turn|>\n<|turn>user\n...<turn|>\n<|turn>model\n`.
+  Thinking (`--think`, `/think`) adds `<|turn>system\n<|think|>\n<turn|>\n` first; the model
+  then thinks in a channel, `<|channel>thought\n...<channel|>`, before its answer. A past reply
+  is rendered trimmed and without its channel. The 26B-it's generation prompt, thinking off,
+  ends in an empty channel, `<|channel>thought\n<channel|>` (4 tokens); E2B-it's and E4B-it's
+  end at `<|turn>model\n`. `<|channel>` and `<channel|>` are special tokens (100, 101), so the
+  chat keeps the special tokens a reply wrote in its text, for the template to find them.
+
+**Turns and the KV cache** ([host.md](host.md) 6). A turn re-feeds only what the template
+renders past what the device holds. The sliding layers keep the last 768 positions in a ring
+(the window 512 + 256), so the chat goes back at most 257 tokens in place (`rollback_slack`);
+further back it restores the rings from the snapshot it took at the reply's start (a
+streamed MoE's on the host). The chat is stateful (it keeps the context) while the ring is
+smaller than `--cap`.
+
+| Checkpoint, mode | A past reply, rendered | The next turn |
+|:--|:--|:--|
+| E2B-it / E4B-it, thinking off | as generated, trimmed | continues the context (a reply ending in whitespace: 1-2 tokens back) |
+| E2B-it / E4B-it, thinking on | without its channel | back to the reply's start: in place up to 257 tokens, else from the snapshot |
+| 26B-A4B-it, thinking off | without the generation prompt's empty channel | back to the reply's start (4 tokens before it), the same way |
+| 26B-A4B-it, thinking on | without its channel | back to the reply's start, the same way |
+
+`tests/test_chatkv.py` checks each row on the tiny model (the slack cut to 2, so every
+rollback past it goes through the snapshot), each turn's logits against a fresh engine fed the
+whole rendering, bit for bit; `test_gemma4_instruct_templates`, with the real tokenizers and
+templates, the point each turn goes back to.
+
+**validate.py** (ISA simulator, the eight default prompts, 16 tokens each, 2026-10-09, tree
+aa2166b1; KL in nats per token):
+
+| Formats | Prompts | Positions | Device vs W+A: top-1, KL | Floor | Device vs fp32: top-1, KL | W+A vs fp32 | Verdict |
+|:--|:--|--:|--:|--:|--:|--:|:--|
+| int8, fp4 PLE table | plain | 81 | 100.0%, 0.0071 | 0.0078 | 97.5%, 0.0137 | 0.0085 | PASS (0.92x) |
+| fp4, int8 head and PLE table | plain | 72 | 98.6%, 0.0095 | 0.0136 | 93.1%, 0.102 | 0.093 | PASS (0.70x) |
+| the mix, int8 head and PLE table | plain | 71 | 100.0%, 0.0135 | 0.0075 | 98.6%, 0.0275 | 0.036 | PASS (1.80x) |
+| int8, fp4 PLE table | `--chat` | 115 | 95.7%, 0.0060 | 0.0033 | 96.5%, 0.0047 | 0.0051 | PASS (1.83x) |
+| the mix, int8 head and PLE table | `--chat` | 117 | 95.7%, 0.0091 | 0.0072 | 94.9%, 0.057 | 0.059 | PASS (1.27x) |
+
+The -it model answers most prompts in a few tokens and stops at `<turn|>`, so a row has 71-117
+positions against the base's 128. The mix's 1.80x on plain prompts is one position of 71: a
+near tie in `def fibonacci(n):` (KL 0.69 there, the floor's 0.17); without it, 0.75x. The
+device follows its golden on every row; what the formats cost is the golden's distance from fp32.
+
+**The formats.** [formats.md](formats.md)'s measure, at 2000 tokens, dKL against int8 with the
+PLE table on the host (the reference), on two texts: docs/isa.md as for the base, and a chat
+(`tools/chat_text.py`: E2B-it's own replies to 16 questions in one conversation, sampled by
+Hugging Face in bf16, the conversation rendered by its template; 2637 tokens, the first 2000
+scored, `formats_scan.py ppl --ids`). On docs/isa.md the -it model is far from calibrated
+(perplexity 142 in float against the base's 18.6); on its own chat, 3.54.
+
+| Formats | Bar | Base, docs/isa.md | -it, docs/isa.md | -it, the chat |
+|:--|--:|--:|--:|--:|
+| int8, fp4 PLE table | | +2.42 (0.08) | -0.57 (0.35) | +0.33 (0.11) |
+| `mlp@15-34=fp4` | 2.75 | +2.25 (0.05) | | +6.09 (0.57) |
+| **`attn@15-24=fp4,mlp@15-34=fp4`** (otpu-chat's mix) | 3.00 | **+2.60 (0.06)** | +6.18 (0.36) | +6.79 (0.58) |
+| `attn@15-34=fp4,mlp@15-34=fp4` | 3.25 | +3.34 (0.08) | +7.15 (0.43) | +7.00 (0.58) |
+
+dKL % (SE). The fp4 PLE table costs the -it model nothing measurable (the base +2.42%), but its
+fp4 layers cost it two and a half times the base's: the mix adds 0.026 nats of KL from float on
+the base, 0.062 and 0.068 on the -it texts. Every mix fails its bar on the -it model, by 6 to
+9 SE.
+
 ## 26B-A4B: accuracy
 
 gemma-4-26B-A4B is the family's mixture of experts: 30 layers ((5 sliding + 1 global) x 5),
 hidden 2816, a dense GeGLU MLP (2112 wide) beside 128 routed experts (704 wide, top 8) in every
 layer, global layers with K = V and 2 KV heads of 512, no per-layer embeddings. Its experts
 stream from the host into slots on the card ([offload.md](offload.md), section 11). Numbers here
-are from omarchy, 2026-10-01.
+are the base checkpoint's (gemma-4-26B-A4B), from omarchy, 2026-10-01; otpu-chat runs the
+instruct checkpoint, gemma-4-26B-A4B-it (same architecture, formats and pool layout).
 
 **The reference.** `reference_logits` against Hugging Face in fp32 on a truncation of the
 checkpoint (`tools/gemma4_hf_check.py --layers 0,5`, both before the soft cap): max |diff|
@@ -348,6 +437,9 @@ Two earlier runs with g2 folded are void: int8 layers, fp4 experts and the int8 
 
 ## Performance
 
+The instruct checkpoints have the base ones' images (layout, formats, bytes a token, programs):
+the speeds here hold for them.
+
 One resident decode token on the Verilator RTL of the board configuration (PAIR, DSTEP, STREAM:
 the production image's), through the board's memory path with the DDR3-1066 bank model at
 133.33 MHz (`tools/perf_qwen.py --model gemma4 --layers 0,...,9,15,...,19 --pos 600 --wformat
@@ -417,7 +509,19 @@ per-layer input):
   host-written inputs (`Image.host_inputs`, the gathers' host twins).
 - `--runslow`: a token at position 600 on the Verilator RTL through the board's memory path,
   per-position and resident, bit-exact against the ISA simulator (logits and DRAM).
-- With models/gemma-4-E2B: the real model's resident decode programs fit IMEM with 6 argument
-  words.
+- With models/gemma-4-E2B-it: the real model's resident decode programs fit IMEM with 6
+  argument words.
+- The instruct checkpoints' settings (`test_instruct_checkpoint_settings`): the stop ids with and
+  without their generation config, otpu-chat's sampling from it, `text_ids`.
+- otpu-chat on the ISA simulator (`test_otpu_chat_on_the_isa_simulator`): a tiny checkpoint
+  saved by Hugging Face with a chat template, a one-shot greedy reply in the card's
+  configuration (one slice; the simulators' default is the design's two).
+- formats_scan's text (`test_formats_scan_text`): docs/isa.md after `<bos>`, or `--ids`.
+
+`tests/test_chatkv.py`'s Gemma 4 chats: `test_gemma4_chat_turns` (the tiny model with the
+instruct template in miniature, E2B's and 26B's generation prompts, thinking on and off: each
+turn continued or rolled back to the reply's start through the sliding rings' snapshot, its
+logits a fresh engine's bit for bit) and `test_gemma4_instruct_templates` (the real tokenizers
+and templates, where models/ has them).
 
 On omarchy (transformers 5.17, PAIR / DSTEP / STREAM) all 14 pass, in 16 minutes.

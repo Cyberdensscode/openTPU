@@ -468,8 +468,19 @@ otpu-chat --backend board --prompt "Why is the sky blue?"   # one-shot, plain ou
 otpu-chat --backend board --clock-mhz 100      # override the core clock (v1 bitstreams)
 otpu-chat --backend board --model lfm2         # LFM2.5-230M instead of Qwen3-0.6B
 otpu-chat --backend board --model qwen35       # Qwen3.5-0.8B (needs RDOT / OUTER / LOG2 in the bitstream)
+otpu-chat --backend board --model gemma4       # Gemma 4 E2B, its instruct checkpoint gemma-4-E2B-it
 otpu-chat --backend board --model smollm3 --wformat int8   # the weights' format (default below)
 ```
+
+The chat models are instruct checkpoints: their chat template turns the conversation into the
+prompt the model was tuned to answer. Gemma 4's short names (`gemma4`, `gemma4-e4b`,
+`gemma4-26b`) are Google's instruct checkpoints, gemma-4-E2B-it, gemma-4-E4B-it and
+gemma-4-26B-A4B-it, since 2026-10-09. The base checkpoints before them (gemma-4-E2B, ...) have
+no chat template: the chat fed the turns as plain text and the model continued it (the base
+26B answered "What is the capital of France?" by repeating the question). otpu-chat now refuses
+a checkpoint without a chat template (`chat_template.jinja`, `chat_template.json` or
+tokenizer_config.json's) before it loads, naming the instruct checkpoint where it knows one;
+`--raw` feeds the turns' text as is, after the tokenizer's BOS.
 
 `--wformat auto`, the default, takes the model's recommended mix of int8 and fp4 layers where it
 has one (Phi-4-mini, SmolLM3-3B, LFM2-2.6B, Qwen3.5-4B, Gemma 4 E2B: [formats.md](formats.md))
@@ -542,8 +553,10 @@ the commands (up / down, Tab completes, Enter runs): `/help`, `/continue` (a rep
 KV cache), `/stats` (the detail inline: the last turn, DRAM for the image and the KV cache, the
 session's turns, tokens in and out and average decode tok/s, the sampling), `/think on|off`
 (thinking mode; the next turn re-feeds what the template renders otherwise: Qwen3 and
-Qwen3.5 the new generation prompt alone, SmolLM3 nearly the whole history: its system block
-names the mode), `/quit`.
+Qwen3.5 the new generation prompt alone, SmolLM3 and Gemma 4 nearly the whole history: their
+system block names the mode), `/quit`. A reply's text keeps the special tokens the model wrote,
+so Gemma 4's thinking shows between `<|channel>thought` and `<channel|>`, as Qwen3's between
+`<think>` and `</think>`.
 
 The KV cache holds `--cap` tokens (default 2048) and the engine has no sliding window. A reply
 that fills the cache stops with "context full"; a message that no longer fits is refused
@@ -602,7 +615,7 @@ otpu-chat --backend board --model qwen35-2b --wformat fp4 --head-format int8 --m
 ```
 
 **Mixture-of-experts models bigger than the card** (`--model lfm2-8b`, `qwen35-35b`,
-`gemma4-26b`: LFM2.5-8B-A1B, Qwen3.5-35B-A3B, gemma-4-26B-A4B) stream their experts from a pool
+`gemma4-26b`: LFM2.5-8B-A1B, Qwen3.5-35B-A3B, gemma-4-26B-A4B-it) stream their experts from a pool
 file on the host into slots in the card's DRAM. The card routes and computes every expert, and
 the host only copies the experts it asks for ([offload.md](offload.md) section 14).
 
@@ -639,11 +652,19 @@ the context). Qwen3's and Qwen3.5's templates render a past reply otherwise than
 generated it saw it: their generation prompt opens the reply with a thinking block (thinking
 off: an empty one, `<think>\n\n</think>\n\n`; Qwen3.5 thinking on: `<think>\n`), which a past
 reply does not have, and a reply's own thinking is dropped. The two renderings part at the
-reply's start. LFM2, SmolLM3, Phi-4-mini and Gemma 4 E2B (no chat template: the text as is)
-render a past reply as it was fed (checked on every checkpoint in `models/`, thinking on and
-off, three turns). Until 2026-10-08 the chat restarted from position 0 whenever the rendering
-did not continue what the device held: on Qwen3 and Qwen3.5 every turn re-fed the whole
-conversation (`Prefilling… 432/823 tok`).
+reply's start. LFM2, SmolLM3 and Phi-4-mini render a past reply as it was fed (checked on
+every checkpoint in `models/`, thinking on and off, three turns). Gemma 4's instruct templates
+render it trimmed and without its thinking channel (`<|channel>thought ... <channel|>`, which
+thinking mode writes): a reply that ends in whitespace goes back a token or two, one with
+thinking to its start. gemma-4-26B-A4B-it's generation prompt, thinking off, opens the reply
+with an empty channel (`<|channel>thought\n<channel|>`, 4 tokens) that a past reply does not
+have, so each of its turns goes back to the reply's start; E2B-it's and E4B-it's have none,
+and their turns continue the context ([gemma4.md](gemma4.md), "The instruct checkpoints"). The
+template parses the channel's ends, which Gemma's tokenizer marks special: the chat keeps a
+reply's special tokens in its text (until 2026-10-09 it dropped them, and a thinking reply
+stayed in the context as text). Until 2026-10-08 the chat restarted from position 0 whenever the
+rendering did not continue what the device held: on Qwen3 and Qwen3.5 every turn re-fed the
+whole conversation (`Prefilling… 432/823 tok`).
 
 Now a turn takes the common prefix k of its rendering and what the device holds, rolls the
 context back to it (`Engine.rollback`, `opentpu/llm/snapshot.py`) and feeds the rest: the last
