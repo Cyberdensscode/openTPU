@@ -31,9 +31,10 @@ ckpt).
         sampled tokens), each with its standard error paired over the tokens. --base F: the
         formats every row starts from, the int8 row's own (no head row where F sets the head)
     python tools/formats_scan.py ppl MODEL FORMATS... [--wformat int8] [--tokens 900] [--out J]
-                                 [--cache DIR] [--base F]
+                                 [--cache DIR] [--base F] [--ids IDS.json]
         the perplexity and dKL of formats strings (as OTPU_FORMATS; "" for none), each with the
-        standard error of its difference from int8's (paired over the tokens)
+        standard error of its difference from int8's (paired over the tokens); --ids: another
+        text's token ids (tools/chat_text.py: a chat of an instruct model's own replies)
     python tools/formats_scan.py check
         tiny random models of each family (Qwen3 with K outliers, SmolLM3, Phi-3, Qwen3.5
         with 4 key heads, LFM2):
@@ -350,9 +351,16 @@ def weight_bytes(shapes: dict, fmt, D: int = 128) -> int:
     return n
 
 
-def text_ids(path, n: int) -> list:
+def text_ids(path, n: int, ids_file=None) -> list:
     """The first n tokens of docs/isa.md, as tools/quant_eval.py reads it (Gemma 4: after <bos>,
-    which an instruct checkpoint's tokenizer does not add)."""
+    which an instruct checkpoint's tokenizer does not add), or of ids_file's token ids (a JSON
+    list, or an object with "ids": tools/chat_text.py's chat)."""
+    if ids_file is not None:
+        ids = json.loads(Path(ids_file).read_text())
+        ids = (ids["ids"] if isinstance(ids, dict) else ids)[:n]
+        if len(ids) < n:
+            raise ValueError(f"{ids_file} has {len(ids)} tokens, {n} asked")
+        return ids
     import transformers
     tok = transformers.AutoTokenizer.from_pretrained(path)
     text = re.sub(r"`|\|", "", (ROOT / "docs/isa.md").read_text())
@@ -649,10 +657,10 @@ def scan(name, out, n_tok: int, f4: str, D: int = 128, cache=None, base: str = "
 
 
 def ppl(name, formats: list, wformat: str, n_tok: int, D: int = 128, out=None,
-        cache=None, base: str = "") -> None:
+        cache=None, base: str = "", ids_file=None) -> None:
     path = model_dir(name)
     spec, run, nbytes, _, _ = _open(path, D, cache)
-    ids = text_ids(path, n_tok)
+    ids = text_ids(path, n_tok, ids_file)
     specs = {"float": None, "int8": (base, "int8", None)}
     specs.update({f or "(none)": (",".join(x for x in (base, f) if x), wformat, None)
                   for f in formats})
@@ -778,12 +786,15 @@ def main():
     a.add_argument("--out", help="the rows as JSON (scan's format)")
     a.add_argument("--cache", help="Gemma 4: the head inputs' directory")
     a.add_argument("--base", default="", help="formats every row starts from, as scan's")
+    a.add_argument("--ids", help="the text: token ids from this JSON file (tools/chat_text.py's "
+                   "chat) instead of docs/isa.md")
     sub.add_parser("check")
     a = ap.parse_args()
     if a.cmd == "scan":
         scan(a.model, a.out, a.tokens, a.fmt, cache=a.cache, base=a.base)
     elif a.cmd == "ppl":
-        ppl(a.model, a.formats, a.wformat, a.tokens, out=a.out, cache=a.cache, base=a.base)
+        ppl(a.model, a.formats, a.wformat, a.tokens, out=a.out, cache=a.cache, base=a.base,
+            ids_file=a.ids)
     else:
         check()
 
