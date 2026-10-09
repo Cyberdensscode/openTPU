@@ -791,6 +791,44 @@ def test_chat_wformat_auto_and_weights_label(run_dir, monkeypatch):
         st.remove()
 
 
+def test_chat_refuses_a_checkpoint_without_a_template(tmp_path, monkeypatch):
+    """otpu-chat refuses a checkpoint without a chat template (a base model: it continues the
+    chat's text, the base gemma-4-26B-A4B repeated the question) before it loads anything,
+    naming the instruct checkpoint where MODELS has one; --raw takes it. A template counts in
+    chat_template.jinja (the Gemma 4 instruct checkpoints'), chat_template.json or
+    tokenizer_config.json."""
+    from opentpu.host import chat as C
+
+    def ckpt(name, **files):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "config.json").write_text("{}")
+        for f, text in files.items():
+            (d / f.replace("_jinja", ".jinja").replace("_json", ".json")).write_text(text)
+        return d
+    base = ckpt("gemma-4-E2B", tokenizer_config_json=json.dumps({"bos_token": "<bos>"}))
+    assert not C.has_chat_template(base) and not C.has_chat_template(ckpt("bare"))
+    assert C.has_chat_template(ckpt("it", chat_template_jinja="{{ messages }}"))
+    assert C.has_chat_template(ckpt("js", chat_template_json=json.dumps({"chat_template": "x"})))
+    assert C.has_chat_template(ckpt("tc", tokenizer_config_json=json.dumps(
+        {"chat_template": "{{ messages }}"})))
+
+    class Loaded(Exception):
+        pass
+
+    def load(path):
+        raise Loaded(path)
+    monkeypatch.setattr(C, "load_tokenizer", load)
+    with pytest.raises(SystemExit, match="no chat template.*--model gemma4: models/gemma-4-E2B-it"):
+        C.main(["--model", str(base), "--prompt", "hi"])
+    with pytest.raises(SystemExit, match=r"no chat template.*\(-it, -Instruct\)"):
+        C.main(["--model", str(tmp_path / "bare"), "--prompt", "hi"])
+    with pytest.raises(Loaded):
+        C.main(["--model", str(base), "--prompt", "hi", "--raw"])
+    with pytest.raises(Loaded):
+        C.main(["--model", str(tmp_path / "it"), "--prompt", "hi"])
+
+
 def test_chat_loads_the_tokenizer_on_a_thread(monkeypatch):
     """otpu-chat loads the tokenizer (importing transformers takes seconds) on a thread while
     the model's image loads: load_tokenizer returns at once, its function waits for the

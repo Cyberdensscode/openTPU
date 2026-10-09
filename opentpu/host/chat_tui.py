@@ -35,7 +35,7 @@ COMMANDS = {"/help": "the commands and keys",
             "/continue": "continue a reply cut at max_new",
             "/reset": "forget the conversation and the KV cache",
             "/stats": "DRAM, session totals, sampling",
-            "/think": "on|off  thinking mode (Qwen3, Qwen3.5)",
+            "/think": "on|off  thinking mode (Qwen3, Qwen3.5, Gemma 4)",
             "/quit": "leave"}
 ARGS = {"/think"}                       # commands that take an argument
 KEYS = ["enter send · esc interrupt · ^s panel · ^c quit", "esc · ^s panel · ^c quit",
