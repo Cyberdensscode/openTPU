@@ -3871,7 +3871,13 @@ LFM2.5-8B-A1B with the repacked pool:
   (6.6 MB a token) with 76 misses in its prompt. Turn 2 hit 99.8% (0.8 MB a token) with 22.
 - The process peaked at 10.7 GB, the simulator's 4 GiB DRAM included.
 
-Not run on the card yet.
+On the card (opentpu, build 1025907f, 2026-10-08), LFM2.5-8B-A1B against that reference:
+[PASS], both turns' tokens the same, on tree 936f8a5f and again on 171a1b50 (with chat-kv's
+rollback: turn 2 reused 36 positions). Turn 1: 21 prompt tokens in 2.16 s (device 13.8 tok/s),
+76 misses, TTFT 2.16 s, decode 13.2 tok/s (device 15.0), 98.7% hits, 6.6 MB a token. Turn 2:
+TTFT 1.43 s, decode 15.2 tok/s (device 15.4), 99.85% hits, 0.78 MB a token. Loading took 186 s
+on 936f8a5f (the image's matrices quantized on one core) and 24 s on 171a1b50 (in workers). The
+35B's and the 26B's chats have not run on the card yet.
 
 ### 14.6 Tests
 

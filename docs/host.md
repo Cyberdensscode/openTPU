@@ -511,6 +511,11 @@ chat's image ahead (`otpu-lock --prebuild lfm2-2.6b:fp4:int8 -- otpu-chat ...`).
 loads on a thread meanwhile (importing transformers takes about 2.5 s). On omarchy, otpu-chat on
 a fake card (the card's configuration; its upload a copy in memory) reaches the first prompt in
 2.1 to 2.5 s from the image cache, 18 to 20 s before it with every matrix in the 4-bit cache.
+On the card (opentpu, 4 cores / 8 threads, 2026-10-08, tree 171a1b50), LFM2-2.6B fp4 with its
+int8 head, a 48-token greedy reply: loaded in 4.3 to 4.6 s from the image cache (the image read
+in 0.3 s), 10.2 s from the start to the reply's end; 284 s to load with nothing cached (8
+workers); production's code before it (82ebb6c), with every matrix in the 4-bit cache, 54.9 s
+for the same run, the same reply.
 
 **The interface** (Textual, `opentpu/host/chat_tui.py`) keeps the terminal's own background
 and one accent colour. The conversation is a single column: a header box with the model,
@@ -717,6 +722,13 @@ and 964 -> 402 M on Qwen3.5-0.8B (7.23 -> 3.02 s, -58%; the fifth turn 341 -> 95
 snapshots and four restores included (12 M). The restart's cost grows with the conversation,
 the rollback's with the last reply and the new message. LFM2.5-230M's turns continued the
 context before as now (98 tokens in 15 runs; the restart's 523 in 70).
+
+**On the card** (2026-10-08, build 1025907f, tree 171a1b50, chatkv.py's defaults): CHATKV PASS
+for Qwen3-0.6B, Qwen3.5-0.8B, Qwen3.5-0.8B `--mtp` and LFM2.5-230M, every turn's logits and
+reply equal to the restart's. The fifth turn's prefill, rollback / restart: Qwen3-0.6B 47 / 192
+tokens, 57.8 / 228.5 M cycles, 0.45 / 1.74 s; Qwen3.5-0.8B 49 / 194 tokens, 92.3 / 338.8 M
+cycles, 0.73 / 2.57 s, its snapshot and restore 1.29 M cycles each (the co-sim's 1.30 M);
+LFM2.5-230M 21 / 190 tokens, 9.9 / 76.7 M cycles, 0.08 / 0.63 s.
 
 ## 7. Control registers
 
