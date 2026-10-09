@@ -41,9 +41,12 @@ class Tok:
 
 
 def _save(d: Path, config: dict, W: dict) -> Path:
+    """A checkpoint directory with a chat template (otpu-chat refuses one without; Tok renders
+    the turns)."""
     from safetensors.numpy import save_file
     d.mkdir(parents=True, exist_ok=True)
     (d / "config.json").write_text(json.dumps(config))
+    (d / "chat_template.jinja").write_text("{% for m in messages %}{{ m.content }} {% endfor %}")
     save_file({k: np.ascontiguousarray(v) for k, v in W.items()}, str(d / "model.safetensors"))
     return d
 
