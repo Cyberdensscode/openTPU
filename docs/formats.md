@@ -334,8 +334,13 @@ attn@15-24, attn@0-9, down@10-14, attn@10-14, then the PLE groups.
 Each row is 3 SE or more over its bar. One kind in a quarter of the layers in fp4 costs E2B-it
 0.3 to 2.7 points beyond int8's, and the cheapest per byte, layers 25-34's down projections,
 +0.94% for 3.5% (bar 0.35). The PLE kinds cost the most again (`ple=fp4` +3.95% for 0.6%). The fp4 PLE table, the base's int8 error
-(+2.42%), costs E2B-it +0.33% (0.11) here and -0.57% (0.35) on docs/isa.md; the int8 table
-does not fit beside int8 layers, and the host table (`OTPU_PLE_HOST=1`) stays opt-in. On
+(+2.42%), costs E2B-it +0.33% (0.11) here and -0.57% (0.35) on docs/isa.md. The int8 table
+does not fit beside int8 layers, so the other choice is the int8 table on the host
+(`OTPU_PLE_HOST=1`, opt-in): by the rule's measure it would win (the fp4 table on the card buys
+no speed in perf.py's loop, 6.37 against 6.39 tok/s), but it holds 2.35 GB of the host's memory,
+which the card host also gives the MoE pools' page cache, and in the card's decode loop its
+per-token row costs 0.56% ([gemma4.md](gemma4.md)). The default keeps the fp4 table on the card:
+about 3 SE of dKL, small, for no host memory and no wait. On
 docs/isa.md the base's mix is +6.18% (0.36), `mlp@15-34=fp4` +4.14% (0.36) and
 `attn@15-34=fp4,mlp@15-34=fp4` +7.15% (0.43). int8's prompt runs hold 4 rows up to bucket 6 at
 2048 tokens (3 in 7-8; the base's mix 2 from bucket 5), and its sampled card loop takes the split
