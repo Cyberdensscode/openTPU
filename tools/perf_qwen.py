@@ -6,7 +6,7 @@ otpu_native_dram in front of the native memory model, sim/verilator/otpu_native_
                                [--head-format int8|int4|fp4] [--ddr 1066 [--mhz 100] [--ldc]]
 
 Uses the real weights (models/Qwen3-0.6B, or --model lfm2: models/LFM2.5-230M, --model qwen35:
-models/Qwen3.5-0.8B, --model gemma4: models/gemma-4-E2B), optionally only the first N layers
+models/Qwen3.5-0.8B, --model gemma4: models/gemma-4-E2B-it), optionally only the first N layers
 (Gemma 4: or a list of checkpoint layers, e.g. 0,1,2,3,4,15,19, its KV-shared layers attending
 to the last own layer of their kind in the list; the LM head is always complete).
 Prints cycles, the core-port roofline (port-B chunk transfers: weights, KV, LD/ST chunks; port

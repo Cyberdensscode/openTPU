@@ -255,7 +255,7 @@ the eight default prompts and 16 tokens each:
 | Gemma 4 E2B (base) | 4-bit, int8 head and PLE table | 99.2%, 0.0029 | 0.0036 | 96.9%, 0.045 | 0.043 |
 | Gemma 4 E2B-it | int8, 4-bit PLE table | 100.0%, 0.0071 | 0.0078 | 97.5%, 0.014 | 0.0085 |
 | Gemma 4 E2B-it | 4-bit, int8 head and PLE table | 98.6%, 0.0095 | 0.0136 | 93.1%, 0.102 | 0.093 |
-| Gemma 4 E2B-it | the mix (otpu-chat's), int8 head and PLE table | 100.0%, 0.0135 | 0.0075 | 98.6%, 0.028 | 0.036 |
+| Gemma 4 E2B-it | the base's mix, int8 head and PLE table | 100.0%, 0.0135 | 0.0075 | 98.6%, 0.028 | 0.036 |
 
 KL is the mean KL(golden || device) in nats per token. The device's KL from the quantized
 golden is 0.70 to 1.16 times the floor's, and its distance from fp32 is what the quantization

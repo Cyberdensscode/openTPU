@@ -13,6 +13,7 @@ import pytest
 from opentpu.compiler import CompileError
 from opentpu.isasim import board_config
 from opentpu.kernels import gather as GA
+from opentpu.llm import formats as FM
 from opentpu.llm import gemma4 as G
 from opentpu.llm import model_dir
 from opentpu.llm.qwen3 import Engine
@@ -731,7 +732,9 @@ def test_formats_scan(tiny, tmp_path, monkeypatch):
 @pytest.mark.skipif(not (REAL / "config.json").exists(), reason=f"no models/{REAL.name}")
 def test_real_model_programs_fit():
     """Gemma 4 E2B on the board: fp4 layers, int8 LM head and PLE fit 4 GiB at 4096 tokens;
-    the resident decode programs fit IMEM and take 6 argument words. Its recommended mix too."""
+    the resident decode programs fit IMEM and take 6 argument words. No recommended mix (every
+    mix fails on the instruct checkpoint: docs/formats.md), so otpu-chat's auto is int8, which
+    fits with the fp4 PLE table; the base's mix fits too."""
     spec = G.Spec.from_hf(REAL)
     img = spec.image(board_config(), 4096, 1, 8, "fp4", "int8", lookup=True)
     assert img.ple_format == "int8" and img.nbytes < 1 << 32
@@ -742,10 +745,15 @@ def test_real_model_programs_fit():
         assert len(ra) == 6
     with pytest.raises(CompileError, match="TMEM"):
         img.compile_rows([(0, p) for p in range(8)], [7])
-    # the recommended mix (docs/formats.md): the shared layers' MLP and layers 15-24's attention
-    # in fp4, the int8 PLE table on the card beside them; three runs (the splits at 15 and 25)
-    mix = spec.image(board_config(), 4096, 1, 8, "mix", lookup=True)
-    assert spec.mix == "attn@15-24=fp4,mlp@15-34=fp4" and mix.formats == spec.mix
+    assert spec.mix == "" and FM.auto(spec, "auto") == "int8"
+    with pytest.raises(ValueError, match="no recommended mix"):
+        spec.image(board_config(), 4096, 1, 8, "mix", lookup=True)
+    i8 = spec.image(board_config(), 2048, 1, 8, "int8", "int8", lookup=True)
+    assert (i8.ple_format, i8.ple_host, len(i8.runs)) == ("fp4", False, 2) and i8.nbytes < 1 << 32
+    # the base's mix (docs/formats.md): the shared layers' MLP and layers 15-24's attention in
+    # fp4, the int8 PLE table on the card beside them; three runs (the splits at 15 and 25)
+    mix = spec.image(board_config(), 4096, 1, 8, "int8", formats="attn@15-24=fp4,mlp@15-34=fp4",
+                     lookup=True)
     assert (mix.ple_format, mix.ple_host, mix.head_format) == ("int8", False, "int8")
     assert len(img.runs) == 2 and len(mix.runs) == 3 and mix.nbytes < 1 << 32
     progs, _ = mix.compile_decode(16, 15 * 256)

@@ -211,10 +211,12 @@ As on the other models ([quant.md](quant.md)), the int8 head is the default: the
 in perplexity for 14% of decode speed. Attention in int8 would recover a third of the 4-bit
 loss for 9% more bytes.
 
-Per layer ([formats.md](formats.md), 2000 tokens of docs/isa.md): the recommended mix
-(`wformat="mix"`, otpu-chat's default) is `attn@15-24=fp4,mlp@15-34=fp4`, the KV-shared layers'
-MLP and the attention of layers 15-24 in fp4, 30.0% faster than int8 on the card (8.30 tok/s on
-fmvf, session mix5) for dKL +2.60% (SE 0.06), 6.7 SE under its bar; fp4 layers are about +21%.
+Per layer ([formats.md](formats.md), 2000 tokens of docs/isa.md): the base checkpoint's mix
+(`wformat="mix"`, otpu-chat's default until 2026-10-09) was `attn@15-24=fp4,mlp@15-34=fp4`, the
+KV-shared layers' MLP and the attention of layers 15-24 in fp4, 30.0% faster than int8 on the
+card (8.30 tok/s on fmvf, session mix5) for dKL +2.60% (SE 0.06), 6.7 SE under its bar; fp4
+layers are about +21%. The instruct checkpoint the chat runs now has no mix: every one fails on
+it, and its default is int8 ("The instruct checkpoints" below).
 The first pick, `attn@15-34=fp4,mlp@15-34=fp4`, measured 8.47 tok/s on the card (32.5%) for
 +3.34%: 1.1 SE over its bar. The PLE table and its lookup stay on the card: int8 where the image
 leaves room, else fp4. The mix keeps the int8 table at 2048 and 4096 tokens (3.955 and 3.973 GiB,
@@ -311,7 +313,7 @@ replies equal to a restart's; 60 tokens fed in 17 runs against a restart's 140 i
 **Replies.** otpu-chat on the ISA simulator (the card's configuration, greedy), "What is the
 capital of France? Answer in one sentence.":
 
-- E2B-it (the mix, int8 head), thinking off: "The capital of France is Paris." (7 tokens, then
+- E2B-it (the base's mix, int8 head), thinking off: "The capital of France is Paris." (7 tokens, then
   `<turn|>`).
 - E2B-it, `--think`: `<|channel>thought` and five numbered steps ("1. **Analyze the Request:**
   The user is asking for the capital of France and requires the answer to be in one
@@ -344,14 +346,18 @@ scored, `formats_scan.py ppl --ids`). On docs/isa.md the -it model is far from c
 | Formats | Bar | Base, docs/isa.md | -it, docs/isa.md | -it, the chat |
 |:--|--:|--:|--:|--:|
 | int8, fp4 PLE table | | +2.42 (0.08) | -0.57 (0.35) | +0.33 (0.11) |
-| `mlp@15-34=fp4` | 2.75 | +2.25 (0.05) | | +6.09 (0.57) |
-| **`attn@15-24=fp4,mlp@15-34=fp4`** (otpu-chat's mix) | 3.00 | **+2.60 (0.06)** | +6.18 (0.36) | +6.79 (0.58) |
+| `mlp@15-34=fp4` | 2.75 | +2.25 (0.05) | +4.14 (0.36) | +6.09 (0.57) |
+| `attn@15-24=fp4,mlp@15-34=fp4` (the base's mix) | 3.00 | **+2.60 (0.06)** | +6.18 (0.36) | +6.79 (0.58) |
 | `attn@15-34=fp4,mlp@15-34=fp4` | 3.25 | +3.34 (0.08) | +7.15 (0.43) | +7.00 (0.58) |
 
-dKL % (SE). The fp4 PLE table costs the -it model nothing measurable (the base +2.42%), but its
-fp4 layers cost it two and a half times the base's: the mix adds 0.026 nats of KL from float on
-the base, 0.062 and 0.068 on the -it texts. Every mix fails its bar on the -it model, by 6 to
-9 SE.
+dKL % (SE). The fp4 PLE table costs the -it model little (+0.33% on the chat; the base
++2.42%), but its fp4 layers cost it two and a half times the base's: the mix adds 0.026 nats of
+KL from float on the base, 0.062 and 0.068 on the -it texts. The per-kind scan on the chat
+([formats.md](formats.md), "Gemma 4 E2B-it") found no mix under its bar: the closest, the fp4
+head, is 3.1 SE over it. So E2B-it has no mix, and otpu-chat's `--wformat auto` takes int8 (the
+fp4 PLE table, the int8 head): 6.37 tok/s on the card against the base's mix's 8.30. Its prompt
+runs hold 4 rows up to bucket 6 at 2048 tokens, and its sampled card loop runs in the split form
+(two programs a token: one exhausts TMEM).
 
 ## 26B-A4B: accuracy
 
