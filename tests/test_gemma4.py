@@ -150,9 +150,13 @@ def test_otpu_chat_on_the_isa_simulator(tmp_path, monkeypatch, capfd):
     simulators' default configuration is the design's two slices, onto which Gemma 4 (one KV
     head) does not map (Image refused it: "one slice"), so the chat runs in the card's
     configuration (board.sim_config); a one-shot reply."""
+    import sys
+
     from opentpu.host import chat as C
     checkpoint(tmp_path)
     monkeypatch.setenv("OTPU_IMG_CACHE", "0")
+    plain = C.Chat.ask_plain                    # (its stream: sys.stdout when it is called)
+    monkeypatch.setattr(C.Chat, "ask_plain", lambda self, text: plain(self, text, sys.stdout))
     capfd.readouterr()
     C.main(["--model", str(tmp_path), "--prompt", "t5 t6 t7", "--greedy", "--max-new", "3",
             "--cap", "1024", "--no-prog-cache"])
