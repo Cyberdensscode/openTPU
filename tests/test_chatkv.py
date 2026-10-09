@@ -587,6 +587,26 @@ def test_gemma4_chat_turns(gemma, monkeypatch, case, think, reply, answer):
         start = len(tok.apply_chat_template(want[:-1], False, think, True)) + head
 
 
+def test_chatkv_tool_on_gemma4(tmp_path, capsys):
+    """tools/qual/chatkv.py, the card check, dry run on the ISA simulator with a Gemma 4
+    checkpoint (test_gemma4.checkpoint: its template renders a reply as fed): the recording
+    sampler takes the model's soft cap (Chat refused the tool's before: "the sampler's softcap
+    None is not the model's 30.0"), the turns continue the context, and each restart's logits
+    and reply equal the turn's: CHATKV PASS."""
+    import importlib.util
+    from pathlib import Path
+
+    from test_gemma4 import checkpoint
+    d = checkpoint(tmp_path / "gemma4")
+    s = importlib.util.spec_from_file_location(
+        "chatkv", Path(__file__).resolve().parent.parent / "tools" / "qual" / "chatkv.py")
+    CK = importlib.util.module_from_spec(s)
+    s.loader.exec_module(CK)
+    assert CK.main(["--model", str(d), "--backend", "isa", "--turns", "2", "--max-new", "3"]) == 0
+    out = capsys.readouterr().out
+    assert "stateful True" in out and "reused 0" in out and "CHATKV PASS" in out
+
+
 @pytest.mark.parametrize("name", ["gemma4", "gemma4-26b"])
 def test_gemma4_instruct_templates(name):
     """The instruct checkpoints' own tokenizer and template (models/gemma-4-E2B-it,

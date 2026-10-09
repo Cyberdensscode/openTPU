@@ -131,21 +131,27 @@ def test_tiny_matches_hf_and_emulation(tiny):
     assert _cos(dev[:12], emu).min() > 0.99
 
 
-def test_otpu_chat_on_the_isa_simulator(tmp_path, monkeypatch, capfd):
-    """otpu-chat --backend isa (the default) on a Gemma 4 checkpoint (saved by Hugging Face, a
-    word-level tokenizer and a chat template): the simulators' default configuration is the
-    design's two slices, onto which Gemma 4 (one KV head) does not map (Image refused it: "one
-    slice"), so the chat runs in the card's configuration (board.sim_config); a one-shot reply."""
+def checkpoint(d: Path, **kw) -> Path:
+    """The tiny model (_model) saved by Hugging Face in d, with a word-level tokenizer ("t17" is
+    token 17) and a chat template (the messages' text one after another)."""
     from tokenizers import Tokenizer, models, pre_tokenizers
-
-    from opentpu.host import chat as C
-    m, _, _ = _model(tmp_path)
-    m.save_pretrained(tmp_path)
+    d.mkdir(parents=True, exist_ok=True)
+    m, _, _ = _model(d, **kw)
+    m.save_pretrained(d)
     tk = Tokenizer(models.WordLevel({f"t{i}": i for i in range(1000)}, unk_token="t0"))
     tk.pre_tokenizer = pre_tokenizers.Whitespace()
-    transformers.PreTrainedTokenizerFast(tokenizer_object=tk).save_pretrained(tmp_path)
-    (tmp_path / "chat_template.jinja").write_text("{% for m in messages %}{{ m.content }} "
-                                                  "{% endfor %}")
+    transformers.PreTrainedTokenizerFast(tokenizer_object=tk).save_pretrained(d)
+    (d / "chat_template.jinja").write_text("{% for m in messages %}{{ m.content }} {% endfor %}")
+    return d
+
+
+def test_otpu_chat_on_the_isa_simulator(tmp_path, monkeypatch, capfd):
+    """otpu-chat --backend isa (the default) on a Gemma 4 checkpoint (checkpoint()): the
+    simulators' default configuration is the design's two slices, onto which Gemma 4 (one KV
+    head) does not map (Image refused it: "one slice"), so the chat runs in the card's
+    configuration (board.sim_config); a one-shot reply."""
+    from opentpu.host import chat as C
+    checkpoint(tmp_path)
     monkeypatch.setenv("OTPU_IMG_CACHE", "0")
     capfd.readouterr()
     C.main(["--model", str(tmp_path), "--prompt", "t5 t6 t7", "--greedy", "--max-new", "3",

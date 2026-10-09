@@ -46,8 +46,9 @@ MESSAGES = ["What is 1 + 32 * 9?",
 
 def recording(rec: list, eng=None):
     """A greedy chat.sampler that keeps the logits of its picks (each turn's first token), and
-    the engine's runs so far (len(eng.stats): the prefill's runs end there)."""
-    base = sampler(0, 0, 1.0, None)
+    the engine's runs so far (len(eng.stats): the prefill's runs end there). Gemma 4's: with its
+    soft cap, as Chat takes (the same argmax)."""
+    base = sampler(0, 0, 1.0, None, softcap=getattr(getattr(eng, "spec", None), "softcap", None))
 
     def pick(logits, context=()):
         rec.append((np.array(logits, np.float32), len(eng.stats) if eng is not None else 0))
