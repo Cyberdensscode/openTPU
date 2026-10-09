@@ -65,8 +65,11 @@ at 91-94% of the DRAM peak instead of 82-87%. Qwen3.5-4B's int8 image is over 4 
   matches Hugging Face's greedy tokens on three prompts with either head. The chat runs the
   instruct checkpoints (gemma-4-E2B-it, ...: the same images and speeds). E4B's table (2.95 GB)
   stays on the host, which copies one 11 KB row into the card per token; its image is 3.96 GiB,
-  int8 with the head and
-  the first 24 layers' down projections in 4-bit ([docs/gemma4_e4b.md](docs/gemma4_e4b.md)).
+  int8 with the head and the first 24 layers' down projections in 4-bit, as measured here
+  ([docs/gemma4_e4b.md](docs/gemma4_e4b.md)). Since 2026-10-09 E4B-it's default is the head and
+  the first 12 layers' gate / up projections in 4-bit: the same bytes a token, perplexity
+  within 0.01% of int8's instead of +3.2%, and prompt runs of 2 rows instead of 3-4
+  ([docs/formats.md](docs/formats.md)).
   In the card's own decode loop (the card picking every token) Gemma 4 decodes faster: E2B
   11.01 / 12.73 tok/s (int8 / 4-bit head), E4B 3.83 tok/s, on the device.*
 - *Every configuration matches the simulator token for token, per-position and with the

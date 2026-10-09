@@ -318,7 +318,8 @@ capital of France? Answer in one sentence.":
 - E2B-it, `--think`: `<|channel>thought` and five numbered steps ("1. **Analyze the Request:**
   The user is asking for the capital of France and requires the answer to be in one
   sentence. ..."), `<channel|>`, then "The capital of France is Paris." (120 tokens).
-- E4B-it (int8 with `down@0-23=fp4`, fp4 head): "The capital of France is Paris."
+- E4B-it (int8 with `down@0-23=fp4`, fp4 head, then its default): "The capital of France is
+  Paris."
 
 **validate.py** (ISA simulator, the eight default prompts, 16 tokens each, 2026-10-09, tree
 aa2166b1; KL in nats per token):
@@ -357,7 +358,10 @@ KL from float on the base, 0.062 and 0.068 on the -it texts. The per-kind scan o
 head, is 3.1 SE over it. So E2B-it has no mix, and otpu-chat's `--wformat auto` takes int8 (the
 fp4 PLE table, the int8 head): 6.37 tok/s on the card against the base's mix's 8.30. Its prompt
 runs hold 4 rows up to bucket 6 at 2048 tokens, and its sampled card loop runs in the split form
-(two programs a token: one exhausts TMEM).
+(two programs a token: one exhausts TMEM). E4B-it, whose int8 image does not fit, takes the
+head and gate / up 0-11 in fp4 since then: +0.56% against int8 on its own chat, where the
+base's choice (the head and down 0-23) is +2.15%; a third layer loop, 2-row prompt runs
+([formats.md](formats.md), "Gemma 4 E4B-it").
 
 ## 26B-A4B: accuracy
 

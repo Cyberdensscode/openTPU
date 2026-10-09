@@ -15,6 +15,7 @@ from opentpu.isasim import board_config
 from opentpu.kernels import gather as GA
 from opentpu.llm import formats as FM
 from opentpu.llm import gemma4 as G
+from opentpu.llm import generate as GN
 from opentpu.llm import model_dir
 from opentpu.llm.qwen3 import Engine
 
@@ -278,12 +279,13 @@ def test_per_layer_formats(tiny):
 
 def test_formats_by_fit(tiny, monkeypatch):
     """The formats follow the fit (Spec.fit_formats, docs/gemma4_e4b.md): an int8 image that
-    fits the card beside no PLE choice takes the head and the own-KV layers' down projections
-    in fp4 (one loop's format, so no extra loop); an image that fits, or not int8, is as asked.
+    fits the card beside no PLE choice takes the head and the gate / up projections of the first
+    half of the own-KV layers in fp4 (a third loop: E4B-it's pick, docs/formats.md); an image
+    that fits, or not int8, is as asked.
     The Engine's compile worker gets the choices (Engine._image_kw): its image is the same
     without choosing again."""
     _, W, spec = tiny
-    assert spec.fit_formats == "head=fp4,down@0-5=fp4"
+    assert spec.fit_formats == "head=fp4,gateup@0-2=fp4"
     monkeypatch.delenv("OTPU_FORMATS", raising=False)
     big = spec.image(_cfg(), 1024, ple_host=True, formats="")
     mix = spec.image(_cfg(), 1024, ple_host=True, formats=spec.fit_formats)
@@ -291,8 +293,9 @@ def test_formats_by_fit(tiny, monkeypatch):
     monkeypatch.setattr(G, "CARD_BYTES", (big.nbytes + mix.nbytes) // 2)
     img = spec.image(_cfg(), 1024)
     assert img.formats == spec.fit_formats and img.head_format == "fp4" and img.ple_host
-    assert img.lf[5] == ("int8", "int8", "fp4", "int8") and img.lf[6] == ("int8",) * 4
-    assert img.nbytes == mix.nbytes and img.runs == mix.runs and len(img.runs) == len(big.runs)
+    assert img.lf[2] == ("int8", "fp4", "int8", "int8") and img.lf[3] == ("int8",) * 4
+    assert img.nbytes == mix.nbytes and img.runs == mix.runs
+    assert len(img.runs) > len(big.runs)            # the own-KV layers' loop splits
     assert spec.image(_cfg(), 1024, wformat="fp4").formats == ""
     eng = Engine(spec, W, cap=1024, cfg=_cfg())
     kw = eng._image_kw
@@ -769,7 +772,7 @@ def test_formats_scan_e4b_tables():
     FS = _tool("formats_scan")
     spec = G.Spec.from_hf(REAL_E4B)
     assert FS._g4_ple(spec, ("", "int8", None), 2048) == ("int8", True)
-    assert FS._g4_ple(spec, ("head=fp4,down@0-23=fp4", "int8", None), 2048) == ("int8", True)
+    assert FS._g4_ple(spec, (spec.fit_formats, "int8", None), 2048) == ("int8", True)
 
 
 @pytest.mark.skipif(not (REAL_E4B / "config.json").exists(),
@@ -778,7 +781,11 @@ def test_e4b_programs_fit():
     """Gemma 4 E4B on the board: with fp4 layers and the int8 head its PLE table does not fit
     beside them in either format, so the image keeps it on the host (int8 records) and fits
     4 GiB at 2048 tokens; the resident decode programs fit IMEM with 5 argument words (the PLE
-    gather reads the slot, not the token's row); 4-row prefill runs fit TMEM."""
+    gather reads the slot, not the token's row); 4-row prefill runs fit TMEM. int8 layers do not
+    fit: the formats by fit, the head and gate / up 0-11 in fp4 (E4B-it's pick, three loops),
+    4 GiB at 2048 and 4096 tokens; at 2048 every bucket's decode, generate (greedy and sampled)
+    and prompt run programs fit IMEM and TMEM, the prompt runs with 2 rows (1 in the last
+    bucket, as today's route near the cap: fit_chunk)."""
     spec = G.Spec.from_hf(REAL_E4B)
     img = spec.image(board_config(), 2048, 1, 8, "fp4", "int8", lookup=True)
     assert img.ple_host and img.ple_format == "int8" and img.nbytes < 3 << 30
@@ -787,10 +794,21 @@ def test_e4b_programs_fit():
         assert 8 * len(progs[0]) <= board_config().IMEM_WORDS
         assert len(ra) == 5
     img.compile_rows([(0, r) for r in range(4)], [3], img.block, tokens=[5, 6, 7, 8])
-    # int8 layers do not fit: the formats by fit, two loops, decode and 4-row runs fit
-    mix = spec.image(board_config(), 2048, 1, 8, lookup=True)
-    assert mix.formats == "head=fp4,down@0-23=fp4" and mix.head_format == "fp4"
-    assert mix.ple_host and 3.9 * 2**30 < mix.nbytes < 1 << 32 and len(mix.runs) == 2
-    progs, ra = mix.compile_decode(8, 7 * mix.block)
-    assert 8 * len(progs[0]) <= board_config().IMEM_WORDS
-    mix.compile_rows([(0, r) for r in range(4)], [3], mix.block, tokens=[5, 6, 7, 8])
+    cfg = board_config()
+    fits = lambda progs: all(8 * len(p) <= cfg.IMEM_WORDS for p in progs)   # noqa: E731
+    mix = spec.image(cfg, 2048, 1, 8, lookup=True)
+    assert mix.formats == spec.fit_formats == "head=fp4,gateup@0-11=fp4"
+    assert mix.head_format == "fp4" and mix.lf[11][1] == "fp4" and mix.lf[12][1] == "int8"
+    assert mix.ple_host and 3.9 * 2**30 < mix.nbytes < 1 << 32 and len(mix.runs) == 3
+    assert spec.image(cfg, 4096, 1, 8, lookup=True).nbytes < 1 << 32
+    samp = GN.Sampling(1.0, 64, 0.95, 1.0)
+    for blocks in range(1, 9):
+        lo = (blocks - 1) * mix.block
+        assert fits(mix.compile_decode(blocks, lo)[0]), blocks
+        for sm in (None, samp):
+            progs = GN.compile_bucket(mix, blocks, lo, mix.block, samp=sm)
+            assert all(fits(p) for p in (progs if isinstance(progs, tuple) else (progs,)))
+        for kind in ("P", "L"):
+            assert fits(mix.compile_prompt_run(blocks, 2 if blocks < 8 else 1, kind)[0]), blocks
+    rows = [(0, r) for r in range(2)]
+    assert fits(mix.compile_rows(rows, [1], mix.block, tokens=[5, 6]))

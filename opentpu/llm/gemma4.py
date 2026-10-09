@@ -207,9 +207,10 @@ class Spec:
         for e in (c.get("eos_token_id", 1), 106,
                   json.loads(gc.read_text()).get("eos_token_id") if gc.exists() else None):
             eos += e if isinstance(e, list) else [] if e is None else [e]
-        # int8 layers that do not fit: the head and the down projections in fp4 in the layers
-        # with their own K / V, one loop (E4B's best mix that keeps two loops)
-        fit = f"head=fp4,down@0-{first - 1}=fp4" if first > 0 else "head=fp4"
+        # int8 layers that do not fit: the head and the gate / up projections of the first
+        # half of the layers with their own K / V in fp4 (gemma-4-E4B-it's: the MLPs of the
+        # second half cost it the most; a third loop, 2-row prompt runs; docs/formats.md)
+        fit = f"head=fp4,gateup@0-{first // 2 - 1}=fp4" if first > 1 else "head=fp4"
         if moe:                 # a MoE's DRAM beside its layers is expert slots (Image experts)
             fit = ""
         return Spec(hidden=c["hidden_size"], kinds=kinds, kv_src=src,
@@ -754,7 +755,7 @@ class Image:
     None for either (and OTPU_PLE_FORMAT / OTPU_PLE_HOST unset): the table on the card in int8
     if the image then fits 4 GiB, else in fp4, else on the host in int8. `formats` None (and
     OTPU_FORMATS unset): spec.formats, or, when it is empty, the layers are int8 and no PLE
-    choice fits them in 4 GiB, spec.fit_formats (E4B: the head and down 0-23 in fp4).
+    choice fits them in 4 GiB, spec.fit_formats (E4B: the head and gate / up 0-11 in fp4).
     `choices` holds what was chosen.
     """
 

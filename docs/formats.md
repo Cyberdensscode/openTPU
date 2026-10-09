@@ -29,7 +29,8 @@ In short:
   E2B-it, the chat's checkpoint: none qualifies (the closest 3.1 SE over its bar), so int8; its
   base checkpoint's was `attn@15-24=fp4,mlp@15-34=fp4` (the KV-shared layers' MLP, layers
   15-24's attention), 30% for 2.6% against int8 with the int8 PLE table, which on E2B-it is
-  +6.8% (fp4 layers: 56% for about 21% on the base, 17% on E2B-it).
+  +6.8% (fp4 layers: 56% for about 21% on the base, 17% on E2B-it). Gemma 4 E4B (int8 does
+  not fit): the head and gate / up 0-11, three loops, +0.56% against int8 on E4B-it.
   Qwen3.5-2B: none qualifies. Qwen3.5-35B-A3B's fp4 head: +1.55% for 13%, so it stays int8.
   Gemma 4 26B-A4B: all dense layers in fp4 fail (+7.9% for 56%); its ranges are not run yet.
   On the card the mixes run at the predicted speed (within 0.1%), and their images give the ISA
@@ -349,10 +350,11 @@ form (one program exhausts TMEM; [autodecode.md](autodecode.md)).
 ### Gemma 4 E4B-it
 
 E4B's int8 image does not fit the card (4.56 GiB), so it has no int8 to gain over, and its
-formats are not this rule's: they follow the fit ([gemma4_e4b.md](gemma4_e4b.md)), the most
-accurate mix that fits 4 GiB in two layer loops (a third splits the own-KV layers' loop, and its
-prompt runs then hold 2 rows instead of 3-4). The default is the head and layers 0-23's down
-projections in fp4 (`Spec.fit_formats`).
+formats are not this rule's: they follow the fit ([gemma4_e4b.md](gemma4_e4b.md)). The base
+checkpoint's rule was the most accurate mix that fits 4 GiB in two layer loops (a third splits
+the own-KV layers' loop, and its prompt runs then hold 2 rows instead of 3-4): the head and
+layers 0-23's down projections in fp4. Since 2026-10-09 the default (`Spec.fit_formats`) is
+gemma-4-E4B-it's pick, three loops: **the head and layers 0-11's gate / up projections in fp4**.
 
 On gemma-4-E4B-it (2026-10-09, omarchy, tree d26d6610): a chat of its own (`tools/chat_text.py
 gemma4-e4b`, 2694 tokens, the first 2000), `formats_scan.py ppl --ids`, dKL against int8 with
@@ -360,23 +362,36 @@ the PLE table on the host (as E4B's images place it), every row's table on the h
 
 | Formats (fp4, the rest int8) | Loops | MiB | dKL % (SE) | Perplexity vs int8 % (SE) | Prompt rows, buckets 1-8 |
 |:--|:-:|--:|--:|--:|:--|
-| **head, down 0-23** (the default) | 2 | 3947 | **+2.15 (0.21)** | +3.17 (0.72) | 4 4 4 3 3 3 3 3 |
+| head, down 0-23 (the base's default) | 2 | 3947 | +2.15 (0.21) | +3.17 (0.72) | 4 4 4 3 3 3 3 3 |
 | gate / up 0-23 (int8 head) | 2 | 3967 | +1.86 (0.17) | +1.84 (0.84) | 4 4 4 4 3 3 3 3 |
 | head, gate / up 0-23 | 2 | 3647 | +2.18 (0.18) | +2.18 (0.81) | 4 4 4 4 2 2 2 2 |
-| head, gate / up 0-11 | 3 | 3947 | +0.56 (0.07) | +0.01 (0.51) | 2 2 2 2 2 2 2 1 |
+| **head, gate / up 0-11** (the default) | 3 | 3947 | **+0.56 (0.07)** | +0.01 (0.51) | 2 2 2 2 2 2 2 1 |
 | head, gate / up and down 0-11 | 3 | 3797 | +0.74 (0.08) | +0.31 (0.53) | 2 2 2 2 2 2 1 1 |
 | head, gate / up 0-11, down 0-23 | 3 | 3647 | +2.32 (0.21) | +2.98 (0.80) | 2 2 2 2 2 2 1 1 |
 
 MiB: the weights a token reads (int8: 4567). Prompt rows: a prompt run's most rows that fit
-IMEM at a 2048-token capacity. Among the two-loop mixes no row beats the default by 2 SE (gate /
-up 0-23: 1.3 SE; with the head too: 0.1 SE), so the default stays. The MLPs of layers 12-23 are
-what cost E4B-it: their gate / up or down projections in fp4 add about 1.6 points each, and
-the three-loop mixes that keep them int8 are 7 to 8 SE better than the default for the same
-or fewer bytes (head, gate / up 0-11: +0.56%; with down 0-11 too, 3.7% faster by the E2B model's
-8.04 M cycles a GB: +0.74%). Their prompt runs hold 2 rows (1 at the top buckets), about half
-the default's prompt rate (14.8 tok/s on the card at 4 rows: an *estimate*). On the base
-checkpoint the same three-loop mix was 4% better in perplexity (1.851 against 1.928) and was
-not taken for that reason.
+IMEM at a 2048-token capacity (the base's default's 4-row runs near position 1000 and beyond go
+over it too: [gemma4_e4b.md](gemma4_e4b.md)).
+
+The MLPs of layers 12-23 are what cost E4B-it: their gate / up or down projections in fp4 add
+about 1.6 points each. Among the two-loop mixes none beats the base's default by 2 SE (gate / up
+0-23: 1.3 SE; with the head too: 0.1 SE); the three-loop mixes that keep layers 12-23 int8 are
+7 to 8 SE better than it for the same or fewer bytes. The default takes the most accurate,
+`head=fp4,gateup@0-11=fp4`: +0.56% against +2.15%, perplexity within 0.01% of int8's, at the
+base default's bytes (3.960 GiB at 2048 tokens, 3.998 at 4096). With the down projections of
+0-11 too it would be 3.7% faster (by the E2B model's 8.04 M cycles a GB) for 0.18 points more
+(2.8 SE), and its prompt runs hold 1 row from bucket 7.
+
+**The exception and its price.** The third loop costs the prompt, not the decode: prompt runs
+of 2 rows (1 in the last bucket, the decode kernel), about half the base default's prompt rate
+(14.8 tok/s on the card at 4 rows, so about 7 tok/s: an *estimate*), and a long first prompt
+waits about twice as long for its first token. The two-loop rule was about that price; it is
+paid once per conversation, as the chat keeps its KV cache across turns ([host.md](host.md) 6)
+and a later turn feeds only its new message, while the quality is paid on every token. On the
+base checkpoint the same mix was 4% better in perplexity (1.851 against 1.928) and was not
+taken; on the instruct one it brings perplexity from +3.17% over int8 to +0.01%.
+Every bucket's decode, generate (greedy and sampled) and prompt run programs fit IMEM and TMEM
+at 2048 tokens (`test_gemma4.py`'s test_e4b_programs_fit).
 
 ### Qwen3.5-35B-A3B's head
 
