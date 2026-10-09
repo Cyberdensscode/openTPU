@@ -545,4 +545,7 @@ turn continued or rolled back to the reply's start through the sliding rings' sn
 logits a fresh engine's bit for bit) and `test_gemma4_instruct_templates` (the real tokenizers
 and templates, where models/ has them).
 
-On omarchy (transformers 5.17, PAIR / DSTEP / STREAM) all 14 pass, in 16 minutes.
+On omarchy (transformers 5.17, PAIR / DSTEP / STREAM, with models/gemma-4-E2B-it and
+E4B-it, 2026-10-09, f4cdfffc): test_gemma4, test_chatkv, test_autodecode, test_validate,
+test_chatmoe, test_host and test_formats, the RTL tests included, 328 passed and 37 skipped (3
+need `--runslow`), in 2 h 2 min.

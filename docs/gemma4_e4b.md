@@ -1,5 +1,9 @@
 # Gemma 4 E4B: the per-layer embeddings from the host
 
+otpu-chat's `gemma4-e4b` is the instruct checkpoint, gemma-4-E4B-it, since 2026-10-09 (the same
+architecture, images and programs; [gemma4.md](gemma4.md), "The instruct checkpoints"); the
+measurements here are the base checkpoint's unless they say so.
+
 Status: runs on the card (build B, 2026-10-01): token for token the ISA simulator's on every
 decode path, the card's generate loop included, at 3.78 tok/s (tools/qual/perf.py) and 3.83
 tok/s in the generate loop (section "On the card"). The weight formats are in section
@@ -156,6 +160,10 @@ repository in September 2026. Same emulation, ppl:
   E4B's int8 image takes it: 3.958 GiB at 2048 tokens with the lookup tables and the
   generate area, the PLE table on the host. `Image.choices` holds what was chosen, so the
   Engine's compile worker builds the same image (`Engine._image_kw`).
+- **gemma-4-E4B-it** (the chat's `gemma4-e4b` since 2026-10-09), on a chat of its own at 2000
+  tokens ([formats.md](formats.md), "Gemma 4 E4B-it"): the default is dKL +2.15% (SE 0.21)
+  against int8, and no two-loop mix beats it by 2 SE, so it stays. The three-loop mix (head,
+  gate / up 0-11) is +0.56% (0.07), 7.9 SE better at the same bytes, with 2-row prompt runs.
 
 ## Per token
 

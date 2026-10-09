@@ -346,6 +346,38 @@ docs/isa.md the base's mix is +6.18% (0.36), `mlp@15-34=fp4` +4.14% (0.36) and
 2048 tokens (3 in 7-8; the base's mix 2 from bucket 5), and its sampled card loop takes the split
 form (one program exhausts TMEM; [autodecode.md](autodecode.md)).
 
+### Gemma 4 E4B-it
+
+E4B's int8 image does not fit the card (4.56 GiB), so it has no int8 to gain over, and its
+formats are not this rule's: they follow the fit ([gemma4_e4b.md](gemma4_e4b.md)), the most
+accurate mix that fits 4 GiB in two layer loops (a third splits the own-KV layers' loop, and its
+prompt runs then hold 2 rows instead of 3-4). The default is the head and layers 0-23's down
+projections in fp4 (`Spec.fit_formats`).
+
+On gemma-4-E4B-it (2026-10-09, omarchy, tree d26d6610): a chat of its own (`tools/chat_text.py
+gemma4-e4b`, 2694 tokens, the first 2000), `formats_scan.py ppl --ids`, dKL against int8 with
+the PLE table on the host (as E4B's images place it), every row's table on the host:
+
+| Formats (fp4, the rest int8) | Loops | MiB | dKL % (SE) | Perplexity vs int8 % (SE) | Prompt rows, buckets 1-8 |
+|:--|:-:|--:|--:|--:|:--|
+| **head, down 0-23** (the default) | 2 | 3947 | **+2.15 (0.21)** | +3.17 (0.72) | 4 4 4 3 3 3 3 3 |
+| gate / up 0-23 (int8 head) | 2 | 3967 | +1.86 (0.17) | +1.84 (0.84) | 4 4 4 4 3 3 3 3 |
+| head, gate / up 0-23 | 2 | 3647 | +2.18 (0.18) | +2.18 (0.81) | 4 4 4 4 2 2 2 2 |
+| head, gate / up 0-11 | 3 | 3947 | +0.56 (0.07) | +0.01 (0.51) | 2 2 2 2 2 2 2 1 |
+| head, gate / up and down 0-11 | 3 | 3797 | +0.74 (0.08) | +0.31 (0.53) | 2 2 2 2 2 2 1 1 |
+| head, gate / up 0-11, down 0-23 | 3 | 3647 | +2.32 (0.21) | +2.98 (0.80) | 2 2 2 2 2 2 1 1 |
+
+MiB: the weights a token reads (int8: 4567). Prompt rows: a prompt run's most rows that fit
+IMEM at a 2048-token capacity. Among the two-loop mixes no row beats the default by 2 SE (gate /
+up 0-23: 1.3 SE; with the head too: 0.1 SE), so the default stays. The MLPs of layers 12-23 are
+what cost E4B-it: their gate / up or down projections in fp4 add about 1.6 points each, and
+the three-loop mixes that keep them int8 are 7 to 8 SE better than the default for the same
+or fewer bytes (head, gate / up 0-11: +0.56%; with down 0-11 too, 3.7% faster by the E2B model's
+8.04 M cycles a GB: +0.74%). Their prompt runs hold 2 rows (1 at the top buckets), about half
+the default's prompt rate (14.8 tok/s on the card at 4 rows: an *estimate*). On the base
+checkpoint the same three-loop mix was 4% better in perplexity (1.851 against 1.928) and was
+not taken for that reason.
+
 ### Qwen3.5-35B-A3B's head
 
 The 35B ([offload.md](offload.md): fp4 layers, the experts streamed into slots, the int8 head)
