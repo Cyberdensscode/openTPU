@@ -789,6 +789,9 @@ def _main(argv=None) -> int:
     tok = transformers.AutoTokenizer.from_pretrained(path)
 
     def encode(p):
+        if not a.chat and _gemma4(spec):        # after <bos> (an instruct tokenizer adds none)
+            from opentpu.llm import gemma4 as G4
+            return G4.text_ids(tok, p, spec.bos)
         if not a.chat:
             return tok(p).input_ids
         ids = tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True,

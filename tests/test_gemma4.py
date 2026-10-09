@@ -1,7 +1,8 @@
 """Gemma 4 on openTPU: sliding and global attention with a KV ring and shared KV layers, GeGLU,
 per-layer embeddings gathered on the device, against Hugging Face transformers. A tiny random
 model always runs; the real model's programs are compiled when its config is in
-models/gemma-4-E2B."""
+models/gemma-4-E2B-it (MODELS' gemma4: the instruct checkpoint, the base one's config but its
+stop ids)."""
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -13,14 +14,15 @@ from opentpu.compiler import CompileError
 from opentpu.isasim import board_config
 from opentpu.kernels import gather as GA
 from opentpu.llm import gemma4 as G
+from opentpu.llm import model_dir
 from opentpu.llm.qwen3 import Engine
 
 torch = pytest.importorskip("torch")
 transformers = pytest.importorskip("transformers")
 pytest.importorskip("transformers.models.gemma4")
 
-REAL = Path(__file__).resolve().parent.parent / "models" / "gemma-4-E2B"
-REAL_E4B = REAL.parent / "gemma-4-E4B"
+REAL = model_dir("gemma4")
+REAL_E4B = model_dir("gemma4-e4b")
 # (two own sliding layers and a global one) x 2, a shared sliding one and two shared globals
 # (HF forces the last layer global): layers 6..8 read layer 4's (sliding) and 5's (global) K / V.
 # The layer loops: (s s f) x 2 with the two sliding layers a loop inside, s, then f x 2
@@ -79,6 +81,34 @@ def test_spec_kv_sources(tiny):
     img = spec.image(_cfg(), 1024)
     assert [(f, len(u), r) for f, u, r in img.runs] == [(0, 3, 2), (6, 1, 1), (7, 1, 2)]
     assert [(e0, len(su), r) for e0, su, r, _ in img.subs[0]] == [(0, 1, 2), (2, 1, 1)]
+
+
+def test_instruct_checkpoint_settings(tmp_path):
+    """The instruct checkpoints (gemma-4-*-it) beside the base ones: the stop ids are <eos>,
+    <turn|> and the generation config's (the instruct ones' <|tool_response>, 50, as Hugging
+    Face's generate stops; the config's top level lists [1, 106], its text_config 1); otpu-chat
+    samples with their generation_config.json, which is chat.SAMPLING's gemma4; plain text goes
+    after <bos>, which their tokenizer does not add (text_ids)."""
+    import types
+
+    from opentpu.host.chat import SAMPLING, sampling
+    _model(tmp_path)
+    top = json.loads((tmp_path / "config.json").read_text())
+    (tmp_path / "config.json").write_text(json.dumps({"text_config": top, "eos_token_id": [1, 106],
+                                                      "model_type": "gemma4"}))
+    assert G.Spec.from_hf(tmp_path).eos == (1, 106)            # (the base checkpoints')
+    gen = dict(bos_token_id=2, do_sample=True, eos_token_id=[1, 106, 50], pad_token_id=0,
+               temperature=1.0, top_k=64, top_p=0.95)          # gemma-4-E2B-it's
+    (tmp_path / "generation_config.json").write_text(json.dumps(gen))
+    spec = G.Spec.from_hf(tmp_path)
+    assert spec.eos == (1, 106, 50)
+    none = types.SimpleNamespace(temperature=None, top_k=None, top_p=None,
+                                 repetition_penalty=None)
+    assert sampling(spec, none, tmp_path) == SAMPLING["gemma4"]
+
+    def tok(bos):
+        return lambda text: {"input_ids": [2] * bos + [ord(c) for c in text]}
+    assert G.text_ids(tok(False), "ab") == G.text_ids(tok(True), "ab") == [2, 97, 98]
 
 
 def test_reference_matches_hf(tiny):
@@ -648,7 +678,7 @@ def test_formats_scan(tiny, tmp_path, monkeypatch):
     assert FS._g4_spans(e2b) == [(0, 9), (10, 14), (15, 24), (25, 34)]
 
 
-@pytest.mark.skipif(not (REAL / "config.json").exists(), reason="no models/gemma-4-E2B")
+@pytest.mark.skipif(not (REAL / "config.json").exists(), reason=f"no models/{REAL.name}")
 def test_real_model_programs_fit():
     """Gemma 4 E2B on the board: fp4 layers, int8 LM head and PLE fit 4 GiB at 4096 tokens;
     the resident decode programs fit IMEM and take 6 argument words. Its recommended mix too."""
@@ -672,7 +702,8 @@ def test_real_model_programs_fit():
     assert 8 * len(progs[0]) <= board_config().IMEM_WORDS
 
 
-@pytest.mark.skipif(not (REAL_E4B / "config.json").exists(), reason="no models/gemma-4-E4B")
+@pytest.mark.skipif(not (REAL_E4B / "config.json").exists(),
+                    reason=f"no models/{REAL_E4B.name}")
 def test_e4b_programs_fit():
     """Gemma 4 E4B on the board: with fp4 layers and the int8 head its PLE table does not fit
     beside them in either format, so the image keeps it on the host (int8 records) and fits

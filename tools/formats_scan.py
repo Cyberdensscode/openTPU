@@ -351,10 +351,14 @@ def weight_bytes(shapes: dict, fmt, D: int = 128) -> int:
 
 
 def text_ids(path, n: int) -> list:
-    """The first n tokens of docs/isa.md, as tools/quant_eval.py reads it."""
+    """The first n tokens of docs/isa.md, as tools/quant_eval.py reads it (Gemma 4: after <bos>,
+    which an instruct checkpoint's tokenizer does not add)."""
     import transformers
     tok = transformers.AutoTokenizer.from_pretrained(path)
-    ids = tok(re.sub(r"`|\|", "", (ROOT / "docs/isa.md").read_text())).input_ids[:n]
+    text = re.sub(r"`|\|", "", (ROOT / "docs/isa.md").read_text())
+    spec = load_spec(path)
+    ids = (G.text_ids(tok, text, spec.bos) if isinstance(spec, G.Spec) else
+           tok(text).input_ids)[:n]
     if len(ids) < n:
         raise ValueError(f"docs/isa.md has {len(ids)} tokens, {n} asked")
     return ids
