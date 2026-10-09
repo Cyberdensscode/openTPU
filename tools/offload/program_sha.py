@@ -3,8 +3,9 @@ weights): two trees give the same programs when every line matches (docs/offload
 
     python3 tools/offload/program_sha.py CFGDIR [--cfg card.pkl]
 
-CFGDIR holds a directory per model with its config.json: gemma-4-E2B, gemma-4-E4B,
-LFM2.5-8B-A1B, Qwen3.5-35B-A3B, gemma-4-26B-A4B (a missing one is skipped). --cfg: the card's
+CFGDIR holds a directory per model with its config.json: gemma-4-E2B-it, gemma-4-E4B-it,
+LFM2.5-8B-A1B, Qwen3.5-35B-A3B, gemma-4-26B-A4B-it (a missing one is skipped; Gemma's base
+checkpoints, gemma-4-E2B, ..., where the -it one is missing: the same programs). --cfg: the card's
 configuration (tools/qual/refs.py cfg: PAIR, DSTEP and STREAM on), else isasim.board_config(),
 which has them off, so a change behind those flags (moe-pair's paired experts) shows only with
 --cfg. Per model: decode and generate at buckets 1-3 (the 26B's 1 and 16; its generate in two
@@ -64,11 +65,14 @@ def main():
     C = Path(a.cfgdir)
     cfg = pickle.load(open(a.cfg, "rb")) if a.cfg else board_config()
     have = lambda m: (C / m / "config.json").exists()    # noqa: E731
-    if have("gemma-4-E2B"):
-        s = load_spec(C / "gemma-4-E2B")
+
+    def gemma(m):                       # the instruct checkpoint's directory, else the base's
+        return next((d for d in (m + "-it", m) if have(d)), None)
+    if gemma("gemma-4-E2B"):
+        s = load_spec(C / gemma("gemma-4-E2B"))
         progs("E2B fp4/int8 4096 rows 8", s.image(cfg, 4096, 1, 8, "fp4", "int8", lookup=True))
-    if have("gemma-4-E4B"):
-        s = load_spec(C / "gemma-4-E4B")
+    if gemma("gemma-4-E4B"):
+        s = load_spec(C / gemma("gemma-4-E4B"))
         progs("E4B fp4/int8 2048 rows 8", s.image(cfg, 2048, 1, 8, "fp4", "int8", lookup=True))
     if have("LFM2.5-8B-A1B"):
         s = load_spec(C / "LFM2.5-8B-A1B")
@@ -80,8 +84,8 @@ def main():
             progs(f"Qwen3.5-35B-A3B fp4/int8 1024 rows 1 x32{name}",
                   s.image(cfg, 1024, 1, 1, "fp4", "int8", lookup=True, experts=32, **kw),
                   s.conv_k - 1)
-    if have("gemma-4-26B-A4B"):
-        s = load_spec(C / "gemma-4-26B-A4B")
+    if gemma("gemma-4-26B-A4B"):
+        s = load_spec(C / gemma("gemma-4-26B-A4B"))
         progs("gemma-4-26B-A4B fp4/int8 4096 rows 1 x22",
               s.image(cfg, 4096, 1, 1, "fp4", "int8", lookup=True, experts=22), buckets=(1, 16))
         os.environ["OTPU_FORMATS"] = "experts=fp4"      # the card's: int8 layers, fp4 experts, head
