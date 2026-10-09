@@ -440,12 +440,16 @@ def _g4_args(spec, v, cap: int = G4CAP) -> tuple:
 @functools.lru_cache(maxsize=None)
 def _g4_ple(spec, v, cap: int) -> tuple:
     """The PLE table's (format, on the host) in variant v's image (a layout, no weights;
-    OTPU_PLE_HOST=1: int8 on the host); ("none", False) without per-layer embeddings."""
+    OTPU_PLE_HOST=1: int8 on the host); ("none", False) without per-layer embeddings. The
+    image is laid out in unbounded DRAM (its PLE choice is by the card's 4 GiB), so a
+    reference that does not fit the card has one too (E4B's int8: the table on the host)."""
+    from dataclasses import replace
+
     from opentpu.isasim import board_config
     if not spec.ple_dim:
         return "none", False
-    img = spec.image(board_config(), cap, 1, Q3.PREFILL_ROWS, v[1], v[2], lookup=True,
-                     formats=v[0])
+    img = spec.image(replace(board_config(), DRAM_BYTES=1 << 40), cap, 1, Q3.PREFILL_ROWS, v[1],
+                     v[2], lookup=True, formats=v[0])
     return img.ple_format, img.ple_host
 
 

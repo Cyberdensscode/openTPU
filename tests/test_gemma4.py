@@ -762,6 +762,18 @@ def test_real_model_programs_fit():
 
 @pytest.mark.skipif(not (REAL_E4B / "config.json").exists(),
                     reason=f"no models/{REAL_E4B.name}")
+def test_formats_scan_e4b_tables():
+    """formats_scan's PLE table per variant on E4B (a layout): int8, the reference, does not
+    fit the card (4.56 GiB) and is measured with the table on the host, as the image places
+    it (it stopped at 'model image needs 4675 MiB per slice'); the default's 4 GiB mix too."""
+    FS = _tool("formats_scan")
+    spec = G.Spec.from_hf(REAL_E4B)
+    assert FS._g4_ple(spec, ("", "int8", None), 2048) == ("int8", True)
+    assert FS._g4_ple(spec, ("head=fp4,down@0-23=fp4", "int8", None), 2048) == ("int8", True)
+
+
+@pytest.mark.skipif(not (REAL_E4B / "config.json").exists(),
+                    reason=f"no models/{REAL_E4B.name}")
 def test_e4b_programs_fit():
     """Gemma 4 E4B on the board: with fp4 layers and the int8 head its PLE table does not fit
     beside them in either format, so the image keeps it on the host (int8 records) and fits
