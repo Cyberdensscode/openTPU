@@ -303,6 +303,21 @@ rollback past it goes through the snapshot), each turn's logits against a fresh 
 whole rendering, bit for bit; `test_gemma4_instruct_templates`, with the real tokenizers and
 templates, the point each turn goes back to.
 
+On the real E2B-it (ISA simulator, the card's configuration, int8, cap 1024, 2026-10-09),
+`tools/qual/chatkv.py --turns 3 --max-new 8`: stateful (device snapshots, 15.8 MiB), each turn
+continued the context (reused 28 and 52 positions: all the device held), with logits and
+replies equal to a restart's; 60 tokens fed in 17 runs against a restart's 140 in 37.
+
+**Replies.** otpu-chat on the ISA simulator (the card's configuration, greedy), "What is the
+capital of France? Answer in one sentence.":
+
+- E2B-it (the mix, int8 head), thinking off: "The capital of France is Paris." (7 tokens, then
+  `<turn|>`).
+- E2B-it, `--think`: `<|channel>thought` and five numbered steps ("1. **Analyze the Request:**
+  The user is asking for the capital of France and requires the answer to be in one
+  sentence. ..."), `<channel|>`, then "The capital of France is Paris." (120 tokens).
+- E4B-it (int8 with `down@0-23=fp4`, fp4 head): "The capital of France is Paris."
+
 **validate.py** (ISA simulator, the eight default prompts, 16 tokens each, 2026-10-09, tree
 aa2166b1; KL in nats per token):
 
