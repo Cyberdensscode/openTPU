@@ -1,17 +1,24 @@
 """Card check of a chat's KV cache across turns (docs/host.md, "The KV cache across turns"): a
 scripted conversation through otpu-chat's Chat on --backend board, greedy, each turn rolled
-back to where its rendering parts from what the device holds (Engine.rollback; Qwen3.5, LFM2:
-from the snapshot of their state each turn takes at its reply's start, copied on the device)
-and fed the rest; then each turn's rendering again from position 0, as the chat fed it before
-(the restart), whose logits must equal the turn's first logits bit for bit (int8 weights: any
-split of a prompt into runs gives the same rows), and whose greedy reply the turn's. Per turn:
-the rendering's tokens, the tokens reused and fed, the prefill's runs, device Mcycles and wall
-seconds against the restart's, the snapshot's and the restore's device cycles (the ISA
-simulator counts no cycles: tokens and runs). --mtp: the turns' prefill is MTP's (its rows and
+back to where its rendering parts from what the device holds (Engine.rollback; Qwen3.5, LFM2,
+Gemma 4 past its rings' slack: from the snapshot of their state each turn takes at its reply's
+start, copied on the device) and fed the rest; then each turn's rendering again from position
+0, as the chat fed it before (the restart), whose logits must equal the turn's first logits bit
+for bit (int8 weights: any split of a prompt into runs gives the same rows), and whose greedy
+reply the turn's. Per turn: the rendering's tokens, the tokens reused and fed, the prefill's
+runs, where a restore took the context (restored at), device Mcycles and wall seconds against
+the restart's, the snapshot's and the restore's device cycles (the ISA simulator counts no
+cycles: tokens and runs). --mtp: the turns' prefill is MTP's (its rows and
 the MTP layer's runs), the restart a plain prefill of the rows.
 
     otpu-lock -- python3 tools/qual/chatkv.py --model qwen35 [--mtp] [--dev /dev/xdma0]
+    otpu-lock -- python3 tools/qual/chatkv.py --model gemma4 --think --max-new 300 --turns 3
     python3 tools/qual/chatkv.py --model qwen3 --backend isa --turns 3 --max-new 8   (dry run)
+
+Gemma 4 E2B-it (int8 layers, the fp4 PLE table) continues each turn's context thinking off; with
+--think the template drops a reply's thinking channel (a reply cut at --max-new, its channel
+open, entirely), so the turn rolls back to the reply's start, through the snapshot (restored)
+once that is more than its rings' slack (257) back.
 
 Prints one line per turn and "CHATKV PASS" (exit 0) or "CHATKV FAIL" (exit 1)."""
 from __future__ import annotations
@@ -133,9 +140,11 @@ def main(argv=None) -> int:
         runs = rec[-1][1] - k0 if not chat.use_mtp else None
         turns.append(dict(ids=ids, t=t, logits=rec[-1][0], reply=list(chat._reply), ops=ops,
                           runs=runs))
+        back = [s["pos"] for s in eng.snap_stats[s0:] if s["op"] == "restore"]
         print(f"turn {len(turns)}: {len(ids)} tokens, reused {t.reused}, fed {t.prefill_tokens}"
               f"{'' if runs is None else f' in {runs} runs'}"
-              f"{' (restarted)' if t.restarted else ''}; prefill {t.prefill_s:.3f} s"
+              f"{' (restarted)' if t.restarted else ''}"
+              f"{f' (restored at {back[0]})' if back else ''}; prefill {t.prefill_s:.3f} s"
               f"{_mc(t.prefill_cycles, cyc_on)}, TTFT {t.ttft_s or 0:.3f} s; "
               + (f"snapshot {ops['snapshot'] / 1e6:.2f} restore {ops['restore'] / 1e6:.2f} "
                  f"Mcycles; " if cyc_on else "")
