@@ -131,6 +131,29 @@ def test_tiny_matches_hf_and_emulation(tiny):
     assert _cos(dev[:12], emu).min() > 0.99
 
 
+def test_otpu_chat_on_the_isa_simulator(tmp_path, monkeypatch, capfd):
+    """otpu-chat --backend isa (the default) on a Gemma 4 checkpoint (saved by Hugging Face, a
+    word-level tokenizer and a chat template): the simulators' default configuration is the
+    design's two slices, onto which Gemma 4 (one KV head) does not map (Image refused it: "one
+    slice"), so the chat runs in the card's configuration (board.sim_config); a one-shot reply."""
+    from tokenizers import Tokenizer, models, pre_tokenizers
+
+    from opentpu.host import chat as C
+    m, _, _ = _model(tmp_path)
+    m.save_pretrained(tmp_path)
+    tk = Tokenizer(models.WordLevel({f"t{i}": i for i in range(1000)}, unk_token="t0"))
+    tk.pre_tokenizer = pre_tokenizers.Whitespace()
+    transformers.PreTrainedTokenizerFast(tokenizer_object=tk).save_pretrained(tmp_path)
+    (tmp_path / "chat_template.jinja").write_text("{% for m in messages %}{{ m.content }} "
+                                                  "{% endfor %}")
+    monkeypatch.setenv("OTPU_IMG_CACHE", "0")
+    capfd.readouterr()
+    C.main(["--model", str(tmp_path), "--prompt", "t5 t6 t7", "--greedy", "--max-new", "3",
+            "--cap", "1024", "--no-prog-cache"])
+    out = capfd.readouterr().out
+    assert "weights: int8, head int8" in out and "prefill 3 tokens" in out and "decode" in out
+
+
 def test_host_sampler_caps_as_hf(tiny):
     """The host's sampler (otpu-chat's picks off the card, its first token on the card) with the
     model's softcap samples Hugging Face's distribution: Gemma4ForCausalLM caps the logits

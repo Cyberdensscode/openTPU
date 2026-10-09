@@ -887,6 +887,17 @@ def make_backend(name: str, spec, cap: int, dev: str, model: str | None = None,
     raise SystemExit(f"unknown backend {name}")
 
 
+def _maps_on_design(spec) -> bool:
+    """The model maps onto the design's configuration (two slices), the simulators' default; a
+    model that takes one slice (Gemma 4: one KV head) runs in the card's instead."""
+    from opentpu.isasim import design_config
+    try:
+        spec.check(design_config())
+    except ValueError:
+        return False
+    return True
+
+
 def weights_label(image, wformat: str) -> str:
     """An image's weight formats in words, as otpu-chat and otpu-smi show them: "mix: int8 +
     gateup@9-35=fp4, head int8" (wformat the choice before formats.named: "mix" names it)."""
@@ -1032,6 +1043,11 @@ def main(argv=None):
         raise SystemExit(f"otpu-chat: {e}") from None
     if a.mtp and (not hasattr(spec, "mtp") or a.per_position):
         raise SystemExit("otpu-chat: --mtp takes a Qwen3.5 model and resident decode")
+    if cfg is None and not streams and not a.mtp and not _maps_on_design(spec):
+        from opentpu.host.board import sim_config     # Gemma 4 (one KV head): the card's
+        from opentpu.isasim import board_config
+        cfg = sim_config(spec, a.cap, board_config(PAIR=True, DSTEP=True, STREAM=True),
+                         lookup=not a.per_position, wformat=wformat, head_format=a.head_format)
     if a.mtp and cfg is None:   # the simulators' default is the design's (two slices): the
         from dataclasses import replace     # card's one-slice configuration instead
 
