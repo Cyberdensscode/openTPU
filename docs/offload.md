@@ -3876,8 +3876,15 @@ On the card (opentpu, build 1025907f, 2026-10-08), LFM2.5-8B-A1B against that re
 rollback: turn 2 reused 36 positions). Turn 1: 21 prompt tokens in 2.16 s (device 13.8 tok/s),
 76 misses, TTFT 2.16 s, decode 13.2 tok/s (device 15.0), 98.7% hits, 6.6 MB a token. Turn 2:
 TTFT 1.43 s, decode 15.2 tok/s (device 15.4), 99.85% hits, 0.78 MB a token. Loading took 186 s
-on 936f8a5f (the image's matrices quantized on one core) and 24 s on 171a1b50 (in workers). The
-35B's and the 26B's chats have not run on the card yet.
+on 936f8a5f (the image's matrices quantized on one core) and 24 s on 171a1b50 (in workers).
+
+Qwen3.5-35B-A3B on the card (tree 171a1b50; its reference from the ISA simulator on 24a7e3f8,
+omarchy): [PASS], both turns' tokens the same. 1720 slots (17% of the 10240 experts), the prompt
+layer by layer (R = 2), the pool 15.2 of 17.1 GB in the page cache after its read. Turn 1: 24
+prompt tokens in 6.53 s (device 4.38 tok/s), 3301 misses, TTFT 6.53 s, 7 tokens to the EOS at
+4.13 tok/s (device 4.39), 60.3% hits, 212 MB a token. Turn 2: 31 tokens fed (20 reused) in
+5.25 s, TTFT 5.25 s, decode 4.55 tok/s (device 4.56), 62.4% hits, 201 MB a token. Loading took
+192 s (10.4's 9 minutes before the parallel build). The 26B's chat has not run on the card yet.
 
 ### 14.6 Tests
 
