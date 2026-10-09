@@ -31,7 +31,8 @@ MIXES: dict = {
     ("qwen3_5_text", 32, 2560, 248320): "delta=fp4,mlp=fp4",    # Qwen3.5-4B
     ("smollm3", 36, 2048, 128256): "gateup@9-35=fp4",           # SmolLM3-3B
     ("lfm2", 30, 2048, 65536): "conv=fp4,mlp=fp4",              # LFM2-2.6B
-    ("gemma4_text", 35, 1536, 262144): "attn@15-24=fp4,mlp@15-34=fp4",  # Gemma 4 E2B
+    # Gemma 4 E2B: none. Its base checkpoint's mix (attn@15-24=fp4,mlp@15-34=fp4) fails on
+    # gemma-4-E2B-it, the chat's, as every other mix (the same config: one entry for both)
 }
 
 

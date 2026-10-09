@@ -1,7 +1,8 @@
 """Gemma 4 on openTPU: sliding and global attention with a KV ring and shared KV layers, GeGLU,
 per-layer embeddings gathered on the device, against Hugging Face transformers. A tiny random
 model always runs; the real model's programs are compiled when its config is in
-models/gemma-4-E2B."""
+models/gemma-4-E2B-it (MODELS' gemma4: the instruct checkpoint, the base one's config but its
+stop ids)."""
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -12,15 +13,18 @@ import pytest
 from opentpu.compiler import CompileError
 from opentpu.isasim import board_config
 from opentpu.kernels import gather as GA
+from opentpu.llm import formats as FM
 from opentpu.llm import gemma4 as G
+from opentpu.llm import generate as GN
+from opentpu.llm import model_dir
 from opentpu.llm.qwen3 import Engine
 
 torch = pytest.importorskip("torch")
 transformers = pytest.importorskip("transformers")
 pytest.importorskip("transformers.models.gemma4")
 
-REAL = Path(__file__).resolve().parent.parent / "models" / "gemma-4-E2B"
-REAL_E4B = REAL.parent / "gemma-4-E4B"
+REAL = model_dir("gemma4")
+REAL_E4B = model_dir("gemma4-e4b")
 # (two own sliding layers and a global one) x 2, a shared sliding one and two shared globals
 # (HF forces the last layer global): layers 6..8 read layer 4's (sliding) and 5's (global) K / V.
 # The layer loops: (s s f) x 2 with the two sliding layers a loop inside, s, then f x 2
@@ -81,6 +85,34 @@ def test_spec_kv_sources(tiny):
     assert [(e0, len(su), r) for e0, su, r, _ in img.subs[0]] == [(0, 1, 2), (2, 1, 1)]
 
 
+def test_instruct_checkpoint_settings(tmp_path):
+    """The instruct checkpoints (gemma-4-*-it) beside the base ones: the stop ids are <eos>,
+    <turn|> and the generation config's (the instruct ones' <|tool_response>, 50, as Hugging
+    Face's generate stops; the config's top level lists [1, 106], its text_config 1); otpu-chat
+    samples with their generation_config.json, which is chat.SAMPLING's gemma4; plain text goes
+    after <bos>, which their tokenizer does not add (text_ids)."""
+    import types
+
+    from opentpu.host.chat import SAMPLING, sampling
+    _model(tmp_path)
+    top = json.loads((tmp_path / "config.json").read_text())
+    (tmp_path / "config.json").write_text(json.dumps({"text_config": top, "eos_token_id": [1, 106],
+                                                      "model_type": "gemma4"}))
+    assert G.Spec.from_hf(tmp_path).eos == (1, 106)            # (the base checkpoints')
+    gen = dict(bos_token_id=2, do_sample=True, eos_token_id=[1, 106, 50], pad_token_id=0,
+               temperature=1.0, top_k=64, top_p=0.95)          # gemma-4-E2B-it's
+    (tmp_path / "generation_config.json").write_text(json.dumps(gen))
+    spec = G.Spec.from_hf(tmp_path)
+    assert spec.eos == (1, 106, 50)
+    none = types.SimpleNamespace(temperature=None, top_k=None, top_p=None,
+                                 repetition_penalty=None)
+    assert sampling(spec, none, tmp_path) == SAMPLING["gemma4"]
+
+    def tok(bos):
+        return lambda text: {"input_ids": [2] * bos + [ord(c) for c in text]}
+    assert G.text_ids(tok(False), "ab") == G.text_ids(tok(True), "ab") == [2, 97, 98]
+
+
 def test_reference_matches_hf(tiny):
     m, W, spec = tiny
     toks = [int(t) for t in np.random.default_rng(0).integers(0, 1000, 32)]
@@ -99,6 +131,39 @@ def test_tiny_matches_hf_and_emulation(tiny):
     assert _cos(dev, hf).min() > 0.985          # int8 noise of a random model (emulation 0.991)
     emu = G.softcap(spec, G.emulated_logits(spec, W, toks[:12]))
     assert _cos(dev[:12], emu).min() > 0.99
+
+
+def checkpoint(d: Path, **kw) -> Path:
+    """The tiny model (_model) saved by Hugging Face in d, with a word-level tokenizer ("t17" is
+    token 17) and a chat template (the messages' text one after another)."""
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    d.mkdir(parents=True, exist_ok=True)
+    m, _, _ = _model(d, **kw)
+    m.save_pretrained(d)
+    tk = Tokenizer(models.WordLevel({f"t{i}": i for i in range(1000)}, unk_token="t0"))
+    tk.pre_tokenizer = pre_tokenizers.Whitespace()
+    transformers.PreTrainedTokenizerFast(tokenizer_object=tk).save_pretrained(d)
+    (d / "chat_template.jinja").write_text("{% for m in messages %}{{ m.content }} {% endfor %}")
+    return d
+
+
+def test_otpu_chat_on_the_isa_simulator(tmp_path, monkeypatch, capfd):
+    """otpu-chat --backend isa (the default) on a Gemma 4 checkpoint (checkpoint()): the
+    simulators' default configuration is the design's two slices, onto which Gemma 4 (one KV
+    head) does not map (Image refused it: "one slice"), so the chat runs in the card's
+    configuration (board.sim_config); a one-shot reply."""
+    import sys
+
+    from opentpu.host import chat as C
+    checkpoint(tmp_path)
+    monkeypatch.setenv("OTPU_IMG_CACHE", "0")
+    plain = C.Chat.ask_plain                    # (its stream: sys.stdout when it is called)
+    monkeypatch.setattr(C.Chat, "ask_plain", lambda self, text: plain(self, text, sys.stdout))
+    capfd.readouterr()
+    C.main(["--model", str(tmp_path), "--prompt", "t5 t6 t7", "--greedy", "--max-new", "3",
+            "--cap", "1024", "--no-prog-cache"])
+    out = capfd.readouterr().out
+    assert "weights: int8, head int8" in out and "prefill 3 tokens" in out and "decode" in out
 
 
 def test_host_sampler_caps_as_hf(tiny):
@@ -214,12 +279,13 @@ def test_per_layer_formats(tiny):
 
 def test_formats_by_fit(tiny, monkeypatch):
     """The formats follow the fit (Spec.fit_formats, docs/gemma4_e4b.md): an int8 image that
-    fits the card beside no PLE choice takes the head and the own-KV layers' down projections
-    in fp4 (one loop's format, so no extra loop); an image that fits, or not int8, is as asked.
+    fits the card beside no PLE choice takes the head and the gate / up projections of the first
+    half of the own-KV layers in fp4 (a third loop: E4B-it's pick, docs/formats.md); an image
+    that fits, or not int8, is as asked.
     The Engine's compile worker gets the choices (Engine._image_kw): its image is the same
     without choosing again."""
     _, W, spec = tiny
-    assert spec.fit_formats == "head=fp4,down@0-5=fp4"
+    assert spec.fit_formats == "head=fp4,gateup@0-2=fp4"
     monkeypatch.delenv("OTPU_FORMATS", raising=False)
     big = spec.image(_cfg(), 1024, ple_host=True, formats="")
     mix = spec.image(_cfg(), 1024, ple_host=True, formats=spec.fit_formats)
@@ -227,8 +293,9 @@ def test_formats_by_fit(tiny, monkeypatch):
     monkeypatch.setattr(G, "CARD_BYTES", (big.nbytes + mix.nbytes) // 2)
     img = spec.image(_cfg(), 1024)
     assert img.formats == spec.fit_formats and img.head_format == "fp4" and img.ple_host
-    assert img.lf[5] == ("int8", "int8", "fp4", "int8") and img.lf[6] == ("int8",) * 4
-    assert img.nbytes == mix.nbytes and img.runs == mix.runs and len(img.runs) == len(big.runs)
+    assert img.lf[2] == ("int8", "fp4", "int8", "int8") and img.lf[3] == ("int8",) * 4
+    assert img.nbytes == mix.nbytes and img.runs == mix.runs
+    assert len(img.runs) > len(big.runs)            # the own-KV layers' loop splits
     assert spec.image(_cfg(), 1024, wformat="fp4").formats == ""
     eng = Engine(spec, W, cap=1024, cfg=_cfg())
     kw = eng._image_kw
@@ -594,6 +661,23 @@ def _tool(name):
     return mod
 
 
+def test_formats_scan_text(tmp_path):
+    """formats_scan's text: docs/isa.md after <bos> for Gemma 4 (checkpoint()'s tokenizer adds
+    none, as the instruct checkpoints'), or --ids' token ids (a list, or tools/chat_text.py's
+    object), refused when shorter than the tokens asked."""
+    import json
+    FS = _tool("formats_scan")
+    d = checkpoint(tmp_path / "g")
+    ids = FS.text_ids(d, 50)
+    assert len(ids) == 50 and ids[0] == 2 and 2 not in ids[1:]
+    (tmp_path / "l.json").write_text(json.dumps(list(range(40))))
+    (tmp_path / "o.json").write_text(json.dumps({"model": "m", "ids": list(range(40))}))
+    assert FS.text_ids(d, 30, tmp_path / "l.json") == FS.text_ids(d, 30, tmp_path / "o.json") \
+        == list(range(30))
+    with pytest.raises(ValueError, match="40 tokens, 41 asked"):
+        FS.text_ids(d, 41, tmp_path / "l.json")
+
+
 def test_formats_scan(tiny, tmp_path, monkeypatch):
     """tools/formats_scan.py's Gemma 4 rows (gemma4_quant_eval.emulate's head inputs, then one
     pass over the soft-capped head in chunks): each variant's NLL, argmax and KL divergence
@@ -648,10 +732,12 @@ def test_formats_scan(tiny, tmp_path, monkeypatch):
     assert FS._g4_spans(e2b) == [(0, 9), (10, 14), (15, 24), (25, 34)]
 
 
-@pytest.mark.skipif(not (REAL / "config.json").exists(), reason="no models/gemma-4-E2B")
+@pytest.mark.skipif(not (REAL / "config.json").exists(), reason=f"no models/{REAL.name}")
 def test_real_model_programs_fit():
     """Gemma 4 E2B on the board: fp4 layers, int8 LM head and PLE fit 4 GiB at 4096 tokens;
-    the resident decode programs fit IMEM and take 6 argument words. Its recommended mix too."""
+    the resident decode programs fit IMEM and take 6 argument words. No recommended mix (every
+    mix fails on the instruct checkpoint: docs/formats.md), so otpu-chat's auto is int8, which
+    fits with the fp4 PLE table; the base's mix fits too."""
     spec = G.Spec.from_hf(REAL)
     img = spec.image(board_config(), 4096, 1, 8, "fp4", "int8", lookup=True)
     assert img.ple_format == "int8" and img.nbytes < 1 << 32
@@ -662,22 +748,44 @@ def test_real_model_programs_fit():
         assert len(ra) == 6
     with pytest.raises(CompileError, match="TMEM"):
         img.compile_rows([(0, p) for p in range(8)], [7])
-    # the recommended mix (docs/formats.md): the shared layers' MLP and layers 15-24's attention
-    # in fp4, the int8 PLE table on the card beside them; three runs (the splits at 15 and 25)
-    mix = spec.image(board_config(), 4096, 1, 8, "mix", lookup=True)
-    assert spec.mix == "attn@15-24=fp4,mlp@15-34=fp4" and mix.formats == spec.mix
+    assert spec.mix == "" and FM.auto(spec, "auto") == "int8"
+    with pytest.raises(ValueError, match="no recommended mix"):
+        spec.image(board_config(), 4096, 1, 8, "mix", lookup=True)
+    i8 = spec.image(board_config(), 2048, 1, 8, "int8", "int8", lookup=True)
+    assert (i8.ple_format, i8.ple_host, len(i8.runs)) == ("fp4", False, 2) and i8.nbytes < 1 << 32
+    # the base's mix (docs/formats.md): the shared layers' MLP and layers 15-24's attention in
+    # fp4, the int8 PLE table on the card beside them; three runs (the splits at 15 and 25)
+    mix = spec.image(board_config(), 4096, 1, 8, "int8", formats="attn@15-24=fp4,mlp@15-34=fp4",
+                     lookup=True)
     assert (mix.ple_format, mix.ple_host, mix.head_format) == ("int8", False, "int8")
     assert len(img.runs) == 2 and len(mix.runs) == 3 and mix.nbytes < 1 << 32
     progs, _ = mix.compile_decode(16, 15 * 256)
     assert 8 * len(progs[0]) <= board_config().IMEM_WORDS
 
 
-@pytest.mark.skipif(not (REAL_E4B / "config.json").exists(), reason="no models/gemma-4-E4B")
+@pytest.mark.skipif(not (REAL_E4B / "config.json").exists(),
+                    reason=f"no models/{REAL_E4B.name}")
+def test_formats_scan_e4b_tables():
+    """formats_scan's PLE table per variant on E4B (a layout): int8, the reference, does not
+    fit the card (4.56 GiB) and is measured with the table on the host, as the image places
+    it (it stopped at 'model image needs 4675 MiB per slice'); the default's 4 GiB mix too."""
+    FS = _tool("formats_scan")
+    spec = G.Spec.from_hf(REAL_E4B)
+    assert FS._g4_ple(spec, ("", "int8", None), 2048) == ("int8", True)
+    assert FS._g4_ple(spec, (spec.fit_formats, "int8", None), 2048) == ("int8", True)
+
+
+@pytest.mark.skipif(not (REAL_E4B / "config.json").exists(),
+                    reason=f"no models/{REAL_E4B.name}")
 def test_e4b_programs_fit():
     """Gemma 4 E4B on the board: with fp4 layers and the int8 head its PLE table does not fit
     beside them in either format, so the image keeps it on the host (int8 records) and fits
     4 GiB at 2048 tokens; the resident decode programs fit IMEM with 5 argument words (the PLE
-    gather reads the slot, not the token's row); 4-row prefill runs fit TMEM."""
+    gather reads the slot, not the token's row); 4-row prefill runs fit TMEM. int8 layers do not
+    fit: the formats by fit, the head and gate / up 0-11 in fp4 (E4B-it's pick, three loops),
+    4 GiB at 2048 and 4096 tokens; at 2048 every bucket's decode, generate (greedy and sampled)
+    and prompt run programs fit IMEM and TMEM, the prompt runs with 2 rows (1 in the last
+    bucket, as today's route near the cap: fit_chunk)."""
     spec = G.Spec.from_hf(REAL_E4B)
     img = spec.image(board_config(), 2048, 1, 8, "fp4", "int8", lookup=True)
     assert img.ple_host and img.ple_format == "int8" and img.nbytes < 3 << 30
@@ -686,10 +794,21 @@ def test_e4b_programs_fit():
         assert 8 * len(progs[0]) <= board_config().IMEM_WORDS
         assert len(ra) == 5
     img.compile_rows([(0, r) for r in range(4)], [3], img.block, tokens=[5, 6, 7, 8])
-    # int8 layers do not fit: the formats by fit, two loops, decode and 4-row runs fit
-    mix = spec.image(board_config(), 2048, 1, 8, lookup=True)
-    assert mix.formats == "head=fp4,down@0-23=fp4" and mix.head_format == "fp4"
-    assert mix.ple_host and 3.9 * 2**30 < mix.nbytes < 1 << 32 and len(mix.runs) == 2
-    progs, ra = mix.compile_decode(8, 7 * mix.block)
-    assert 8 * len(progs[0]) <= board_config().IMEM_WORDS
-    mix.compile_rows([(0, r) for r in range(4)], [3], mix.block, tokens=[5, 6, 7, 8])
+    cfg = board_config()
+    fits = lambda progs: all(8 * len(p) <= cfg.IMEM_WORDS for p in progs)   # noqa: E731
+    mix = spec.image(cfg, 2048, 1, 8, lookup=True)
+    assert mix.formats == spec.fit_formats == "head=fp4,gateup@0-11=fp4"
+    assert mix.head_format == "fp4" and mix.lf[11][1] == "fp4" and mix.lf[12][1] == "int8"
+    assert mix.ple_host and 3.9 * 2**30 < mix.nbytes < 1 << 32 and len(mix.runs) == 3
+    assert spec.image(cfg, 4096, 1, 8, lookup=True).nbytes < 1 << 32
+    samp = GN.Sampling(1.0, 64, 0.95, 1.0)
+    for blocks in range(1, 9):
+        lo = (blocks - 1) * mix.block
+        assert fits(mix.compile_decode(blocks, lo)[0]), blocks
+        for sm in (None, samp):
+            progs = GN.compile_bucket(mix, blocks, lo, mix.block, samp=sm)
+            assert all(fits(p) for p in (progs if isinstance(progs, tuple) else (progs,)))
+        for kind in ("P", "L"):
+            assert fits(mix.compile_prompt_run(blocks, 2 if blocks < 8 else 1, kind)[0]), blocks
+    rows = [(0, r) for r in range(2)]
+    assert fits(mix.compile_rows(rows, [1], mix.block, tokens=[5, 6]))

@@ -8,12 +8,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 # short names for the checkpoints the tools know, downloaded into models/<dir>; the last three
 # are mixture-of-experts models bigger than the card's DRAM, their experts streamed from a pool
-# file (opentpu/host/streamed.py)
+# file (opentpu/host/streamed.py). Gemma 4's are the instruct checkpoints (-it): the base ones
+# (gemma-4-E2B, ...) have no chat template and continue a chat's text instead of answering
 MODELS = {"qwen3": "Qwen3-0.6B", "lfm2": "LFM2.5-230M", "qwen35": "Qwen3.5-0.8B",
           "lfm2-2.6b": "LFM2-2.6B", "smollm3": "SmolLM3-3B", "phi4-mini": "Phi-4-mini-instruct",
-          "qwen35-2b": "Qwen3.5-2B", "qwen35-4b": "Qwen3.5-4B", "gemma4": "gemma-4-E2B",
-          "lfm2-8b": "LFM2.5-8B-A1B", "qwen35-35b": "Qwen3.5-35B-A3B",
-          "gemma4-26b": "gemma-4-26B-A4B"}
+          "qwen35-2b": "Qwen3.5-2B", "qwen35-4b": "Qwen3.5-4B", "gemma4": "gemma-4-E2B-it",
+          "gemma4-e4b": "gemma-4-E4B-it", "lfm2-8b": "LFM2.5-8B-A1B",
+          "qwen35-35b": "Qwen3.5-35B-A3B", "gemma4-26b": "gemma-4-26B-A4B-it"}
 
 
 def model_dir(name) -> Path:

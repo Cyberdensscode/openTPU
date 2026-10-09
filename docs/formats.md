@@ -26,8 +26,11 @@ In short:
   16%). Qwen3.5-4B: `delta=fp4,mlp=fp4` (the attention layers int8), 56% for 5.3% (fp4: 64% for
   6.5%, on its bar). SmolLM3-3B: `gateup@9-35=fp4`, 23% for 2.1%. LFM2-2.6B:
   `conv=fp4,mlp=fp4` (the attention layers int8), 77% for 7.4% (fp4: 82% for 11.8%). Gemma 4
-  E2B: `attn@15-24=fp4,mlp@15-34=fp4` (the KV-shared layers' MLP, layers 15-24's attention),
-  30% for 2.6% against int8 with the int8 PLE table (fp4 layers: 56% for about 21%).
+  E2B-it, the chat's checkpoint: none qualifies (the closest 3.1 SE over its bar), so int8; its
+  base checkpoint's was `attn@15-24=fp4,mlp@15-34=fp4` (the KV-shared layers' MLP, layers
+  15-24's attention), 30% for 2.6% against int8 with the int8 PLE table, which on E2B-it is
+  +6.8% (fp4 layers: 56% for about 21% on the base, 17% on E2B-it). Gemma 4 E4B (int8 does
+  not fit): the head and gate / up 0-11, three loops, +0.56% against int8 on E4B-it.
   Qwen3.5-2B: none qualifies. Qwen3.5-35B-A3B's fp4 head: +1.55% for 13%, so it stays int8.
   Gemma 4 26B-A4B: all dense layers in fp4 fail (+7.9% for 56%); its ranges are not run yet.
   On the card the mixes run at the predicted speed (within 0.1%), and their images give the ISA
@@ -105,6 +108,12 @@ from int8's.
   in each quarter of the layers, and the head; pass 2 every set of whole kinds (and the head),
   and the quarter groups added in order of dKL per byte saved (the scans before Gemma 4's: of
   NLL). `ppl MODEL FORMATS... --tokens 2000`: the given strings.
+- `--ids FILE` (ppl and scan) scores another text's token ids instead (a JSON list, or an object
+  with `ids`): `tools/chat_text.py MODEL OUT.json` makes one from a chat, an instruct model's own
+  replies to 16 questions in one conversation (Hugging Face in bf16, the checkpoint's sampling,
+  seed 0), rendered by its chat template. An instruct model can be far from calibrated on prose
+  (gemma-4-E2B-it's float perplexity on docs/isa.md is 142, its base's 18.6), so its mixes are
+  scored on what a chat feeds it as well.
 
 ## The rule
 
@@ -228,7 +237,8 @@ against +11.80%).
 
 ### Gemma 4 E2B
 
-`formats_scan.py`'s Gemma 4 family runs `tools/gemma4_quant_eval.py`'s emulation a variant at a
+This section is the base checkpoint's (gemma-4-E2B, 2026-10-02); the instruct checkpoint the
+chat runs, gemma-4-E2B-it, has its own scan below, and no mix. `formats_scan.py`'s Gemma 4 family runs `tools/gemma4_quant_eval.py`'s emulation a variant at a
 time up to the head's input (its KV-shared layers read earlier layers' K / V), then one pass
 over the soft-capped head for every variant. The kinds are attn, gateup, down and ple (a
 layer's PLE gate and projection; unranged, the PLE model projection too), the groups the layers
@@ -273,7 +283,7 @@ Finals, 2000 tokens:
 Image: at 2048 tokens, of the card's 4 GiB, with the PLE table the image takes. Gain over the
 reference's 20.875 M cycles.
 
-The default is `attn@15-24=fp4,mlp@15-34=fp4`, 6.7 SE under its bar (session mix5, below): the
+The base's default was `attn@15-24=fp4,mlp@15-34=fp4`, 6.7 SE under its bar (session mix5, below): the
 KV-shared layers' MLP and the attention of layers 15-24 in fp4; the layers with their own K / V,
 the attention of layers 25-34 and every PLE weight in int8. It runs three layer runs (boundaries
 at 15 and 25; six layer bodies, resident decode 2579 instructions), and its image keeps the int8
@@ -285,6 +295,103 @@ over its bar; `mlp@15-34=fp4` alone (9.1 SE under, 2% slower) keeps the int8 tab
 about 2048 tokens (10 MiB spare) and takes the fp4 table at 4096, so it is not a default. Against
 int8 with the fp4 table the faster mixes would qualify (`attn@15-34=fp4,mlp=fp4` +4.59% for
 +48.9%); the bar is the accurate int8's, so the degraded table does not loosen it.
+
+### Gemma 4 E2B-it
+
+gemma-4-E2B-it, the instruct checkpoint otpu-chat runs since 2026-10-09, has the base's layers,
+images, bytes and speeds, so the same kinds, groups, model and bars. Its fp4 layers cost it more,
+and no mix qualifies: its default is int8 (`--wformat auto`: no MIXES entry), whose image takes
+the fp4 PLE table, 6.37 tok/s on the card (session mix4). The base's mix is +6.18% (SE 0.36) on
+docs/isa.md for a bar of 3.00 ([gemma4.md](gemma4.md), "The instruct checkpoints").
+
+**The text** is a chat of its own (`tools/chat_text.py gemma4`: its replies to 16 questions in
+one conversation, Hugging Face in bf16 with the checkpoint's sampling, seed 0, rendered by its
+template; 2637 tokens, the first 2000 scored), as on docs/isa.md the -it model is far from
+calibrated (float perplexity 142, the base's 18.6; on the chat 3.54). The reference is int8 with
+the int8 PLE table on the host, on the same tokens. The scan (`formats_scan.py scan gemma4 OUT
+--ids chat-it.json --tokens 2000`, omarchy, 2 h 19 min, tree a241e4e3) ran at the finals' length,
+so its rows are the finals; pass 2 added the groups in this order of dKL per byte: down@25-34,
+attn@25-34, gateup@25-34, gateup@0-9, gateup@15-24, down@0-9, down@15-24, gateup@10-14,
+attn@15-24, attn@0-9, down@10-14, attn@10-14, then the PLE groups.
+
+| Formats | PLE table | dKL % (SE) | Perplexity vs the reference % (SE) | MB | Gain | Bar | Margin |
+|:--|:--|--:|--:|--:|--:|--:|--:|
+| **int8** (the default) | fp4 | **+0.33 (0.11)** | -0.72 (0.59) | 2351 | -0.2% | | |
+| `attn@25-34=fp4` | fp4 | +0.62 (0.12) | -0.50 (0.66) | 2313 | +1.2% | 0.12 | -4.1 SE |
+| `down@25-34=fp4` | fp4 | +0.94 (0.15) | -0.36 (0.70) | 2257 | +3.5% | 0.35 | -3.9 SE |
+| `down@25-34=fp4,attn@25-34=fp4` | fp4 | +1.13 (0.16) | +0.04 (0.77) | 2219 | +5.1% | 0.51 | -3.9 SE |
+| `head=fp4` | fp4 | +1.33 (0.17) | +0.50 (0.71) | 2150 | +8.1% | 0.81 | -3.1 SE |
+| `gateup@25-34=fp4` | fp4 | +1.94 (0.22) | +1.47 (0.76) | 2162 | +7.6% | 0.76 | -5.3 SE |
+| `attn@25-34=fp4,mlp@25-34=fp4` | fp4 | +3.09 (0.32) | +2.61 (0.93) | 2030 | +13.8% | 1.38 | -5.3 SE |
+| the same, `gateup@0-9=fp4` | fp4 | +4.18 (0.42) | +0.38 (1.28) | 1936 | +18.7% | 1.87 | -5.5 SE |
+| `gateup=fp4` | fp4 | +6.05 (0.48) | -0.11 (1.40) | 1832 | +24.6% | 2.46 | -7.4 SE |
+| `mlp@15-34=fp4` | int8 | +6.09 (0.57) | +5.58 (1.21) | 1785 | +27.5% | 2.75 | -5.8 SE |
+| the same, `gateup@15-24=fp4` | int8 | +5.55 (0.46) | +2.30 (1.33) | 1747 | +29.9% | 2.99 | -5.5 SE |
+| `attn@15-24=fp4,mlp@15-34=fp4` (the base's) | int8 | +6.79 (0.58) | +6.76 (1.29) | 1747 | +29.9% | 2.99 | -6.5 SE |
+| `attn@15-34=fp4,mlp@15-34=fp4` | int8 | +7.00 (0.58) | +7.24 (1.30) | 1709 | +32.4% | 3.24 | -6.4 SE |
+| `mlp=fp4` | int8 | +10.03 (0.79) | +4.06 (1.69) | 1572 | +42.3% | 4.23 | -7.3 SE |
+| fp4, int8 head | int8 | +17.33 (1.19) | +12.86 (2.43) | 1413 | +56.0% | 5.60 | -9.9 SE |
+
+Each row is 3 SE or more over its bar. One kind in a quarter of the layers in fp4 costs E2B-it
+0.3 to 2.7 points beyond int8's, and the cheapest per byte, layers 25-34's down projections,
++0.94% for 3.5% (bar 0.35). The PLE kinds cost the most again (`ple=fp4` +3.95% for 0.6%). The fp4 PLE table, the base's int8 error
+(+2.42%), costs E2B-it +0.33% (0.11) here and -0.57% (0.35) on docs/isa.md. The int8 table
+does not fit beside int8 layers, so the other choice is the int8 table on the host
+(`OTPU_PLE_HOST=1`, opt-in): by the rule's measure it would win (the fp4 table on the card buys
+no speed in perf.py's loop, 6.37 against 6.39 tok/s), but it holds 2.35 GB of the host's memory,
+which the card host also gives the MoE pools' page cache, and in the card's decode loop its
+per-token row costs 0.56% ([gemma4.md](gemma4.md)). The default keeps the fp4 table on the card:
+about 3 SE of dKL, small, for no host memory and no wait. On
+docs/isa.md the base's mix is +6.18% (0.36), `mlp@15-34=fp4` +4.14% (0.36) and
+`attn@15-34=fp4,mlp@15-34=fp4` +7.15% (0.43). int8's prompt runs hold 4 rows up to bucket 6 at
+2048 tokens (3 in 7-8; the base's mix 2 from bucket 5), and its sampled card loop takes the split
+form (one program exhausts TMEM; [autodecode.md](autodecode.md)).
+
+### Gemma 4 E4B-it
+
+E4B's int8 image does not fit the card (4.56 GiB), so it has no int8 to gain over, and its
+formats are not this rule's: they follow the fit ([gemma4_e4b.md](gemma4_e4b.md)). The base
+checkpoint's rule was the most accurate mix that fits 4 GiB in two layer loops (a third splits
+the own-KV layers' loop, and its prompt runs then hold 2 rows instead of 3-4): the head and
+layers 0-23's down projections in fp4. Since 2026-10-09 the default (`Spec.fit_formats`) is
+gemma-4-E4B-it's pick, three loops: **the head and layers 0-11's gate / up projections in fp4**.
+
+On gemma-4-E4B-it (2026-10-09, omarchy, tree d26d6610): a chat of its own (`tools/chat_text.py
+gemma4-e4b`, 2694 tokens, the first 2000), `formats_scan.py ppl --ids`, dKL against int8 with
+the PLE table on the host (as E4B's images place it), every row's table on the host:
+
+| Formats (fp4, the rest int8) | Loops | MiB | dKL % (SE) | Perplexity vs int8 % (SE) | Prompt rows, buckets 1-8 |
+|:--|:-:|--:|--:|--:|:--|
+| head, down 0-23 (the base's default) | 2 | 3947 | +2.15 (0.21) | +3.17 (0.72) | 4 4 4 3 3 3 3 3 |
+| gate / up 0-23 (int8 head) | 2 | 3967 | +1.86 (0.17) | +1.84 (0.84) | 4 4 4 4 3 3 3 3 |
+| head, gate / up 0-23 | 2 | 3647 | +2.18 (0.18) | +2.18 (0.81) | 4 4 4 4 2 2 2 2 |
+| **head, gate / up 0-11** (the default) | 3 | 3947 | **+0.56 (0.07)** | +0.01 (0.51) | 2 2 2 2 2 2 2 1 |
+| head, gate / up and down 0-11 | 3 | 3797 | +0.74 (0.08) | +0.31 (0.53) | 2 2 2 2 2 2 1 1 |
+| head, gate / up 0-11, down 0-23 | 3 | 3647 | +2.32 (0.21) | +2.98 (0.80) | 2 2 2 2 2 2 1 1 |
+
+MiB: the weights a token reads (int8: 4567). Prompt rows: a prompt run's most rows that fit
+IMEM at a 2048-token capacity (the base's default's 4-row runs near position 1000 and beyond go
+over it too: [gemma4_e4b.md](gemma4_e4b.md)).
+
+The MLPs of layers 12-23 are what cost E4B-it: their gate / up or down projections in fp4 add
+about 1.6 points each. Among the two-loop mixes none beats the base's default by 2 SE (gate / up
+0-23: 1.3 SE; with the head too: 0.1 SE); the three-loop mixes that keep layers 12-23 int8 are
+7 to 8 SE better than it for the same or fewer bytes. The default takes the most accurate,
+`head=fp4,gateup@0-11=fp4`: +0.56% against +2.15%, perplexity within 0.01% of int8's, at the
+base default's bytes (3.960 GiB at 2048 tokens, 3.998 at 4096). With the down projections of
+0-11 too it would be 3.7% faster (by the E2B model's 8.04 M cycles a GB) for 0.18 points more
+(2.8 SE), and its prompt runs hold 1 row from bucket 7.
+
+**The exception and its price.** The third loop costs the prompt, not the decode: prompt runs
+of 2 rows (1 in the last bucket, the decode kernel), about half the base default's prompt rate
+(14.8 tok/s on the card at 4 rows, so about 7 tok/s: an *estimate*), and a long first prompt
+waits about twice as long for its first token. The two-loop rule was about that price; it is
+paid once per conversation, as the chat keeps its KV cache across turns ([host.md](host.md) 6)
+and a later turn feeds only its new message, while the quality is paid on every token. On the
+base checkpoint the same mix was 4% better in perplexity (1.851 against 1.928) and was not
+taken; on the instruct one it brings perplexity from +3.17% over int8 to +0.01%.
+Every bucket's decode, generate (greedy and sampled) and prompt run programs fit IMEM and TMEM
+at 2048 tokens (`test_gemma4.py`'s test_e4b_programs_fit).
 
 ### Qwen3.5-35B-A3B's head
 

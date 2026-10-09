@@ -3734,7 +3734,7 @@ every expert; the host reads the pool file and writes DRAM, nothing else.
 ```sh
 otpu-chat --backend board --model lfm2-8b       # LFM2.5-8B-A1B
 otpu-chat --backend board --model qwen35-35b    # Qwen3.5-35B-A3B
-otpu-chat --backend board --model gemma4-26b    # gemma-4-26B-A4B
+otpu-chat --backend board --model gemma4-26b    # gemma-4-26B-A4B-it
 otpu-chat --backend board --model qwen35-35b --pool /data/pools/q35.bin
 otpu-chat --backend isa --model lfm2-8b         # the ISA simulator, with the card's 4 GiB
 ```
@@ -3742,6 +3742,14 @@ otpu-chat --backend isa --model lfm2-8b         # the ISA simulator, with the ca
 The engine is moe_card's: `opentpu/host/streamed.py` builds it for both tools, with the settings
 measured best on the card. tools/offload/moe_card.py stays the tool for measurements; its options
 reach every setting.
+
+The 26B is Google's instruct checkpoint, gemma-4-26B-A4B-it, since 2026-10-09. The base
+checkpoint of sections 11-13 (gemma-4-26B-A4B, the same architecture, formats and pool layout)
+has no chat template: the chat fed it the turns as plain text, and its scripted chat (14.5)
+answered "What is the capital of France? Answer in one sentence." with "\n\nWhat is the capital
+of France?\n\nWhat is the capital of France?". otpu-chat now refuses a checkpoint without a chat
+template (docs/host.md 6). The instruct checkpoint's config.json lists its stop ids, so its pool
+key differs from the base's: the base pool is refused, and the 26B-it has its own.
 
 ### 14.1 The pool
 
@@ -3762,7 +3770,7 @@ OTPU_FORMATS=experts=fp4 python3 tools/offload/pack_pool.py MODEL POOL init --wf
 
 Gemma 4 26B's pool needs `OTPU_FORMATS=experts=fp4` and `--wformat int8` on every command (its
 layers are int8, its experts fp4). The pools are 4.1 GB (LFM2.5-8B-A1B, 704 experts), 17.1 GB
-(Qwen3.5-35B-A3B, 10240) and 12.1 GB (gemma-4-26B-A4B, 3840). LFM2.5-8B-A1B's packed in 15
+(Qwen3.5-35B-A3B, 10240) and 13.2 GB (gemma-4-26B-A4B-it, 3840). LFM2.5-8B-A1B's packed in 15
 minutes with three workers on omarchy (2026-10-08).
 
 otpu-chat checks the pool before it builds the image, so a bad pool costs seconds rather than the

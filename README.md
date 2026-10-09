@@ -61,10 +61,15 @@ at 91-94% of the DRAM peak instead of 82-87%. Qwen3.5-4B's int8 image is over 4 
   "wall" adds the host. Prefill is the 512-token prompt, on the device.*
 - *DRAM traffic comes from the card's own counters while it runs.*
 - *Gemma 4 E2B keeps its per-layer embedding tables on the card (3.5-3.6 GiB images;
-  [docs/gemma4.md](docs/gemma4.md)); in int8 it does not fit. It matches Hugging Face's greedy
-  tokens on three prompts with either head. E4B's table (2.95 GB) stays on the host, which
-  copies one 11 KB row into the card per token; its image is 3.96 GiB, int8 with the head and
-  the first 24 layers' down projections in 4-bit ([docs/gemma4_e4b.md](docs/gemma4_e4b.md)).
+  [docs/gemma4.md](docs/gemma4.md)); in int8 it does not fit. The base checkpoint (gemma-4-E2B)
+  matches Hugging Face's greedy tokens on three prompts with either head. The chat runs the
+  instruct checkpoints (gemma-4-E2B-it, ...: the same images and speeds). E4B's table (2.95 GB)
+  stays on the host, which copies one 11 KB row into the card per token; its image is 3.96 GiB,
+  int8 with the head and the first 24 layers' down projections in 4-bit, as measured here
+  ([docs/gemma4_e4b.md](docs/gemma4_e4b.md)). Since 2026-10-09 E4B-it's default is the head and
+  the first 12 layers' gate / up projections in 4-bit: the same bytes a token, perplexity
+  within 0.01% of int8's instead of +3.2%, and prompt runs of 2 rows instead of 3-4
+  ([docs/formats.md](docs/formats.md)).
   In the card's own decode loop (the card picking every token) Gemma 4 decodes faster: E2B
   11.01 / 12.73 tok/s (int8 / 4-bit head), E4B 3.83 tok/s, on the device.*
 - *Every configuration matches the simulator token for token, per-position and with the
@@ -102,7 +107,7 @@ experts, int8 head:
   (section 10.3).
 - Both match the simulator bit for bit.
 
-otpu-chat chats with both, and with gemma-4-26B-A4B (`--model lfm2-8b`, `qwen35-35b`,
+otpu-chat chats with both, and with gemma-4-26B-A4B-it (`--model lfm2-8b`, `qwen35-35b`,
 `gemma4-26b`), with the same engine and settings. Each model's experts are packed once into a
 pool file beside its checkpoint, and the chat checks the pool before it loads
 ([docs/offload.md](docs/offload.md), section 14).
@@ -187,7 +192,7 @@ it over JTAG, then run `sudo otpu-setup` and `otpu-chat --backend board`.
 
 | Command | What it does |
 |:--|:--|
-| `otpu-chat` | chat with Qwen3-0.6B, LFM2.5-230M (`--model lfm2`), Qwen3.5-0.8B (`--model qwen35`), LFM2-2.6B (`lfm2-2.6b`), SmolLM3-3B (`smollm3`), Phi-4-mini (`phi4-mini`) or Qwen3.5-2B / 4B (`qwen35-2b`, `qwen35-4b`); MoE models bigger than the card with their experts streamed: LFM2.5-8B-A1B (`lfm2-8b`), Qwen3.5-35B-A3B (`qwen35-35b`), gemma-4-26B-A4B (`gemma4-26b`) |
+| `otpu-chat` | chat with Qwen3-0.6B, LFM2.5-230M (`--model lfm2`), Qwen3.5-0.8B (`--model qwen35`), LFM2-2.6B (`lfm2-2.6b`), SmolLM3-3B (`smollm3`), Phi-4-mini (`phi4-mini`) or Qwen3.5-2B / 4B (`qwen35-2b`, `qwen35-4b`), Gemma 4 E2B / E4B (`gemma4`, `gemma4-e4b`: the instruct checkpoints, gemma-4-E2B-it / E4B-it); MoE models bigger than the card with their experts streamed: LFM2.5-8B-A1B (`lfm2-8b`), Qwen3.5-35B-A3B (`qwen35-35b`), gemma-4-26B-A4B-it (`gemma4-26b`); a checkpoint without a chat template (a base model) only with `--raw` |
 | `otpu-smi` | temperature, power, DRAM bandwidth and per-unit utilization |
 | `otpu-lens` | record a run and open it in the profiler |
 | `otpu-selftest`, `otpu-diag` | check that the card works |
@@ -201,13 +206,13 @@ in the formats you pick), and its activations are rounded to int8 per 128 values
 device's quantizer rounds them: every matmul input, and in attention the query, K, V and the
 softmax weights. The device is the ISA simulator, the RTL (Verilator) or the card, and
 `--against` adds a second device that must give the same tokens and bit-identical logits. It
-is measured on Qwen3-0.6B, LFM2.5-230M, Qwen3.5-0.8B and Gemma 4 E2B; the MoE models are not
-supported.
+is measured on Qwen3-0.6B, LFM2.5-230M, Qwen3.5-0.8B and Gemma 4 E2B (base and instruct); the
+MoE models are not supported.
 
 ```sh
 python3 tools/validate.py --model qwen3                                    # ISA simulator, int8
 python3 tools/validate.py --model lfm2 --wformat fp4 --head-format int8   # 4-bit layers
-python3 tools/validate.py --model gemma4                                   # E2B: 16 GB (below)
+python3 tools/validate.py --model gemma4                                   # E2B-it: 16 GB (below)
 
 # the RTL against the ISA simulator, bit for bit: slow, so one prompt and a few tokens
 # (this one takes 4 minutes on a 16-core host, the Verilator build included)
@@ -249,13 +254,23 @@ the eight default prompts and 16 tokens each:
 | Qwen3-0.6B | 4-bit, int8 head | 96.9%, 0.0123 | 0.0163 | 85.9%, 0.193 | 0.195 |
 | Qwen3.5-0.8B | int8 | 96.1%, 0.0020 | 0.0017 | 97.7%, 0.0033 | 0.0029 |
 | Qwen3.5-0.8B | 4-bit, int8 head | 96.9%, 0.0020 | 0.0021 | 88.3%, 0.076 | 0.077 |
-| Gemma 4 E2B | int8, 4-bit PLE table | 100.0%, 0.0036 | 0.0035 | 99.2%, 0.015 | 0.017 |
-| Gemma 4 E2B | 4-bit, int8 head and PLE table | 99.2%, 0.0029 | 0.0036 | 96.9%, 0.045 | 0.043 |
+| Gemma 4 E2B (base) | int8, 4-bit PLE table | 100.0%, 0.0036 | 0.0035 | 99.2%, 0.015 | 0.017 |
+| Gemma 4 E2B (base) | 4-bit, int8 head and PLE table | 99.2%, 0.0029 | 0.0036 | 96.9%, 0.045 | 0.043 |
+| Gemma 4 E2B-it | int8, 4-bit PLE table | 100.0%, 0.0071 | 0.0078 | 97.5%, 0.014 | 0.0085 |
+| Gemma 4 E2B-it | 4-bit, int8 head and PLE table | 98.6%, 0.0095 | 0.0136 | 93.1%, 0.102 | 0.093 |
+| Gemma 4 E2B-it | the base's mix, int8 head and PLE table | 100.0%, 0.0135 | 0.0075 | 98.6%, 0.028 | 0.036 |
 
 KL is the mean KL(golden || device) in nats per token. The device's KL from the quantized
-golden is 0.75 to 1.16 times the floor's, and its distance from fp32 is what the quantization
+golden is 0.70 to 1.16 times the floor's, and its distance from fp32 is what the quantization
 alone predicts. A run takes 2 to 14 minutes on a 16-core host (Gemma 4 E2B: 16 and 26, the
-host shared with other jobs) and peaks at 2.5 GB (LFM2) to 16 GB (Gemma 4 E2B).
+host shared with other jobs; E2B-it 8 to 14 on omarchy alone) and peaks at 2.5 GB (LFM2) to
+16 GB (Gemma 4 E2B). Gemma 4 E2B-it, the instruct checkpoint otpu-chat runs (2026-10-09, tree
+aa2166b1), answers most prompts in a few tokens and stops at its end of turn (`<turn|>`): its
+rows have 71 to 81 positions against the base's 128, so one position weighs more. The mix's
+1.80x is one position of 71, a near tie in `def fibonacci(n):`'s (KL 0.69, the floor's 0.17
+there); without it, 0.75x. The prompts
+are plain text after `<bos>`, as the base's, which the instruct tokenizer does not add
+(`gemma4.text_ids`).
 
 Qwen3's activation rounding costs more than the other models': its k_norm gains have outlier
 channels (Qwen3-0.6B: up to 42 times their median), and K is rounded to int8 with one scale per

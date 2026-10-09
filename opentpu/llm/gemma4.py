@@ -1,5 +1,5 @@
-"""Gemma 4 text decoder (google/gemma-4-E2B: the language model; the vision and audio encoders
-are not loaded) on openTPU.
+"""Gemma 4 text decoder (google/gemma-4-E2B-it, the instruct checkpoint, or the base gemma-4-E2B:
+the language model; the vision and audio encoders are not loaded) on openTPU.
 
 Gemma 4 E2B has 35 layers, hidden size 1536, a 262,144-token vocabulary and a tied LM head:
   attention  8 query heads and 1 KV head. Sliding layers attend over the last 512 tokens with
@@ -51,6 +51,7 @@ How it maps onto openTPU:
 
 Pieces:
   Spec              model dimensions, layer kinds, KV sources and MLP widths (config.json)
+  text_ids          plain text's token ids, after <bos> (an instruct tokenizer adds none)
   load_weights      the checkpoint's language model as a lazy mapping of fp32 numpy arrays
                     (HF names, model.language_model.* -> model.*); the PLE table as rows
   reference_logits  plain numpy forward pass (the math, fp32)
@@ -118,7 +119,7 @@ class Spec:
     softcap: float | None = 30.0
     tied: bool = True
     bos: int = 2
-    eos: tuple = (1, 106)   # <eos>, <turn|>
+    eos: tuple = (1, 106)   # <eos>, <turn|> (from_hf: and the generation config's)
     ckpt_layers: tuple | None = None   # the checkpoint layer of each layer (None: the same)
     embed: str = "int8"     # the embedding rows are dequantized on the device only (from the
                             # quantized LM head): an Engine always gets the lookup tables
@@ -200,9 +201,16 @@ class Spec:
         if c.get("hidden_activation", "gelu_pytorch_tanh") != "gelu_pytorch_tanh":
             raise ValueError(f"activation {c['hidden_activation']} is not gelu_tanh")
         moe = c.get("enable_moe_block", False)
-        # int8 layers that do not fit: the head and the down projections in fp4 in the layers
-        # with their own K / V, one loop (E4B's best mix that keeps two loops)
-        fit = f"head=fp4,down@0-{first - 1}=fp4" if first > 0 else "head=fp4"
+        # the stop ids: <eos>, <turn|> (a turn's end) and the generation config's, as Hugging
+        # Face's generate stops (the instruct checkpoints': <|tool_response>, 50, too)
+        eos, gc = [], Path(model_dir) / "generation_config.json"
+        for e in (c.get("eos_token_id", 1), 106,
+                  json.loads(gc.read_text()).get("eos_token_id") if gc.exists() else None):
+            eos += e if isinstance(e, list) else [] if e is None else [e]
+        # int8 layers that do not fit: the head and the gate / up projections of the first
+        # half of the layers with their own K / V in fp4 (gemma-4-E4B-it's: the MLPs of the
+        # second half cost it the most; a third loop, 2-row prompt runs; docs/formats.md)
+        fit = f"head=fp4,gateup@0-{first // 2 - 1}=fp4" if first > 1 else "head=fp4"
         if moe:                 # a MoE's DRAM beside its layers is expert slots (Image experts)
             fit = ""
         return Spec(hidden=c["hidden_size"], kinds=kinds, kv_src=src,
@@ -216,7 +224,7 @@ class Spec:
                     softcap=c.get("final_logit_softcapping"),
                     tied=top.get("tie_word_embeddings", c.get("tie_word_embeddings", True)),
                     bos=c.get("bos_token_id", 2),
-                    eos=(c.get("eos_token_id", 1), 106), fit_formats=fit, mix=FM.mix_for(c),
+                    eos=tuple(dict.fromkeys(eos)), fit_formats=fit, mix=FM.mix_for(c),
                     n_kv_global=gkv.pop() if gkv else 0, k_eq_v=kev,
                     experts=c["num_experts"] if moe else 0,
                     top_k=c["top_k_experts"] if moe else 0,
@@ -344,6 +352,14 @@ class Weights(dict):
         """Rows idx (a list) of tensor k, fp32, without loading the rest."""
         f, name = self._files[k]
         return _Rows(f, name)[list(idx)]
+
+
+def text_ids(tok, text: str, bos: int = 2) -> list:
+    """`text`'s token ids as Gemma 4 reads plain text: after <bos>. The base checkpoints'
+    tokenizer adds it; the instruct ones' (gemma-4-*-it) adds none, their chat template writes
+    it."""
+    ids = list(tok(text)["input_ids"])
+    return ids if ids[:1] == [bos] else [bos] + ids
 
 
 def load_weights(model_dir) -> Weights:
@@ -739,7 +755,7 @@ class Image:
     None for either (and OTPU_PLE_FORMAT / OTPU_PLE_HOST unset): the table on the card in int8
     if the image then fits 4 GiB, else in fp4, else on the host in int8. `formats` None (and
     OTPU_FORMATS unset): spec.formats, or, when it is empty, the layers are int8 and no PLE
-    choice fits them in 4 GiB, spec.fit_formats (E4B: the head and down 0-23 in fp4).
+    choice fits them in 4 GiB, spec.fit_formats (E4B: the head and gate / up 0-11 in fp4).
     `choices` holds what was chosen.
     """
 

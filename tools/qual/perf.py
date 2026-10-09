@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT))
 from transformers import AutoTokenizer  # noqa: E402
 
 from opentpu.host import chat as C  # noqa: E402
+from opentpu.llm import gemma4 as G4  # noqa: E402
 from opentpu.llm import load_spec, model_dir  # noqa: E402
 from opentpu.llm import qwen3 as Q  # noqa: E402
 
@@ -43,7 +44,10 @@ def main():
     board, info = eng.backend.board, eng.backend.info
     khz = info["core_khz"]
     text = (ROOT / "tools/data/austen_pp_ch1.txt").read_text()
-    ids = tok(text)["input_ids"][:a.prompt]
+    if isinstance(spec, G4.Spec):         # after <bos> (an instruct tokenizer adds none)
+        ids = G4.text_ids(tok, text, spec.bos)[:a.prompt]
+    else:
+        ids = tok(text)["input_ids"][:a.prompt]
     t0, n0 = time.perf_counter(), len(eng.stats)
     logits = eng.prefill(ids)
     wall = time.perf_counter() - t0

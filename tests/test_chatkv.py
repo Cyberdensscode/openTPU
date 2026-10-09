@@ -489,6 +489,167 @@ def test_chat_restarts_without_a_snapshot(snapshots):
     assert chat.session.restarts == (0 if snapshots else 2) and chat.session.reused == reused
 
 
+class _GemmaTok:
+    """Gemma 4's instruct tokenizer and chat template in miniature. One token per character:
+    ASCII at 200 + its code, any other id i as the character U+4E00 + i (every reply decodes
+    and encodes back); the special tokens at Gemma's ids, which decode drops unless told to
+    keep them, as the real one does; plain text without <bos> (the instruct tokenizer adds
+    none). The template, as gemma-4-*-it's: <bos>, each message <|turn>role\\n...<turn|>\\n (a
+    reply with its thinking channel, <|channel>...<channel|>, dropped and the rest trimmed),
+    thinking on a system turn with <|think|> first; the generation prompt <|turn>model\\n, and
+    with empty_thought (26B-A4B-it's) an empty thinking channel after it, thinking off."""
+    BOS, THINK, SOC, EOC, SOT, EOT = 2, 98, 100, 101, 105, 106
+    SPECIAL = {1, BOS, THINK, SOC, EOC, SOT, EOT}
+
+    def __init__(self, empty_thought=False):
+        self.empty_thought = empty_thought
+
+    @staticmethod
+    def ch(i):
+        return chr(i - 200) if 200 <= i < 328 else chr(0x4E00 + i)
+
+    def ids(self, text):
+        return [ord(c) + 200 if ord(c) < 128 else ord(c) - 0x4E00 for c in text]
+
+    def __call__(self, text):
+        return {"input_ids": self.ids(text)}
+
+    def apply_chat_template(self, history, add_generation_prompt, enable_thinking, tokenize):
+        c = self.ch
+        out = c(self.BOS)
+        if enable_thinking:
+            out += f"{c(self.SOT)}system\n{c(self.THINK)}\n{c(self.EOT)}\n"
+        for m in history:
+            role, text = "model" if m["role"] == "assistant" else m["role"], m["content"]
+            if role == "model":         # strip_thinking
+                text = "".join(p.split(c(self.SOC))[0] for p in text.split(c(self.EOC)))
+            out += f"{c(self.SOT)}{role}\n{text.strip()}{c(self.EOT)}\n"
+        if add_generation_prompt:
+            out += f"{c(self.SOT)}model\n"
+            if self.empty_thought and not enable_thinking:
+                out += f"{c(self.SOC)}thought\n{c(self.EOC)}"
+        return self.ids(out)
+
+    def decode(self, ids, skip_special_tokens=True):
+        return "".join(self.ch(i) for i in ids if not (skip_special_tokens and i in self.SPECIAL))
+
+
+@pytest.mark.parametrize("case, think, reply, answer", [
+    ("e2b", False, "ab cd", "ab cd"), ("e2b", False, "ab cd\n\n\n", "ab cd"),
+    ("e2b", True, "\x01thought\nhm\x02ab", "ab"), ("26b", False, "ab cd", "ab cd")])
+def test_gemma4_chat_turns(gemma, monkeypatch, case, think, reply, answer):
+    """A Gemma 4 instruct chat's turns (_GemmaTok's template: the E2B's, or the 26B-A4B's whose
+    generation prompt opens the reply with an empty thinking channel), each reply scripted
+    (\\x01, \\x02: the thinking channel's ends). The history renders each reply as the template
+    gets it with its special tokens: its thinking channel dropped, the rest trimmed (with the
+    channel's ends dropped from the reply's text, the thinking stayed in the context as text).
+    A reply rendered as fed is continued (E2B); one rendered otherwise (whitespace trimmed, the
+    thinking dropped, the 26B's empty channel) rolls the sliding rings back to the snapshot at
+    the reply's start (rollback_slack patched to 2 for that: the long replies past the real
+    slack are test_gemma4_rollback_inside_and_beyond_the_slack's), and feeds the reply and the
+    new message. Every turn's logits a fresh engine's on its rendering, bit for bit."""
+    from test_gemma4 import _cfg
+    W, spec = gemma
+    tok = _GemmaTok(empty_thought=case == "26b")
+    script = tok.ids(reply.replace("\x01", tok.ch(tok.SOC)).replace("\x02", tok.ch(tok.EOC)))
+    script += [tok.EOT]
+    head = len(tok.ids(tok.ch(tok.SOT) + "model\n"))        # the reply's header
+    firsts, k = [], [0]
+
+    def pick(logits, context=()):
+        if k[0] == 0:
+            firsts.append(np.array(logits, np.float32))
+        t, k[0] = script[k[0]], (k[0] + 1) % len(script)
+        return t
+
+    def make(snapshots=0):
+        return Engine(spec, W, cap=1024, cfg=_cfg(), resident=True, prompt_runs=True,
+                      snapshots=snapshots)
+    chat = Chat(make(1), tok, think, pick, 16)
+    assert chat.eng.stateful and not chat.on_card
+    monkeypatch.setattr(type(chat.eng.image), "rollback_slack", property(lambda self: 2))
+    want, start = [], None
+    for i, msg in enumerate(["hello", "and?", "ok"]):
+        fed, s0 = list(chat.fed), len(chat.eng.snap_stats)
+        _, turn = chat.ask(msg)
+        assert turn.end == "eos" and chat._reply == script[:-1] and not turn.restarted, i
+        want.append({"role": "user", "content": msg})
+        ids = tok.apply_chat_template(want, True, think, True)
+        assert tok.apply_chat_template(chat.history[:-1], True, think, True) == ids, i
+        restores = [s["pos"] for s in chat.eng.snap_stats[s0:] if s["op"] == "restore"]
+        if i and reply == answer and case == "e2b":     # rendered as fed: continued
+            assert turn.reused == len(fed) and not restores, i
+        elif i:
+            assert _common(ids, fed) < len(fed) and turn.reused == start == restores[0], i
+        assert turn.prefill_tokens == len(ids) - turn.reused
+        assert np.array_equal(_bits(firsts[-1]), _bits(make().prefill(ids))), i
+        want.append({"role": "assistant", "content": answer})
+        start = len(tok.apply_chat_template(want[:-1], False, think, True)) + head
+
+
+def test_chatkv_tool_on_gemma4(tmp_path, capsys):
+    """tools/qual/chatkv.py, the card check, dry run on the ISA simulator with a Gemma 4
+    checkpoint (test_gemma4.checkpoint: its template renders a reply as fed): the recording
+    sampler takes the model's soft cap (Chat refused the tool's before: "the sampler's softcap
+    None is not the model's 30.0"), the turns continue the context, and each restart's logits
+    and reply equal the turn's: CHATKV PASS."""
+    import importlib.util
+    from pathlib import Path
+
+    from test_gemma4 import checkpoint
+    d = checkpoint(tmp_path / "gemma4")
+    s = importlib.util.spec_from_file_location(
+        "chatkv", Path(__file__).resolve().parent.parent / "tools" / "qual" / "chatkv.py")
+    CK = importlib.util.module_from_spec(s)
+    s.loader.exec_module(CK)
+    assert CK.main(["--model", str(d), "--backend", "isa", "--turns", "2", "--max-new", "3"]) == 0
+    out = capsys.readouterr().out
+    assert "stateful True" in out and "reused 0" in out and "CHATKV PASS" in out
+
+
+@pytest.mark.parametrize("name", ["gemma4", "gemma4-26b"])
+def test_gemma4_instruct_templates(name):
+    """The instruct checkpoints' own tokenizer and template (models/gemma-4-E2B-it,
+    gemma-4-26B-A4B-it: chat_template.jinja), with Chat's rendering, three turns: plain text
+    gets no <bos> (gemma4.text_ids adds it); a reply as the model writes it (its tokens fed,
+    its text kept with its special tokens) is continued, thinking on or off, except behind the
+    26B's generation prompt, thinking off, which opens the reply with an empty thinking channel
+    (4 tokens: the reply's start, reply_start, is before it): back to the reply's start; a
+    reply's own thinking channel is dropped: back to the reply's start too."""
+    import types
+
+    from opentpu.llm import gemma4 as G4
+    from opentpu.llm import model_dir
+    path = model_dir(name)
+    if not (path / "chat_template.jinja").exists():
+        pytest.skip(f"no models/{path.name}")
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(path)
+    assert tok("Paris")["input_ids"][:1] != [2] and G4.text_ids(tok, "Paris")[:1] == [2]
+    eng = types.SimpleNamespace(spec=G4.Spec.from_hf(path), stateful=True)
+    for think in (False, True):
+        for reply in ("Paris is the capital of France.",
+                      "<|channel>thought\nThe user asks for a capital.<channel|>Paris."):
+            pick = sampler(0, 0, 1.0, None, softcap=eng.spec.softcap)
+            chat, empty = Chat(eng, tok, think, pick, 16), 0
+            for i, msg in enumerate(["What is the capital of France?", "And of Italy?", "Ok"]):
+                chat.history.append({"role": "user", "content": msg})
+                ids = chat._template()
+                k, at = _common(ids, chat.fed), chat.reply_start(ids)
+                if i == 0:
+                    empty = len(ids) - at
+                    assert empty == (4 if name == "gemma4-26b" and not think else 0)
+                elif reply.startswith("<|channel>") or empty:
+                    assert k == start < len(chat.fed), (think, reply, i)
+                else:
+                    assert k == len(chat.fed), (think, reply, i)
+                start = at
+                out = list(tok(reply)["input_ids"])
+                chat.fed = ids + out            # (the reply's last token is fed by the next turn)
+                chat.history.append({"role": "assistant",
+                                     "content": tok.decode(out, skip_special_tokens=False)})
+
+
 # --------------------------------------------------------------------------------- RTL
 @pytest.mark.parametrize("case", ["qwen35", "lfm2"])
 def test_rollback_on_board_model(have_verilator, case):

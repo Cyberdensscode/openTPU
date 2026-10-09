@@ -472,12 +472,15 @@ def test_the_command_line_on_a_tiny_gemma4(tmp_path):
     """main() on a tiny Gemma 4 checkpoint (text-only, as Hugging Face saves it) with fp4
     weights: the device image's formats reach the golden (--json's image), Hugging Face loads
     without its PLE table (the golden reads the rows it needs from the checkpoint): PASS (top-1
-    agreement at least MIN_TOP1, KL near the floor; a near tie may flip, see above)."""
+    agreement at least MIN_TOP1, KL near the floor; a near tie may flip, see above). The
+    prompts go after <bos>, which the word-level tokenizer does not add (as the instruct
+    checkpoints' does not: gemma4.text_ids)."""
     import json
     prompts = _checkpoint("gemma4", tmp_path)
     assert V.main(["--model", str(tmp_path), "--tokens", "6", "--wformat", "fp4", "--json",
                    str(tmp_path / "r.json")] + prompts) == 0
     res = json.loads((tmp_path / "r.json").read_text())
+    assert [p["ids"] for p in res["prompts"]] == [[2] + p for p in PROMPTS]
     assert res["image"]["head"] == "fp4" and res["image"]["ple_table"] == "int8"
     assert res["formats"]["model.per_layer_model_projection.weight"] == "fp4"
     assert res["pass"]

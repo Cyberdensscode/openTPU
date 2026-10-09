@@ -201,7 +201,7 @@ def key(cfg, model: str, wf: str, hf: str, n: int, long: bool = False,
 def _chat(tok, text: str) -> list:
     """`text` as a user turn of the model's chat template, with today's date pinned (DATE:
     SmolLM3's system header states the date, and a reference must not expire); a base model
-    without a template (Gemma 4 E2B) gets the plain text."""
+    without a template gets the plain text."""
     if not tok.chat_template:
         return list(tok(text)["input_ids"])
     msgs = [{"role": "user", "content": text}]

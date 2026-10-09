@@ -1,5 +1,11 @@
 # Gemma 4 E4B: the per-layer embeddings from the host
 
+otpu-chat's `gemma4-e4b` is the instruct checkpoint, gemma-4-E4B-it, since 2026-10-09 (the same
+architecture, images and programs; [gemma4.md](gemma4.md), "The instruct checkpoints"), and its
+default formats are the head and gate / up 0-11 in fp4 (three loops; "The choice" below). The
+measurements here are the base checkpoint's, in its default formats (the head and down 0-23 in
+fp4), unless they say so.
+
 Status: runs on the card (build B, 2026-10-01): token for token the ISA simulator's on every
 decode path, the card's generate loop included, at 3.78 tok/s (tools/qual/perf.py) and 3.83
 tok/s in the generate loop (section "On the card"). The weight formats are in section
@@ -144,18 +150,29 @@ repository in September 2026. Same emulation, ppl:
 - With three loops, decode is 2,298 / 2,967 instructions (bucket 1 / 8). That fits the 4K
   IMEM. A 4-row prefill run is 4,439 instructions even at position 0, though, so prefill falls
   back to 2-row runs, and those pass 4,096 near position 2044.
-- The default, `down@0-23=fp4` with the fp4 head, keeps today's two loops. Its prefill runs
-  4 rows up to about position 1000, like the fp4 image.
+- The base checkpoint's default, `down@0-23=fp4` with the fp4 head, kept today's two loops.
+  Its prefill runs 4 rows up to about position 1000, like the fp4 image.
 - Formats are set per layer and kind by `Spec.formats`, `Image(formats=)` or `OTPU_FORMATS`
   (`gemma4.layer_formats`: "kind[@a-b]=fmt", over `wformat`; `head=fmt` for the LM head).
 - **The default follows the fit, not the model.** `Spec.from_hf` stores a mix,
-  `Spec.fit_formats`: the head and the own-KV layers' down projections in fp4 (E4B:
-  `head=fp4,down@0-23=fp4`). An int8 image (`wformat="int8"`, nothing else asked) takes it
+  `Spec.fit_formats`: since 2026-10-09 the head and the gate / up projections of the first half
+  of the own-KV layers in fp4 (E4B: `head=fp4,gateup@0-11=fp4`, three loops; until then the
+  head and the own-KV layers' down projections, `head=fp4,down@0-23=fp4`). An int8 image
+  (`wformat="int8"`, nothing else asked) takes it
   only when it fits 4 GiB beside no PLE choice. E2B's int8 image fits (3.442 GiB, fp4 PLE
   records on the card), so it stays as it is, and E2B's default fp4 layers never take it.
-  E4B's int8 image takes it: 3.958 GiB at 2048 tokens with the lookup tables and the
-  generate area, the PLE table on the host. `Image.choices` holds what was chosen, so the
-  Engine's compile worker builds the same image (`Engine._image_kw`).
+  E4B's int8 image takes it: 3.960 GiB at 2048 tokens with the lookup tables and the
+  generate area, the PLE table on the host (3.958 with the base's mix). `Image.choices` holds
+  what was chosen, so the Engine's compile worker builds the same image (`Engine._image_kw`).
+- **gemma-4-E4B-it** (the chat's `gemma4-e4b` since 2026-10-09), on a chat of its own at 2000
+  tokens ([formats.md](formats.md), "Gemma 4 E4B-it"): the base's default is dKL +2.15% (SE
+  0.21) against int8 (perplexity +3.17%), and no two-loop mix beats it by 2 SE; the three-loop
+  mix, the head and gate / up 0-11, is +0.56% (0.07; perplexity +0.01%), 7.9 SE better at the
+  same bytes. It is the default since then, the two-loop rule's exception: its prompt runs hold
+  2 rows (1 in the last bucket), about half the prompt rate, which a chat pays once (its later
+  turns feed only the new message), while the quality counts on every token. At 2048 tokens
+  every bucket's decode, generate and prompt run programs fit IMEM and TMEM
+  (test_e4b_programs_fit). The measurements in this document are the base's default's.
 
 ## Per token
 

@@ -8,6 +8,8 @@
     otpu-chat --backend board-sim             # the Verilator board model (very slow)
     otpu-chat --prompt "Why is the sky blue?" # one-shot
     otpu-chat --think                         # Qwen3 thinking mode
+    otpu-chat --model gemma4                  # Gemma 4 E2B, its instruct checkpoint
+                                              # (gemma-4-E2B-it; --think: thinking mode too)
     otpu-chat --model qwen35-2b --mtp         # Qwen3.5 with its MTP drafter (docs/mtp.md)
     otpu-chat --model phi4-mini --wformat fp4 # the weights' format (default auto: the model's
                                               # recommended mix, else int8; docs/formats.md)
@@ -23,12 +25,16 @@ the KV context, updated while the reply streams; /stats adds DRAM, session total
 The model runs on the device, the prompt several tokens per run (Engine.prefill_chunks; a
 dense model's from programs at run-time positions, compiled once per bucket: docs/prefill.md)
 and the reply token by token; the host only tokenizes, looks up the embedding rows, applies the
-chat template and samples from the logits. The KV cache stays in device DRAM
-across turns; a turn feeds what its rendering of the conversation does not share with what
-the device holds: the new message, and the last reply again where the template renders it
-otherwise than it was generated (Qwen3's and Qwen3.5's drop the thinking block): the context
-rolls back to the common prefix (Engine.rollback, from a snapshot of the recurrent state taken
-at the reply's start: opentpu/llm/snapshot.py). On the card the tool holds the device lock
+chat template and samples from the logits. A checkpoint without a chat template (a base model,
+which continues the text instead of answering) is refused unless --raw. The KV cache stays in
+device DRAM across turns; a turn feeds what its rendering of the conversation does not share
+with what the device holds: the new message, and the last reply again where the template
+renders it otherwise than it was generated (Qwen3's and Qwen3.5's drop the thinking block, Gemma
+4's its thinking channel; Gemma 4 26B-A4B's generation prompt opens the reply with an empty one):
+the context rolls back to the common prefix (Engine.rollback, from a snapshot of the recurrent
+or windowed state taken at the reply's start: opentpu/llm/snapshot.py). A reply's text keeps
+the special tokens the model wrote (Gemma 4's thinking channel, <|channel>...<channel|>), so the
+template sees the reply as it was generated. On the card the tool holds the device lock
 and publishes its status (model, DRAM, tokens/s) for otpu-smi; the next token's program is
 compiled while the card runs the current one (Engine pipelining). --mtp (Qwen3.5) decodes with
 the model's MTP drafter, the loop on the device (opentpu/llm/mtp.py: a verify of two rows and a
@@ -57,7 +63,7 @@ from opentpu.llm.qwen3 import Engine, load_weights
 # Sampling defaults per model family (Spec module; sampling() says when they apply);
 # command-line flags override them. LFM2's are LFM2.5-230M's generation_config.json; Qwen3's
 # and Qwen3.5's their model cards' non-thinking settings (Qwen3.5's without the presence
-# penalty).
+# penalty); Gemma 4's its checkpoints' generation_config.json (the instruct and base ones').
 SAMPLING = {"qwen3": dict(temperature=0.7, top_k=20, top_p=0.8, repetition_penalty=1.0),
             "lfm2": dict(temperature=0.1, top_k=50, top_p=1.0, repetition_penalty=1.05),
             "qwen35": dict(temperature=0.7, top_k=20, top_p=0.8, repetition_penalty=1.0),
@@ -379,7 +385,8 @@ class Detok:
     decodes only the tokens since the last emitted text, from one token earlier (the prefix):
     new text = decode(prefix..) minus decode(prefix..read), which keeps the spaces and merges
     that depend on the token before. Text that ends in an incomplete UTF-8 sequence (U+FFFD)
-    is held back until the rest of the character arrives."""
+    is held back until the rest of the character arrives. Special tokens are text too, as in
+    the reply's (Chat._finish)."""
 
     def __init__(self, tok, ids=()):
         """ids: the reply so far (resume), already shown."""
@@ -387,7 +394,7 @@ class Detok:
         self.prefix, self.read = max(0, len(self.ids) - 1), len(self.ids)
 
     def _dec(self, ids) -> str:
-        return self.tok.decode(ids, skip_special_tokens=True)
+        return self.tok.decode(ids, skip_special_tokens=False)
 
     def add(self, t: int) -> str:
         self.ids.append(t)
@@ -670,7 +677,7 @@ class Chat:
         k1 = len(self.eng.stats)
         out, n0, t_first = list(out), len(out), None
         detok = Detok(self.tok, out)
-        shown = self.tok.decode(out, skip_special_tokens=True) if out else ""
+        shown = self.tok.decode(out, skip_special_tokens=False) if out else ""
         sink = None                          # the next pick, fed while the device runs
         while logits is not None and not turn.end:
             if len(out) - n0 >= self.max_new:
@@ -720,7 +727,8 @@ class Chat:
     def _finish(self, out: list[int], shown: str, turn: Turn, on_update) -> str:
         self._experts(turn, True)
         self._reply = out
-        reply = self.tok.decode(out, skip_special_tokens=True)
+        # the special tokens kept: the template parses them (Gemma 4's thinking channel)
+        reply = self.tok.decode(out, skip_special_tokens=False)
         if len(reply) > len(shown) and reply.startswith(shown):
             on_update(reply[len(shown):], turn)       # a held-back incomplete character
         return reply
@@ -736,7 +744,7 @@ class Chat:
         samp = None if getattr(self.pick, "greedy", False) else G.Sampling(**self.pick.params)
         out, n0 = list(out), len(out)
         detok = Detok(self.tok, out)
-        shown = self.tok.decode(out, skip_special_tokens=True) if out else ""
+        shown = self.tok.decode(out, skip_special_tokens=False) if out else ""
         t_first = None
 
         def take(t: int) -> None:
@@ -821,6 +829,17 @@ NOTES = {"max_new": "(stopped at max_new={max_new} tokens · {cmd} or raise --ma
          "stopped": "(interrupted)"}
 
 
+def has_chat_template(path) -> bool:
+    """The checkpoint at `path` has a chat template, as transformers finds one beside its
+    tokenizer: chat_template.jinja (the Gemma 4 instruct checkpoints'), chat_template.json or
+    tokenizer_config.json's chat_template. A base checkpoint (gemma-4-E2B, ...) has none."""
+    path = Path(path)
+    if (path / "chat_template.jinja").exists() or (path / "chat_template.json").exists():
+        return True
+    cfg = path / "tokenizer_config.json"
+    return cfg.exists() and bool(json.loads(cfg.read_text()).get("chat_template"))
+
+
 def load_tokenizer(path):
     """AutoTokenizer.from_pretrained(path) on a thread: importing transformers (and torch with
     it) takes seconds, while the model's image is read and written to the device. A function
@@ -866,6 +885,17 @@ def make_backend(name: str, spec, cap: int, dev: str, model: str | None = None,
         from opentpu.llm.rtl_backend import RtlBackend
         return RtlBackend, None
     raise SystemExit(f"unknown backend {name}")
+
+
+def _maps_on_design(spec) -> bool:
+    """The model maps onto the design's configuration (two slices), the simulators' default; a
+    model that takes one slice (Gemma 4: one KV head) runs in the card's instead."""
+    from opentpu.isasim import design_config
+    try:
+        spec.check(design_config())
+    except ValueError:
+        return False
+    return True
 
 
 def weights_label(image, wformat: str) -> str:
@@ -923,7 +953,12 @@ def main(argv=None):
     ap.add_argument("--prompt", help="ask one question and exit (plain output)")
     ap.add_argument("--plain", action="store_true",
                     help="a line-by-line REPL instead of the full-screen interface")
-    ap.add_argument("--think", action="store_true", help="enable Qwen3 / Qwen3.5 thinking mode")
+    ap.add_argument("--think", action="store_true",
+                    help="enable thinking mode (Qwen3, Qwen3.5, Gemma 4's instruct checkpoints)")
+    ap.add_argument("--raw", action="store_true",
+                    help="a checkpoint without a chat template (a base model, refused without "
+                         "it): the turns' text fed as is, after its tokenizer's BOS; the model "
+                         "continues the text")
     ap.add_argument("--greedy", action="store_true")
     ap.add_argument("--temperature", type=float,
                     help="sampling flags default to the model's generation_config.json, else "
@@ -980,6 +1015,12 @@ def main(argv=None):
     if a.top_p is not None and not 0 <= a.top_p <= 1:     # (Hugging Face's range)
         ap.error(f"--top-p {a.top_p}: 0 .. 1 (0 keeps the most likely token only)")
     path = model_dir(a.model)
+    if not a.raw and not has_chat_template(path):
+        it = [f"--model {n}: models/{d}" for n, d in MODELS.items() if d == f"{path.name}-it"]
+        raise SystemExit(f"otpu-chat: {path} has no chat template: a base checkpoint, which "
+                         f"continues a chat's text instead of answering it. Chat with its "
+                         f"instruct checkpoint ({(it or ['-it, -Instruct'])[0]}), or --raw to "
+                         f"feed the turns' text as is")
     tokenizer = load_tokenizer(path)        # (on a thread, while the model loads)
     spec = load_spec(path)
     wformat = FM.auto(spec, a.wformat)
@@ -1002,6 +1043,11 @@ def main(argv=None):
         raise SystemExit(f"otpu-chat: {e}") from None
     if a.mtp and (not hasattr(spec, "mtp") or a.per_position):
         raise SystemExit("otpu-chat: --mtp takes a Qwen3.5 model and resident decode")
+    if cfg is None and not streams and not a.mtp and not _maps_on_design(spec):
+        from opentpu.host.board import sim_config     # Gemma 4 (one KV head): the card's
+        from opentpu.isasim import board_config
+        cfg = sim_config(spec, a.cap, board_config(PAIR=True, DSTEP=True, STREAM=True),
+                         lookup=not a.per_position, wformat=wformat, head_format=a.head_format)
     if a.mtp and cfg is None:   # the simulators' default is the design's (two slices): the
         from dataclasses import replace     # card's one-slice configuration instead
 
