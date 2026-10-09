@@ -1,7 +1,6 @@
 """The on-card decode loop's ISA (docs/isa.md): VOP ARGMAX, RLD and HALT CHAIN on the ISA
 simulator."""
 import time
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -9,6 +8,7 @@ import pytest
 from opentpu import Config, fp32 as F, isa as I
 from opentpu.isasim import Machine, SimError
 from opentpu.llm import generate as G
+from opentpu.llm import model_dir
 
 
 def f(x):
@@ -708,15 +708,15 @@ def test_gemma4_generate_on_rtl(have_verilator, tiny_gemma4, split):
     assert np.array_equal(isa.machine.slices[0].dram[:n], rtl.drams[0][:n])
 
 
-@pytest.mark.skipif(not (Path(__file__).resolve().parent.parent / "models" / "gemma-4-E2B" /
-                     "config.json").exists(), reason="no models/gemma-4-E2B")
+@pytest.mark.skipif(not (model_dir("gemma4") / "config.json").exists(),
+                    reason=f"no models/{model_dir('gemma4').name}")
 def test_gemma4_e2b_generate_fits_imem():
     """Gemma 4 E2B on the board (fp4 layers, int8 LM head and PLE, 4096 tokens, the generate
     area in the 4 GiB image): every bucket's generate program, greedy and sampled, is one
     program under IMEM (layout only, no weights)."""
     from opentpu.isasim import board_config
     from opentpu.llm import gemma4
-    spec = gemma4.Spec.from_hf(Path(__file__).resolve().parent.parent / "models" / "gemma-4-E2B")
+    spec = gemma4.Spec.from_hf(model_dir("gemma4"))
     img = spec.image(board_config(), 4096, 1, 8, "fp4", "int8", lookup=True)
     assert img.nbytes < 1 << 32
     for samp in (None, G.Sampling(1.0, 64, 0.95, 1.0)):
