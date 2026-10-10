@@ -40,6 +40,7 @@ def test_lef_lib_consistent(tmp_path, kind, depth, width):
     assert len(pins) == want + 2 and {"VDD", "VSS"} <= set(pins)
     for y in map(float, re.findall(r"LAYER metal3 ;\n\s+RECT 0.000 ([\d.]+)", lef)):
         assert F.MARGIN <= y <= h - F.MARGIN
+        assert abs(y / 0.14 - round(y / 0.14)) < 1e-6         # on the metal3 track grid
     # the Liberty: the same area and pins (buses by name), balanced braces, a clock arc
     assert lib.count("{") == lib.count("}")
     assert abs(float(re.search(r"area : ([\d.]+)", lib).group(1)) - w * h) < 0.01

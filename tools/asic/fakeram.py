@@ -25,7 +25,8 @@ A 1R1W macro is 1.5x the 1RW's area (an 8T bit cell, about 1.3x, and a second de
 its clock power, with the same read timing. Setup and hold are 0.05 ns on every input, input
 capacitance 5 fF (clk 25 fF), as in fakeram45. Leakage is 0, as in fakeram45 (the power estimate
 is dynamic). Geometry: the pins on the left edge on metal3 at a 0.28 um pitch (rd_out, wd_in,
-w_mask_in, then the addresses and controls, a 2 um gap between groups), VDD / VSS straps on
+w_mask_in, then the addresses and controls, 2.24 um between groups; every pin on the 0.14 um
+metal3 track grid), VDD / VSS straps on
 metal4 at a 4.48 um pitch, metal1-metal3 obstructed except the pin column, metal4 except the
 straps; the height fits the pins and the size is snapped to the 0.19 x 1.4 um site.
 
@@ -40,7 +41,7 @@ from pathlib import Path
 
 PITCH = 0.28          # pin pitch on metal3 (um)
 PIN_W = 0.07          # pin size
-GAP = 2.0             # between pin groups
+GAP = 2.24            # between pin groups (16 metal3 tracks: every pin stays on the track grid)
 MARGIN = 2.8          # top and bottom keep-out for the straps' ends
 SITE_W, SITE_H = 0.19, 1.4
 STRAP_W, STRAP_PITCH = 0.28, 4.48
