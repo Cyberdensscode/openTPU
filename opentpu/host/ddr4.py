@@ -170,13 +170,24 @@ def main(argv: list[str] | None = None, open_transport=None) -> int:
     ap.add_argument("--dimm", type=int, action="append", help="DIMM (default: every one)")
     ap.add_argument("--gib", type=float, default=1.0, help="bist: GiB per DIMM (from its start)")
     ap.add_argument("--passes", type=int, default=1)
-    ap.add_argument("--clear", action="store_true", help="ecc: clear the counters after")
+    ap.add_argument("--clear", action="store_true",
+                    help="ecc: clear the counters after (every DIMM's)")
     a = ap.parse_args(argv)
     if open_transport is None:
         from .board import XdmaTransport
-        t = XdmaTransport(a.dev, dma=False)
+        # the BIST writes over the DRAM: it holds the device lock (a DMA transport's); status
+        # and ecc only read registers, as otpu-smi
+        t = XdmaTransport(a.dev, dma=a.cmd == "bist")
     else:
         t = open_transport()
+    try:
+        return _run(a, t)
+    finally:
+        if open_transport is None:
+            t.close()
+
+
+def _run(a, t) -> int:
     if not present(t):
         print("otpu-ddr4: not a DDR4 LiteDRAM card (register map 4 with a DDR4 target, "
               "CFG_PLATFORM)", file=sys.stderr)
