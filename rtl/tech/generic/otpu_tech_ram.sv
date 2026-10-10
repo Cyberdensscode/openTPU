@@ -7,13 +7,15 @@
 // of the word written at the same edge returns the old word here (read-first); the macros do not
 // promise it (a 1R1W macro's same-address read is undefined), so a user must not depend on it
 // (otpu_tmem bypasses the write it would hit). STYLE is the FPGA's ram_style ("block",
-// "distributed" or "auto"); the macros ignore it.
+// "distributed" or "auto"); the macros ignore it. In simulation every word starts at 0, unless
+// ZERO is 0 (a user that loads the memory from its own initial block: their order is undefined).
 
 // One read port and one write port (simple dual-port).
 module otpu_ram_1r1w #(
   parameter int    W     = 32,
   parameter int    N     = 1024,
-  parameter string STYLE = "block"
+  parameter string STYLE = "block",
+  parameter bit    ZERO  = 1'b1
 ) (
   input  logic                 clk,
   input  logic                 we,
@@ -25,24 +27,30 @@ module otpu_ram_1r1w #(
 );
   if (STYLE == "distributed") begin : g_lut
     (* ram_style = "distributed" *) logic [W-1:0] mem [N];
-    always_ff @(posedge clk) if (we) mem[wa] <= wd;
-    always_ff @(posedge clk) if (re) rd <= mem[ra];
+    always_ff @(posedge clk) begin
+      if (we) mem[wa] <= wd;
+      if (re) rd <= mem[ra];
+    end
 `ifndef SYNTHESIS
-    initial for (int i = 0; i < N; i++) mem[i] = '0;
+    initial if (ZERO) for (int i = 0; i < N; i++) mem[i] = '0;
 `endif
   end else if (STYLE == "auto") begin : g_auto
     logic [W-1:0] mem [N];
-    always_ff @(posedge clk) if (we) mem[wa] <= wd;
-    always_ff @(posedge clk) if (re) rd <= mem[ra];
+    always_ff @(posedge clk) begin
+      if (we) mem[wa] <= wd;
+      if (re) rd <= mem[ra];
+    end
 `ifndef SYNTHESIS
-    initial for (int i = 0; i < N; i++) mem[i] = '0;
+    initial if (ZERO) for (int i = 0; i < N; i++) mem[i] = '0;
 `endif
   end else begin : g_bram
     (* ram_style = "block" *) logic [W-1:0] mem [N];
-    always_ff @(posedge clk) if (we) mem[wa] <= wd;
-    always_ff @(posedge clk) if (re) rd <= mem[ra];
+    always_ff @(posedge clk) begin
+      if (we) mem[wa] <= wd;
+      if (re) rd <= mem[ra];
+    end
 `ifndef SYNTHESIS
-    initial for (int i = 0; i < N; i++) mem[i] = '0;
+    initial if (ZERO) for (int i = 0; i < N; i++) mem[i] = '0;
 `endif
   end
 endmodule
@@ -51,7 +59,8 @@ endmodule
 module otpu_ram_1r1w_be #(
   parameter int    W     = 64,           // a multiple of 8
   parameter int    N     = 1024,
-  parameter string STYLE = "block"
+  parameter string STYLE = "block",
+  parameter bit    ZERO  = 1'b1
 ) (
   input  logic                 clk,
   input  logic                 we,
@@ -65,19 +74,21 @@ module otpu_ram_1r1w_be #(
   initial if (W % 8 != 0) $fatal(1, "otpu_ram_1r1w_be: W %0d is not a multiple of 8", W);
   if (STYLE == "block") begin : g_bram
     (* ram_style = "block" *) logic [W-1:0] mem [N];
-    always_ff @(posedge clk) if (we)
-      for (int k = 0; k < W / 8; k++) if (wbe[k]) mem[wa][8*k +: 8] <= wd[8*k +: 8];
-    always_ff @(posedge clk) if (re) rd <= mem[ra];
+    always_ff @(posedge clk) begin
+      for (int k = 0; k < W / 8; k++) if (we && wbe[k]) mem[wa][8*k +: 8] <= wd[8*k +: 8];
+      if (re) rd <= mem[ra];
+    end
 `ifndef SYNTHESIS
-    initial for (int i = 0; i < N; i++) mem[i] = '0;
+    initial if (ZERO) for (int i = 0; i < N; i++) mem[i] = '0;
 `endif
   end else begin : g_auto
     logic [W-1:0] mem [N];
-    always_ff @(posedge clk) if (we)
-      for (int k = 0; k < W / 8; k++) if (wbe[k]) mem[wa][8*k +: 8] <= wd[8*k +: 8];
-    always_ff @(posedge clk) if (re) rd <= mem[ra];
+    always_ff @(posedge clk) begin
+      for (int k = 0; k < W / 8; k++) if (we && wbe[k]) mem[wa][8*k +: 8] <= wd[8*k +: 8];
+      if (re) rd <= mem[ra];
+    end
 `ifndef SYNTHESIS
-    initial for (int i = 0; i < N; i++) mem[i] = '0;
+    initial if (ZERO) for (int i = 0; i < N; i++) mem[i] = '0;
 `endif
   end
 endmodule
@@ -87,7 +98,8 @@ endmodule
 module otpu_ram_1rw #(
   parameter int    W     = 32,
   parameter int    N     = 1024,
-  parameter string STYLE = "block"
+  parameter string STYLE = "block",
+  parameter bit    ZERO  = 1'b1
 ) (
   input  logic                 clk,
   input  logic                 en,
@@ -103,7 +115,7 @@ module otpu_ram_1rw #(
       else rd <= mem[a];
     end
 `ifndef SYNTHESIS
-    initial for (int i = 0; i < N; i++) mem[i] = '0;
+    initial if (ZERO) for (int i = 0; i < N; i++) mem[i] = '0;
 `endif
   end else begin : g_auto
     logic [W-1:0] mem [N];
@@ -112,7 +124,7 @@ module otpu_ram_1rw #(
       else rd <= mem[a];
     end
 `ifndef SYNTHESIS
-    initial for (int i = 0; i < N; i++) mem[i] = '0;
+    initial if (ZERO) for (int i = 0; i < N; i++) mem[i] = '0;
 `endif
   end
 endmodule

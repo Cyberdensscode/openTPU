@@ -51,6 +51,7 @@ module otpu_actram #(
   localparam int GW = (GROUPS > 1) ? $clog2(GROUPS) : 1;
   localparam int PB = (D > 32) ? 32 : D;      // bytes per piece
   localparam int NP = D / PB;
+  localparam int RAW = $clog2(GROUPS * BLOCKS);  // the RAMs' address bits
   initial if (D % LANES != 0) $fatal(1, "otpu_actram: LANES must divide D");
   initial if (D % PB != 0) $fatal(1, "otpu_actram: D must be a multiple of 32 above 32");
   initial if (ROWS % MCOLS != 0 || (GROUPS > 1 && (MCOLS & (MCOLS - 1)) != 0))
@@ -141,7 +142,6 @@ module otpu_actram #(
 `endif
 
   for (genvar j = 0; j < MCOLS; j++) begin : g_row
-    logic [31:0]    asc [GROUPS*BLOCKS];
     logic [31:0]    rs;
     wire [BW-1:0] rb = r_hi[j] ? r_blk2[BW-1:0] : r_blk[BW-1:0];
     wire [GW+BW-1:0] ra = (GROUPS > 1) ? {r_grp[GW-1:0], rb} : (GW+BW)'(rb);
@@ -153,7 +153,6 @@ module otpu_actram #(
       (* keep *) logic [BW-1:0] wb;
       (* keep *) logic          wsel;
       (* keep *) logic [GW-1:0] wg;
-      logic [PB*8-1:0] act [GROUPS*BLOCKS];
       logic [PB*8-1:0] rd;
       always_ff @(posedge clk) begin
         wb <= w_idx_h[DW +: BW];
@@ -161,23 +160,20 @@ module otpu_actram #(
         wg <= wg_n[j];
       end
       wire [GW+BW-1:0] wa = (GROUPS > 1) ? {wg, wb} : (GW+BW)'(wb);
-      always_ff @(posedge clk) begin
-        for (int b = 0; b < PB; b++)
-          if (wsel && wbe[p*PB + b]) act[wa][8 * b +: 8] <= wd[8 * (p*PB + b) +: 8];
-        if (ren) rd <= act[ra];
-      end
+      // the piece's bytes: a technology RAM with byte enables (rtl/tech)
+      otpu_ram_1r1w_be #(.W(PB*8), .N(GROUPS*BLOCKS), .STYLE("auto")) u_act (
+        .clk, .we(wsel), .wbe(wbe[p*PB +: PB]), .wa(wa[RAW-1:0]), .wd(wd[p*PB*8 +: PB*8]),
+        .re(ren), .ra(ra[RAW-1:0]), .rd);
       assign r_data[j*D*8 + p*PB*8 +: PB*8] = rd;
 `ifndef SYNTHESIS
-      initial begin wsel = 1'b0; for (int b = 0; b < GROUPS*BLOCKS; b++) act[b] = '0; end
+      initial wsel = 1'b0;
 `endif
     end
-    always_ff @(posedge clk) begin
-      if (ssel[j]) asc[sa] <= sd;
-      if (ren) rs <= asc[ra];
-    end
+    // the column's block scales
+    otpu_ram_1r1w #(.W(32), .N(GROUPS*BLOCKS), .STYLE("auto")) u_asc (
+      .clk, .we(ssel[j]), .wa(sa[RAW-1:0]), .wd(sd), .re(ren), .ra(ra[RAW-1:0]), .rd(rs));
     assign r_scale[j*32 +: 32] = rs;
 `ifndef SYNTHESIS
-    initial for (int b = 0; b < GROUPS*BLOCKS; b++) asc[b] = '0;
     // a consumed read of a block (or its scale) with a write in any register: it would return
     // the old bytes
     wire [GW+BW-1:0] wa = g_pc[0].wa;

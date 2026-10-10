@@ -71,6 +71,8 @@ module otpu_tmem #(
   localparam int BD = WORDS / LANES;        // words per bank
   localparam int IW = $clog2(BD);
   initial if (IMPL == 1 && WPB != 1) $fatal(1, "otpu_tmem: IMPL 1 needs WPB = 1");
+  initial if (IMPL == 1) for (int p = 0; p < NRP; p++)
+    if (CPY[p] >= NCP) $fatal(1, "otpu_tmem: port %0d's copy %0d >= NCP %0d", p, CPY[p], NCP);
   // the read port that holds each port's copy: IMPL 0, the port itself or SH_HOST (a guest);
   // IMPL 1, the first port on its copy
   function automatic int host_of(input int p);

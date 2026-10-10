@@ -252,7 +252,6 @@ module otpu_mxu
   // address fanning out to every LUT). The chunk FIFO is its own module (kept as a hierarchy):
   // inline, Vivado absorbed its read register into the DSP input registers of the products,
   // which left an asynchronous read, and built it from 5,472 RAM64M anyway.
-  (* ram_style = "block" *) logic [63:0]    f_scale [SDEPTH];   // {a_rdata2, a_rdata}
   logic [PW-1:0]  f_head, f_tail;
   logic [SPW-1:0] s_head, s_tail;
   logic [PW:0]    f_count;
@@ -436,15 +435,16 @@ module otpu_mxu
   endfunction
   always_comb for (int j = 0; j < MCOLS; j++) as0[j] = act_scale[j*32 +: 32];
 
-  // FIFO writes (the slot was reserved when the chunk was issued; see occ)
-  always_ff @(posedge clk) begin
-    if (a_rvalid) f_scale[s_tail] <= {a_rdata2, a_rdata};
-  end
+  // FIFO writes (the slot was reserved when the chunk was issued; see occ); the RAMs are
+  // technology RAMs (rtl/tech): the scales {a_rdata2, a_rdata}, read into ws0r with the S0 stage
+  otpu_ram_1r1w #(.W(64), .N(SDEPTH), .STYLE("block")) u_fs (
+    .clk, .we(a_rvalid), .wa(s_tail), .wd({a_rdata2, a_rdata}), .re(en_c), .ra(s_rd),
+    .rd(ws0r));
   for (genvar g = 0; g < FG; g++) begin : g_fd
     localparam int LO = fg_lo(g);
     localparam int W = ((g == FG - 1) ? FW : fg_lo(g + 1)) - LO;
     (* keep_hierarchy = "yes" *)
-    otpu_ram_sdp #(.W(W), .N(DEPTH)) u_fd (
+    otpu_ram_1r1w #(.W(W), .N(DEPTH), .STYLE("block")) u_fd (
       .clk, .we(b_rvalid), .wa(f_tl[g]), .wd(b_rdata[LO +: W]), .re(en_c), .ra(f_rdl[g]),
       .rd(w0[LO +: W]));
   end
@@ -472,7 +472,6 @@ module otpu_mxu
       m0.h <= c_w4 && !c_pair && ck[0];
       m0.o <= c_pair && !(last_k && c_KB[0]);
     end
-    ws0r <= f_scale[s_rd];
     cu0 <= c_unit;
     wf0 <= c_wf;
     pr0 <= c_pair;
