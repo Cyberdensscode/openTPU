@@ -1008,10 +1008,14 @@ def test_axi_write_bursts(have_verilator, stall, seed):
     assert aw == beats
 
 
-def test_tmem_random_traffic(have_verilator):
+@pytest.mark.parametrize("impl", [0, 1])
+def test_tmem_random_traffic(have_verilator, impl):
     """TMEM alone against a reference model; most reads hit the previous cycle's writes, which
-    are still in TMEM's registered write stage (the bypass)."""
-    exe = rtlsim.build("tb_tmem", [rtlsim.RTL / "mem/otpu_tmem.sv", rtlsim.TB / "tb_tmem.sv"])
+    are still in TMEM's registered write stage (the bypass). impl 1: the banked TMEM (copies of
+    1R1W bank RAMs shared by ports, one granted read per copy and bank)."""
+    exe = rtlsim.build("tb_tmem", [rtlsim.RTL / "mem/otpu_tmem.sv",
+                                   rtlsim.RTL / "tech/generic/otpu_tech_ram.sv",
+                                   rtlsim.TB / "tb_tmem.sv"], {"IMPL": impl})
     r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=120)
     assert r.returncode == 0 and "PASS" in r.stdout, r.stdout[-2000:] + r.stderr[-2000:]
 

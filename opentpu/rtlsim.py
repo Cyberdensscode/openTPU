@@ -25,6 +25,7 @@ RTL_SOURCES = [
     "vpu/otpu_vtree.sv", "dma/otpu_dma.sv", "mxu/otpu_mxu.sv", "tech/generic/otpu_tech_dsp.sv",
     "vpu/otpu_quant.sv", "vpu/otpu_se_comp.sv", "vpu/otpu_se_tail.sv", "vpu/otpu_vpu.sv",
     "top/otpu_coll.sv", "top/otpu_slice.sv", "top/otpu_top.sv",
+    "tech/generic/otpu_tech_ram.sv",
 ]
 
 
@@ -177,6 +178,10 @@ if os.environ.get("OTPU_VPU_CL"):
 # TMEM lanes of the MXU and the quantizer when fewer than LANES (timing only): OTPU_ULANES=8
 if os.environ.get("OTPU_ULANES"):
     UARCH["ULANES"] = int(os.environ["OTPU_ULANES"])
+# The banked TMEM of the ASIC targets (timing only): three copies of 1R1W bank RAMs, one read
+# and one write per copy and bank per cycle (otpu_tmem IMPL 1): OTPU_TMEM=banked
+if os.environ.get("OTPU_TMEM") == "banked":
+    UARCH.update(TMEM_IMPL=1, RPB=1, WPB=1)
 
 # The memory path. AXI: the board's memory path -- its adapter (otpu_native_dram) in front of a
 # two-channel native memory model (sim/verilator/otpu_native_mem.sv) with random stalls (percent)
