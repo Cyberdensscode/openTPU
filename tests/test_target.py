@@ -199,6 +199,26 @@ def test_rtl_file_lists_agree():
     assert sim == T.sources("nangate45", "generic")
     for f in T.CORE + T.SHELL + sum(T.TECH.values(), []) + sum(T.BOARDS.values(), []):
         assert (ROOT / "rtl" / f).exists(), f
+    bcu = [f"rtl/{f}" for f in T.sources("bcu1525")]
+    assert "rtl/tech/xilinxus/otpu_tech_dsp.sv" in bcu
+    assert _tcl_rtl(ROOT / "boards/bcu1525/vivado/create_project.tcl") == bcu
+    assert _make_rtl(ROOT / "boards/bcu1525/Makefile") == \
+        [f for f in bcu if not f.endswith("otpu_fpga_top_bcu.sv")]
+
+
+def test_bcu1525_target_matches_its_rtl_defaults():
+    """The BCU1525's top and sys wrapper default to its target's values (run_vivado.sh passes
+    them as generics too), with the channel layout otpu_board and otpu_ctrl assume (two channels
+    per slice, 2 GiB a slice addresses of each: CFG_DRAM)."""
+    p = T.rtl_params("bcu1525")
+    for f in ("otpu_fpga_top_bcu.sv", "otpu_bcu_sys.sv"):
+        top = _sv_defaults(ROOT / "rtl/boards/bcu1525" / f)
+        for k in ("S", "D", "MCOLS", "ACT_BLOCKS", "TMEM_WORDS", "IMEM_WORDS", "FIFO_DEPTH",
+                  "LANES", "WIN", "WPB", "MXU_IMPL", "MXU_CL", "VPU_CL", "ULANES", "TRACE_DEPTH",
+                  "PQ_WIN", "CHASH", "DSTEP", "DDR_MTS", "PLATFORM"):
+            assert p[k] == top[k], (f, k)
+    assert p["RPB"] == 8 * p["LANES"]                       # the tops: RPB = 8 * LANES
+    assert (p["NCH"], p["CH_LOG2"], p["DRAM_LOG2"]) == (2, 31, 32)
 
 
 def test_tech_families_define_the_same_cells():

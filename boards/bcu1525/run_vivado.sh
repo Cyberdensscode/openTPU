@@ -11,13 +11,25 @@ here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 out="${OUT_DIR:-$root/build/vivado_bcu1525}"
 jobs="${JOBS:-8}"
-s="${S:-2}"
-mcols="${MCOLS:-4}"
-vpu_cl="${VPU_CL:-2}"
-lanes="${LANES:-8}"
+# The target (targets/bcu1525.toml through opentpu/target.py): the knobs' defaults, the platform
+# id, the DDR4 rate and the arch hash the CFG_* registers report (without python3: the same
+# built-in values, CFG_HASH 0)
+if tenv="$(PYTHONPATH="$root" python3 -m opentpu.target env bcu1525 2>/dev/null)"; then
+  eval "$tenv"
+else
+  echo "run_vivado: python3 -m opentpu.target env bcu1525 failed: built-in defaults, CFG_HASH 0" >&2
+fi
+s="${S:-${T_S:-2}}"
+mcols="${MCOLS:-${T_MCOLS:-4}}"
+vpu_cl="${VPU_CL:-${T_VPU_CL:-2}}"
+lanes="${LANES:-${T_LANES:-8}}"
 act_rows="${ACT_ROWS:-$mcols}"
-dstep="${DSTEP:-1}"
-core_mhz="${CORE_MHZ:-100}"
+dstep="${DSTEP:-${T_DSTEP:-1}}"
+core_mhz="${CORE_MHZ:-${T_CORE_MHZ:-100}}"
+platform="${T_PLATFORM:-2}"
+ddr_mts="${T_DDR_MTS:-1600}"
+arch_hash="$(PYTHONPATH="$root" python3 -m opentpu.target hash bcu1525 MCOLS="$mcols" \
+  LANES="$lanes" ACT_ROWS="$act_rows" DSTEP="$dstep" 2>/dev/null || echo 0)"
 build_id="${BUILD_ID:-$(git -C "$root" rev-parse HEAD 2>/dev/null | cut -c1-8)}"
 build_id="${build_id:-0}"
 mkdir -p "$out"
@@ -29,7 +41,8 @@ run() { local script="$1"; shift
 if [[ "${STEP:-}" == impl ]]; then
   run "$here/vivado/build.tcl" "$out" "$jobs" impl "${IMPL_STRATEGY:-}"
 else
-  run "$here/vivado/create_project.tcl" "$out" "$mcols" "$core_mhz" "$build_id" "$vpu_cl" "$lanes" "$act_rows" "$dstep" "$s"
+  run "$here/vivado/create_project.tcl" "$out" "$mcols" "$core_mhz" "$build_id" "$vpu_cl" "$lanes" \
+    "$act_rows" "$dstep" "$s" "$platform" "$arch_hash" "$ddr_mts"
   run "$here/vivado/build.tcl" "$out" "$jobs" full "${IMPL_STRATEGY:-}"
 fi
 echo "done: $out/otpu.bit"

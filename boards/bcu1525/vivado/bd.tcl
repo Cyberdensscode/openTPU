@@ -1,14 +1,16 @@
 # Block design "otpu_bd" for the BCU1525 (create_project.tcl; boards/ypcb-00338/vivado/bd_native.tcl
-# is its model): PCIe (XDMA, Gen3), the core clock, resets, the SYSMON and the control interconnect.
-# No memory controllers and no memory interconnect: the accelerator and XDMA's DMA meet on each DDR4
-# channel in front of its LiteDRAM core (otpu_ld4, one per channel), outside the block design.
-# External interfaces:
-#   M_AXI_CTL     AXI4-Lite master -> the accelerator's control registers (BAR0 0x00000, core_clk)
-#   M_AXI_MEMCAL  AXI4-Lite master -> the four LiteDRAM cores' CSRs (BAR0 0x40000 + c * 0x10000,
-#                 64 KB each, core_clk: the top splits it by address bits 17:16)
-#   M_AXI_DMA     AXI4 master -> the DDR4 channels (XDMA's DMA, xdma_aclk; 512 bits at x16, 256 at
-#                 x8; card address bits 32:31 = the channel j = 2s + c, 2 GiB each: what slice s
-#                 addresses of its channel c; opentpu.host.board.channel_map)
+# is its model): PCIe (XDMA, Gen3), the core clock, resets, the SYSMON, the control interconnect and
+# XDMA's DMA split onto the channels. No memory controllers: the accelerator and XDMA's DMA meet on
+# each DDR4 channel in front of its LiteDRAM core (otpu_ld4, one per channel), outside the block
+# design (rtl/boards/bcu1525/otpu_fpga_top_bcu.sv). External interfaces:
+#   M_AXI_CTL       AXI4-Lite master -> the accelerator's control registers (BAR0 0x00000, core_clk)
+#   M_AXI_MEMCAL<d> AXI4-Lite masters -> DIMM d's LiteDRAM core's CSRs (BAR0 0x40000 + d * 0x10000,
+#                   64 KB each, core_clk)
+#   M_AXI_DMA<j>    AXI4 masters, 128 bits, no IDs, xdma_aclk -> board channel j = 2s + c's bridge
+#                   (otpu_mem_ch): XDMA's DMA (512 bits at x16, 256 at x8) through the SmartConnect
+#                   sc_dma, which decodes card address bits 32:31 (channel j at j * 2 GiB: what
+#                   slice s addresses of its channel c; opentpu.host.board.channel_map) and
+#                   converts the width
 # and device_temp (the SYSMON's die temperature, 10 bits, core_clk; BAR0 0x30000: its registers).
 # The BAR0 layout keeps the YPCB's (control at 0x0, the system monitor at 0x30000, 1 MB), so the
 # host's register access is the same; 0x10000 (the YPCB core's CSRs, R_MEMCAL) is left unmapped.
@@ -59,14 +61,14 @@ create_bd_port -dir O -type rst xdma_aresetn
 create_bd_port -dir O -from 9 -to 0 device_temp
 create_bd_port -dir O pcie_link_up
 
-set lites {M_AXI_CTL M_AXI_MEMCAL}
+set lites {M_AXI_CTL M_AXI_MEMCAL0 M_AXI_MEMCAL1 M_AXI_MEMCAL2 M_AXI_MEMCAL3}
 foreach p $lites {
   set m [create_bd_intf_port -mode Master -vlnv xilinx.com:interface:aximm_rtl:1.0 $p]
   set_property -dict [list CONFIG.PROTOCOL AXI4LITE CONFIG.DATA_WIDTH 32 CONFIG.ADDR_WIDTH 32 \
     CONFIG.HAS_BURST 0 CONFIG.HAS_LOCK 0 CONFIG.HAS_PROT 0 CONFIG.HAS_CACHE 0 CONFIG.HAS_QOS 0 \
     CONFIG.HAS_REGION 0 CONFIG.FREQ_HZ $CORE_HZ] $m
 }
-set_property CONFIG.ASSOCIATED_BUSIF {M_AXI_CTL:M_AXI_MEMCAL} [get_bd_ports core_clk]
+set_property CONFIG.ASSOCIATED_BUSIF [join $lites :] [get_bd_ports core_clk]
 set_property CONFIG.ASSOCIATED_RESET {core_rstn} [get_bd_ports core_clk]
 set_property CONFIG.FREQ_HZ $CORE_HZ [get_bd_ports core_clk]
 
@@ -137,9 +139,23 @@ connect_bd_net [get_bd_pins xdma_0/user_lnk_up] [get_bd_ports pcie_link_up]
 connect_bd_net [get_bd_pins xdma_0/axi_aclk] [get_bd_ports xdma_aclk]
 connect_bd_net [get_bd_pins xdma_0/axi_aresetn] [get_bd_ports xdma_aresetn]
 
-make_bd_intf_pins_external [get_bd_intf_pins xdma_0/M_AXI]
-set_property NAME M_AXI_DMA [get_bd_intf_ports -of [get_bd_intf_nets -of [get_bd_intf_pins xdma_0/M_AXI]]]
-set_property CONFIG.ASSOCIATED_BUSIF {M_AXI_DMA} [get_bd_ports xdma_aclk]
+# XDMA's DMA onto the four channels: one 128-bit AXI4 master each (otpu_mem_ch's XDMA side), in
+# xdma_aclk; INCR bursts of full-width beats (otpu_mem_ch relies on it: no burst type port), in
+# order per master (no IDs: otpu_mem_ch answers in order)
+set dmas {M_AXI_DMA0 M_AXI_DMA1 M_AXI_DMA2 M_AXI_DMA3}
+set scd [create_bd_cell -type ip -vlnv [ip_vlnv smartconnect] sc_dma]
+set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {4} CONFIG.NUM_CLKS {1}] $scd
+connect_bd_net [get_bd_pins xdma_0/axi_aclk] [get_bd_pins sc_dma/aclk]
+connect_bd_net [get_bd_pins xdma_0/axi_aresetn] [get_bd_pins sc_dma/aresetn]
+connect_bd_intf_net [get_bd_intf_pins xdma_0/M_AXI] [get_bd_intf_pins sc_dma/S00_AXI]
+foreach p $dmas {
+  set m [create_bd_intf_port -mode Master -vlnv xilinx.com:interface:aximm_rtl:1.0 $p]
+  set_property -dict [list CONFIG.PROTOCOL AXI4 CONFIG.DATA_WIDTH 128 CONFIG.ADDR_WIDTH 33 \
+    CONFIG.ID_WIDTH 0 CONFIG.HAS_BURST 0 CONFIG.HAS_LOCK 0 CONFIG.HAS_PROT 0 CONFIG.HAS_CACHE 0 \
+    CONFIG.HAS_QOS 0 CONFIG.HAS_REGION 0 CONFIG.FREQ_HZ $XDMA_HZ] $m
+  connect_bd_intf_net [get_bd_intf_pins sc_dma/M0[string index $p end]_AXI] $m
+}
+set_property CONFIG.ASSOCIATED_BUSIF [join $dmas :] [get_bd_ports xdma_aclk]
 set_property CONFIG.ASSOCIATED_RESET {xdma_aresetn} [get_bd_ports xdma_aclk]
 set_property CONFIG.FREQ_HZ $XDMA_HZ [get_bd_ports xdma_aclk]
 
@@ -159,30 +175,37 @@ connect_bd_net [get_bd_pins sysmon/temp_out] [get_bd_ports device_temp]
 
 # ------------------------------------------------------------------ control interconnect
 set scl [create_bd_cell -type ip -vlnv [ip_vlnv smartconnect] sc_ctl]
-set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {3} CONFIG.NUM_CLKS {2}] $scl
+set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {6} CONFIG.NUM_CLKS {2}] $scl
 connect_bd_net [get_bd_pins xdma_0/axi_aclk] [get_bd_pins sc_ctl/aclk]
 connect_bd_net [get_bd_pins clk_wiz_0/core_clk] [get_bd_pins sc_ctl/aclk1]
 connect_bd_net [get_bd_pins xdma_0/axi_aresetn] [get_bd_pins sc_ctl/aresetn]
 connect_bd_intf_net [get_bd_intf_pins xdma_0/M_AXI_LITE] [get_bd_intf_pins sc_ctl/S00_AXI]
 connect_bd_intf_net [get_bd_intf_pins sc_ctl/M00_AXI] [get_bd_intf_ports M_AXI_CTL]
 connect_bd_intf_net [get_bd_intf_pins sc_ctl/M01_AXI] [get_bd_intf_pins sysmon/S_AXI_LITE]
-connect_bd_intf_net [get_bd_intf_pins sc_ctl/M02_AXI] [get_bd_intf_ports M_AXI_MEMCAL]
+foreach d {0 1 2 3} {
+  connect_bd_intf_net [get_bd_intf_pins sc_ctl/M0[expr {$d + 2}]_AXI] [get_bd_intf_ports M_AXI_MEMCAL$d]
+}
 
 # ------------------------------------------------------------------ address map
 # BAR0: 0x00000 the control registers (64 KB), 0x30000 the SYSMON, 0x40000-0x7FFFF the LiteDRAM
-# cores' CSRs (channel c at 0x40000 + c * 0x10000). XDMA's DMA: 8 GiB to M_AXI_DMA (channel j at
-# j * 2 GiB, the 2 GiB of it the slices address; the top routes by address bits 32:31)
+# cores' CSRs (DIMM d at 0x40000 + d * 0x10000). XDMA's DMA: 8 GiB, M_AXI_DMA<j> at j * 2 GiB (the
+# 2 GiB of each channel the slices address; address bits 32:31)
 set lite [get_bd_addr_spaces xdma_0/M_AXI_LITE]
 assign_bd_address -offset 0x00000000 -range 64K -target_address_space $lite [get_bd_addr_segs M_AXI_CTL/Reg] -force
 assign_bd_address -offset 0x00030000 -range 64K -target_address_space $lite \
   [get_bd_addr_segs -of [get_bd_intf_pins sysmon/S_AXI_LITE]] -force
-assign_bd_address -offset 0x00040000 -range 256K -target_address_space $lite [get_bd_addr_segs M_AXI_MEMCAL/Reg] -force
-assign_bd_address -offset 0x00000000 -range 8G -target_address_space [get_bd_addr_spaces xdma_0/M_AXI] \
-  [get_bd_addr_segs M_AXI_DMA/Reg] -force
+foreach d {0 1 2 3} {
+  assign_bd_address -offset [format 0x%08X [expr {0x40000 + $d * 0x10000}]] -range 64K \
+    -target_address_space $lite [get_bd_addr_segs M_AXI_MEMCAL$d/Reg] -force
+}
+foreach j {0 1 2 3} {
+  assign_bd_address -offset [format 0x%09X [expr {$j * 0x80000000}]] -range 2G \
+    -target_address_space [get_bd_addr_spaces xdma_0/M_AXI] [get_bd_addr_segs M_AXI_DMA$j/Reg] -force
+}
 
 validate_bd_design
 
-foreach p [concat {pcie_mgt pcie_refclk M_AXI_DMA} $lites] {
+foreach p [concat {pcie_mgt pcie_refclk} $dmas $lites] {
   if {[get_bd_intf_ports $p] eq ""} { error "block design port $p missing: [get_bd_intf_ports]" }
 }
 foreach {k want} [list pf0_device_id 7028 pf0_class_code 120000 pf0_subsystem_id 4F54 \
@@ -191,7 +214,9 @@ foreach {k want} [list pf0_device_id 7028 pf0_class_code 120000 pf0_subsystem_id
   set got [get_property CONFIG.$k [get_bd_cells xdma_0]]
   if {$got ne $want} { error "xdma_0: $k is $got, expected $want" }
 }
-set w [get_property CONFIG.DATA_WIDTH [get_bd_intf_ports M_AXI_DMA]]
-if {$w != $AXI_BITS} { error "M_AXI_DMA is $w bits, expected $AXI_BITS" }
-puts "M_AXI_DMA: $w bits, address [get_property CONFIG.ADDR_WIDTH [get_bd_intf_ports M_AXI_DMA]] bits"
+foreach p $dmas {
+  set w [get_property CONFIG.DATA_WIDTH [get_bd_intf_ports $p]]
+  if {$w != 128} { error "$p is $w bits, expected 128 (otpu_mem_ch's XDMA side)" }
+}
+puts "M_AXI_DMA0..3: 128 bits from XDMA's $AXI_BITS"
 save_bd_design

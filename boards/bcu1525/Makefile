@@ -1,7 +1,9 @@
 # openTPU on the BCU1525 (VCU1525 build: xcvu9p-fsgd2104-2L-e, 4 x DDR4 RDIMM, PCIe Gen3 x16;
 # docs/bcu1525.md).
 #   make lint       offline: Tcl syntax, XDC pins / ports vs the DDR4 core's pads and the top,
-#                   core.json's hashes (scripts/check_offline.py)
+#                   core.json's hashes (scripts/check_offline.py); Verilator lint of the top
+#                   (-DSYNTHESIS, the DSP48E2 cells of rtl/tech/xilinxus) with stand-ins for the
+#                   block design, the DDR4 core and the unisim primitives (sim/)
 #   make pins       regenerate constraints/*.xdc from AMD's VCU1525 board file (scripts/gen_pins.py)
 #   make core       regenerate litedram/ (tools/litedram/gen_core_ddr4.py; LITEX_VENV: a venv with
 #                   core.json's packages; RVSHIM: a directory whose riscv64-unknown-elf-* work)
@@ -22,9 +24,21 @@ OUT ?= $(ROOT)/build/vivado_bcu1525
 BIT ?= $(OUT)/otpu.bit
 MCS ?= $(OUT)/otpu.mcs
 
+# the RTL: opentpu.target sources("bcu1525") (tests/test_target.py checks it), the top linted last
+RTL := $(addprefix $(ROOT)/rtl/, vpu/otpu_fp.sv vpu/otpu_fpipe.sv top/otpu_pkg.sv mem/otpu_tmem.sv \
+  mem/otpu_actram.sv seq/otpu_seq.sv vpu/otpu_vtree.sv dma/otpu_dma.sv mxu/otpu_mxu.sv \
+  tech/xilinxus/otpu_tech_dsp.sv vpu/otpu_quant.sv vpu/otpu_se_comp.sv vpu/otpu_se_tail.sv \
+  vpu/otpu_vpu.sv top/otpu_coll.sv top/otpu_slice.sv shell/otpu_ctrl.sv shell/otpu_trace.sv \
+  shell/otpu_board.sv mem/otpu_native_dram.sv shell/otpu_afifo.sv shell/otpu_mem_ch.sv \
+  shell/otpu_axi_split2.sv boards/bcu1525/otpu_bcu_sys.sv)
+LINT := verilator --lint-only -Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNUSEDSIGNAL \
+  -Wno-UNUSEDPARAM -DSYNTHESIS sim/unisim_dsp48e2_stub.sv sim/unisim_stubs.sv
+
 .PHONY: lint pins core ipcheck bit impl program flash
 lint:
 	python3 scripts/check_offline.py
+	$(LINT) --top-module otpu_fpga_top_bcu $(RTL) sim/otpu_bd_wrapper_stub.sv \
+	  sim/otpu_ld4_stub.sv $(ROOT)/rtl/boards/bcu1525/otpu_fpga_top_bcu.sv
 
 pins:
 	python3 scripts/gen_pins.py
