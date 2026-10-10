@@ -60,14 +60,37 @@ make these numbers from a run.
 
 | | nangate45-small | nangate45 (the card's arch) |
 |---|---|---|
-| stage | routed, final report (signoff extraction) | synthesis and floorplan (placement running) |
+| stage | routed, final report (signoff extraction) | CTS (global routing ran out of memory: 24 GB peak, Docker's VM has 23.4) |
 | die | 2.65 x 2.65 mm = 7.02 mm² | 5.53 x 5.53 mm = 30.6 mm² |
-| standard cells | 1.18 mm², 590 K instances (20.8% of the core): 94 K flip-flops 0.43 mm², 373 K gates 0.66 mm² | 4.04 mm², 1.76 M instances after synthesis (17.0% of the core) |
+| standard cells | 1.18 mm², 590 K instances (20.8% of the core): 94 K flip-flops 0.43 mm², 373 K gates 0.66 mm² | 4.36 mm², 2.02 M instances (18.3% of the core; 1.76 M after synthesis) |
 | macros | 27, 233 KiB, 1.31 mm² | 113, 1126 KiB, 6.62 mm² |
-| register to register | 2.39 ns: **419 MHz** (no violation at 2.5 ns) | |
-| with the ports | 2.95 ns: 339 MHz (one endpoint: `sw_req`) | |
-| power at 400 MHz | 0.79 W: sequential 0.28, clock 0.20, combinational 0.15, macros 0.16; leakage 21 mW | |
-| route | 16.2 m of wire, 0 DRC violations, 0 antenna violations | |
+| register to register | 2.39 ns: **419 MHz** (no violation at 2.5 ns) | 5.60 ns: 178 MHz (clock skew 2.7 ns, see below) |
+| with the ports | 2.95 ns: 339 MHz (one endpoint: `sw_req`) | 6.40 ns: 156 MHz |
+| power at 400 MHz | 0.79 W: sequential 0.28, clock 0.20, combinational 0.15, macros 0.16; leakage 21 mW | 3.34 W: sequential 1.09, clock 0.93, macros 0.87, combinational 0.46; leakage 82 mW |
+| route | 16.2 m of wire, 0 DRC violations, 0 antenna violations | not routed |
+
+The card's clock is a physical-design result, not the RTL's: CTS left the macros' clock pins at
+4.9-5.0 ns of insertion delay against 2.3 ns for the flip-flops (2.7 ns of skew on a 30 mm² die
+with 113 macros; nangate45-small's skew is 0.13 ns), and the worst path pays it: a TMEM bank
+macro (launched 2.6 ns late) -> a 1.1 ns wire across the die -> the TMEM read mux -> the DMA's
+`dsw` (-3.10 ns). By kind, after CTS (`tools/asic/paths.py card 300 4_cts`, the worst 100 K
+endpoints):
+
+| kind | failing endpoints | worst slack | the worst path |
+|---|---|---|---|
+| io | 1227 | -3.90 ns | DMA `fs_k` -> port `sw_req` |
+| sram | 4815 | -3.10 ns | TMEM bank macro -> DMA `dsw`; the TMEM's reads into every unit -2.2 to -2.7 (the macros' late clock) |
+| dma | 73.6 K | -1.81 ns | DMA `fs_k` -> the arbitration -> the quantizer's block buffer (the enable fanout, now across a 5.5 mm die) |
+| tmem | 491 | -1.77 ns | DMA `fs_k` -> TMEM bypass hit |
+| control | 2572 | -1.69 ns | MXU `h` -> the quantizer's block buffer |
+| fpipe | 13.1 K | -1.38 ns | DMA `fs_k` -> the quantizer's fadd s2 (an enable) |
+| systolic | 0 | +0.41 ns | MXU `hi0` -> PE |
+
+Without the skew the macro paths are about -0.5 ns; the enable fanout (-1.8 ns, no macro in it)
+is then the card's limit, as it is the small point's second: on a 30 mm² die it is wire. Next for
+the card: balance the macro clock tree (CTS options, the macros'
+placement next to their muxes), a denser floorplan (35% leaves 5.5 mm of die for 10.7 mm² of
+cells and macros), and Docker with more than 24 GB for global routing.
 
 The final power-grid check failed on one row segment (PSM-0069: 26 um boxed in by macros,
 narrower than the M4 straps' pitch, its rails unconnected; 14 cells); the run finished with the
