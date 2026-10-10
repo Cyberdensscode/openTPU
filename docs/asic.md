@@ -53,13 +53,20 @@ make these numbers from a run.
 
 | | nangate45-small | nangate45 (the card's arch) |
 |---|---|---|
-| stage | global route (detailed route running) | (running) |
+| stage | routed, final report (signoff extraction) | (running) |
 | die | 2.65 x 2.65 mm = 7.02 mm² | |
-| standard cells | 1.18 mm², 590 K instances (20.8% of the core) | |
+| standard cells | 1.18 mm², 590 K instances (20.8% of the core): 94 K flip-flops 0.43 mm², 373 K gates 0.66 mm² | |
 | macros | 27, 233 KiB, 1.31 mm² | 113, 1126 KiB, 6.62 mm² |
-| register to register | 2.40 ns: **416 MHz** (CTS: 2.37 ns, 422 MHz) | |
-| with the ports | 3.12 ns: 320 MHz (worst: `sw_req`) | |
-| power at 400 MHz | 0.81 W: sequential 0.28, clock 0.21, combinational 0.16, macros 0.16; leakage 21 mW | |
+| register to register | 2.39 ns: **419 MHz** (no violation at 2.5 ns) | |
+| with the ports | 2.95 ns: 339 MHz (one endpoint: `sw_req`) | |
+| power at 400 MHz | 0.79 W: sequential 0.28, clock 0.20, combinational 0.15, macros 0.16; leakage 21 mW | |
+| route | 16.2 m of wire, 0 DRC violations, 0 antenna violations | |
+
+The final power-grid check failed on one row segment (PSM-0069: 26 um boxed in by macros,
+narrower than the M4 straps' pitch, its rails unconnected; 14 cells); the run finished with the
+IR-drop analysis off. The flow now drops such rows (`asic/nangate45/tapcell.tcl`, checked on this
+floorplan: no row narrower than 60 um is left) and no longer fixes hold at the ports (2188 input
+endpoints, 12 K hold buffers here); the card's run has both.
 
 Area per unit after synthesis (before placement's buffers), nangate45-small, mm²:
 
@@ -79,55 +86,59 @@ three copies' macros.
 
 ### Critical paths
 
-nangate45-small after CTS (`tools/asic/paths.py small 300 4_cts`; 91 K endpoints). The worst path
-of each kind, and per stage class the worst path out of it (its own logic) and into it:
+nangate45-small, final (`tools/asic/paths.py small 300 6_final`: 91 K endpoints, signoff
+parasitics). The worst path of each kind:
 
 | kind | endpoints | worst slack | the worst path |
 |---|---|---|---|
-| io | 435 | -0.749 ns | DMA `is_st` -> the slice's SW port arbitration -> port `sw_req` (31 levels) |
-| control | 25 K | 0.133 ns | sequencer `q_pr` -> `c_fp` (50 levels): the dispatch footprint, `fp_ranges` then `fp_seg` |
-| control | | 0.293 ns | VPU `ic` -> quantizer block buffer (45 levels): the VPU's issue test (`ic + l < cols`) -> its TMEM request -> the slice's banked arbiter (`gnt_k`) -> the quantizer's grant -> its enables |
-| dma / fpipe | 43 K / 8 K | 0.401 / 0.409 ns | DMA stream state (`fs_k`, `is_st`, `busy`) -> the stream engine's handshake -> the VPU's enables (30 levels; it reaches the fp pipes' stage registers, the logic is the enable's) |
-| tmem | 7.6 K | 0.426 ns | DMA `is_st` -> TMEM bypass hit (`bh`) |
-| sram | 3.9 K | 0.455 ns | DMA chunk buffer macro -> TMEM bank macro (write data) |
-| systolic | 3.6 K | 0.690 ns | MXU PAIR column select (`hi0`) -> PE |
+| io | 435 | -0.452 ns | DMA stream state `fs_k` -> the slice's SW port arbitration -> port `sw_req` (27 levels) |
+| control | 19 K | 0.114 ns | sequencer `q_pr` -> `c_fp` (50 levels): the dispatch footprint of the queued command, `fp_ranges` then `fp_seg` |
+| dma | 52 K | 0.398 ns | DMA stream state `fs_k` -> the TMEM arbitration -> the quantizer's grant -> its enables, into its block buffer (39 levels); the same source reaches the VPU's registers (8.6 K endpoints at 0.57 ns) |
+| tmem | 4.1 K | 0.533 ns | DMA `fs_k` -> TMEM bypass hit (`bh`) |
+| fpipe | 8.1 K | 0.544 ns | DMA `fs_k` -> the quantizer's fadd s1 (37 levels): an enable again |
+| sram | 3.9 K | 0.593 ns | DMA chunk buffer macro -> TMEM bank macro (write data) |
+| systolic | 3.6 K | 0.765 ns | MXU PAIR column select (`hi0`) -> PE |
 
-| stage class | out of it (its own logic) | into it, from its operands |
+Per stage class, the worst path out of it (its own logic) and into it from its operands:
+
+| stage class | out of it | into it, from its operands |
 |---|---|---|
-| otpu_fmul s1 (the significand product) | | 0.619 ns from an fmul's result, 0.683 from an fadd's (19-21 levels): about 1.85 ns |
-| otpu_fmul s2 (normalise, round) | 1.262 ns (17 levels) | |
-| otpu_fadd s1 -> s2 | 1.052 ns (29 levels) | |
-| otpu_fadd s2 -> s3 | 0.829 ns (26 levels) | |
-| otpu_fadd s3 -> s4 | 1.217 ns (19 levels) | |
-| systolic PE -> PE | 1.142 ns (19 levels) | 1.063 from the weight data |
-| systolic column end | 1.086 ns (25 levels) | |
-| sequencer | 0.133 ns (50 levels) | |
+| otpu_fmul s1 (the significand product) | | 0.657 ns from an fmul's result, 0.692 from an fadd's (19-21 levels): about 1.8 ns |
+| otpu_fmul s2 (normalise, round) | 1.353 ns (13 levels) | |
+| otpu_fadd s1 -> s2 | 1.055 ns (29 levels) | |
+| otpu_fadd s2 -> s3 | 0.831 ns (26 levels) | |
+| otpu_fadd s3 -> s4 | 1.267 ns (21 levels) | |
+| systolic PE -> PE | 1.102 ns (19 levels) | 1.017 from the weight data |
+| systolic column end | 1.106 ns (25 levels) | |
+| sequencer | 0.114 ns (50 levels) | |
 
-Into every fp stage register the worst path is an enable (0.41-0.50 ns: the DMA's stream state or
-the VPU's issue test through the arbiter), not the arithmetic: the units stall by enable, and the
-grant reaches thousands of registers.
+Into every fp stage register the worst path is an enable (0.54-0.59 ns: the DMA's stream state, the
+MXU's `al_i` or the VPU's issue test through the arbiter), not the arithmetic: the units stall by
+enable, and the grant reaches thousands of registers. After CTS the order was the same except that
+the VPU's issue test (`ic` -> the arbiter -> the quantizer's block buffer, 0.29 ns) came second;
+routing's repair moved it behind the DMA's.
 
 **LM / LA.** `otpu_fmul` is two stages and `otpu_fadd` four whatever LM / LA say: a larger LM or LA
 appends delay registers after the last stage (`otpu_delay u_pad`), it moves no logic. Raising them
 shortens no path unless synthesis retimes (ORFS's `SYNTH_RETIME_MODULES`, experimental), so a
 lm3la6 run would time the same as the default and was not run. The fp stages are not the limit
-either: their own logic has 0.6-1.3 ns of slack at 2.5 ns (the product stage about 1.85 ns, the
-next 1.67 ns), against 0.13 ns for the sequencer and 0.29-0.41 ns for the arbitration and enable
-paths. A faster fp datapath (a split multiplier: the XLS pilot's +27..48% clock on the operator)
-pays once those are fixed, from about 530 MHz.
+either: their own logic has 0.66-1.35 ns of slack at 2.5 ns (the product stage about 1.8 ns,
+fadd's second stage 1.67 ns), against 0.11 ns for the sequencer and 0.40-0.60 ns for the
+arbitration and enable paths. A faster fp datapath (a split multiplier: the XLS pilot's +27..48%
+clock on the operator) pays once those are fixed, from about 540 MHz.
 
 ### Open problems
 
 - **The ports.** The SW and port B requests (`sw_req`, `sw_addr`, `sw_wdata`, `b_wmask`, ...) leave
   the block combinationally from the DMA's and quantizer's state through the slice's arbitration
-  (12-31 levels): with 20% of the period outside, 320 MHz. A register stage at the boundary (as the
+  (12-27 levels): with 20% of the period outside, 339 MHz. A register stage at the boundary (as the
   platform's adapter would add) frees them.
 - **Sequencer dispatch.** `q_pr -> c_fp` (the footprint of the queued command, 50 levels) is the
   worst register-to-register path; `fp_ranges` and `fp_seg` in two cycles would give it a full one.
-- **Grant fanout.** A unit's request -> the banked arbiter -> another unit's grant -> its enables
-  (45 levels), and the DMA's stream state -> the VPU's enables: the stall-by-enable design puts a
-  high-fanout enable behind the arbitration. A registered grant (a cycle from request to grant) or
-  per-unit clock gating is the lever.
+- **Grant fanout.** The DMA's stream state -> the arbitration -> the quantizer's and the VPU's
+  enables (39 levels), a unit's request -> the banked arbiter -> another unit's grant -> its
+  enables (43-45): the stall-by-enable design puts a high-fanout enable behind the arbitration. A
+  registered grant (a cycle from request to grant) or per-unit clock gating is the lever.
 - The macros are CACTI-fitted estimates (`tools/asic/fakeram.py`), not a compiler's; a real PDK's
   1R1W macros (IHP SG13G2, commercial) replace them through `rtl/tech/asic`'s leaves.
 - Power is vectorless; a VCD from the Verilator RTL (a decode token) would give real activities.

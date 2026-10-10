@@ -35,7 +35,11 @@ python3 tools/asic/paths.py small 300 4_cts        # the same, after CTS (placem
 
 `ORFS_CPUS` (default 6) is the container's CPUs and ORFS's NUM_CORES; `ORFS_IMAGE` the image.
 `make` resumes from the stage files that exist: an interrupted `run` continues where it stopped
-(after a config change, clean from the stage it affects).
+(after a config change, clean from the stage it affects). The sources are the worktree's own: an
+RTL file newer than the run's synthesis makes `make` start over from synthesis; to run one stage
+on the results there are, name its `do-` target (`ORFS_TARGET=do-finish`, `do-grt`, ...).
+`ORFS_VARS` adds ORFS variables to a run (`ORFS_VARS="SKIP_INCREMENTAL_REPAIR=1"`: no repair in
+global routing, an hour less on nangate45-small).
 
 Design points (`tools/asic/flow.py` POINTS, from the targets: arch, uarch, `core_mhz`):
 
