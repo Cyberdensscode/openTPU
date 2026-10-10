@@ -482,6 +482,72 @@ def test_tiny_qwen3_two_slices_on_board_model(have_verilator, nreg):
         assert np.array_equal(brd.backend.read(s, 0, n), isa.backend.machine.slices[s].dram[:n])
 
 
+# BAR / GATHER across the BCU1525's SLR crossings (otpu_board g_xs: otpu_coll_hub, a port per
+# slice): TMEM words, DRAM bytes
+_CA, _CR, _CG, _CG2, _CG3, _CG4 = 0, 4096, 8192, 10240, 12288, 14336
+_CDATA, _CACC, _COUT, _CPROG = 0x10000, 0x20000, 0x100000, 0x300000
+_COUTS = ((0, _CG, 400), (0x1000, _CG2, 160), (0x2000, _CG3, 512), (0x3000, _CG4, 512),
+          (0x4000, _CR, 1024))
+
+
+def _collective_program(s: int) -> list:
+    """Slice s's program: BARs back to back, a BAR while the other slice is still busy (slice 1
+    first, then slice 0: a loop of VOPs on its accumulator), BARs right after and right before
+    GATHERs, two GATHERs back to back (the second of the lagging accumulators), the results to
+    DRAM."""
+    from opentpu import isa as I
+
+    def lag(who):
+        return [I.loop(1, 120), I.vop(I.V_ADD, _CR, _CR, _CA, 4, 256, 256, 256, 256)] \
+            if s == who else []
+    return [I.ld(_CDATA, _CA, 2048), I.ld(_CACC, _CR, 1024),
+            I.bar(), I.bar(), I.bar(),
+            *lag(1), I.bar(),
+            I.gather(_CA, _CG, 3, 50, 64, 64, 192), I.bar(),
+            *lag(0), I.bar(), I.gather(_CA + 512, _CG2, 2, 37, 40, 40, 80),
+            I.bar(), I.gather(_CR, _CG3, 4, 64, 256, 64, 256),
+            I.gather(_CR + 8, _CG4, 4, 64, 256, 64, 256), I.bar(), I.bar(),
+            *[I.st(_COUT + o, t, n) for o, t, n in _COUTS],
+            I.halt()]
+
+
+@pytest.mark.parametrize("nreg,seed", [(0b1010, 5), (0, 9)])
+def test_bar_and_gather_across_slrs_on_board_model(have_verilator, nreg, seed):
+    """The BCU1525's board (S = 2, the board's SLR crossings, the collective through
+    otpu_coll_hub and a port per slice; nreg: the channels' crossings, as the board's 1 and 3,
+    or none) runs BARs back to back, a BAR with one slice far behind the other (each in turn),
+    BARs right after and right before GATHERs and GATHERs back to back, under two memory stall
+    patterns (seed): the results and both slices' instruction counts are the ISA simulator's.
+    (One run per simulation: each flush of the board model starts it from reset.)"""
+    from opentpu import isa as I
+    from opentpu.isasim import Machine
+    cfg = board_config(DRAM_BYTES=1 << 23, S=2)
+    progs = [_collective_program(s) for s in range(2)]
+    rng = np.random.default_rng(11)
+    ins = [(rng.standard_normal(2048).astype(np.float32), rng.standard_normal(1024)
+            .astype(np.float32)) for _ in range(2)]
+    drams = []
+    for x, y in ins:
+        d = np.zeros(cfg.DRAM_BYTES, np.uint8)
+        d[_CDATA:_CDATA + x.nbytes] = x.view(np.uint8)
+        d[_CACC:_CACC + y.nbytes] = y.view(np.uint8)
+        drams.append(d)
+    m = Machine(cfg, progs, drams).run()
+    b = Board(SimTransport(ch_bytes=cfg.DRAM_BYTES // 2, stall=20, seed=seed, target="bcu1525",
+                           params={"NREG": nreg}))
+    assert b.slices == 2
+    for s, (x, y) in enumerate(ins):
+        b.write(_CDATA, x.view(np.uint8), s)
+        b.write(_CACC, y.view(np.uint8), s)
+    b.load_program(_CPROG, [np.asarray(I.assemble(p), np.uint32) for p in progs])
+    st = b.run()
+    assert st["instructions"] == [sl.icount for sl in m.slices]
+    for s in range(2):
+        for o, _, n in _COUTS:
+            got = b.read(_COUT + o, 4 * n, s)
+            assert np.array_equal(got, m.slices[s].dram[_COUT + o:_COUT + o + 4 * n]), (s, hex(o))
+
+
 def test_tiny_qwen3_generate_on_board_model(have_verilator):
     """The generate loop through the board (CAPS bit30, BoardBackend.run_generate): from the
     DRAM state of a 248-token prefill on the ISA simulator, 12 tokens across the attention
