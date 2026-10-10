@@ -36,6 +36,10 @@ module otpu_bcu_sys #(
   parameter int DDR_MTS    = 1600,
   parameter int PLATFORM   = 2,
   parameter logic [31:0] ARCH_HASH = 32'h0,
+  // bit j: board channel j's native port crosses an SLR (slice 0 in SLR0 on DIMM C1 in SLR1,
+  // slice 1 in SLR2 on C2 in SLR1: channels 1 and 3; constraints/bcu1525_floorplan.xdc): two
+  // otpu_native_reg, u_tx with the slice and u_rx with the channel, flip-flop to flip-flop across
+  parameter logic [3:0] SLL = 4'b1010,
   parameter int NC         = 2 * S          // memory channels (two per slice)
 ) (
   // core clock and reset (synchronous, high), XDMA's clock and reset
@@ -108,7 +112,12 @@ module otpu_bcu_sys #(
   input  logic [NC-1:0][1:0]      c_rdata_valid,
   input  logic [NC-1:0][1:0][511:0] c_rdata_data
 );
-  // the accelerator's native masters, per channel
+  // the accelerator's native masters, per channel (the board's side: b_*; the bridge's: n_*)
+  logic [NC-1:0]        b_cvalid, b_cready, b_cwe, b_wvalid, b_wready, b_rvalid, b_err;
+  logic [NC-1:0][24:0]  b_caddr;
+  logic [NC-1:0][511:0] b_wdata, b_rdata;
+  logic [NC-1:0][63:0]  b_wmask;
+  logic [NC-1:0][15:0]  b_wdone;
   logic [NC-1:0]        n_cvalid, n_cready, n_cwe, n_wvalid, n_wready, n_rvalid, n_err;
   logic [NC-1:0][24:0]  n_caddr;
   logic [NC-1:0][511:0] n_wdata, n_rdata;
@@ -116,6 +125,34 @@ module otpu_bcu_sys #(
   logic [NC-1:0][15:0]  n_wdone;
 
   for (genvar j = 0; j < NC; j++) begin : g_ch
+    if (SLL[j]) begin : g_sll
+      logic cv, cr, cwe, wv, wr, rv, err;
+      logic [24:0] ca;
+      logic [511:0] wd, rd;
+      logic [63:0] wm;
+      logic [15:0] wdone;
+      otpu_native_reg u_tx (.clk, .rst,
+        .s_cvalid(b_cvalid[j]), .s_cready(b_cready[j]), .s_cwe(b_cwe[j]), .s_caddr(b_caddr[j]),
+        .s_wvalid(b_wvalid[j]), .s_wready(b_wready[j]), .s_wdata(b_wdata[j]),
+        .s_wmask(b_wmask[j]), .s_rvalid(b_rvalid[j]), .s_rdata(b_rdata[j]),
+        .s_wdone(b_wdone[j]), .s_err(b_err[j]),
+        .m_cvalid(cv), .m_cready(cr), .m_cwe(cwe), .m_caddr(ca), .m_wvalid(wv), .m_wready(wr),
+        .m_wdata(wd), .m_wmask(wm), .m_rvalid(rv), .m_rdata(rd), .m_wdone(wdone), .m_err(err));
+      otpu_native_reg u_rx (.clk, .rst,
+        .s_cvalid(cv), .s_cready(cr), .s_cwe(cwe), .s_caddr(ca), .s_wvalid(wv), .s_wready(wr),
+        .s_wdata(wd), .s_wmask(wm), .s_rvalid(rv), .s_rdata(rd), .s_wdone(wdone), .s_err(err),
+        .m_cvalid(n_cvalid[j]), .m_cready(n_cready[j]), .m_cwe(n_cwe[j]), .m_caddr(n_caddr[j]),
+        .m_wvalid(n_wvalid[j]), .m_wready(n_wready[j]), .m_wdata(n_wdata[j]),
+        .m_wmask(n_wmask[j]), .m_rvalid(n_rvalid[j]), .m_rdata(n_rdata[j]),
+        .m_wdone(n_wdone[j]), .m_err(n_err[j]));
+    end else begin : g_wire
+      assign n_cvalid[j] = b_cvalid[j]; assign b_cready[j] = n_cready[j];
+      assign n_cwe[j] = b_cwe[j];       assign n_caddr[j] = b_caddr[j];
+      assign n_wvalid[j] = b_wvalid[j]; assign b_wready[j] = n_wready[j];
+      assign n_wdata[j] = b_wdata[j];   assign n_wmask[j] = b_wmask[j];
+      assign b_rvalid[j] = n_rvalid[j]; assign b_rdata[j] = n_rdata[j];
+      assign b_wdone[j] = n_wdone[j];   assign b_err[j] = n_err[j];
+    end
     logic bid, rid;                   // (XIDW 1: XDMA's IDs stay in the SmartConnect)
     otpu_mem_ch #(.XIDW(1)) u_ch (
       .clk, .rst,
@@ -154,6 +191,7 @@ module otpu_bcu_sys #(
     .s_ctl_awaddr, .s_ctl_awvalid, .s_ctl_awready, .s_ctl_wdata, .s_ctl_wstrb, .s_ctl_wvalid,
     .s_ctl_wready, .s_ctl_bresp, .s_ctl_bvalid, .s_ctl_bready, .s_ctl_araddr, .s_ctl_arvalid,
     .s_ctl_arready, .s_ctl_rdata, .s_ctl_rresp, .s_ctl_rvalid, .s_ctl_rready,
-    .n_cvalid, .n_cready, .n_cwe, .n_caddr, .n_wvalid, .n_wready, .n_wdata, .n_wmask,
-    .n_rvalid, .n_rdata, .n_wdone, .n_err);
+    .n_cvalid(b_cvalid), .n_cready(b_cready), .n_cwe(b_cwe), .n_caddr(b_caddr),
+    .n_wvalid(b_wvalid), .n_wready(b_wready), .n_wdata(b_wdata), .n_wmask(b_wmask),
+    .n_rvalid(b_rvalid), .n_rdata(b_rdata), .n_wdone(b_wdone), .n_err(b_err));
 endmodule

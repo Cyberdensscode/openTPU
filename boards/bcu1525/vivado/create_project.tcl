@@ -83,6 +83,27 @@ set_property generic "S=$S MCOLS=$MCOLS ACT_ROWS=$ACT_ROWS VPU_CL=$VPU_CL LANES=
 set cons $root/boards/bcu1525/constraints
 add_files -fileset constrs_1 -norecurse [concat [glob $cons/*.xdc] [list $ld/otpu_ld4.xdc]]
 set_property SCOPED_TO_REF otpu_ld4 [get_files $ld/otpu_ld4.xdc]
+# TMEM_URAM=1 (environment, run_vivado.sh): the TMEM copies in UltraRAM (a synthesis property:
+# vivado/tmem_uram.xdc)
+if {[info exists ::env(TMEM_URAM)] && $::env(TMEM_URAM) eq "1"} {
+  add_files -fileset constrs_1 -norecurse $here/tmem_uram.xdc
+  set_property USED_IN_IMPLEMENTATION false [get_files $here/tmem_uram.xdc]
+  puts "TMEM in UltraRAM (tmem_uram.xdc)"
+}
+# then, after the IP's and LiteX's constraints, as unmanaged Tcl on the synthesized netlist: each
+# otpu_mem_ch's crossings (the YPCB's file, scoped to the module), the top's crossings and the SLR
+# floorplan (bcu1525_top.tcl, bcu1525_floorplan.tcl: UNVERIFIED, docs/bcu1525.md section 10)
+set memch $root/boards/ypcb-00338/constraints/otpu_mem_ch.tcl
+set late [list $memch $cons/bcu1525_top.tcl $cons/bcu1525_floorplan.tcl]
+add_files -fileset constrs_1 -norecurse $late
+set_property SCOPED_TO_REF otpu_mem_ch [get_files $memch]
+set_property PROCESSING_ORDER LATE [get_files $late]
+set_property USED_IN_SYNTHESIS false [get_files $late]
+foreach f $late {
+  if {![string match -nocase *tcl* [get_property FILE_TYPE [get_files $f]]]} {
+    error "$f: FILE_TYPE [get_property FILE_TYPE [get_files $f]], expected TCL (unmanaged)"
+  }
+}
 
 if {[info exists ::env(OTPU_FAST)] && $::env(OTPU_FAST) eq "1"} {
   set_property strategy {Vivado Synthesis Defaults} [get_runs synth_1]

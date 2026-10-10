@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Offline checks of the BCU1525 flow (no Vivado needed):
-  - every Tcl script is complete (balanced braces / quotes: tclsh `info complete`);
+  - every Tcl script (vivado/, constraints/) is complete (balanced braces / quotes: tclsh `info complete`);
   - no package pin is placed twice across the XDCs, and each port is placed once;
   - each DDR4 channel's XDC ports are the LiteDRAM core's pads (litedram/ports.txt: ddram_* ->
     ddr4_c<n>_*) plus the board-only ones (par, cs_hi[2:0], cke1, odt1, which the top ties);
@@ -42,7 +42,7 @@ def widths(bits) -> dict[str, int]:
 
 def main() -> int:
     bad = []
-    for tcl in sorted((BOARD / "vivado").glob("*.tcl")):
+    for tcl in sorted((BOARD / "vivado").glob("*.tcl")) + sorted((BOARD / "constraints").glob("*.tcl")):
         r = subprocess.run(["tclsh"], input=f"set f [open {{{tcl}}}]; set s [read $f]; "
                            f"puts [info complete $s]", capture_output=True, text=True)
         ok = r.stdout.strip() == "1"

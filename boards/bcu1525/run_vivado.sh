@@ -3,7 +3,8 @@
 # (docs/bcu1525.md). The knobs, as boards/ypcb-00338/run_vivado.sh's:
 #   S=2 MCOLS=4 VPU_CL=2 LANES=8 ACT_ROWS=MCOLS DSTEP=1   the accelerator (S slices, two DDR4 channels each)
 #   CORE_MHZ=100 (the default: development builds at 100 MHz until the design runs; FAST=1: Vivado's
-#   default strategies)   PCIE_LANES=16|8 (Gen3)   BUILD_ID   OUT_DIR   JOBS   STEP=impl   IMPL_STRATEGY
+#   default strategies)   PCIE_LANES=16|8 (Gen3)   TMEM_URAM=0|1 (the TMEM in UltraRAM)   BUILD_ID
+#   OUT_DIR   JOBS   STEP=impl   IMPL_STRATEGY
 # The VU9P is outside Vivado's free tier: the license must cover it, and the Virtex UltraScale+
 # device files must be installed (Vivado's installer, "Virtex UltraScale+").
 set -euo pipefail
@@ -36,6 +37,7 @@ mkdir -p "$out"
 export OTPU_IP_CACHE="${OTPU_IP_CACHE-$HOME/.cache/otpu-vivado-ip}"
 export OTPU_FAST="${FAST:-0}"
 export PCIE_LANES="${PCIE_LANES:-16}"
+export TMEM_URAM="${TMEM_URAM:-0}"     # 1: the TMEM copies in UltraRAM (vivado/tmem_uram.xdc)
 run() { local script="$1"; shift
   vivado -mode batch -nojournal -log "$out/$(basename "$script" .tcl).log" -source "$script" -tclargs "$@"; }
 if [[ "${STEP:-}" == impl ]]; then

@@ -42,6 +42,8 @@ module tb_board;
   parameter int PLATFORM   = 1;            // CFG_PLATFORM (opentpu/target.py)
   parameter logic [31:0] ARCH_HASH = 32'h0;  // CFG_HASH
   parameter logic [11:0] TEMP = 12'hA1A;  // the XADC code of 45 C
+  parameter int NREG       = 0;            // bit j: channel j through two otpu_native_reg (an SLR
+                                           // crossing's register slices, otpu_bcu_sys SLL)
 
   logic clk = 1'b0, rst = 1'b1, dump = 1'b0;
   always #5 clk = ~clk;
@@ -85,8 +87,41 @@ module tb_board;
     .s_ctl_bresp(bresp), .s_ctl_bvalid(bvalid), .s_ctl_bready(bready),
     .s_ctl_araddr(araddr), .s_ctl_arvalid(arvalid), .s_ctl_arready(arready),
     .s_ctl_rdata(rdata), .s_ctl_rresp(rresp), .s_ctl_rvalid(rvalid), .s_ctl_rready(rready),
-    .n_cvalid(ncv), .n_cready(ncr), .n_cwe(ncwe), .n_caddr(nca), .n_wvalid(nwv), .n_wready(nwr),
-    .n_wdata(nwd), .n_wmask(nwm), .n_rvalid(nrv), .n_rdata(nrd), .n_wdone(nwdone), .n_err(nerr));
+    .n_cvalid(bcv), .n_cready(bcr), .n_cwe(bcwe), .n_caddr(bca), .n_wvalid(bwv), .n_wready(bwr),
+    .n_wdata(bwd), .n_wmask(bwm), .n_rvalid(brv), .n_rdata(brd), .n_wdone(bwdone), .n_err(berr));
+
+  // the board's side of the channels, and the register slices where NREG asks for them
+  logic [2*S-1:0] bcv, bcr, bcwe, bwv, bwr, brv, berr;
+  logic [2*S-1:0][24:0] bca;
+  logic [2*S-1:0][511:0] bwd, brd;
+  logic [2*S-1:0][63:0] bwm;
+  logic [2*S-1:0][15:0] bwdone;
+  for (genvar j = 0; j < 2 * S; j++) begin : g_nreg
+    if (NREG >> j & 1) begin : g_reg
+      logic cv, cr, cwe, wv, wr, rv, err;
+      logic [24:0] ca;
+      logic [511:0] wd, rd;
+      logic [63:0] wm;
+      logic [15:0] wdone;
+      otpu_native_reg u_tx (.clk, .rst,
+        .s_cvalid(bcv[j]), .s_cready(bcr[j]), .s_cwe(bcwe[j]), .s_caddr(bca[j]),
+        .s_wvalid(bwv[j]), .s_wready(bwr[j]), .s_wdata(bwd[j]), .s_wmask(bwm[j]),
+        .s_rvalid(brv[j]), .s_rdata(brd[j]), .s_wdone(bwdone[j]), .s_err(berr[j]),
+        .m_cvalid(cv), .m_cready(cr), .m_cwe(cwe), .m_caddr(ca), .m_wvalid(wv), .m_wready(wr),
+        .m_wdata(wd), .m_wmask(wm), .m_rvalid(rv), .m_rdata(rd), .m_wdone(wdone), .m_err(err));
+      otpu_native_reg u_rx (.clk, .rst,
+        .s_cvalid(cv), .s_cready(cr), .s_cwe(cwe), .s_caddr(ca), .s_wvalid(wv), .s_wready(wr),
+        .s_wdata(wd), .s_wmask(wm), .s_rvalid(rv), .s_rdata(rd), .s_wdone(wdone), .s_err(err),
+        .m_cvalid(ncv[j]), .m_cready(ncr[j]), .m_cwe(ncwe[j]), .m_caddr(nca[j]),
+        .m_wvalid(nwv[j]), .m_wready(nwr[j]), .m_wdata(nwd[j]), .m_wmask(nwm[j]),
+        .m_rvalid(nrv[j]), .m_rdata(nrd[j]), .m_wdone(nwdone[j]), .m_err(nerr[j]));
+    end else begin : g_wire
+      assign ncv[j] = bcv[j]; assign bcr[j] = ncr[j]; assign ncwe[j] = bcwe[j];
+      assign nca[j] = bca[j]; assign nwv[j] = bwv[j]; assign bwr[j] = nwr[j];
+      assign nwd[j] = bwd[j]; assign nwm[j] = bwm[j]; assign brv[j] = nrv[j];
+      assign brd[j] = nrd[j]; assign bwdone[j] = nwdone[j]; assign berr[j] = nerr[j];
+    end
+  end
 
   for (genvar s = 0; s < S; s++) begin : g_slice
     localparam int C = 2 * s;

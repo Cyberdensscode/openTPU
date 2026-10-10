@@ -448,11 +448,14 @@ def test_tiny_qwen3_on_board_model(have_verilator, formats):
     assert brd.stats[-1]["cycles"] > 0
 
 
-def test_tiny_qwen3_two_slices_on_board_model(have_verilator):
+@pytest.mark.parametrize("nreg", [0, 0b1010])
+def test_tiny_qwen3_two_slices_on_board_model(have_verilator, nreg):
     """The BCU1525's board (otpu_board S = 2: two slices, each on its two channels, one
     control block, the collective unit between them; SimTransport(target="bcu1525")) runs a
     tiny Qwen3 split over two slices: logits bit-identical to the ISA simulator at S = 2, and
-    each slice's DRAM, read back through the host's channel map, the ISA simulator's."""
+    each slice's DRAM, read back through the host's channel map, the ISA simulator's. nreg: the
+    channels that cross an SLR on the board (1 and 3) through two otpu_native_reg each, as
+    otpu_bcu_sys builds them."""
     from opentpu.llm.qwen3 import Engine, Spec
     torch.manual_seed(0)
     hc = transformers.Qwen3Config(hidden_size=256, num_hidden_layers=2, num_attention_heads=4,
@@ -464,7 +467,8 @@ def test_tiny_qwen3_two_slices_on_board_model(have_verilator):
     spec = Spec(256, 2, 4, 2, 128, 512, 1000)
     cfg = board_config(DRAM_BYTES=1 << 23, S=2)
     isa = Engine(spec, W, cap=256, cfg=cfg)
-    tr = SimTransport(ch_bytes=cfg.DRAM_BYTES // 2, stall=20, seed=5, target="bcu1525")
+    tr = SimTransport(ch_bytes=cfg.DRAM_BYTES // 2, stall=20, seed=5, target="bcu1525",
+                      params={"NREG": nreg})
     brd = Engine(spec, W, cap=256, cfg=cfg,
                  backend=lambda c, imgs: BoardBackend(c, imgs, transport=tr))
     assert brd.backend.info["cfg"]["S"] == 2 and brd.backend.info["cfg"]["platform"] == 2
