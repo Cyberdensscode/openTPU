@@ -273,8 +273,8 @@ exceptions or clock changes in either file.
 `otpu_xunit` may change:
 
 - `rtl/top/otpu_slice.sv`, `otpu_top.sv` and `otpu_pkg.sv`;
-- the board wrappers `rtl/boards/ypcb-00338/{otpu_board,otpu_ctrl,otpu_trace,otpu_native_sys,
-  otpu_mem_ch,otpu_afifo,otpu_axi_split2,otpu_fpga_top_ld}.sv`;
+- the board wrappers `rtl/shell/{otpu_board,otpu_ctrl,otpu_trace,otpu_mem_ch,otpu_afifo,
+  otpu_axi_split2}.sv` and `rtl/boards/ypcb-00338/{otpu_native_sys,otpu_fpga_top_ld}.sv`;
 - `boards/ypcb-00338/constraints/otpu_top_ld.xdc` (pblocks and placement, but no timing
   exceptions).
 

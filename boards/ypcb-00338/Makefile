@@ -31,12 +31,12 @@ LANES ?= 8
 ACT_ROWS ?= $(MCOLS)
 RTL := $(addprefix $(ROOT)/rtl/, vpu/otpu_fp.sv vpu/otpu_fpipe.sv top/otpu_pkg.sv \
   mem/otpu_tmem.sv mem/otpu_actram.sv seq/otpu_seq.sv vpu/otpu_vtree.sv \
-  dma/otpu_dma.sv mxu/otpu_mxu.sv vpu/otpu_quant.sv vpu/otpu_se_comp.sv vpu/otpu_se_tail.sv \
+  dma/otpu_dma.sv mxu/otpu_mxu.sv tech/xilinx7/otpu_tech_dsp.sv vpu/otpu_quant.sv vpu/otpu_se_comp.sv vpu/otpu_se_tail.sv \
   vpu/otpu_vpu.sv \
   top/otpu_coll.sv top/otpu_slice.sv \
-  boards/ypcb-00338/otpu_ctrl.sv boards/ypcb-00338/otpu_trace.sv boards/ypcb-00338/otpu_board.sv \
-  mem/otpu_native_dram.sv boards/ypcb-00338/otpu_afifo.sv boards/ypcb-00338/otpu_mem_ch.sv \
-  boards/ypcb-00338/otpu_axi_split2.sv boards/ypcb-00338/otpu_native_sys.sv)
+  shell/otpu_ctrl.sv shell/otpu_trace.sv shell/otpu_board.sv \
+  mem/otpu_native_dram.sv shell/otpu_afifo.sv shell/otpu_mem_ch.sv \
+  shell/otpu_axi_split2.sv boards/ypcb-00338/otpu_native_sys.sv)
 # MXU_IMPL: the MXU create_project.tcl builds (MXU systolic, the default: 2); the systolic cells'
 # DSP48E1 comes from a lint stub
 MXU_IMPL ?= 2

@@ -98,7 +98,7 @@ def test_card_target_matches_the_rtl_defaults():
     """The card's target states what otpu_board / otpu_fpga_top_ld build by default, so passing
     the target's values as generics leaves the bitstream's netlist as it was."""
     p = T.rtl_params("ypcb-00338")
-    board = _sv_defaults(ROOT / "rtl/boards/ypcb-00338/otpu_board.sv")
+    board = _sv_defaults(ROOT / "rtl/shell/otpu_board.sv")
     for k in ("D", "TMEM_WORDS", "IMEM_WORDS", "ACT_BLOCKS", "FIFO_DEPTH", "WIN", "WPB",
               "TRACE_DEPTH", "PQ_WIN", "CHASH", "DSTEP"):
         assert p[k] == board[k], k
@@ -169,3 +169,48 @@ def test_device_config_before_map_4_is_the_card(no_env):
     assert info["cfg"] is None
     assert device_config(info) == T.config("ypcb-00338")
     check_fits(board_config(TMEM_WORDS=1 << 20), info)              # nothing to check against
+
+
+# ------------------------------------------------------------------------------ RTL file lists
+def _make_rtl(path: Path) -> list[str]:
+    """The board Makefile's RTL list (rtl/ paths)."""
+    m = re.search(r"RTL := \$\(addprefix \$\(ROOT\)/rtl/, (.*?)\)\n", path.read_text(), re.S)
+    return ["rtl/" + f for f in m.group(1).replace("\\", " ").split()]
+
+
+def _tcl_rtl(path: Path) -> list[str]:
+    m = re.search(r"set rtl \[list \\(.*?)\]\n", path.read_text(), re.S)
+    return m.group(1).replace("\\", " ").split()
+
+
+def test_rtl_file_lists_agree():
+    """Every flow's RTL list is opentpu.target.sources(): the board Makefile's lint and
+    create_project.tcl (the board's top last, the Makefile linting it separately), the
+    simulators' (rtlsim.RTL_SOURCES: the generic cells, plus the simulation-only DRAM model,
+    native adapter and top) and tools/synth's."""
+    from opentpu import rtlsim
+    card = [f"rtl/{f}" for f in T.sources("ypcb-00338")]
+    tcl = _tcl_rtl(ROOT / "boards/ypcb-00338/vivado/create_project.tcl")
+    assert tcl == card
+    make = _make_rtl(ROOT / "boards/ypcb-00338/Makefile")
+    assert make == [f for f in card if not f.endswith("otpu_fpga_top_ld.sv")]
+    sim = [f for f in rtlsim.RTL_SOURCES
+           if f not in ("mem/otpu_dram.sv", "mem/otpu_native_dram.sv", "top/otpu_top.sv")]
+    assert sim == T.sources("nangate45", "generic")
+    for f in T.CORE + T.SHELL + sum(T.TECH.values(), []) + sum(T.BOARDS.values(), []):
+        assert (ROOT / "rtl" / f).exists(), f
+
+
+def test_tech_families_define_the_same_cells():
+    """rtl/tech/<family>/ files define the same modules with the same ports and parameters."""
+    def iface(path: Path) -> dict:
+        txt = re.sub(r"//.*", "", path.read_text())
+        mods = {}
+        for m in re.finditer(r"module\s+(\w+)\s*#\((.*?)\)\s*\((.*?)\);", txt, re.S):
+            norm = lambda s: re.sub(r"\s+", " ", s).strip()
+            mods[m.group(1)] = (norm(m.group(2)), norm(m.group(3)))
+        return mods
+    ref = iface(ROOT / "rtl/tech/generic/otpu_tech_dsp.sv")
+    assert set(ref) == {"otpu_pe", "otpu_colend"}
+    for fam in ("xilinx7", "xilinxus"):
+        assert iface(ROOT / f"rtl/tech/{fam}/otpu_tech_dsp.sv") == ref, fam

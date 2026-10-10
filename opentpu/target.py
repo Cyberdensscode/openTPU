@@ -19,6 +19,7 @@ the environment selects (OTPU_TARGET, default the YPCB-00338 card).
     python3 -m opentpu.target hash NAME [K=V]   arch_hash, 8 hex digits (K: an FPGA build's
                                                 MCOLS / LANES / ACT_ROWS / DSTEP knobs)
     python3 -m opentpu.target env [NAME]        shell assignments T_<PARAM>=<value> (flows)
+    python3 -m opentpu.target files NAME        the RTL file list (sources())
     python3 -m opentpu.target list              the targets
 """
 from __future__ import annotations
@@ -52,6 +53,26 @@ PLATFORM_KEYS = ("board", "core_mhz", "mem", "channels_per_slice", "channel_byte
 # NRP x 16, the board build as NRP x LANES; both select the slice's write-mask arbiter.
 NRP = 8
 SIM_LANES_MAX = 16
+
+
+# The RTL, as file lists under rtl/ in compile order: the core (no vendor cell, no FPGA-only
+# memory), a cell family, the FPGA boards' shell (control block, trace, the native DRAM adapter,
+# the channel bridges) and a board's top. sources() puts a target's together; the flows take
+# theirs from it or are checked against it (tests/test_target.py: rtlsim.RTL_SOURCES, the board
+# Makefile, create_project.tcl, tools/synth).
+CORE = ["vpu/otpu_fp.sv", "vpu/otpu_fpipe.sv", "top/otpu_pkg.sv", "mem/otpu_tmem.sv",
+        "mem/otpu_actram.sv", "seq/otpu_seq.sv", "vpu/otpu_vtree.sv", "dma/otpu_dma.sv",
+        "mxu/otpu_mxu.sv", "vpu/otpu_quant.sv", "vpu/otpu_se_comp.sv", "vpu/otpu_se_tail.sv",
+        "vpu/otpu_vpu.sv", "top/otpu_coll.sv", "top/otpu_slice.sv"]
+TECH = {"generic": ["tech/generic/otpu_tech_dsp.sv"],
+        "xilinx7": ["tech/xilinx7/otpu_tech_dsp.sv"],
+        "xilinxus": ["tech/xilinxus/otpu_tech_dsp.sv"],
+        "asic": ["tech/generic/otpu_tech_dsp.sv"]}
+SHELL = ["shell/otpu_ctrl.sv", "shell/otpu_trace.sv", "shell/otpu_board.sv",
+         "mem/otpu_native_dram.sv", "shell/otpu_afifo.sv", "shell/otpu_mem_ch.sv",
+         "shell/otpu_axi_split2.sv"]
+BOARDS = {"ypcb-00338": ["boards/ypcb-00338/otpu_native_sys.sv",
+                         "boards/ypcb-00338/otpu_fpga_top_ld.sv"]}
 
 
 class TargetError(ValueError):
@@ -203,6 +224,18 @@ def rtl_params(t: Target | str | None = None) -> dict:
     }
 
 
+def sources(t: Target | str | None = None, family: str | None = None) -> list[str]:
+    """The RTL files of `t` under rtl/, in compile order: the core, the cell family's cells
+    (`family` overrides the target's: the simulators build every target with "generic"), and
+    for an FPGA the shell and the board's top (once the board has one)."""
+    t = t if isinstance(t, Target) else load(t)
+    tech = TECH[family or t.family]
+    core = CORE[:CORE.index("mxu/otpu_mxu.sv") + 1] + tech + CORE[CORE.index("mxu/otpu_mxu.sv") + 1:]
+    if t.kind != "fpga":
+        return core
+    return core + SHELL + BOARDS.get(t.platform["board"], [])
+
+
 def build_config(t: Target | str | None = None, **knobs):
     """The Config of an FPGA build of `t` with the board flow's knobs (run_vivado.sh MCOLS,
     LANES, ACT_ROWS, DSTEP; the CFG_HASH it reports): ACT_ROWS equal to MCOLS is 0 (no
@@ -253,6 +286,8 @@ def main(argv: list[str]) -> int:
         print(f"  arch_hash {arch_hash(config(t)):08x}")
     elif cmd == "generics":
         print(" ".join(f"{k}={_fmt(v)}" for k, v in rtl_params(t).items()))
+    elif cmd == "files":                        # files NAME [FAMILY]: rtl/ paths, one a line
+        print("\n".join(f"rtl/{f}" for f in sources(t, argv[2] if len(argv) > 2 else None)))
     elif cmd == "hash":                          # hash NAME [MCOLS=4 LANES=8 ACT_ROWS=4 DSTEP=1]
         print(f"{arch_hash(build_config(t, **_knobs(argv[2:]))):08x}")
     elif cmd == "env":                           # shell assignments T_<PARAM>=<value>

@@ -300,9 +300,9 @@ def test_axil_iso_resets_apart(have_verilator):
     a response to an access from before the master's reset reaches the master after it."""
     import subprocess
     from opentpu import rtlsim
-    board = rtlsim.RTL / "boards" / "ypcb-00338"
     for bypass in (0, 1):
-        exe = rtlsim.build("tb_axil_iso", [board / "otpu_ctrl.sv", rtlsim.TB / "tb_axil_iso.sv"],
+        exe = rtlsim.build("tb_axil_iso", [rtlsim.RTL / "shell/otpu_ctrl.sv",
+                                           rtlsim.TB / "tb_axil_iso.sv"],
                            {"BYPASS": bypass})
         for seed in (1, 2):
             r = subprocess.run([str(exe), f"+seed={seed}", "+mrst=300", "+slvrst=60",

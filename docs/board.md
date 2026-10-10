@@ -15,8 +15,10 @@ or Qwen3.5-0.8B) on it.
       slice + otpu_native_dram ── ch1 ───────── otpu_mem_ch ── LiteDRAM ch1 ── DDR3 CH1 (2 GiB)
 ```
 
-Files: `rtl/boards/ypcb-00338/` (otpu_fpga_top_ld, otpu_native_sys, otpu_mem_ch, otpu_board,
-otpu_ctrl), `boards/ypcb-00338/` (constraints, Vivado Tcl, the generated LiteDRAM core, build and
+Files: `rtl/boards/ypcb-00338/` (otpu_fpga_top_ld, otpu_native_sys), `rtl/shell/` (what the
+FPGA boards share: otpu_board, otpu_ctrl, otpu_trace, otpu_mem_ch, otpu_afifo, otpu_axi_split2),
+`rtl/tech/xilinx7/` (the MXU's DSP48E1 cells), `targets/ypcb-00338.toml` (the build's
+configuration, [targets.md](targets.md)), `boards/ypcb-00338/` (constraints, Vivado Tcl, the generated LiteDRAM core, build and
 program scripts, self-test), `opentpu/host/` (driver and tools, [host.md](host.md)).
 
 The MIG builds (the two MIGs' AXI ports behind a SmartConnect, `otpu_axi_dram`, `bd.tcl`; and

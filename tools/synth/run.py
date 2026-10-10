@@ -22,16 +22,17 @@ OUT = Path(os.environ.get("SYNTH_OUT", ROOT / "build" / "synth_board"))
 BASE = ["vpu/otpu_fp.sv", "vpu/otpu_fpipe.sv", "top/otpu_pkg.sv"]
 ALL = ["mem/otpu_tmem.sv", "mem/otpu_native_dram.sv", "mem/otpu_actram.sv",
        "seq/otpu_seq.sv", "vpu/otpu_vtree.sv", "dma/otpu_dma.sv", "mxu/otpu_mxu.sv",
+       "tech/xilinx7/otpu_tech_dsp.sv",
        "vpu/otpu_quant.sv", "vpu/otpu_se_comp.sv", "vpu/otpu_se_tail.sv", "vpu/otpu_vpu.sv",
-       "top/otpu_coll.sv", "top/otpu_slice.sv", "boards/ypcb-00338/otpu_ctrl.sv",
-       "boards/ypcb-00338/otpu_trace.sv", "boards/ypcb-00338/otpu_board.sv"]
+       "top/otpu_coll.sv", "top/otpu_slice.sv", "shell/otpu_ctrl.sv",
+       "shell/otpu_trace.sv", "shell/otpu_board.sv"]
 
-# board parameters (rtl/boards/ypcb-00338/otpu_board.sv, opentpu.isasim.board_config)
+# board parameters (rtl/shell/otpu_board.sv, opentpu.isasim.board_config)
 COMPONENTS = {
     "otpu_seq": (["seq/otpu_seq.sv"], dict(IMEM_WORDS=32768, S=1, D=128, WIN=16)),
     "otpu_dma": (["dma/otpu_dma.sv"],
                  dict(D=128, LANES=8)),
-    "otpu_mxu": (["mxu/otpu_mxu.sv"], dict(D=128, MCOLS=4, DEPTH=1024, LANES=8, IMPL=2)),
+    "otpu_mxu": (["mxu/otpu_mxu.sv", "tech/xilinx7/otpu_tech_dsp.sv"], dict(D=128, MCOLS=4, DEPTH=1024, LANES=8, IMPL=2)),
     "otpu_quant": (["vpu/otpu_quant.sv"], dict(D=128, LANES=8)),
     "otpu_vpu": (["vpu/otpu_vtree.sv", "vpu/otpu_se_comp.sv", "vpu/otpu_se_tail.sv",
                   "vpu/otpu_vpu.sv"], dict(LANES=8)),
@@ -39,8 +40,8 @@ COMPONENTS = {
     "otpu_actram": (["mem/otpu_actram.sv"], dict(D=128, MCOLS=4, BLOCKS=128, LANES=8)),
     "otpu_coll": (["top/otpu_coll.sv"], dict(S=1, LANES=8)),
     "otpu_native_dram": (["mem/otpu_native_dram.sv"], dict(D=128)),
-    "otpu_ctrl": (["boards/ypcb-00338/otpu_ctrl.sv"], dict(D=128, MCOLS=4, LANES=8)),
-    "otpu_trace": (["boards/ypcb-00338/otpu_trace.sv"], dict(DEPTH=16384, QD=32, WIN=16)),
+    "otpu_ctrl": (["shell/otpu_ctrl.sv"], dict(D=128, MCOLS=4, LANES=8)),
+    "otpu_trace": (["shell/otpu_trace.sv"], dict(DEPTH=16384, QD=32, WIN=16)),
     "otpu_board": (ALL, {}),
 }
 

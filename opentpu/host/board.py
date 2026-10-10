@@ -3,7 +3,7 @@
 The card exposes, through the XDMA bridge:
   - its two DDR3 channels on the bridge's AXI master: channel c at BASE[c] (2 GiB each),
     written with /dev/xdma0_h2c_0 and read with /dev/xdma0_c2h_0 (file offset = AXI address);
-  - the control registers (rtl/boards/ypcb-00338/otpu_ctrl.sv; map in regs.py and
+  - the control registers (rtl/shell/otpu_ctrl.sv; map in regs.py and
     docs/observability.md) on BAR0, /dev/xdma0_user.
 
 The accelerator addresses one logical DRAM interleaved over the channels in 64-byte beats:
@@ -495,12 +495,10 @@ class SimTransport:
         from opentpu import rtlsim, simtmp     # (the simulator's: not on the card's path)
         root = Path(__file__).resolve().parents[2]
         srcs = [rtlsim.RTL / s for s in rtlsim.RTL_SOURCES if not s.endswith("otpu_top.sv")]
-        board = root / "rtl/boards/ypcb-00338"
-        srcs += [board / "otpu_ctrl.sv", board / "otpu_board.sv"]
-        if (board / "otpu_trace.sv").exists():             # register map 2
-            srcs.insert(-2, board / "otpu_trace.sv")
+        shell = root / "rtl/shell"                  # the FPGA boards' shell (docs/targets.md)
+        srcs += [shell / "otpu_ctrl.sv", shell / "otpu_trace.sv", shell / "otpu_board.sv"]
         native = rtlsim.MEMORY["NATIVE"] if self.native is None else self.native
-        srcs += [rtlsim.TB / "otpu_native_mem.sv", board / "otpu_afifo.sv", board / "otpu_mem_ch.sv",
+        srcs += [rtlsim.TB / "otpu_native_mem.sv", shell / "otpu_afifo.sv", shell / "otpu_mem_ch.sv",
                  rtlsim.TB / "otpu_chmem.sv", rtlsim.TB / "otpu_ldn_model.sv"]
         srcs += [rtlsim.TB / "tb_board.sv"]
         from opentpu.isasim import board_config

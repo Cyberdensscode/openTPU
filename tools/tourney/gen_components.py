@@ -33,7 +33,7 @@ C = {
                "tests/test_rtl.py::test_fuzz_two_slices[0]",
                "tests/test_rtl.py::test_scoreboard_stress_two_slices[0]"]),
     "otpu_mxu": dict(
-        files=["rtl/mxu/otpu_mxu.sv"], top="otpu_mxu",
+        files=["rtl/mxu/otpu_mxu.sv", "rtl/tech/xilinx7/otpu_tech_dsp.sv"], top="otpu_mxu",
         params=dict(D=128, MCOLS=4, DEPTH=1024, LANES=8, IMPL=2, SID=0),
         desc="MXU: streams int8 weight chunks (D bytes/cycle) through a prefetch FIFO against up to "
              "MCOLS stationary int8 rows in ACT RAM; products in the systolic array (IMPL 2: a "
@@ -159,10 +159,10 @@ XUNIT = {
                    "unit boundaries: register slices on inter-unit buses, fanout of broadcast "
                    "signals, placement.",
     "allowed": ["rtl/top/otpu_slice.sv", "rtl/top/otpu_top.sv", "rtl/top/otpu_pkg.sv",
-                "rtl/boards/ypcb-00338/otpu_board.sv", "rtl/boards/ypcb-00338/otpu_ctrl.sv",
-                "rtl/boards/ypcb-00338/otpu_native_sys.sv", "rtl/boards/ypcb-00338/otpu_mem_ch.sv",
-                "rtl/boards/ypcb-00338/otpu_afifo.sv", "rtl/boards/ypcb-00338/otpu_axi_split2.sv",
-                "rtl/boards/ypcb-00338/otpu_fpga_top_ld.sv", "rtl/boards/ypcb-00338/otpu_trace.sv",
+                "rtl/shell/otpu_board.sv", "rtl/shell/otpu_ctrl.sv",
+                "rtl/boards/ypcb-00338/otpu_native_sys.sv", "rtl/shell/otpu_mem_ch.sv",
+                "rtl/shell/otpu_afifo.sv", "rtl/shell/otpu_axi_split2.sv",
+                "rtl/boards/ypcb-00338/otpu_fpga_top_ld.sv", "rtl/shell/otpu_trace.sv",
                 "boards/ypcb-00338/constraints/otpu_top_ld.xdc"],
     "synth": {"parts": []},
     "objectives": ["fmax"],

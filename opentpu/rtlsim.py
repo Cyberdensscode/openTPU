@@ -22,7 +22,7 @@ BUILD = ROOT / "build" / "verilator"
 RTL_SOURCES = [
     "vpu/otpu_fp.sv", "vpu/otpu_fpipe.sv", "top/otpu_pkg.sv", "mem/otpu_dram.sv", "mem/otpu_tmem.sv",
     "mem/otpu_native_dram.sv", "mem/otpu_actram.sv", "seq/otpu_seq.sv",
-    "vpu/otpu_vtree.sv", "dma/otpu_dma.sv", "mxu/otpu_mxu.sv",
+    "vpu/otpu_vtree.sv", "dma/otpu_dma.sv", "mxu/otpu_mxu.sv", "tech/generic/otpu_tech_dsp.sv",
     "vpu/otpu_quant.sv", "vpu/otpu_se_comp.sv", "vpu/otpu_se_tail.sv", "vpu/otpu_vpu.sv",
     "top/otpu_coll.sv", "top/otpu_slice.sv", "top/otpu_top.sv",
 ]
@@ -227,8 +227,8 @@ def top_params(cfg, dram_lat: int = 8, uarch: dict | None = None, axi: bool | in
 def build_top(cfg, dram_lat: int = 8, uarch: dict | None = None, axi: bool = False,
               dram_bytes: int | None = None, ldc: int | None = None) -> Path:
     ldc = (MEMORY["LDC"] if ldc is None else ldc) if axi else 0
-    board = RTL / "boards" / "ypcb-00338"
-    mem = ([board / "otpu_afifo.sv", board / "otpu_mem_ch.sv", TB / LDC_MODELS[ldc],
+    shell = RTL / "shell"
+    mem = ([shell / "otpu_afifo.sv", shell / "otpu_mem_ch.sv", TB / LDC_MODELS[ldc],
             TB / "otpu_ldc_mem.sv"] if ldc else [TB / "otpu_native_mem.sv"] if axi else [])
     return build("tb_top", [RTL / s for s in RTL_SOURCES] + mem + [TB / "tb_top.sv"],
                  top_params(cfg, dram_lat, uarch, 2 if ldc else axi, dram_bytes))

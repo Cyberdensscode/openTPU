@@ -1,6 +1,6 @@
 # Observability: registers, counters and the hardware trace
 
-The contract between the board RTL (`rtl/boards/ypcb-00338/otpu_ctrl.sv`, `otpu_trace.sv`) and
+The contract between the board RTL (`rtl/shell/otpu_ctrl.sv`, `otpu_trace.sv`) and
 the host (`opentpu/host`, `otpu-smi`, `otpu-lens`). Register offsets are bytes from BAR0; every
 register is 32 bits. The control block decodes 12 address bits (4 KiB; the map repeats through
 the 64 KiB BAR). Reads answer a few cycles after the address (the data path is registered);

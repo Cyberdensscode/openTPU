@@ -25,7 +25,7 @@ set t_xcl [env_or MEMCH_XCLK 8.0]
 file mkdir $out
 
 set_part xc7k480t-ffg1156-2
-read_verilog -sv [list $root/rtl/boards/ypcb-00338/otpu_afifo.sv $root/rtl/boards/ypcb-00338/otpu_mem_ch.sv]
+read_verilog -sv [list $root/rtl/shell/otpu_afifo.sv $root/rtl/shell/otpu_mem_ch.sv]
 synth_design -top otpu_mem_ch -mode out_of_context -flatten_hierarchy rebuilt
 
 create_clock -name clk -period $t_clk [get_ports clk]

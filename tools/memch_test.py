@@ -22,7 +22,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = Path(os.environ.get("MEMCH_OUT", ROOT / "build" / "memch"))
-RTL = ROOT / "rtl" / "boards" / "ypcb-00338"
+RTL = ROOT / "rtl" / "shell"
 TB = ROOT / "sim" / "verilator"
 SRC = [RTL / "otpu_afifo.sv", RTL / "otpu_axi_split2.sv", RTL / "otpu_mem_ch.sv",
        TB / "otpu_ldn_model.sv", TB / "otpu_ldc_model.sv", TB / "otpu_ldc_ch.v", TB / "tb_memch.sv"]

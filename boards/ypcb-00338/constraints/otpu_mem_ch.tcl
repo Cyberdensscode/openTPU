@@ -1,4 +1,4 @@
-# Clock-domain crossings of otpu_mem_ch (rtl/boards/ypcb-00338/otpu_mem_ch.sv) and its six
+# Clock-domain crossings of otpu_mem_ch (rtl/shell/otpu_mem_ch.sv) and its six
 # otpu_afifo instances. Scoped to the module and read after the clocks exist, as Xilinx's own
 # xpm_cdc constraint files are: Tcl (variables, get_property, if / foreach), so an unmanaged Tcl
 # constraint file (.tcl), not an XDC:

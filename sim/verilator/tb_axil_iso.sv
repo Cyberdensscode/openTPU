@@ -1,4 +1,4 @@
-// Unit test of otpu_axil_iso (rtl/boards/ypcb-00338/otpu_ctrl.sv; tests/test_board.py): a master
+// Unit test of otpu_axil_iso (rtl/shell/otpu_ctrl.sv; tests/test_board.py): a master
 // with a write and a read channel of its own (AW and W given apart, each held until taken, B / R
 // taken at random) and a register-file slave (AW and W taken apart, answers after a random
 // latency, a read's data tagged with its address), each reset at random apart from the other.

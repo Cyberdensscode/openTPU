@@ -10,7 +10,7 @@ What the host sees:
 
 | Device node | What it is | Used for |
 |---|---|---|
-| `/dev/xdma0_user` | BAR0, the AXI-Lite control registers (`rtl/boards/ypcb-00338/otpu_ctrl.sv`) | start / load / status / counters |
+| `/dev/xdma0_user` | BAR0, the AXI-Lite control registers (`rtl/shell/otpu_ctrl.sv`) | start / load / status / counters |
 | `/dev/xdma0_h2c_0` | DMA host -> card; file offset = card AXI address | writing DRAM |
 | `/dev/xdma0_c2h_0` | DMA card -> host; file offset = card AXI address | reading DRAM |
 
@@ -1277,7 +1277,7 @@ read and returns its index in the next flush's `results` (in order; an address m
 `wait_cycles(n)` queues the testbench's existing `C n` command (wait n cycles; no RTL change).
 `otpu-smi --sim` samples the counters twice this way, and `Board.run(trace=...)` reads the
 whole trace buffer (CAPS depth) in the flush that ran the program. When
-`rtl/boards/ypcb-00338/otpu_trace.sv` exists it is added to the model's sources; the
+`rtl/shell/otpu_trace.sv` exists it is added to the model's sources; the
 testbench's AXI-Lite address is 12 bits wide (register map 2).
 
 The model is built with the configuration the environment selects -- `OTPU_MCOLS`,

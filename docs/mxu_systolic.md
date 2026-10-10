@@ -47,7 +47,9 @@ deskew: column j's s4 delayed MCOLS-1-j cycles -> all columns aligned for the ep
   next hop: fan-out 2, not MCOLS.
 - **PAIR (4-bit, 2M <= MCOLS):** columns j < M take the chunk's low block, columns j >= M its high
   block. Both decoded streams flow (2 x 8 bits per position per hop) and each column selects its
-  stream with a per-command constant (`hi0[j]`) in the DSP48E1 itself (`otpu_pe`: A = low, D =
+  stream with a per-command constant (`hi0[j]`) in the DSP48E1 itself (`otpu_pe`, in
+  `rtl/tech/xilinx7/otpu_tech_dsp.sv`; the generic and DSP48E2 versions in `rtl/tech/generic`,
+  `rtl/tech/xilinxus`: A = low, D =
   high, INMODE selects one through the pre-adder), so there is no fabric mux per position and
   column. `hi0[j]` drives the INMODE of the column's 128 DSPs (a 128 fan-out, the OOC's worst path
   at MCOLS 4: 152 MHz); it only changes between commands whose rows do not overlap.

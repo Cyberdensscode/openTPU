@@ -5,6 +5,7 @@ description: 'MXU: streams int8 weight chunks (D bytes/cycle) through a prefetch
   read-modify-write, RMAX.'
 allowed:
 - rtl/mxu/otpu_mxu.sv
+- rtl/tech/xilinx7/otpu_tech_dsp.sv
 synth:
   parts:
   - top: otpu_mxu
@@ -21,6 +22,7 @@ synth:
     - rtl/vpu/otpu_fpipe.sv
     - rtl/top/otpu_pkg.sv
     - rtl/mxu/otpu_mxu.sv
+    - rtl/tech/xilinx7/otpu_tech_dsp.sv
 target_mhz: 110
 tests:
   fast:

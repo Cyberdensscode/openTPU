@@ -1,4 +1,4 @@
-"""The board's hardware trace (rtl/boards/ypcb-00338/otpu_trace.sv; docs/observability.md):
+"""The board's hardware trace (rtl/shell/otpu_trace.sv; docs/observability.md):
 64-bit records -> the trace lines the simulator prints with +trace (opentpu/profile.py).
 
 A record is [63:60] type, [59:0] payload; the cycle fields are the slice's cycle counter (the
@@ -28,7 +28,7 @@ P_FIELDS = ["bm", "bd", "am", "aq", "mx", "fm", "fq", "fv", "fc"]
 Q_FIELDS = ["bs", "as", "ms", "mb", "ff", "ld"]
 H_FIELDS = ["bmxu", "bdma", "amxu", "aq"]
 
-# control registers (rtl/boards/ypcb-00338/otpu_ctrl.sv)
+# control registers (rtl/shell/otpu_ctrl.sv)
 R_TRACE_CTRL, R_TRACE_COUNT, R_TRACE_DROP = 0x200, 0x204, 0x208
 R_TRACE_ADDR, R_TRACE_LO, R_TRACE_HI = 0x20C, 0x210, 0x214
 TRACE_ENABLE, TRACE_CLEAR, TRACE_STOP_WHEN_FULL, TRACE_BUSY = 1, 2, 4, 8

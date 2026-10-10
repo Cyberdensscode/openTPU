@@ -9,14 +9,14 @@ allowed:
 - rtl/top/otpu_slice.sv
 - rtl/top/otpu_top.sv
 - rtl/top/otpu_pkg.sv
-- rtl/boards/ypcb-00338/otpu_board.sv
-- rtl/boards/ypcb-00338/otpu_ctrl.sv
+- rtl/shell/otpu_board.sv
+- rtl/shell/otpu_ctrl.sv
 - rtl/boards/ypcb-00338/otpu_native_sys.sv
-- rtl/boards/ypcb-00338/otpu_mem_ch.sv
-- rtl/boards/ypcb-00338/otpu_afifo.sv
-- rtl/boards/ypcb-00338/otpu_axi_split2.sv
+- rtl/shell/otpu_mem_ch.sv
+- rtl/shell/otpu_afifo.sv
+- rtl/shell/otpu_axi_split2.sv
 - rtl/boards/ypcb-00338/otpu_fpga_top_ld.sv
-- rtl/boards/ypcb-00338/otpu_trace.sv
+- rtl/shell/otpu_trace.sv
 - boards/ypcb-00338/constraints/otpu_top_ld.xdc
 synth:
   parts: []

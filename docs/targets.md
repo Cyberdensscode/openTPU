@@ -49,6 +49,22 @@ the hash of the Config the registers describe. `check_fits(cfg, info)` (BoardBac
 programs compiled for another MXU, lanes or ACT RAM rows, or needing more slices, TMEM, IMEM,
 ACT RAM or DRAM than the device has.
 
+## The RTL's layers
+
+- The core, `rtl/top`, `rtl/mxu`, `rtl/vpu`, `rtl/mem`, `rtl/seq`, `rtl/dma`: no vendor cell.
+- `rtl/tech/<family>/`: the same modules in each family, the file list picks one. Today the
+  systolic MXU's cells `otpu_pe` and `otpu_colend` (`otpu_tech_dsp.sv`): `generic` (behavioural:
+  the simulators and the ASIC flows), `xilinx7` (DSP48E1: the YPCB card), `xilinxus` (DSP48E2:
+  UltraScale+). `tests/test_tech.py` checks that the xilinx7 cells equal the generic ones cycle
+  for cycle on yosys's DSP48E1 model.
+- `rtl/shell/`: what the PCIe + native-memory FPGA boards share (control block, trace, the
+  channel bridges, XDMA's split, `otpu_board`). The native DRAM adapter is `rtl/mem/otpu_native_dram.sv`.
+- `rtl/boards/<board>/`: the board's top and its clock / memory / host wiring.
+
+`opentpu.target.sources(t)` is the file list (`python3 -m opentpu.target files NAME`); the board
+Makefile, `create_project.tcl` and `rtlsim.RTL_SOURCES` hold the same lists, which
+`tests/test_target.py` checks.
+
 ## Adding a target
 
 1. Copy the closest `targets/*.toml`, give it a new name and a new `platform_id`.

@@ -38,7 +38,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 FORMAT, VERSION = "openTPU-power", 1
-# instance name (rtl/top/otpu_slice.sv, rtl/boards/ypcb-00338/otpu_board.sv) -> unit
+# instance name (rtl/top/otpu_slice.sv, rtl/shell/otpu_board.sv) -> unit
 UNIT_INSTANCES = {"u_mxu": "MXU", "u_act": "MXU", "u_vpu": "VPU", "u_quant": "QNT",
                   "u_dma": "DMA", "u_tmem": "TMEM", "u_seq": "SEQ", "u_mem": "DRAM"}
 BOARD_INSTANCE = "u_board"          # otpu_board in otpu_fpga_top_ld: the accelerator

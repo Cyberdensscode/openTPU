@@ -248,7 +248,7 @@ def test_full_component_prompt_does_not_quote_the_rtl():
     p = AG.hypothesis_prompt_fmax(c, ROOT, champ, "(none)", "(none)", AG.FMAX_CATEGORIES[0],
                                   125.49)
     assert "=== rtl/" not in p and "read the ones on the paths you target" in p
-    assert "rtl/vpu/otpu_se_tail.sv" in p and "rtl/boards/ypcb-00338/otpu_board.sv" in p
+    assert "rtl/vpu/otpu_se_tail.sv" in p and "rtl/shell/otpu_board.sv" in p
     assert len(p) < 40000
 
 
