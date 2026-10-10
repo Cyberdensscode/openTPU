@@ -7,14 +7,13 @@ through OpenROAD-flow-scripts, for PPA numbers.
     python3 tools/asic/flow.py all POINT        # the three
     python3 tools/asic/flow.py points           # the design points
 
-POINT is a design point of POINTS (the arch and uarch of a targets/nangate45*.toml). Everything
-goes to build/asic/<point>/:
+POINT is a design point: an ASIC target (targets/*.toml with kind "asic": its arch, uarch and
+clock; card = nangate45, small = nangate45-small) or a variant of one (POINTS). Everything goes to
+build/asic/<point>/:
 
     macros/        the SRAM macros the design uses (tools/asic/fakeram.py: LEF, Liberty, Verilog)
     src/           otpu_sram_map.sv (the leaves otpu_sram_1r1w / otpu_sram_1rw: one branch per
-                   macro size), and while the MXU's cells still sit in otpu_mxu.sv, a copy of it
-                   with their behavioural models (otpu_mxu_asic.sv; the Xilinx DSP48E1 is under
-                   SYNTHESIS there)
+                   macro size), a variant's edited sources
     config.mk, constraint.sdc   the ORFS design
     work/          ORFS's WORK_HOME (logs/, reports/, results/, objects/)
     report.json    the PPA summary
@@ -36,76 +35,61 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 RTL = ROOT / "rtl"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(ROOT))
 import fakeram  # noqa: E402
+from opentpu import target as T  # noqa: E402
 
 IMAGE = os.environ.get("ORFS_IMAGE", "openroad/orfs:latest")
 YOSYS = os.environ.get("YOSYS", "yosys")
 
-# The design points: the slice's parameters (otpu_asic_top), the clock (ns) the SDC asks for, and
-# the floorplan's utilisation. card: the YPCB-00338 card's arch (programs compiled for the card
-# run on it; TMEM banked, the MXU's cells behavioural). small: a small slice for fast iterations
-# and a shuttle-sized die.
-POINTS = {
-    "small": dict(params=dict(D=32, MCOLS=2, ACT_BLOCKS=32, ACT_ROWS=2, TMEM_WORDS=1 << 14,
-                              IMEM_WORDS=1 << 13, FIFO_DEPTH=64, LANES=4, WIN=16, MXU_IMPL=2,
-                              VPU_CL=1, ULANES=4, HAS_DSTEP=0),
-                  clock_ns=2.5, util=35),
-    "card": dict(params=dict(D=128, MCOLS=4, ACT_BLOCKS=128, ACT_ROWS=4, TMEM_WORDS=1 << 16,
-                             IMEM_WORDS=1 << 15, FIFO_DEPTH=1024, LANES=8, WIN=16, MXU_IMPL=2,
-                             VPU_CL=2, ULANES=8, HAS_DSTEP=1),
-                 clock_ns=2.5, util=35),
-}
-# Variants: a point's RTL with source edits (rewrite: file -> [(old, new)], applied to copies in
-# src/). lm3la6: otpu_fpipe's multiplier and adder one and two stages deeper (LM 3, LA 6; the
-# localparams of the VPU, the stream engine and the quantizer), for the critical-path study
+# The design points: a target (its arch / uarch: otpu_asic_top's parameters; its core_mhz: the
+# clock the SDC asks for), the floorplan's utilisation, and a variant's source edits (rewrite:
+# file -> [(old, new)], applied to copies in src/). lm3la6: otpu_fpipe's multiplier and adder one
+# and two stages deeper (LM 3, LA 6: the localparams of the VPU, the stream engine and the
+# quantizer), for the critical-path study.
 _DEEP = {f: [("localparam int LM = 2, LA = 4;", "localparam int LM = 3, LA = 6;")]
          for f in ("vpu/otpu_vpu.sv", "vpu/otpu_se_comp.sv", "vpu/otpu_se_tail.sv",
                    "vpu/otpu_quant.sv")}
-POINTS["small-lm3la6"] = dict(POINTS["small"], rewrite=_DEEP)
-POINTS["card-lm3la6"] = dict(POINTS["card"], rewrite=_DEEP)
+POINTS = {
+    "small": dict(target="nangate45-small", util=35),
+    "card": dict(target="nangate45", util=35),
+    "small-lm3la6": dict(target="nangate45-small", util=35, rewrite=_DEEP),
+    "card-lm3la6": dict(target="nangate45", util=35, rewrite=_DEEP),
+}
+for _t in T.names():
+    if T.load(_t).kind == "asic":
+        POINTS.setdefault(_t, dict(target=_t, util=35))
+ASIC_TOP = "asic/otpu_asic_top.sv"
 
-# The core's sources (rtlsim.RTL_SOURCES without the simulation DRAM, the board's adapter, the
-# simulation top and the generic RAMs), then the ASIC's
-CORE = ["vpu/otpu_fp.sv", "vpu/otpu_fpipe.sv", "top/otpu_pkg.sv", "mem/otpu_tmem.sv",
-        "mem/otpu_actram.sv", "seq/otpu_seq.sv", "vpu/otpu_vtree.sv", "dma/otpu_dma.sv",
-        "mxu/otpu_mxu.sv", "vpu/otpu_quant.sv", "vpu/otpu_se_comp.sv", "vpu/otpu_se_tail.sv",
-        "vpu/otpu_vpu.sv", "top/otpu_coll.sv", "top/otpu_slice.sv"]
-ASIC = ["tech/asic/otpu_tech_ram.sv", "asic/otpu_asic_top.sv"]
-GENERIC_DSP = "tech/generic/otpu_tech_dsp.sv"     # the MXU's cells, once they leave otpu_mxu.sv
+
+def params(point: str) -> dict:
+    """otpu_asic_top's parameters for the point's target."""
+    t = T.load(POINTS[point]["target"])
+    a, u = t.arch, t.uarch
+    return dict(D=a["D"], MCOLS=a["MCOLS"], ACT_BLOCKS=a["ACT_BLOCKS"], ACT_ROWS=t.act_rows,
+                TMEM_WORDS=a["TMEM_WORDS"], IMEM_WORDS=a["IMEM_WORDS"],
+                FIFO_DEPTH=u["FIFO_DEPTH"], LANES=a["LANES"], WIN=u["WIN"],
+                MXU_IMPL=u["MXU_IMPL"], MXU_CL=u["MXU_CL"], VPU_CL=u["VPU_CL"],
+                ULANES=u["ULANES"], HAS_DSTEP=int(a["DSTEP"]), TMEM_IMPL=u["TMEM_IMPL"],
+                RPB=u["RPB"], WPB=u["WPB"])
+
+
+def clock_ns(point: str) -> float:
+    return round(1000.0 / T.load(POINTS[point]["target"]).platform["core_mhz"], 4)
 
 
 def out_dir(point: str) -> Path:
     return ROOT / "build" / "asic" / point
 
 
-def behavioural_mxu(text: str) -> str:
-    """otpu_mxu.sv with otpu_pe's and otpu_colend's SYNTHESIS branches (DSP48E1) dropped: their
-    behavioural models stay. Unchanged once the cells live in rtl/tech."""
-    for mod in ("otpu_pe", "otpu_colend"):
-        m = re.search(rf"^module {mod}\b.*?^endmodule", text, re.S | re.M)
-        if not m:
-            continue
-        body = m.group(0)
-        new = re.sub(r"`ifdef SYNTHESIS\n.*?`else\n(.*?)`endif\n", r"\1", body, flags=re.S)
-        text = text.replace(body, new)
-    return text
-
-
 def sources(point: str) -> list[Path]:
-    """The RTL the ASIC synthesizes (the generated files of `prep` included)."""
+    """The RTL the ASIC synthesizes: the target's (opentpu.target.sources: the core, the
+    generic DSP cells, the macro-tiled RAMs), a variant's edited copies, the ASIC top."""
     src = out_dir(point) / "src"
     rw = POINTS[point].get("rewrite", {})
-    files = []
-    for f in CORE:
-        if f == "mxu/otpu_mxu.sv":
-            files.append(src / "otpu_mxu_asic.sv")
-        elif f in rw:
-            files.append(src / Path(f).name)
-        else:
-            files.append(RTL / f)
-    if (RTL / GENERIC_DSP).exists():
-        files.append(RTL / GENERIC_DSP)
-    return files + [RTL / f for f in ASIC]
+    files = [src / Path(f).name if f in rw else RTL / f
+             for f in T.sources(POINTS[point]["target"])]
+    return files + [RTL / ASIC_TOP]
 
 
 def probe(point: str) -> list[fakeram.Macro]:
@@ -120,7 +104,7 @@ def probe(point: str) -> list[fakeram.Macro]:
         "(* blackbox *)\nmodule otpu_sram_1rw #(parameter int W = 1, parameter int N = 2) (\n"
         "  input logic clk, en, we, input logic [$clog2(N)-1:0] a,\n"
         "  input logic [W-1:0] wd, wm, output logic [W-1:0] rd);\nendmodule\n")
-    gp = " ".join(f"-G {k}={v}" for k, v in POINTS[point]["params"].items())
+    gp = " ".join(f"-G {k}={v}" for k, v in params(point).items())
     files = " ".join(str(f) for f in sources(point) + [stub])
     dump = o / "src" / "probe_cells.txt"
     script = (f"read_slang -D SYNTHESIS --keep-hierarchy --ignore-assertions {files} "
@@ -175,7 +159,7 @@ def sram_map(macros: list[fakeram.Macro]) -> str:
 
 
 def sdc(point: str) -> str:
-    p = POINTS[point]["clock_ns"]
+    p = clock_ns(point)
     return f"""# openTPU ASIC block ({point}): one clock; the memory ports and controls timed against a
 # virtual clock with 20% of the period outside (tools/asic/flow.py)
 current_design otpu_asic_top
@@ -194,7 +178,7 @@ def config_mk(point: str, macros: list[fakeram.Macro]) -> str:
             [str(o / "macros" / f"{m.name}_bb.v") for m in macros]
     lefs = " ".join(str(o / "macros" / f"{m.name}.lef") for m in macros)
     libs = " ".join(str(o / "macros" / f"{m.name}.lib") for m in macros)
-    params = " ".join(f"{k} {v}" for k, v in P["params"].items())
+    tops = " ".join(f"{k} {v}" for k, v in params(point).items())
     return f"""# Generated by tools/asic/flow.py: openTPU's ASIC block, design point {point}
 export DESIGN_NAME = otpu_asic_top
 export DESIGN_NICKNAME = otpu_{point}
@@ -202,7 +186,7 @@ export PLATFORM = nangate45
 export SYNTH_HDL_FRONTEND = slang
 export SYNTH_HIERARCHICAL = 1
 export VERILOG_FILES = {' '.join(files)}
-export VERILOG_TOP_PARAMS = {params}
+export VERILOG_TOP_PARAMS = {tops}
 export SDC_FILE = {o / 'constraint.sdc'}
 export ADDITIONAL_LEFS = {lefs}
 export ADDITIONAL_LIBS = {libs}
@@ -225,8 +209,6 @@ export SYNTH_MEMORY_MAX_BITS = 16384
 def prep(point: str) -> list[fakeram.Macro]:
     o = out_dir(point)
     (o / "src").mkdir(parents=True, exist_ok=True)
-    (o / "src" / "otpu_mxu_asic.sv").write_text(
-        behavioural_mxu((RTL / "mxu" / "otpu_mxu.sv").read_text()))
     for f, edits in POINTS[point].get("rewrite", {}).items():
         t = (RTL / f).read_text()
         for a, b in edits:
@@ -268,8 +250,8 @@ def report(point: str) -> dict:
     """Area, timing and power from ORFS's final reports and metrics."""
     o = out_dir(point)
     w = o / "work"
-    rep: dict = {"point": point, "clock_ns": POINTS[point]["clock_ns"],
-                 "params": POINTS[point]["params"]}
+    rep: dict = {"point": point, "target": POINTS[point]["target"],
+                 "clock_ns": clock_ns(point), "params": params(point)}
     mets = sorted(w.glob("logs/nangate45/*/base/*.json")) + \
         sorted(w.glob("reports/nangate45/*/base/*.json"))
     for f in sorted(w.glob("logs/nangate45/*/base/*.json")):
@@ -317,8 +299,8 @@ def main(argv: list[str]) -> None:
         print(__doc__)
         sys.exit(2)
     if argv[0] == "points":
-        for k, v in POINTS.items():
-            print(k, v)
+        for k in POINTS:
+            print(k, POINTS[k]["target"], f"{clock_ns(k)} ns", params(k))
         return
     point = argv[1]
     if point not in POINTS:

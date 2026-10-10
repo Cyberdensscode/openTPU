@@ -9,9 +9,10 @@
 // area and clock are the core's PPA. The run control (reset, the loader, the run's arguments)
 // and the status the board's control block (otpu_ctrl) reads are ports too.
 //
-// The ASIC configuration: the banked TMEM (TMEM_IMPL 1: three copies of 1R1W bank RAMs, one read
-// and one write per copy and bank per cycle) and the technology RAMs on SRAM macros
-// (rtl/tech/asic/otpu_tech_ram.sv); the MXU's cells behavioural (rtl/tech/generic).
+// The ASIC configuration (the targets' defaults, targets/nangate45*.toml): the banked TMEM
+// (TMEM_IMPL 1: three copies of 1R1W bank RAMs, one read and one write per copy and bank per
+// cycle) and the technology RAMs on SRAM macros (rtl/tech/asic/otpu_tech_ram.sv); the MXU's cells
+// behavioural (rtl/tech/generic/otpu_tech_dsp.sv).
 module otpu_asic_top
   import otpu_pkg::*;
 #(
@@ -28,7 +29,10 @@ module otpu_asic_top
   parameter int MXU_CL     = 16,
   parameter int VPU_CL     = 2,
   parameter int ULANES     = LANES,
-  parameter bit HAS_DSTEP  = 1'b1
+  parameter bit HAS_DSTEP  = 1'b1,
+  parameter int TMEM_IMPL  = 1,         // the banked TMEM (otpu_tmem IMPL 1) and its limits
+  parameter int RPB        = 1,
+  parameter int WPB        = 1
 ) (
   input  logic                clk,
   input  logic                sys_rst,      // the loader's reset
@@ -85,9 +89,9 @@ module otpu_asic_top
 
   otpu_slice #(.SID(0), .S(1), .D(D), .MCOLS(MCOLS), .ACT_BLOCKS(ACT_BLOCKS),
                .ACT_ROWS(ACT_ROWS), .TMEM_WORDS(TMEM_WORDS), .IMEM_WORDS(IMEM_WORDS),
-               .FIFO_DEPTH(FIFO_DEPTH), .LANES(LANES), .WIN(WIN), .RPB(1), .WPB(1),
+               .FIFO_DEPTH(FIFO_DEPTH), .LANES(LANES), .WIN(WIN), .RPB(RPB), .WPB(WPB),
                .MXU_IMPL(MXU_IMPL), .MXU_CL(MXU_CL), .VPU_CL(VPU_CL), .ULANES(ULANES),
-               .HAS_DSTEP(HAS_DSTEP), .TMEM_IMPL(1)) u_slice (
+               .HAS_DSTEP(HAS_DSTEP), .TMEM_IMPL(TMEM_IMPL)) u_slice (
     .clk, .sys_rst, .rst, .rinit(rinit_a), .ld_start, .ld_addr, .ld_n, .ld_busy,
     .a_rdy, .b_rdy, .sw_rdy, .wr_idle, .rd_idle,
     .a_req, .a_we, .a_addr, .a_wdata, .a_be, .a_rvalid, .a_rdata, .a_rdata2,

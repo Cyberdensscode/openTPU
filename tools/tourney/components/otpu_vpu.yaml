@@ -18,6 +18,7 @@ synth:
     - rtl/vpu/otpu_fp.sv
     - rtl/vpu/otpu_fpipe.sv
     - rtl/top/otpu_pkg.sv
+    - rtl/tech/generic/otpu_tech_ram.sv
     - rtl/vpu/otpu_vtree.sv
     - rtl/vpu/otpu_se_comp.sv
     - rtl/vpu/otpu_se_tail.sv
