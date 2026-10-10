@@ -265,22 +265,52 @@ def report(point: str) -> dict:
                                     "power__total", "design__die__area", "design__core__area",
                                     "design__instance__utilization")):
                 rep.setdefault("metrics", {})[f"{f.stem}:{k}"] = v
-    fin = w / "reports" / "nangate45" / f"otpu_{point}" / "base" / "6_finish.rpt"
-    if fin.exists():
-        t = fin.read_text()
-        m = re.search(r"report_worst_slack.*?worst slack (?:max )?(-?[\d.]+)", t, re.S)
-        if m:
-            rep["wns_ns"] = float(m.group(1))
-        m = re.search(r"Total\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)", t)
-        if m:
-            rep["power_w"] = {"internal": float(m.group(1)), "switching": float(m.group(2)),
-                              "leakage": float(m.group(3)), "total": float(m.group(4))}
-        m = re.search(r"Design area ([\d.]+) u\^2 (\d+)% utilization", t)
-        if m:
-            rep["design_area_um2"], rep["utilization_pct"] = float(m.group(1)), int(m.group(2))
-    if "wns_ns" in rep:
-        p = rep["clock_ns"] - min(0.0, rep["wns_ns"])
-        rep["fmax_mhz"] = round(1000 / p, 1)
+    # the latest stage's report: timing (worst slack with the ports' budgets; the clock's
+    # minimum period, register to register), power (vectorless, the default activities), area
+    rdir = w / "reports" / "nangate45" / f"otpu_{point}" / "base"
+    for name in ("6_finish.rpt", "5_global_route.rpt", "4_cts_final.rpt"):
+        if (rdir / name).exists():
+            rep["stage"] = name.split(".")[0]
+            t = (rdir / name).read_text()
+            break
+    else:
+        t = ""
+    m = re.search(r"report_worst_slack\s*-+\s*worst slack (?:max )?(-?[\d.]+)", t)
+    if m:
+        rep["wns_ns"] = float(m.group(1))
+        rep["fmax_io_mhz"] = round(1000 / (rep["clock_ns"] - min(0.0, rep["wns_ns"])), 1)
+    m = re.search(r"core_clock period_min = ([\d.]+) fmax = ([\d.]+)", t)
+    if m:
+        rep["period_min_ns"], rep["fmax_mhz"] = float(m.group(1)), float(m.group(2))
+    m = re.search(r"^Total\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)", t, re.M)
+    if m:
+        rep["power_w"] = {"internal": float(m.group(1)), "switching": float(m.group(2)),
+                          "leakage": float(m.group(3)), "total": float(m.group(4))}
+        for g in ("Sequential", "Combinational", "Clock", "Macro"):
+            m = re.search(rf"^{g}\s+\S+\s+\S+\s+\S+\s+([\d.eE+-]+)", t, re.M)
+            if m:
+                rep["power_w"][g.lower()] = float(m.group(1))
+    m = re.search(r"Design area ([\d.]+) u\^2 (\d+)% utilization", t)
+    if m:
+        rep["design_area_um2"], rep["utilization_pct"] = float(m.group(1)), int(m.group(2))
+    # area per unit (synthesis, before placement's buffers): the slice's units and the collective
+    # unit, each with its macros (the otpu_sram_* leaves below it)
+    st = rdir / "synth_stat.txt"
+    if st.exists():
+        units: dict = {}
+        for sec in re.split(r"^=== ", st.read_text(), flags=re.M)[1:]:
+            mod, _, path = sec.split(" ===", 1)[0].partition("$")
+            p = path.split(".")[1:]
+            if p[:1] == ["u_slice"]:
+                p = p[1:]
+            m = re.search(r"Chip area for module .*?: ([\d.]+)", sec)
+            if len(p) != 1 or not m:
+                continue
+            # (yosys stat: count and area with the submodules, then without)
+            mac = sum(float(x.group(1)) for x in re.finditer(
+                r"^\s+\d+\s+([\d.E+-]+)\s+\S+\s+\S+\s+fakeram45_", sec, re.M))
+            units[p[0]] = {"um2": round(float(m.group(1))), "macro_um2": round(mac)}
+        rep["units"] = dict(sorted(units.items(), key=lambda kv: -kv[1]["um2"]))
     tiles = o / "src" / "tiles.json"
     if tiles.exists():
         ts = json.loads(tiles.read_text())
