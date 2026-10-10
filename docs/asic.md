@@ -32,8 +32,15 @@ DMA, QUANT 3, COLL. The ports of one arbitration group are on different copies, 
 always fits (the quantizer reads three ports at once, the VPU two; with fewer copies they could
 never be granted). The slice's arbiter counts per copy and bank (`gnt_k`), and a bank's address
 comes from the port granted in it. Results are the same as the FPGA's (the ISA simulator's); cycles
-differ where ports meet in a bank. Three copies is 3x the TMEM's bits (the FPGA build has six); a
-two-copy TMEM needs the quantizer's row-factor read off the TMEM ports.
+differ where ports meet in a bank: a Qwen3-0.6B decode token on the RTL (`tools/asic/tmem_cycles.py`,
+the board's micro-architecture otherwise) takes 4,819,205 cycles banked against 4,815,735 with a
+copy per port, +0.07%, with identical results. Three copies is 3x the TMEM's bits (the FPGA build
+has six); a two-copy TMEM needs the quantizer's row-factor read off the TMEM ports.
+
+Verified: the RTL suite (`tests/test_rtl.py`, 133) and the model tokens on the RTL (Qwen3-0.6B
+int8, fp4 with an int8 head, fp4 PAIR; Qwen3.5-0.8B with and without DSTEP) bit-exact against the
+ISA simulator with the ASIC's TMEM (`OTPU_TARGET=nangate45 OTPU_UARCH=board`: 138 passed) and
+with the card's (138 passed).
 
 **Macros.** NanGate45 has no memory compiler. `tools/asic/fakeram.py` writes abstract macros in
 bsg_fakeram's form (the pins, layers and straps of ORFS's fakeram45 macros) for 1RW and 1R1W
