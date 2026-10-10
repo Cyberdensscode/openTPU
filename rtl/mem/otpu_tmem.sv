@@ -30,6 +30,15 @@
 //
 // Within one port the enabled lanes must hit distinct banks (or read the same word); the
 // simulation stops on a violation, so the timing it reports is honest.
+//
+// IMPL 1 (banked; an ASIC, whose SRAM macros cannot be replicated per read port at no cost):
+// NCP copies instead of one per read port, each LANES banks of one 1R1W RAM (otpu_ram_1r1w, the
+// target's technology cell). CPY[p] is read port p's copy; ports of one unit (the slice's
+// arbitration group) sit on different copies, so a unit alone always fits. Each copy's bank
+// serves one read per cycle: the slice's arbiter admits at most one port per copy and bank (a
+// port's lanes in one bank read one word), and the bank's address comes from that port's granted
+// lanes (r_en), not its requests. Writes are broadcast to every copy, one per bank (WPB = 1).
+// The registered write stage, the bypass and the lanes' data path are IMPL 0's.
 module otpu_tmem #(
   parameter int WORDS = 1 << 16,
   parameter int LANES = 8,
@@ -41,7 +50,10 @@ module otpu_tmem #(
   parameter int SH_HOST = 0,              // the read port whose copy SH_MASK's ports share
   parameter logic [NRP-1:0] SH_MASK = '0, // guests on SH_HOST's copy (the arbiter lets a guest
                                           // read only when no port before it on the copy asks)
-  parameter int SID   = 0
+  parameter int SID   = 0,
+  parameter int IMPL  = 0,                // 0: a copy per read port (block RAM); 1: banked (see top)
+  parameter int NCP   = 1,                // IMPL 1: copies
+  parameter logic [NRP-1:0][1:0] CPY = '0 // IMPL 1: each read port's copy (< NCP)
 ) (
   input  logic                                clk,
   input  logic [NRP-1:0][LANES-1:0]           r_en,     // granted reads
@@ -58,6 +70,16 @@ module otpu_tmem #(
   localparam int BW = $clog2(LANES);
   localparam int BD = WORDS / LANES;        // words per bank
   localparam int IW = $clog2(BD);
+  initial if (IMPL == 1 && WPB != 1) $fatal(1, "otpu_tmem: IMPL 1 needs WPB = 1");
+  initial if (IMPL == 1) for (int p = 0; p < NRP; p++)
+    if (CPY[p] >= NCP) $fatal(1, "otpu_tmem: port %0d's copy %0d >= NCP %0d", p, CPY[p], NCP);
+  // the read port that holds each port's copy: IMPL 0, the port itself or SH_HOST (a guest);
+  // IMPL 1, the first port on its copy
+  function automatic int host_of(input int p);
+    if (IMPL == 0) return SH_MASK[p] ? SH_HOST : p;
+    for (int q = 0; q < NRP; q++) if (CPY[q] == CPY[p]) return q;
+    return p;
+  endfunction
 
 
   // ---- write selection: per bank, the enabled lanes of all write ports. The arbiter admits at
@@ -168,19 +190,21 @@ module otpu_tmem #(
     logic [LANES-1:0][IW-1:0] b_a;
     wire  [BW+IW-1:0]         a0 = r_addr[p][0][BW+IW-1:0];
     wire  [BW-1:0]            rot = a0[BW-1:0];
+    // IMPL 1: a copy's bank serves the one port granted in it, so its enables are the grants
+    wire  [LANES-1:0]         rs = (IMPL == 1) ? r_en[p] : r_req[p];
     always_comb begin
       b_en = '0; b_a = '0;
       if (GEN_R[p]) begin
         for (int b = 0; b < LANES; b++)
           for (int l = 0; l < LANES; l++)
-            if (r_addr[p][l][BW-1:0] == BW'(b) && r_req[p][l]) begin
+            if (r_addr[p][l][BW-1:0] == BW'(b) && rs[l]) begin
               b_en[b] = 1'b1;
               b_a[b] = b_a[b] | r_addr[p][l][BW +: IW];
             end
       end else begin
         logic [LANES-1:0] t;
         t = '0;
-        b_en = r_req[p];
+        b_en = rs;
         for (int k = 0; k < BW; k++)
           if (rot[k]) begin
             t = b_en;
@@ -202,7 +226,7 @@ module otpu_tmem #(
   // (tests: the dump and the check see a fault in the registered write stage, the RAM or one
   // copy)
   function automatic int first_copy();
-    for (int p = 0; p < NRP; p++) if (!SH_MASK[p]) return p;
+    for (int p = 0; p < NRP; p++) if (host_of(p) == p) return p;
     return 0;
   endfunction
   localparam int DP = first_copy();
@@ -226,12 +250,24 @@ module otpu_tmem #(
 `endif
 
   // ---- the copies: one per read port, except the guests (SH_MASK), which read SH_HOST's copy:
-  // it serves the first port that requests, the host, then the guests in port order
+  // it serves the first port that requests, the host, then the guests in port order. IMPL 1:
+  // one per CPY value, held by its first port; each bank serves the port granted in it.
   for (genvar p = 0; p < NRP; p++) begin : g_port
-   if (!SH_MASK[p]) begin : g_copy
+   if (host_of(p) == p) begin : g_copy
     logic [LANES-1:0]         b_en;
     logic [LANES-1:0][IW-1:0] b_a;
-    if (p == SH_HOST && SH_MASK != '0) begin : g_sh
+    if (IMPL == 1) begin : g_bk
+      always_comb begin
+        b_en = '0; b_a = '0;
+        for (int g = 0; g < NRP; g++)
+          if (CPY[g] == CPY[p])
+            for (int b = 0; b < LANES; b++)
+              if (pb_en[g][b]) begin
+                b_en[b] = 1'b1;
+                b_a[b] = b_a[b] | pb_a[g][b];
+              end
+      end
+    end else if (p == SH_HOST && SH_MASK != '0) begin : g_sh
       always_comb begin
         logic take;
         b_en = pb_en[p]; b_a = pb_a[p];
@@ -248,15 +284,26 @@ module otpu_tmem #(
     logic [LANES-1:0][31:0]    q, qb;
     logic [LANES-1:0][WPB-1:0] bh;      // the read hit these writes, still registered
     for (genvar b = 0; b < LANES; b++) begin : g_bank
-      logic [31:0] mem [BD];
-      always_ff @(posedge clk) begin
-        if (b_en[b]) q[b] <= mem[b_a[b]];
-        for (int w = 0; w < WPB; w++)
+      logic [31:0] mem [BD];               // IMPL 0's (IMPL 1: unused, the RAM cell holds them)
+      if (IMPL == 1) begin : g_ram
+        logic [31:0] wd;
 `ifdef SYNTHESIS
-          if (pw_v[b][w]) mem[pw_a[b][w]] <= pw_d[b][w];
+        assign wd = pw_d[b][0];
 `else
-          if (pw_v[b][w]) mem[pw_a[b][w]] <= pw_d[b][w] ^ fault(p, b, pw_a[b][w]);
+        assign wd = pw_d[b][0] ^ fault(p, b, pw_a[b][0]);
 `endif
+        otpu_ram_1r1w #(.W(32), .N(BD), .STYLE("block")) u_ram (
+          .clk, .we(pw_v[b][0]), .wa(pw_a[b][0]), .wd, .re(b_en[b]), .ra(b_a[b]), .rd(q[b]));
+      end else begin : g_inf
+        always_ff @(posedge clk) begin
+          if (b_en[b]) q[b] <= mem[b_a[b]];
+          for (int w = 0; w < WPB; w++)
+`ifdef SYNTHESIS
+            if (pw_v[b][w]) mem[pw_a[b][w]] <= pw_d[b][w];
+`else
+            if (pw_v[b][w]) mem[pw_a[b][w]] <= pw_d[b][w] ^ fault(p, b, pw_a[b][w]);
+`endif
+        end
       end
       always_ff @(posedge clk)
         if (b_en[b])
@@ -269,20 +316,33 @@ module otpu_tmem #(
 `ifndef SYNTHESIS
       initial for (int i = 0; i < BD; i++) mem[i] = '0;
       initial bh[b] = '0;
-      always @(posedge clk) begin           // the dump: DP's words, then the others against them
-        if (dump && p == DP)
-          for (int r = 0; r < BD; r++) img[r * LANES + b] = mem[r];
-        if (dump_q && p != DP)
-          for (int r = 0; r < BD; r++)
-            if (mem[r] != img[r * LANES + b])
-              $fatal(1, "TMEM%0d: copy %0d's word %0d is %h, copy %0d's %h", SID, p, r * LANES + b,
-                     mem[r], DP, img[r * LANES + b]);
+      // the dump: DP's words, then the others against them
+      if (IMPL == 1) begin : g_dump1
+        always @(posedge clk) begin
+          if (dump && p == DP)
+            for (int r = 0; r < BD; r++) img[r * LANES + b] = g_ram.u_ram.g_bram.mem[r];
+          if (dump_q && p != DP)
+            for (int r = 0; r < BD; r++)
+              if (g_ram.u_ram.g_bram.mem[r] != img[r * LANES + b])
+                $fatal(1, "TMEM%0d: copy %0d's word %0d is %h, copy %0d's %h", SID, p,
+                       r * LANES + b, g_ram.u_ram.g_bram.mem[r], DP, img[r * LANES + b]);
+        end
+      end else begin : g_dump0
+        always @(posedge clk) begin
+          if (dump && p == DP)
+            for (int r = 0; r < BD; r++) img[r * LANES + b] = mem[r];
+          if (dump_q && p != DP)
+            for (int r = 0; r < BD; r++)
+              if (mem[r] != img[r * LANES + b])
+                $fatal(1, "TMEM%0d: copy %0d's word %0d is %h, copy %0d's %h", SID, p,
+                       r * LANES + b, mem[r], DP, img[r * LANES + b]);
+        end
       end
 `endif
     end
     assign pq[p] = qb;
    end else begin : g_guest
-    assign pq[p] = pq[SH_HOST];
+    assign pq[p] = pq[host_of(p)];
    end
     wire  [BW-1:0]            rot = r_addr[p][0][BW-1:0];
     wire  [LANES-1:0][31:0]   qb = pq[p];
@@ -344,7 +404,7 @@ module otpu_tmem #(
   endfunction
   always @(posedge clk) begin
     for (int p = 0; p < NRP; p++)
-      if (SH_MASK[p] && |r_en[p]) begin
+      if (IMPL == 0 && SH_MASK[p] && |r_en[p]) begin
         if (|r_req[SH_HOST]) $fatal(1, "TMEM%0d: guest port %0d read beside its host at %0t", SID, p, $time);
         for (int g = 0; g < p; g++)
           if (SH_MASK[g] && |r_req[g]) $fatal(1, "TMEM%0d: guest port %0d read beside port %0d at %0t", SID, p, g, $time);

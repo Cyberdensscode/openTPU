@@ -66,7 +66,6 @@ module otpu_seq
   localparam int NROW = IMEM_WORDS / (8 * IPR);
   localparam int RW = $clog2(NROW);
   initial if (D % 32 != 0) $fatal(1, "otpu_seq: D must be a multiple of 32");
-  logic [D*8-1:0] imem [NROW];
   logic [D*8-1:0] irow;           // the RAM output: the row holding fa
   logic [255:0]   ir;             // the instruction at pc
   logic           ir_v;           // ir is valid (0 only in the first cycle after reset)
@@ -256,10 +255,9 @@ module otpu_seq
   // The RAM reads fa_n on the cycles fa moves (fe) and holds fa's row otherwise: the decision
   // whether R moves on (the dispatch, from the window) reaches the read enable, not the
   // address multiplexer (the sequencer's worst path at 125 MHz ran window -> ld -> address)
-  always_ff @(posedge clk) begin
-    if (im_we) imem[RW'(im_row)] <= im_data;
-    if (fe) irow <= imem[RW'(fa_n / IPR)];
-  end
+  // IMEM: a technology RAM (rtl/tech), one row write (the loader) and one row read per cycle
+  otpu_ram_1r1w #(.W(D*8), .N(NROW), .STYLE("auto"), .ZERO(1'b0)) u_imem (
+    .clk, .we(im_we), .wa(RW'(im_row)), .wd(im_data), .re(fe), .ra(RW'(fa_n / IPR)), .rd(irow));
   always_ff @(posedge clk) begin
     fa <= fa_d;
     if (rst) ir_v <= 1'b0;
@@ -753,7 +751,8 @@ module otpu_seq
     if ($value$plusargs("dir=%s", dir) && !$test$plusargs("boot"))
       $readmemh($sformatf("%s/prog_%0d.hex", dir, SID), init_w);
     for (int r = 0; r < NROW; r++)
-      for (int w = 0; w < 8 * IPR; w++) imem[r][32 * w +: 32] = init_w[r * 8 * IPR + w];
+      for (int w = 0; w < 8 * IPR; w++)
+        u_imem.g_auto.mem[r][32 * w +: 32] = init_w[r * 8 * IPR + w];
   end
 `endif
 endmodule

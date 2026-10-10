@@ -166,8 +166,7 @@ module otpu_dma
   wire ld_dv  = ld_act && sl_nz && (cnt != 0);              // deliver the segment at sw
   wire ld_eat = (ld_dv && seg_end) || ds_eat;               // ... which frees its chunk's slot
 
-  // block RAM, written in its own reset-free process (see otpu_mxu); read every cycle
-  (* ram_style = "block" *) logic [D*8-1:0] lb [DEPTH];
+  // block RAM (a technology RAM, rtl/tech), read every cycle
   logic [D*8-1:0] lb_q;
   // ST: a complete chunk (st_push: its data st_cd, word mask st_cm) into the buffer at wp;
   // a write run (st_wq) issues the chunk at rp, and the buffer's read follows the next one
@@ -175,11 +174,9 @@ module otpu_dma
   logic [D*8-1:0] st_cd;
   logic [CW-1:0]  st_cm;
   (* ram_style = "distributed" *) logic [CW-1:0] lm [DEPTH];
-  always_ff @(posedge clk) begin
-    if (b_rvalid) lb[wp] <= b_rdata;
-    else if (st_push) lb[wp] <= st_cd;
-    lb_q <= lb[st_iss ? rp + 1'b1 : rp];
-  end
+  otpu_ram_1r1w #(.W(D*8), .N(DEPTH), .STYLE("block")) u_lb (
+    .clk, .we(b_rvalid || st_push), .wa(wp), .wd(b_rvalid ? b_rdata : st_cd), .re(1'b1),
+    .ra(st_iss ? rp + 1'b1 : rp), .rd(lb_q));
   always_ff @(posedge clk)
     if (st_push) lm[wp] <= st_cm;
   // ---- streams (DSTEP, STREAM; docs/stream.md)

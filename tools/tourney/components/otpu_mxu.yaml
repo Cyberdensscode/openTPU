@@ -21,6 +21,7 @@ synth:
     - rtl/vpu/otpu_fp.sv
     - rtl/vpu/otpu_fpipe.sv
     - rtl/top/otpu_pkg.sv
+    - rtl/tech/generic/otpu_tech_ram.sv
     - rtl/mxu/otpu_mxu.sv
     - rtl/tech/xilinx7/otpu_tech_dsp.sv
 target_mhz: 110

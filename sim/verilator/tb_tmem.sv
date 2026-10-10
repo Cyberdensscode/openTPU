@@ -3,10 +3,14 @@
 // while their banks stay free, as the slice's arbiter does), and the reads aim mostly at words
 // written in the last two cycles, so the registered-write bypass is exercised. A read returns
 // the word as of its own cycle (writes of the same cycle are not seen) the cycle after it is
-// granted, and the lane holds that value until its next granted read.
-module tb_tmem;
+// granted, and the lane holds that value until its next granted read. IMPL 1 (the banked TMEM):
+// ports 0 and 1 share copy 0, port 2 has copy 1, and a read port is granted only while its banks
+// on its copy are free (as the slice's banked arbiter does).
+module tb_tmem #(parameter int IMPL = 0);
   localparam int WORDS = 256, LANES = 4, NRP = 3, NWP = 2, WPB = 1, CYCLES = 20000;
   localparam int BW = $clog2(LANES);
+  localparam int NCP = 2;
+  localparam logic [NRP-1:0][1:0] CPY = {2'd1, 2'd0, 2'd0};
 
   logic clk = 0;
   logic [NRP-1:0][LANES-1:0]       r_en, r_req;
@@ -15,7 +19,8 @@ module tb_tmem;
   logic [NWP-1:0]                  w_gnt;
   logic [NWP-1:0][LANES-1:0][31:0] w_addr, w_data;
 
-  otpu_tmem #(.WORDS(WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .WPB(WPB)) dut (
+  otpu_tmem #(.WORDS(WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .WPB(WPB), .IMPL(IMPL),
+              .NCP(NCP), .CPY(CPY)) dut (
     .clk, .r_en, .r_req, .r_addr, .r_data, .w_en, .w_req, .w_gnt, .w_addr, .w_data,
     .dump(1'b0));
 
@@ -44,6 +49,7 @@ module tb_tmem;
 
     for (int cyc = 0; cyc < CYCLES; cyc++) begin
       logic [LANES-1:0] busy;
+      logic [NCP-1:0][LANES-1:0] rbusy;
       int unsigned      wrote [$];
       // ---- writes: each port's lanes take a random permutation of banks
       busy = '0;
@@ -64,17 +70,22 @@ module tb_tmem;
         w_en[p] = w_gnt[p] ? w_req[p] : '0;
       end
       // ---- reads
+      rbusy = '0;
       for (int p = 0; p < NRP; p++) begin
         int perm [LANES];
         bit g;
+        logic [LANES-1:0] banks;
         for (int l = 0; l < LANES; l++) perm[l] = l;
         perm.shuffle();
-        g = $urandom_range(3) != 0;
+        banks = '0;
         for (int l = 0; l < LANES; l++) begin
           r_req[p][l] = $urandom_range(2) != 0;
           r_addr[p][l] = pick_addr(perm[l]);
-          r_en[p][l] = g && r_req[p][l];
+          if (r_req[p][l]) banks[perm[l]] = 1'b1;
         end
+        g = $urandom_range(3) != 0 && (IMPL == 0 || (banks & rbusy[CPY[p]]) == '0);
+        if (g) rbusy[CPY[p]] |= banks;
+        for (int l = 0; l < LANES; l++) r_en[p][l] = g && r_req[p][l];
       end
       #1;
       // ---- the reads see the memory before this cycle's writes

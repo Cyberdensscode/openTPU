@@ -242,18 +242,13 @@ module otpu_se_tail
   ss_meta_t um;
   f32_t  ud [L];
   logic [$clog2(UBD)-1:0] wc;
-  (* ram_style = "block" *) logic [L*32+$bits(ss_meta_t)-1:0] ub [UBD];
   logic [L*32+$bits(ss_meta_t)-1:0] ub_q, ub_d;
   always_comb begin
     ub_d[L*32 +: $bits(ss_meta_t)] = x0;
     for (int l = 0; l < L; l++) ub_d[32 * l +: 32] = xd[l];
   end
-  always_ff @(posedge clk) begin
-    if (pe) begin
-      ub[wc] <= ub_d;
-      ub_q <= ub[wc - $clog2(UBD)'(T_U - 1)];
-    end
-  end
+  otpu_ram_1r1w #(.W(L*32+$bits(ss_meta_t)), .N(UBD), .STYLE("block")) u_ub (
+    .clk, .we(pe), .wa(wc), .wd(ub_d), .re(pe), .ra(wc - $clog2(UBD)'(T_U - 1)), .rd(ub_q));
   always_ff @(posedge clk)
     if (rst || init) wc <= '0;
     else if (pe) wc <= wc + 1'b1;

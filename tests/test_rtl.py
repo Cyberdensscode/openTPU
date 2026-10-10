@@ -1008,21 +1008,26 @@ def test_axi_write_bursts(have_verilator, stall, seed):
     assert aw == beats
 
 
-def test_tmem_random_traffic(have_verilator):
+@pytest.mark.parametrize("impl", [0, 1])
+def test_tmem_random_traffic(have_verilator, impl):
     """TMEM alone against a reference model; most reads hit the previous cycle's writes, which
-    are still in TMEM's registered write stage (the bypass)."""
-    exe = rtlsim.build("tb_tmem", [rtlsim.RTL / "mem/otpu_tmem.sv", rtlsim.TB / "tb_tmem.sv"])
+    are still in TMEM's registered write stage (the bypass). impl 1: the banked TMEM (copies of
+    1R1W bank RAMs shared by ports, one granted read per copy and bank)."""
+    exe = rtlsim.build("tb_tmem", [rtlsim.RTL / "mem/otpu_tmem.sv",
+                                   rtlsim.RTL / "tech/generic/otpu_tech_ram.sv",
+                                   rtlsim.TB / "tb_tmem.sv"], {"IMPL": impl})
     r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=120)
     assert r.returncode == 0 and "PASS" in r.stdout, r.stdout[-2000:] + r.stderr[-2000:]
 
 
-@pytest.mark.parametrize("port", [None, 3])
+@pytest.mark.parametrize("port", [None, 4])
 def test_tmem_dump_is_the_ram(have_verilator, port):
     """The TMEM dump that assert_same_state compares is the memory's contents, not the writes
     asked of it: a write that lands with bit 0 flipped (+tmem_fault: the registered write stage
     into the block RAMs) shows in the dump, though no instruction reads the word again; in one
-    copy only (port 3's), the dump's check of the copies stops the simulation. Before, the dump
-    was a shadow of the write requests and saw neither."""
+    copy only (port 4's: VPU B holds a copy of its own in both TMEMs, a copy per port and the
+    banked one), the dump's check of the copies stops the simulation. Before, the dump was a
+    shadow of the write requests and saw neither."""
     cfg = Config(S=1)
     dram = np.random.default_rng(7).integers(0, 256, 1 << 16, dtype=np.uint8)
     prog = [I.ld(0, 64, 32), I.halt()]          # TMEM 64..95, never read again

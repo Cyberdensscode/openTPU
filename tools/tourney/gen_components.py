@@ -7,7 +7,8 @@ from pathlib import Path
 import yaml
 
 OUT = Path(__file__).resolve().parent / "components"
-BASE = ["rtl/vpu/otpu_fp.sv", "rtl/vpu/otpu_fpipe.sv", "rtl/top/otpu_pkg.sv"]
+BASE = ["rtl/vpu/otpu_fp.sv", "rtl/vpu/otpu_fpipe.sv", "rtl/top/otpu_pkg.sv",
+        "rtl/tech/generic/otpu_tech_ram.sv"]
 FAST = ["tests/test_rtl.py::test_mlp_rtl[1]",
         "tests/test_rtl.py::test_attention_decode_rtl[1-8-2-100]",
         "tests/test_rtl.py::test_design_size_block_128_rtl",
