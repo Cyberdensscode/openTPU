@@ -234,14 +234,16 @@ def prep(point: str) -> list[fakeram.Macro]:
 def run(point: str, cpus: int = 6, target: str = "finish") -> int:
     o = out_dir(point)
     (o / "work").mkdir(parents=True, exist_ok=True)
-    # ORFS_CLEAN=floorplan (or place, cts, ...): redo from that stage (config changes do not)
+    # ORFS_CLEAN=floorplan (or place, cts, ...): redo from that stage (config changes do not);
+    # ORFS_VARS: more ORFS variables for this run, e.g. "SKIP_INCREMENTAL_REPAIR=1"
     stage = os.environ.get("ORFS_CLEAN")
     clean = (f"make DESIGN_CONFIG={o / 'config.mk'} WORK_HOME={o / 'work'} clean_{stage} && "
              if stage else "")
     cmd = ["docker", "run", "--rm", "--platform", "linux/amd64", f"--cpus={cpus}",
            "-v", f"{ROOT}:{ROOT}", "-w", str(ROOT), IMAGE, "bash", "-lc",
            f"cd /OpenROAD-flow-scripts && source env.sh >/dev/null 2>&1; cd flow && "
-           f"{clean}make DESIGN_CONFIG={o / 'config.mk'} WORK_HOME={o / 'work'} NUM_CORES={cpus} {target}"]
+           f"{clean}make DESIGN_CONFIG={o / 'config.mk'} WORK_HOME={o / 'work'} NUM_CORES={cpus} "
+           f"{os.environ.get('ORFS_VARS', '')} {target}"]
     with open(o / "run.log", "w") as log:
         return subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT).returncode
 
