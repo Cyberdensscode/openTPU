@@ -204,6 +204,8 @@ export MACRO_PLACE_HALO = 10 10
 # channels between macros at least the standard-cell grid's metal4 strap pitch (56 um), so the
 # rails in every channel reach a strap (pdngen: "Unable to repair all channels" at 44.8)
 export RTLMP_MIN_CHANNEL_SIZE = 60 60
+# and no row narrower than that pitch (a pocket boxed in by macros: its rails would float)
+export TAPCELL_TCL = {ROOT / 'asic' / 'nangate45' / 'tapcell.tcl'}
 export TNS_END_PERCENT = 100
 export LEC_CHECK = 0
 # the small RAMs left to flip-flops (the dispatch window, the MXU's drain rows, LUT RAMs: the
