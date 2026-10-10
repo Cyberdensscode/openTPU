@@ -1,0 +1,53 @@
+# openTPU on the BCU1525 (VCU1525 build: xcvu9p-fsgd2104-2L-e, 4 x DDR4 RDIMM, PCIe Gen3 x16;
+# docs/bcu1525.md).
+#   make lint       offline: Tcl syntax, XDC pins / ports vs the DDR4 core's pads and the top,
+#                   core.json's hashes (scripts/check_offline.py)
+#   make pins       regenerate constraints/*.xdc from AMD's VCU1525 board file (scripts/gen_pins.py)
+#   make core       regenerate litedram/ (tools/litedram/gen_core_ddr4.py; LITEX_VENV: a venv with
+#                   core.json's packages; RVSHIM: a directory whose riscv64-unknown-elf-* work)
+#   make ipcheck    the block design and the DDR4 core in Vivado on PART (any UltraScale+ part with a
+#                   PCIE4 block: the free tier's xcku5p-ffvb676-2-e until a VU9P license exists)
+#   make bit        Vivado batch build (S, MCOLS, CORE_MHZ=100, PCIE_LANES=16, FAST=1: run_vivado.sh)
+#   make impl       rerun implementation on the existing project
+#   make program    JTAG load over the board's FT4232H (openFPGALoader -b vcu1525; BIT=path)
+#   make flash      write the SPI flash (MT25QU01G) -- permanent. openFPGALoader needs its
+#                   spiOverJtag bitstream for xcvu9p-fsgd2104, which it does not ship (only the
+#                   VCU118's flga2104): build one with Vivado, or use Vivado's hardware manager
+#                   (program_hw_cfgmem, part mt25qu01g-spi-x1_x2_x4, MCS=path)
+ROOT := $(abspath ../..)
+LITEX_VENV ?= $(HOME)/eda/litex-venv
+RVSHIM ?= $(HOME)/eda/rvshim
+PART ?= xcku5p-ffvb676-2-e
+OUT ?= $(ROOT)/build/vivado_bcu1525
+BIT ?= $(OUT)/otpu.bit
+MCS ?= $(OUT)/otpu.mcs
+
+.PHONY: lint pins core ipcheck bit impl program flash
+lint:
+	python3 scripts/check_offline.py
+
+pins:
+	python3 scripts/gen_pins.py
+
+core:
+	PATH=$(RVSHIM):$(LITEX_VENV)/bin:$$PATH $(LITEX_VENV)/bin/python $(ROOT)/tools/litedram/gen_core_ddr4.py \
+	  --cpu --sys-mhz 200 --out $(ROOT)/build/ld4
+	cp $(ROOT)/build/ld4/otpu_ld4.v $(ROOT)/build/ld4/otpu_ld4.xdc $(ROOT)/build/ld4/otpu_ld4_*.init \
+	  $(ROOT)/build/ld4/csr.csv $(ROOT)/build/ld4/sdram_init.py $(ROOT)/build/ld4/ports.txt litedram/
+	@echo "update litedram/core.json's sha256s (make lint checks them)"
+
+ipcheck:
+	vivado -mode batch -nojournal -log $(OUT)_ipcheck.log -source vivado/ip_check.tcl \
+	  -tclargs $(PART) $(OUT)_ipcheck bd,ld4
+
+bit:
+	./run_vivado.sh
+
+impl:
+	STEP=impl ./run_vivado.sh
+
+program:
+	openFPGALoader -b vcu1525 $(BIT)
+
+flash:
+	openFPGALoader -b vcu1525 -f $(BIT)
