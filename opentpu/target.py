@@ -165,6 +165,15 @@ def load(name: str | None = None) -> Target:
                   tech=dict(raw["tech"]), platform=dict(raw["platform"]), path=path)
 
 
+def by_platform(pid: int) -> Target | None:
+    """The target whose platform_id a device reports (CFG_PLATFORM), if this tree has it."""
+    for n in names():
+        t = load(n)
+        if t.platform_id == pid:
+            return t
+    return None
+
+
 def current() -> Target:
     """The target OTPU_TARGET names (default the YPCB-00338 card)."""
     return load(os.environ.get("OTPU_TARGET") or DEFAULT)

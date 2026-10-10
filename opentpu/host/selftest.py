@@ -46,7 +46,8 @@ from opentpu.host import memcal
 from opentpu.host.runstate import busy_exits
 from opentpu.host import regs as R
 from opentpu.host.board import (CH_BYTES, ID_OTPU, R_ID, R_SCRATCH, R_STATUS, ST_CALIB0,
-                                ST_CALIB1, Board, SimTransport, XdmaTransport, device_config)
+                                ST_CALIB1, Board, SimTransport, XdmaTransport, config_summary,
+                                device_config)
 from opentpu.host.checks import (address_lines, bandwidth, channel_patterns, masked_program,
                                  model_check, partial_writes, pattern_test, run_demo,
                                  stream_check, vops_check)
@@ -171,13 +172,7 @@ def main(argv=None) -> int:
         nonlocal cfg
         i = board.info()
         cfg = device_config(i, DRAM_BYTES=2 * ch_bytes)
-        msg = f"D={i['D']} MCOLS={i['MCOLS']} LANES={i['LANES']}, register map {i['regmap']}"
-        if i["core_khz"]:
-            msg += f", core {i['core_khz'] / 1e3:g} MHz"
-        if i["ddr_mts"]:
-            msg += f", DDR3-{i['ddr_mts']}"
-        if i["build_id"] is not None:
-            msg += f", build {i['build_id']:08x}"
+        msg = config_summary(i)
         return True, msg
 
     def calib():

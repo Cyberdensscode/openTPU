@@ -317,6 +317,8 @@ the card went from 0.052 (build 84989047, before K smoothing) to 0.012.
 5. [docs/lfm2.md](docs/lfm2.md), [docs/qwen35.md](docs/qwen35.md), [docs/llama.md](docs/llama.md),
    [docs/benchmarks.md](docs/benchmarks.md): whole models and where their cycles go.
 6. [docs/board.md](docs/board.md): the physical card, from clocks to PCIe.
+7. [docs/targets.md](docs/targets.md): how one design builds for several boards and chips (a
+   target file per build: `targets/*.toml`).
 
 ## What's next
 
@@ -327,6 +329,11 @@ the card went from 0.052 (build 84989047, before K smoothing) to 0.012.
   working on its margin and area. Decode is bound by DRAM, so a faster clock mostly helps prefill.
 - **Faster prefill.** The four-column systolic matrix unit is in the production image; prefill is
   still limited by the matrix unit's multiply rate.
+
+- **More targets.** The design builds from target files (`targets/*.toml`,
+  [docs/targets.md](docs/targets.md)): the YPCB-00338 in production, the BCU1525 (Virtex
+  UltraScale+ VU9P, four DDR4 DIMMs) being brought up, and ASICs, starting with NanGate45 and
+  OpenROAD for area, clock and power numbers.
 
 ## Contributing
 

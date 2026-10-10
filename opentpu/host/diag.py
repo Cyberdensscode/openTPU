@@ -43,7 +43,8 @@ from . import memcal
 from . import memtest as M
 from . import power as P
 from . import regs as R
-from .board import CH_BYTES, Board, ConfigMismatch, SimTransport, XdmaTransport, device_config
+from .board import (CH_BYTES, Board, ConfigMismatch, SimTransport, XdmaTransport, config_summary,
+                    device_config)
 from .checks import (PROG_AT, masked_program, model_check, partial_writes, pattern_test,
                      run_demo, vops_program, waitw_host, waitw_timeout)
 from .opchecks import diag_image, op_checks
@@ -331,13 +332,7 @@ def run(a, t, dev: str, sim: bool) -> tuple[list[Row], list[str]]:
     def config():
         i = ctx["info"] = ctx["board"].info()
         ctx["cfg"] = device_config(i, DRAM_BYTES=2 * ch_bytes)
-        msg = f"D={i['D']} MCOLS={i['MCOLS']} LANES={i['LANES']}, register map {i['regmap']}"
-        if i["core_khz"]:
-            msg += f", core {i['core_khz'] / 1e3:g} MHz"
-        if i["ddr_mts"]:
-            msg += f", DDR3-{i['ddr_mts']}"
-        if i["build_id"] is not None:
-            msg += f", build {i['build_id']:08x}"
+        msg = config_summary(i)
         return True, msg, {"info": {k: v for k, v in i.items() if k != "caps"}}
     d.check("platform", "configuration (VERSION)", config, [link])
 

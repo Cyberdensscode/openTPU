@@ -214,3 +214,13 @@ def test_tech_families_define_the_same_cells():
     assert set(ref) == {"otpu_pe", "otpu_colend"}
     for fam in ("xilinx7", "xilinxus"):
         assert iface(ROOT / f"rtl/tech/{fam}/otpu_tech_dsp.sv") == ref, fam
+
+
+def test_config_summary_names_the_target(no_env):
+    from opentpu.host.board import config_summary
+    kw = dict(devname=None, ddr_mts=1066, pair=True, dstep=True, stream=True)
+    old = config_summary(Board(FakeTransport(regmap=3, **kw)).info())
+    assert old == "D=128 MCOLS=4 LANES=8, register map 3, core 100 MHz, DDR3-1066, build 1234abcd"
+    new = config_summary(Board(FakeTransport(regmap=4, **kw)).info())
+    assert "register map 4, ypcb-00338 (S=1, 2 channels x 2048 MiB)" in new and "DDR3-1066" in new
+    assert T.by_platform(2).name == "bcu1525" and T.by_platform(999) is None

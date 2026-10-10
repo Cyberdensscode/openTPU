@@ -1136,6 +1136,26 @@ def device_config(info: dict, **kw):
     return replace(cfg, **kw) if kw else cfg
 
 
+def config_summary(info: dict) -> str:
+    """One line describing the bitstream `info` (Board.info()) reports (otpu-selftest, otpu-diag):
+    the MXU, the register map, with map 4 the target it was built from and its slices, the core
+    clock, the memory and the build."""
+    from opentpu.target import by_platform
+    i, c = info, info.get("cfg")
+    msg = f"D={i['D']} MCOLS={i['MCOLS']} LANES={i['LANES']}, register map {i['regmap']}"
+    t = by_platform(c["platform"]) if c else None
+    if c:
+        msg += (f", {t.name if t else 'platform %d' % c['platform']} (S={c['S']}, "
+                f"{c['channels']} channels x {c['channel_bytes'] >> 20} MiB)")
+    if i["core_khz"]:
+        msg += f", core {i['core_khz'] / 1e3:g} MHz"
+    if i["ddr_mts"]:
+        msg += f", {(t.platform.get('mem', 'ddr3') if t else 'ddr3').upper()}-{i['ddr_mts']}"
+    if i["build_id"] is not None:
+        msg += f", build {i['build_id']:08x}"
+    return msg
+
+
 def check_fits(cfg, info: dict) -> None:
     """Raise ConfigMismatch unless programs compiled for `cfg` run on the device `info`
     describes: the same MXU, lanes and ACT RAM rows, and (register map 4) no more slices, TMEM,
