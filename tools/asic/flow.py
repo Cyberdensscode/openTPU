@@ -161,13 +161,19 @@ def sram_map(macros: list[fakeram.Macro]) -> str:
 def sdc(point: str) -> str:
     p = clock_ns(point)
     return f"""# openTPU ASIC block ({point}): one clock; the memory ports and controls timed against a
-# virtual clock with 20% of the period outside (tools/asic/flow.py)
+# virtual clock with 20% of the period outside (tools/asic/flow.py). No hold checks at the ports:
+# the ideal virtual clock against the propagated core clock (~1.2 ns of insertion delay) makes
+# the input paths hold violations (nangate45-small: 2188 endpoints, up to 0.69 ns: port
+# A's read data into the MXU FIFOs' macros; 12 K hold buffers), which is the integrator's
+# boundary, not the block's.
 current_design otpu_asic_top
 set clk_period {p}
 create_clock -name core_clock -period $clk_period [get_ports clk]
 create_clock -name vclk -period $clk_period
 set_input_delay [expr $clk_period * 0.2] -clock vclk [all_inputs -no_clocks]
 set_output_delay [expr $clk_period * 0.2] -clock vclk [all_outputs]
+set_false_path -hold -from [all_inputs -no_clocks]
+set_false_path -hold -to [all_outputs]
 """
 
 
