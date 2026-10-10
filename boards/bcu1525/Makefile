@@ -27,7 +27,7 @@ MCS ?= $(OUT)/otpu.mcs
 # the RTL: opentpu.target sources("bcu1525") (tests/test_target.py checks it), the top linted last
 RTL := $(addprefix $(ROOT)/rtl/, vpu/otpu_fp.sv vpu/otpu_fpipe.sv top/otpu_pkg.sv mem/otpu_tmem.sv \
   mem/otpu_actram.sv seq/otpu_seq.sv vpu/otpu_vtree.sv dma/otpu_dma.sv mxu/otpu_mxu.sv \
-  tech/xilinxus/otpu_tech_dsp.sv vpu/otpu_quant.sv vpu/otpu_se_comp.sv vpu/otpu_se_tail.sv \
+  tech/xilinxus/otpu_tech_dsp.sv tech/generic/otpu_tech_ram.sv vpu/otpu_quant.sv vpu/otpu_se_comp.sv vpu/otpu_se_tail.sv \
   vpu/otpu_vpu.sv top/otpu_coll.sv top/otpu_slice.sv shell/otpu_ctrl.sv shell/otpu_trace.sv \
   shell/otpu_board.sv mem/otpu_native_dram.sv shell/otpu_afifo.sv shell/otpu_mem_ch.sv \
   shell/otpu_axi_split2.sv boards/bcu1525/otpu_bcu_sys.sv)

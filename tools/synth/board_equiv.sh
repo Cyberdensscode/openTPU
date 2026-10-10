@@ -16,7 +16,7 @@ git -C "$W" show "$rev:rtl/shell/otpu_ctrl.sv" > "$d/old_ctrl.sv" || exit 2
 R=$W/rtl
 LIB="$R/top/otpu_pkg.sv $R/vpu/otpu_fp.sv $R/vpu/otpu_fpipe.sv $R/mem/otpu_tmem.sv $R/mem/otpu_actram.sv
      $R/seq/otpu_seq.sv $R/vpu/otpu_vtree.sv $R/dma/otpu_dma.sv $R/mxu/otpu_mxu.sv
-     $R/tech/generic/otpu_tech_dsp.sv $R/vpu/otpu_quant.sv $R/vpu/otpu_se_comp.sv
+     $R/tech/generic/otpu_tech_dsp.sv $R/tech/generic/otpu_tech_ram.sv $R/vpu/otpu_quant.sv $R/vpu/otpu_se_comp.sv
      $R/vpu/otpu_se_tail.sv $R/vpu/otpu_vpu.sv $R/top/otpu_coll.sv $R/top/otpu_slice.sv
      $R/shell/otpu_trace.sv $R/mem/otpu_native_dram.sv"
 BB="--blackboxed-module otpu_slice --blackboxed-module otpu_native_dram --blackboxed-module otpu_coll
