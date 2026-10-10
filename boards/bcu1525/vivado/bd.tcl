@@ -7,7 +7,8 @@
 #   M_AXI_MEMCAL  AXI4-Lite master -> the four LiteDRAM cores' CSRs (BAR0 0x40000 + c * 0x10000,
 #                 64 KB each, core_clk: the top splits it by address bits 17:16)
 #   M_AXI_DMA     AXI4 master -> the DDR4 channels (XDMA's DMA, xdma_aclk; 512 bits at x16, 256 at
-#                 x8; card address bits 35:34 = the channel, 16 GiB each)
+#                 x8; card address bits 32:31 = the channel j = 2s + c, 2 GiB each: what slice s
+#                 addresses of its channel c; opentpu.host.board.channel_map)
 # and device_temp (the SYSMON's die temperature, 10 bits, core_clk; BAR0 0x30000: its registers).
 # The BAR0 layout keeps the YPCB's (control at 0x0, the system monitor at 0x30000, 1 MB), so the
 # host's register access is the same; 0x10000 (the YPCB core's CSRs, R_MEMCAL) is left unmapped.
@@ -169,14 +170,14 @@ connect_bd_intf_net [get_bd_intf_pins sc_ctl/M02_AXI] [get_bd_intf_ports M_AXI_M
 
 # ------------------------------------------------------------------ address map
 # BAR0: 0x00000 the control registers (64 KB), 0x30000 the SYSMON, 0x40000-0x7FFFF the LiteDRAM
-# cores' CSRs (channel c at 0x40000 + c * 0x10000). XDMA's DMA: 64 GiB to M_AXI_DMA (channel c at
-# c * 16 GiB; the top routes by address bits 35:34)
+# cores' CSRs (channel c at 0x40000 + c * 0x10000). XDMA's DMA: 8 GiB to M_AXI_DMA (channel j at
+# j * 2 GiB, the 2 GiB of it the slices address; the top routes by address bits 32:31)
 set lite [get_bd_addr_spaces xdma_0/M_AXI_LITE]
 assign_bd_address -offset 0x00000000 -range 64K -target_address_space $lite [get_bd_addr_segs M_AXI_CTL/Reg] -force
 assign_bd_address -offset 0x00030000 -range 64K -target_address_space $lite \
   [get_bd_addr_segs -of [get_bd_intf_pins sysmon/S_AXI_LITE]] -force
 assign_bd_address -offset 0x00040000 -range 256K -target_address_space $lite [get_bd_addr_segs M_AXI_MEMCAL/Reg] -force
-assign_bd_address -offset 0x00000000 -range 64G -target_address_space [get_bd_addr_spaces xdma_0/M_AXI] \
+assign_bd_address -offset 0x00000000 -range 8G -target_address_space [get_bd_addr_spaces xdma_0/M_AXI] \
   [get_bd_addr_segs M_AXI_DMA/Reg] -force
 
 validate_bd_design
