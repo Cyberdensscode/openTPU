@@ -99,6 +99,7 @@ module otpu_ctrl #(
   parameter bit CHASH = 1'b0,            // CAPS bit7: the hashed channel interleave (otpu_native_dram)
   parameter bit DSTEP = 1'b1,            // CAPS bit6 and bit26: the stream engine (DSTEP, STREAM)
   parameter bit HOSTCAL = 1'b0,          // CAPS bit27: the host calibrates the DDR3 controllers
+  parameter int LDP = 2,                 // cycles after LOAD before the loaders' busy shows (>= 2)
   // the configuration registers (CFG_*, register map 4): the target's values
   parameter int S          = 1,
   parameter int TMEM_WORDS = 1 << 16,
@@ -186,9 +187,9 @@ module otpu_ctrl #(
   logic [63:0] cycles;
   logic [31:0] n_brd, n_bwr, n_ard, n_awr, n_bst, scratch;
   logic        clear, snap;
-  logic [1:0]  ld_pend_q;                  // LOAD written, loader not yet visibly busy
+  logic [LDP-1:0] ld_pend_q;               // LOAD written, loader not yet visibly busy
   wire         ld_pend = ld_start || (|ld_pend_q);
-  always_ff @(posedge clk) ld_pend_q <= rst ? 2'b00 : {ld_pend_q[0], ld_start};
+  always_ff @(posedge clk) ld_pend_q <= rst ? '0 : {ld_pend_q[LDP-2:0], ld_start};
 
   // ---- write channel: take address and data together
   logic       w_go, tr_inc;
