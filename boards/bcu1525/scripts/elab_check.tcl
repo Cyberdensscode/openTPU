@@ -20,10 +20,23 @@ foreach c {u_sys/u_board/u_slice u_sys/u_board/u_mem {u_sys/g_ch[0].u_ch} {u_sys
            u_sys/u_board/u_ctrl u_sys/u_board/u_coll u_sys/u_board/g_trace.u_trace u_sys/u_board/u_iso
            {u_sys/g_ch[1].u_ch} {u_sys/g_ch[1].g_sll.u_rx} {u_sys/g_ch[3].u_ch}
            {u_sys/g_ch[3].g_sll.u_rx} u_ld1 u_ld2 {g_csr[1].u_iso} {g_csr[2].u_iso}
-           {g_bufg[1].u_bufg}} {
+           {g_bufg[1].u_bufg} u_sys/u_board/g_xs.u_chub {u_sys/u_board/g_xs.g_x[0].g_pf.u_pf_tx}
+           {u_sys/u_board/g_xs.g_x[0].g_pf.u_pf_rx}} {
   if {[llength [get_cells -quiet $c]] != 1} { puts "ELAB-CHECK missing cell $c"; incr bad }
 }
-foreach r {{u_sys/u_board/g_slice[1].core_rst_reg} lrs1_reg ld_crs1_reg {u_sys/u_board/cal_s1_reg}
+# the board's own crossing stages and collective ports (otpu_board g_xs), per slice
+foreach s {0 1} {
+  foreach u {u_dn_tx u_dn_rx u_up_tx u_up_rx u_cport} {
+    set c "u_sys/u_board/g_xs.g_x\[$s\].$u"
+    if {[llength [get_cells -quiet $c]] != 1} { puts "ELAB-CHECK missing cell $c"; incr bad }
+  }
+  foreach u {u_dn_tx u_dn_rx u_up_tx u_up_rx} {
+    if {[llength [get_cells -quiet "u_sys/u_board/g_xs.g_x\[$s\].$u/r_reg*"]] == 0} {
+      puts "ELAB-CHECK missing register g_x\[$s\].$u/r_reg"; incr bad
+    }
+  }
+}
+foreach r {lrs1_reg ld_crs1_reg {u_sys/u_board/cal_s1_reg}
            {u_sys/u_board/ded_s1_reg} {u_sys/g_ch[1].g_sll.u_rx/s_rdata_reg}
            {u_sys/g_ch[1].g_sll.u_tx/u_wd/m_data_reg}} {
   if {[llength [get_cells -quiet $r*]] == 0} { puts "ELAB-CHECK missing register $r"; incr bad }

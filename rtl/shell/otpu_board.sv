@@ -516,14 +516,10 @@ module otpu_xr #(
   input  logic [W-1:0] d,
   output logic [W-1:0] q
 );
-  (* max_fanout = 256 *) logic [W-1:0] r;
+  (* max_fanout = 256 *) logic [W-1:0] r;     // r_reg: the floorplan's USER_SLL_REG cells
   assign q = r;
-  if (RW > 0) begin : g_rw
-    always_ff @(posedge clk) begin
-      r[W-1:RW] <= d[W-1:RW];
-      r[RW-1:0] <= rst ? '0 : d[RW-1:0];
-    end
-  end else begin : g_d
-    always_ff @(posedge clk) r <= d;
+  always_ff @(posedge clk) begin
+    r <= d;
+    if (rst) for (int i = 0; i < RW; i++) r[i] <= 1'b0;
   end
 endmodule
