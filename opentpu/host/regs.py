@@ -53,6 +53,9 @@ CAP_STREAM = 1 << 26
 # (opentpu/host/memcal.py) through their CSRs in the BAR0 window at R_MEMCAL; STATUS CALIB0/1
 # rise when it has. The MIG bitstreams (before LiteDRAM) calibrate themselves.
 CAP_HOSTCAL, R_MEMCAL = 1 << 27, 0x10000
+# A DDR4 board's LiteDRAM cores (the BCU1525: one per DIMM, calibrated by their own CPUs;
+# opentpu/host/ddr4.py): DIMM d's CSRs in BAR0 at R_DDR4 + d x DDR4_STRIDE
+R_DDR4, DDR4_STRIDE = 0x40000, 0x10000
 # CAPS bit30: the decode loop on the card (docs/isa.md RLD, VOP ARGMAX, HALT CHAIN; the
 # generate programs of opentpu/llm/generate.py)
 CAP_GEN = 1 << 30
@@ -68,6 +71,9 @@ CFG_REGS = (R_CFG_SLICES, R_CFG_TMEM, R_CFG_IMEM, R_CFG_ACT, R_CFG_DRAM, R_CFG_U
 # reserved: the slices' DRAM windows (0xA0 + 4s), for platforms with more memory per channel than
 # a slice addresses (docs/targets.md)
 R_CFG_WIN0 = 0xA0
+# slice s's ICOUNT at R_ICOUNT_S + 4s on a multi-slice bitstream (CFG_SLICES > 1; ICOUNT is slice
+# 0's)
+R_ICOUNT_S = 0xC0
 
 
 def cfg(vals: list[int]) -> dict:
@@ -112,8 +118,12 @@ R_I2C_CTRL, R_I2C_IN = 0x220, 0x224
 I2C_ALERT0 = 1 << 4              # I2C_IN: the LM73's ALERT pin (active low)
 
 
-def temp_c(code: int) -> float:
-    """XADC die-temperature code (12 bits) -> degrees Celsius (UG480)."""
+def temp_c(code: int, family: str = "xilinx7") -> float:
+    """Die-temperature code (12 bits) -> degrees Celsius: the 7-series XADC's (UG480), or on
+    UltraScale+ (family "xilinxus") SYSMONE4's with its internal reference (UG580; the BCU1525's
+    top gives its 10-bit code as the 12-bit code's upper bits)."""
+    if family == "xilinxus":
+        return (code & 0xFFF) * 509.3140064 / 4096 - 280.2308787
     return (code & 0xFFF) * 503.975 / 4096 - 273.15
 
 

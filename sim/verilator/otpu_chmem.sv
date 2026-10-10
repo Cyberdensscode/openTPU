@@ -17,7 +17,7 @@ module otpu_chmem #(
   parameter int WORDS = 1 << 18,
   parameter int PHYS  = 0,
   parameter int LAT   = 20,              // minimum read latency (controller cycles)
-  parameter int SID   = 0,               // (otpu_native_mem's; unused)
+  parameter int SID   = 0,               // the slice: its channels' files are ch<2 SID + c>
   parameter bit CHASH = 1'b1             // (otpu_native_mem's; unused: the images are physical)
 ) (
   input  logic                  clk,
@@ -74,7 +74,7 @@ module otpu_chmem #(
       .c_cmd_valid(cv), .c_cmd_ready(cr), .c_cmd_we(cwe), .c_cmd_addr(ca),
       .c_wdata_valid(wv), .c_wdata_ready(wr), .c_wdata_data(wd), .c_wdata_we(we),
       .c_rdata_valid(rv), .c_rdata_data(rd));
-    otpu_ldn_model #(.BEATS(BEATS), .LAT(LAT), .CH(c), .IMG(1'b1)) u_mem (
+    otpu_ldn_model #(.BEATS(BEATS), .LAT(LAT), .CH(2 * SID + c), .IMG(1'b1)) u_mem (
       .clk(uclk), .rst(urst),
       .c_cmd_valid(cv), .c_cmd_ready(cr), .c_cmd_we(cwe), .c_cmd_addr(ca),
       .c_wdata_valid(wv), .c_wdata_ready(wr), .c_wdata_data(wd), .c_wdata_we(we),

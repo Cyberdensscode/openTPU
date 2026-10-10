@@ -3,7 +3,7 @@
 It implements the register protocol the driver uses -- register map 3 (or 4: the CFG_*
 registers; or 2: no MXU_STARVE; or
 1, regmap=1: 8-bit address decode, 0xDEADBEEF for registers v1 does not have) -- over two
-channel memories in RAM.
+channel memories in RAM (two per slice when `cfg` reports more than one: ICOUNT_s as ICOUNT).
 It computes nothing: a run takes `run_s` seconds of wall time (HALTED rises then), reports
 `cycles` and retires PROG_N instructions; the DRAM keeps what the host wrote.
 
@@ -85,6 +85,9 @@ class FakeTransport:
                                c.LANES if LANES is None else LANES)
         self.version = D << 16 | MCOLS << 8 | LANES
         self.cfg_words = R.cfg_words(cfg or _target_cfg(D, MCOLS, LANES, pair, dstep, stream))
+        self.slices = R.cfg(self.cfg_words)["S"] if regmap >= R.CFG_SINCE else 1
+        if self.slices > 1:             # two channels per slice (board.channel_map)
+            self.ch = [np.zeros(ch_bytes, np.uint8) for _ in range(2 * self.slices)]
         self.i2c = i2c
         self.ddr_mts = ddr_mts          # None: a bitstream without the DDR_MTS register
         self.w4 = w4                    # CAPS bit4: the MXU runs 4-bit weights
@@ -201,7 +204,8 @@ class FakeTransport:
         if off in (R.R_CYCLES, R.R_CYCLES_HI):
             c = self.cycles_per_run if self.runs else 0
             return c & 0xFFFFFFFF if off == R.R_CYCLES else c >> 32
-        if off == R.R_ICOUNT:
+        if off == R.R_ICOUNT or (self.slices > 1 and R.R_ICOUNT_S + 4 <= off
+                                 < R.R_ICOUNT_S + 4 * self.slices):
             return self.regs[R.R_PROG_N] if self.runs else 0
         if off in (R.R_B_RD, R.R_B_WR, R.R_A_RD, R.R_A_WR, R.R_B_STALL):
             return 0

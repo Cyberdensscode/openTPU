@@ -45,15 +45,18 @@ vendor = "xilinx"
 
 [platform]
 board = "bcu1525"
-core_mhz = 100.0
+core_mhz = 100.0                # development builds first (docs/bcu1525.md 2)
 mem = "ddr4"
-mem_mts = 2400
+mem_mts = 1600                  # LiteDRAM's USPDDRPHY at 200 MHz first; the RDIMMs are DDR4-2400
+                                # (300 MHz) once its controller closes timing there
 mem_ctrl = "litedram"
 hostcal = false
 channels_per_slice = 2
-channel_bytes = 2147483648      # addressed per channel by a slice (a DIMM holds up to 16 GiB)
-channel_phys_bytes = 17179869184
+channel_bytes = 2147483648      # addressed per channel by a slice (a DIMM holds up to 16 GiB);
+                                # the host's DMA reaches the same: channel j = 2s + c at j x this
+                                # (opentpu.host.board.channel_map, the block design's map)
+channel_phys_bytes = 17179869184  # an MTA18ASF2G72PZ RDIMM (the board file's), 16 GiB
 beat_bytes = 64
 host = "pcie"
 pcie_gen = 3
-pcie_lanes = 16
+pcie_lanes = 16                 # GTY quads 224-227 (SLR1), XDMA 512 bits at 250 MHz

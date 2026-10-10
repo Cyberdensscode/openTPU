@@ -117,10 +117,11 @@ def pcie_link(dev: str) -> tuple:
 
 
 def link_verdict(lk: tuple) -> tuple[bool, str]:
-    """pcie_link's link against the card's own: its bitstream's speed (Gen1 or Gen2) at x8."""
+    """pcie_link's link against the card's own: its bitstream's speed (Gen1, Gen2, the BCU1525's
+    Gen3) at its width (the YPCB-00338's x8, the BCU1525's x16: LnkCap's)."""
     sp, wd, msp, mwd = lk
-    ok = sp.split()[0] == msp.split()[0] and wd == "8"
-    return ok, f"{sp} x{wd} (the card's {msp} x{mwd}: expected its speed at x8)"
+    ok = sp.split()[0] == msp.split()[0] and wd == mwd
+    return ok, f"{sp} x{wd} (the card's {msp} x{mwd}: expected its speed and width)"
 
 
 def driver_state(dev: str) -> tuple[bool, str]:
@@ -192,7 +193,7 @@ def diagnose(rows: list[Row], regmap: int | None = None) -> list[str]:
         hints.append("no openTPU answers on BAR0: link down, bitstream not loaded, or the "
                      "card was reprogrammed after enumeration (otpu-setup --rescan)")
     if st.get("PCIe link") == FAIL:
-        hints.append("PCIe link below the card's own (its bitstream's Gen at x8): a lower speed "
+        hints.append("PCIe link below the card's own (its bitstream's Gen and width): a lower speed "
                      "is a link that did not retrain after a reload (otpu-setup --rescan, else a "
                      "warm reboot) or a slower root port; a narrower one is lane order / GT "
                      "placement (board.md section 6.3) or the slot's width")

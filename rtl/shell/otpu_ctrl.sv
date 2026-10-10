@@ -65,6 +65,8 @@
 //   0x94 CFG_UARCH    RO  [3:0] MXU_IMPL, [7:4] TMEM_IMPL, [15:8] VPU_CL, [23:16] ULANES
 //   0x98 CFG_PLATFORM RO  the target's platform id (1 YPCB-00338, 2 BCU1525; 256 and up ASICs)
 //   0x9C CFG_HASH     RO  opentpu.target.arch_hash of the target's Config at build time
+//   0xA0 + 4s         (reserved: slice s's DRAM window, docs/targets.md)
+//   0xC0 + 4s ICOUNT_s RO slice s's instructions retired (S > 1; ICOUNT is slice 0's)
 //   0x100 + 8k     RO  free-running counter k's shadow (64 bits, low word first), k =
 //                      UPTIME RUNNING MXU_BUSY MXU_MAC VPU_BUSY QNT_BUSY DMA_BUSY TMEM_DENY
 //                      DRAM_RD DRAM_WR DRAM_WAIT INSTR MXU_STARVE (version 3); cleared by
@@ -97,6 +99,7 @@ module otpu_ctrl #(
   parameter bit CHASH = 1'b0,            // CAPS bit7: the hashed channel interleave (otpu_native_dram)
   parameter bit DSTEP = 1'b1,            // CAPS bit6 and bit26: the stream engine (DSTEP, STREAM)
   parameter bit HOSTCAL = 1'b0,          // CAPS bit27: the host calibrates the DDR3 controllers
+  parameter int LDP = 2,                 // cycles after LOAD before the loaders' busy shows (>= 2)
   // the configuration registers (CFG_*, register map 4): the target's values
   parameter int S          = 1,
   parameter int TMEM_WORDS = 1 << 16,
@@ -110,7 +113,12 @@ module otpu_ctrl #(
   parameter int VPU_CL     = 2,
   parameter int ULANES     = 8,
   parameter int PLATFORM   = 0,
-  parameter logic [31:0] ARCH_HASH = 32'h0
+  parameter logic [31:0] ARCH_HASH = 32'h0,
+  // the free-running counters' increment widths (2 and 2 for the YPCB's one slice on two
+  // channels): DRAM_RD / DRAM_WR the beats every slice's channels move in a cycle, INSTR the
+  // instructions every slice retires in a cycle (up to 2 each)
+  parameter int CW         = $clog2(S * NCH + 1),
+  parameter int IW         = $clog2(2 * S + 1)
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -142,7 +150,7 @@ module otpu_ctrl #(
   input  logic        halted,
   input  logic        error,
   input  logic        wait_to,
-  input  logic [31:0] icount,
+  input  logic [S-1:0][31:0] icount,  // each slice's (ICOUNT: slice 0's; ICOUNT_s at 0xC0 + 4s)
   input  logic        wr_idle,
   input  logic        axi_err,
   input  logic [1:0]  calib,
@@ -153,9 +161,9 @@ module otpu_ctrl #(
   // activity for the free-running counters (any registered or combinational source)
   input  logic        mxu_busy, mxu_mac, vpu_busy, qnt_busy, dma_busy, tmem_deny,
   input  logic        mxu_starve,        // the MXU streams a command and has no chunk
-  input  logic [1:0]  dram_rd, dram_wr,  // 64-byte beats this cycle
+  input  logic [CW-1:0] dram_rd, dram_wr,  // 64-byte beats this cycle (every slice's channels)
   input  logic        dram_wait,
-  input  logic [1:0]  instr,             // instructions retired this cycle
+  input  logic [IW-1:0] instr,           // instructions retired this cycle (every slice's)
   // trace buffer (otpu_trace)
   output logic        tr_en,
   output logic        tr_stop,
@@ -179,9 +187,9 @@ module otpu_ctrl #(
   logic [63:0] cycles;
   logic [31:0] n_brd, n_bwr, n_ard, n_awr, n_bst, scratch;
   logic        clear, snap;
-  logic [1:0]  ld_pend_q;                  // LOAD written, loader not yet visibly busy
+  logic [LDP-1:0] ld_pend_q;               // LOAD written, loader not yet visibly busy
   wire         ld_pend = ld_start || (|ld_pend_q);
-  always_ff @(posedge clk) ld_pend_q <= rst ? 2'b00 : {ld_pend_q[0], ld_start};
+  always_ff @(posedge clk) ld_pend_q <= rst ? '0 : {ld_pend_q[LDP-2:0], ld_start};
 
   // ---- write channel: take address and data together
   logic       w_go, tr_inc;
@@ -248,23 +256,29 @@ module otpu_ctrl #(
 
   // ---- free-running counters (reset only), their increments registered first; SNAP copies
   // them all into the shadows in one cycle
-  logic [1:0]  fr_inc [NFR];
+  localparam int FW = CW > IW ? CW : IW;
+  logic [15:0][31:0] ic_all;  // ICOUNT_s (S > 1)
+  always_comb begin
+    ic_all = '0;
+    ic_all[S-1:0] = icount;
+  end
+  logic [FW-1:0] fr_inc [NFR];
   logic [63:0] fr [NFR], fr_s [NFR];
   logic [31:0] n_snap;
   always_ff @(posedge clk) begin
-    fr_inc[0]  <= 2'd1;
-    fr_inc[1]  <= 2'(run && !halted);
-    fr_inc[2]  <= 2'(mxu_busy);
-    fr_inc[3]  <= 2'(mxu_mac);
-    fr_inc[4]  <= 2'(vpu_busy);
-    fr_inc[5]  <= 2'(qnt_busy);
-    fr_inc[6]  <= 2'(dma_busy);
-    fr_inc[7]  <= 2'(tmem_deny);
-    fr_inc[8]  <= dram_rd;
-    fr_inc[9]  <= dram_wr;
-    fr_inc[10] <= 2'(dram_wait);
-    fr_inc[11] <= instr;
-    fr_inc[12] <= 2'(mxu_starve);
+    fr_inc[0]  <= FW'(1);
+    fr_inc[1]  <= FW'(run && !halted);
+    fr_inc[2]  <= FW'(mxu_busy);
+    fr_inc[3]  <= FW'(mxu_mac);
+    fr_inc[4]  <= FW'(vpu_busy);
+    fr_inc[5]  <= FW'(qnt_busy);
+    fr_inc[6]  <= FW'(dma_busy);
+    fr_inc[7]  <= FW'(tmem_deny);
+    fr_inc[8]  <= FW'(dram_rd);
+    fr_inc[9]  <= FW'(dram_wr);
+    fr_inc[10] <= FW'(dram_wait);
+    fr_inc[11] <= FW'(instr);
+    fr_inc[12] <= FW'(mxu_starve);
     if (rst) begin
       for (int k = 0; k < NFR; k++) begin fr[k] <= '0; fr_s[k] <= '0; fr_inc[k] <= '0; end
       n_snap <= '0;
@@ -307,7 +321,7 @@ module otpu_ctrl #(
       10'h005: r_d <= ld_n;
       10'h006: r_d <= cycles[31:0];
       10'h007: r_d <= cycles[63:32];
-      10'h008: r_d <= icount;
+      10'h008: r_d <= icount[0];
       10'h009: r_d <= n_brd;
       10'h00A: r_d <= n_bwr;
       10'h00B: r_d <= n_ard;
@@ -341,7 +355,9 @@ module otpu_ctrl #(
       10'h088: r_d <= {28'd0, i2c_lo};
       10'h089: r_d <= {27'd0, i2c_in};
       default:
-        if (r_a[9:6] == 4'h1 && r_a[5:1] < 5'(NFR))
+        if (S > 1 && r_a[9:4] == 6'h03 && 32'(r_a[3:0]) < 32'(S))
+          r_d <= ic_all[r_a[3:0]];
+        else if (r_a[9:6] == 4'h1 && r_a[5:1] < 5'(NFR))
           r_d <= r_a[0] ? fr_s[r_a[5:1]][63:32] : fr_s[r_a[5:1]][31:0];
         else
           r_d <= 32'hDEAD_BEEF;

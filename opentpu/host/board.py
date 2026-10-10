@@ -1,15 +1,20 @@
 """Host driver for the openTPU board (YPCB-00338 over PCIe, Xilinx XDMA).
 
 The card exposes, through the XDMA bridge:
-  - its two DDR3 channels on the bridge's AXI master: channel c at BASE[c] (2 GiB each),
-    written with /dev/xdma0_h2c_0 and read with /dev/xdma0_c2h_0 (file offset = AXI address);
+  - its memory channels on the bridge's AXI master: channel j at BASE[j] (the YPCB-00338's two
+    DDR3 channels, 2 GiB each; a register map 4 bitstream's from its CFG_* registers:
+    channel_map), written with /dev/xdma0_h2c_0 and read with /dev/xdma0_c2h_0 (file offset =
+    AXI address);
   - the control registers (rtl/shell/otpu_ctrl.sv; map in regs.py and
     docs/observability.md) on BAR0, /dev/xdma0_user.
 
 The accelerator addresses one logical DRAM interleaved over the channels in 64-byte beats:
 logical beat b of chunk m = b // 2 lives at BASE[c] + m * 64 on channel c = b % 2, or, on a
 bitstream with CAPS.chash, c = (b % 2) ^ parity(m) (rtl/mem/otpu_native_dram.sv). This driver
-applies the same map, so the host works with logical addresses only.
+applies the same map, so the host works with logical addresses only. On a multi-slice bitstream
+(CFG_SLICES S > 1: the BCU1525's two) each slice has a logical DRAM of its own on its two
+channels, slice s's channel c being the card's channel 2s + c (Board.write / read take the
+slice).
 
 BoardBackend implements the Engine backend interface (write / read / run, plus prepare and
 attach), so `Engine(..., cfg=device_config(board.info()), backend=BoardBackend)` runs Qwen3,
@@ -168,6 +173,16 @@ def join(parts: list[np.ndarray], addr: int = 0, chash: bool = False) -> np.ndar
     return v.reshape(-1)
 
 
+def channel_map(info: dict | None) -> tuple[int, ...]:
+    """The card (AXI) addresses of the memory channels, channel j = 2s + c being slice s's
+    channel c, at j x the bytes a slice addresses per channel: from a register map 4 bitstream's
+    CFG_* registers (CFG_SLICES, CFG_DRAM; the YPCB-00338's are BASE), BASE before them."""
+    c = (info or {}).get("cfg")
+    if not c:
+        return BASE
+    return tuple(j * c["channel_bytes"] for j in range(c["S"] * c["channels"]))
+
+
 # ------------------------------------------------------------------------------ transports
 def _readinto(fd: int, mv: memoryview, off: int) -> int:
     """A synchronous read at `off` straight into `mv`. Not preadv: vectored reads reach the
@@ -263,6 +278,7 @@ class XdmaTransport:
     # post, not ~100 (HOST_IDLE's 50 us slept ~110 on the card's host; docs/offload.md 10.8)
     host_idle = 0.0
     _dma = _DmaLock("", flock=False)    # a transport built bare (tests): its threads only
+    bases = BASE                        # the channels' card addresses (Board.info: channel_map)
 
     def __init__(self, dev: str = "/dev/xdma0", dma: bool = True):
         self.dev, self.devname = dev, Path(dev).name
@@ -281,10 +297,15 @@ class XdmaTransport:
             self.close()
             raise
         # BAR0 (1 MiB, the XDMA AXI-Lite master in the block design since the first bitstream)
-        # through its four 64 KiB windows: the control registers (their first 4 KiB), the
-        # LiteDRAM CSRs (R_MEMCAL: memcal; the MIG bitstreams' ECC registers), and the XADC
-        # (0x30000)
-        self.regs = mmap.mmap(fd, 0x40000, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+        # through its 64 KiB windows: the control registers (their first 4 KiB), the LiteDRAM
+        # CSRs (R_MEMCAL: memcal; the MIG bitstreams' ECC registers), the XADC / SYSMON
+        # (0x30000), and on a DDR4 board each DIMM's core's CSRs (R_DDR4: ddr4); the first
+        # four alone if the driver maps less
+        try:
+            self.regs = mmap.mmap(fd, R.R_DDR4 + 4 * R.DDR4_STRIDE, mmap.MAP_SHARED,
+                                  mmap.PROT_READ | mmap.PROT_WRITE)
+        except OSError:
+            self.regs = mmap.mmap(fd, R.R_DDR4, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
         os.close(fd)
         # One 32-bit load / store per register access. A slice of the mmap is copied byte by
         # byte (CPython 3.14): four 1-byte AXI-Lite writes, and otpu_ctrl, which takes the
@@ -331,7 +352,7 @@ class XdmaTransport:
                 buf[-BEAT:] = self.mem_read(ch, o1 - BEAT, BEAT)
             buf[off - o0:off - o0 + len(a)] = a
             a, off = buf, o0
-        base, pos = BASE[ch] + off, 0
+        base, pos = self.bases[ch] + off, 0
         while pos < len(a):
             k = min(DMA_CHUNK, len(a) - pos)
             src = a[pos:pos + k]
@@ -349,7 +370,7 @@ class XdmaTransport:
         """n bytes of channel `ch` at `off`, DMA'd into `out` (or a new buffer placed for full
         speed); an `out` that is placed badly (see DMA_PLACE) gets them through the staging
         buffer."""
-        base = BASE[ch] + off
+        base = self.bases[ch] + off
         if out is None:     # small reads are latency-bound: no mmap for them
             buf = placed(n, base) if n >= 64 << 10 else np.empty(n, np.uint8)
         else:
@@ -419,8 +440,8 @@ class XdmaTransport:
 
 class SimTransport:
     """The Verilator model of the board (sim/verilator/tb_board.sv): the memory lives here as
-    the two channels' physical images, register operations are queued and replayed by the
-    testbench when a result is needed (a flush).
+    the channels' physical images (two per slice of `target`'s build), register operations are
+    queued and replayed by the testbench when a result is needed (a flush).
 
     Every flush is a fresh simulation: DRAM persists (through the channel image files), but the
     control registers, IMEM and TMEM start from reset. The Board protocol is built for that --
@@ -439,8 +460,13 @@ class SimTransport:
 
     def __init__(self, ch_bytes: int = 1 << 24, stall: int = 20, seed: int = 1,
                  params: dict | None = None, plusargs: list | None = None,
-                 native: bool | str | None = None):
-        self.ch = [np.zeros(ch_bytes, np.uint8) for _ in range(2)]
+                 native: bool | str | None = None, target=None):
+        from opentpu.target import current, load
+        # the target whose build the model is (default the current one): its slices (two
+        # channels each), CFG_PLATFORM and CFG_HASH
+        self.target = load(target) if isinstance(target, str) else (target or current())
+        self.slices = self.target.arch["S"]
+        self.ch = [np.zeros(ch_bytes, np.uint8) for _ in range(2 * self.slices)]
         self.stall, self.seed = stall, seed
         self.params = params or {}
         self.native = native                    # the channels (rtlsim.MEMORY["NATIVE"]):
@@ -499,12 +525,14 @@ class SimTransport:
         srcs += [shell / "otpu_ctrl.sv", shell / "otpu_trace.sv", shell / "otpu_board.sv"]
         native = rtlsim.MEMORY["NATIVE"] if self.native is None else self.native
         srcs += [rtlsim.TB / "otpu_native_mem.sv", shell / "otpu_afifo.sv", shell / "otpu_mem_ch.sv",
+                 shell / "otpu_axi_split2.sv",      # otpu_native_reg (tb_board NREG)
                  rtlsim.TB / "otpu_chmem.sv", rtlsim.TB / "otpu_ldn_model.sv"]
         srcs += [rtlsim.TB / "tb_board.sv"]
         from opentpu.isasim import board_config
         cfg = board_config()                        # OTPU_MCOLS / OTPU_LANES: the "bitstream"
         # VPU_CL and ULANES as the bitstream builds them (make bit: VPU_CL 2, ULANES 8)
-        p = {"WORDS": 2 * len(self.ch[0]) // 4, "MCOLS": cfg.MCOLS, "LANES": cfg.LANES,
+        p = {"S": self.slices, "WORDS": 2 * len(self.ch[0]) // 4, "MCOLS": cfg.MCOLS,
+             "LANES": cfg.LANES,
              "ACT_ROWS": cfg.act_rows,
              "VPU_CL": rtlsim.UARCH.get("VPU_CL", 2), "ULANES": rtlsim.UARCH.get("ULANES", 8),
              "MXU_IMPL": rtlsim.UARCH.get("MXU_IMPL", 2),
@@ -512,15 +540,15 @@ class SimTransport:
         p.update(self.params)
         # the configuration registers (register map 4) as the target's build of this
         # configuration reports them (run_vivado.sh: opentpu.target build_config / arch_hash)
-        from opentpu.target import arch_hash, build_config, current
-        t = current()
+        from opentpu.target import arch_hash, build_config
+        t = self.target
         p.setdefault("PLATFORM", t.platform_id)
         p.setdefault("ARCH_HASH", "32'h%08x" % arch_hash(build_config(
             t, MCOLS=p["MCOLS"], LANES=p["LANES"], ACT_ROWS=p["ACT_ROWS"],
             DSTEP=p.get("DSTEP", 1))))
         exe = rtlsim.build("tb_board", srcs, p)
         with simtmp.tempdir("otpu_board_") as d:
-            for c in (0, 1):
+            for c in range(len(self.ch)):
                 self.ch[c].view("<u4").astype(">u4").tofile(d / f"ch{c}.bin")
             (d / "host.txt").write_text("\n".join(self.script) + "\n")
             self.script, self.nreads = [], 0
@@ -537,7 +565,7 @@ class SimTransport:
                     self.regs_seen[int(a, 16)] = int(v, 16)
                 elif line.startswith("DONE"):
                     self.cycles += int(line.split("=")[1])
-            for c in (0, 1):
+            for c in range(len(self.ch)):
                 self.ch[c] = np.fromfile(d / f"ch{c}_out.bin", np.uint8)
 
 
@@ -731,8 +759,27 @@ class Board:
                 d["act_rows"] = self.t.reg_read(R.R_ACT_ROWS)
         if d["regmap"] >= R.CFG_SINCE:
             d["cfg"] = R.cfg(self.t.reg_read_many(list(R.CFG_REGS)))
+            if hasattr(self.t, "bases"):            # the DMA's channel addresses
+                self.t.bases = channel_map(d)
+            from opentpu.target import by_platform  # the sensor: XADC, or UltraScale+'s SYSMON
+            t = by_platform(d["cfg"]["platform"])
+            if t is not None and t.family != "xilinx7" and d["temp_c"] is not None:
+                d["temp_c"] = round(R.temp_c(tp, t.family), 2)
         self._info = d
         return d
+
+    @property
+    def slices(self) -> int:
+        """The bitstream's slices (CFG_SLICES; 1 before register map 4). The board model's
+        transport knows them (a register read there is a simulation of its own: SimTransport)."""
+        if self._info is None and getattr(self.t, "batched", False):
+            return getattr(self.t, "slices", 1)
+        c = (self._info or self.info())["cfg"]
+        return c["S"] if c else 1
+
+    def _base(self, ch: int) -> int:
+        """Channel ch's card address (where the DMA buffers are placed for: DMA_PLACE)."""
+        return getattr(self.t, "bases", BASE)[ch]
 
     @property
     def chash(self) -> bool:
@@ -774,8 +821,8 @@ class Board:
         return d
 
     # ------------------------------------------------------------------ DRAM
-    def write(self, addr: int, data) -> None:
-        """Logical bytes to the card. Only the 64-byte beats they fall in are written: the
+    def write(self, addr: int, data, s: int = 0) -> None:
+        """Logical bytes to the card (slice s's DRAM). Only the 64-byte beats they fall in are written: the
         bytes off the chunk grid go beat by beat to their channels (a partial beat's other
         bytes kept by the transport: XdmaTransport.mem_write reads that beat alone), never the
         rest of their chunks, which the card may store meanwhile (a generate run's state words
@@ -790,21 +837,23 @@ class Board:
         a1 = end // (2 * BEAT) * (2 * BEAT)
         if a1 <= a0:
             a0 = a1 = end                               # (none: beats only)
-        self._beats(addr, data[:a0 - addr])
+        self._beats(addr, data[:a0 - addr], s)
         if a1 > a0:
-            self._chunks(a0, data[a0 - addr:a1 - addr])
-        self._beats(a1, data[a1 - addr:])
+            self._chunks(a0, data[a0 - addr:a1 - addr], s)
+        self._beats(a1, data[a1 - addr:], s)
 
-    def _beats(self, addr: int, data: np.ndarray) -> None:
+    def _beats(self, addr: int, data: np.ndarray, s: int = 0) -> None:
         """Bytes of at most a chunk's worth (a write's edges), beat by beat to their channels."""
         x, end = addr, addr + len(data)
         while x < end:
             k = min(end, (x // BEAT + 1) * BEAT) - x
-            self.t.mem_write(*beat_at(x, self.chash), data[x - addr:x - addr + k])
+            c, off = beat_at(x, self.chash)
+            self.t.mem_write(2 * s + c, off, data[x - addr:x - addr + k])
             x += k
 
-    def _chunks(self, a0: int, data: np.ndarray) -> None:
-        """Whole chunks from a0 (chunk aligned) to the two channels."""
+    def _chunks(self, a0: int, data: np.ndarray, s: int = 0) -> None:
+        """Whole chunks from a0 (chunk aligned) to slice s's two channels."""
+        j = 2 * s                                       # its first channel
         if self.chash:                                  # channel order (a copy)
             data = data.copy()
             hash_swap(a0, data.reshape(-1, 2, BEAT))
@@ -812,16 +861,16 @@ class Board:
         if lim:                                         # a run is in flight (RUN_H2C)
             for c, off, part in split(a0, data):
                 for i in range(0, len(part), lim):
-                    self.t.mem_write(c, off + i, part[i:i + lim])
+                    self.t.mem_write(j + c, off + i, part[i:i + lim])
             return
         if not (getattr(self.t, "threaded", False) and len(data) > PIPE):
             for c, off, part in split(a0, data):
-                self.t.mem_write(c, off, part)
+                self.t.mem_write(j + c, off, part)
             return
         # pieces of PIPE bytes: the worker DMAs piece i while this thread splits piece i + 1
         # into the other pair of buffers (placed for full DMA speed, see DMA_PLACE)
         h = PIPE // 2
-        slots = [[placed(h, BASE[c] + a0 // 2) for c in (0, 1)] for _ in range(2)]
+        slots = [[placed(h, self._base(j + c) + a0 // 2) for c in (0, 1)] for _ in range(2)]
         ex, prev = self._worker(), None
         for i, pos in enumerate(range(0, len(data), PIPE)):
             v = data[pos:pos + PIPE].reshape(-1, 2, BEAT)
@@ -829,7 +878,7 @@ class Board:
             for c in (0, 1):
                 buf = slots[i % 2][c][:len(v) * BEAT]
                 np.copyto(buf.reshape(-1, BEAT), v[:, c, :])
-                parts.append((c, a0 // 2 + i * h, buf))
+                parts.append((j + c, a0 // 2 + i * h, buf))
             if prev is not None:
                 prev.result()
             prev = ex.submit(lambda ps: [self.t.mem_write(*p) for p in ps], parts)
@@ -850,34 +899,40 @@ class Board:
             return False
         if not force and self.t.reg_read(R.R_SCRATCH) == R.DRAM_INIT:
             return False
+        c = (self._info or self.info())["cfg"]  # every slice's channels, what a slice addresses
+        nch, size = (c["S"] * c["channels"], c["channel_bytes"]) if c else (2, CH_BYTES)
         z = placed(64 << 20, 0)             # zeros, placed: no bounce copies
-        for c in (0, 1):
-            for off in range(0, CH_BYTES, len(z)):
-                self.t.mem_write(c, off, z)
+        for ch in range(nch):
+            for off in range(0, size, len(z)):
+                self.t.mem_write(ch, off, z)
         # the ECC counters (STATUS ECC_DED) from here on: a read of a beat not yet written (an
         # earlier run's, a tool's) counted its random check bits as uncorrectable
-        from opentpu.host import memcal
+        from opentpu.host import ddr4, memcal
         memcal.ecc(self.t, clear=True)
+        ddr4.ecc(self.t, clear=True)
         self.t.reg_write(R.R_SCRATCH, R.DRAM_INIT)
         return True
 
-    def read(self, addr: int, n: int) -> np.ndarray:
+    def read(self, addr: int, n: int, s: int = 0) -> np.ndarray:
+        """n logical bytes from slice s's DRAM at addr."""
+        j = 2 * s                                       # its first channel
         a0 = addr // (2 * BEAT) * (2 * BEAT)
         a1 = -(-(addr + n) // (2 * BEAT)) * (2 * BEAT)
         half = (a1 - a0) // 2
         out = np.empty((half // BEAT, 2, BEAT), np.uint8)
         if not (getattr(self.t, "threaded", False) and 2 * half > PIPE):
             for c in (0, 1):                            # each channel's run, interleaved
-                out[:, c, :] = self.t.mem_read(c, a0 // 2, half).reshape(-1, BEAT)
+                out[:, c, :] = self.t.mem_read(j + c, a0 // 2, half).reshape(-1, BEAT)
         else:
             # pieces of PIPE / 2 bytes per channel: the worker reads piece i + 1 into one pair of
             # buffers while this thread interleaves piece i from the other pair
             h = PIPE // 2
-            slots = [[placed(h, BASE[c] + a0 // 2) for c in (0, 1)] for _ in range(2)]
+            slots = [[placed(h, self._base(j + c) + a0 // 2) for c in (0, 1)] for _ in range(2)]
 
             def get(i: int):
                 k = min(h, half - i * h)
-                return [self.t.mem_read(c, a0 // 2 + i * h, k, slots[i % 2][c][:k]) for c in (0, 1)]
+                return [self.t.mem_read(j + c, a0 // 2 + i * h, k, slots[i % 2][c][:k])
+                        for c in (0, 1)]
 
             npieces = -(-half // h)
             ex = self._worker()
@@ -894,18 +949,32 @@ class Board:
         return flat if (a0, a1) == (addr, addr + n) else flat[addr - a0:addr - a0 + n].copy()
 
     # ------------------------------------------------------------------ programs
-    def load_program(self, addr: int, words: np.ndarray) -> None:
+    def load_program(self, addr: int, words) -> None:
         """Copy a program into DRAM at `addr` (chunk aligned) and into IMEM. A run started and
         not seen halted (a wait that raised) is stopped first: its reads in flight would land
-        in IMEM as the new program's rows."""
-        words = np.asarray(words, "<u4")
+        in IMEM as the new program's rows. On a multi-slice bitstream `words` may be a list,
+        slice s's program at its index, each in its own DRAM at `addr` (the slices load the same
+        PROG_ADDR and PROG_N: the shorter ones padded with NOPs); slices it names no program
+        for get a HALT."""
+        progs = [np.asarray(w, "<u4") for w in words] if isinstance(words, (list, tuple)) \
+            else [np.asarray(words, "<u4")]
+        S = self.slices
+        if len(progs) > S:
+            raise ValueError(f"{len(progs)} programs for a bitstream of {S} slices")
+        if len(progs) < S:
+            from opentpu import isa as I
+            progs += [np.asarray(I.assemble([I.halt()]), "<u4")] * (S - len(progs))
+        n = max(len(w) for w in progs)
         if self.in_run:
             self.stop()
-        self.write(addr, words.view(np.uint8))
+        for s, w in enumerate(progs):
+            if len(w) < n:
+                w = np.concatenate([w, np.zeros(n - len(w), "<u4")])
+            self.write(addr, w.view(np.uint8), s)
         t = self.t
         t.reg_write(R_CTRL, 0)
         t.reg_write(R_PROG_ADDR, addr)
-        t.reg_write(R_PROG_N, len(words) // 8)
+        t.reg_write(R_PROG_N, n // 8)
         t.reg_write(R_CTRL, CTRL_LOAD)
         t.poll(R_STATUS, ST_LOADING, 0)
 
@@ -1013,7 +1082,9 @@ class Board:
         self.in_run = False
         if traced:                      # the last cycles' events still drain into the buffer
             t.poll(R.R_TRACE_CTRL, R.TR_BUSY, 0, timeout)
-        offs = self.RUN_OFFS + ([R.R_TRACE_COUNT, R.R_TRACE_DROP] if traced else [])
+        S = self.slices
+        ics = [R.R_ICOUNT_S + 4 * s for s in range(1, S)]  # (slice 0's: ICOUNT)
+        offs = self.RUN_OFFS + ics + ([R.R_TRACE_COUNT, R.R_TRACE_DROP] if traced else [])
         raw = None
         if traced and getattr(t, "batched", False):
             # the board model: one simulation, so the whole buffer is read after the counters
@@ -1028,7 +1099,9 @@ class Board:
         else:
             vals = t.reg_read_many(offs)
         st, lo, hi, ic, brd, bwr, ard, awr, bst = vals[:9]
-        stats = {"cycles": lo | hi << 32, "instructions": [ic], "b_reads": brd,
+        ic = [ic] + vals[9:9 + len(ics)]
+        vals = vals[:9] + vals[9 + len(ics):]
+        stats = {"cycles": lo | hi << 32, "instructions": ic, "b_reads": brd,
                  "b_writes": bwr, "a_reads": ard, "a_writes": awr, "b_stall": bst,
                  "status": st}
         if traced:
@@ -1047,7 +1120,8 @@ class Board:
         if stats["ecc_ded"] and self._ded0 is False:
             raise RuntimeError("an uncorrectable ECC error during the run (STATUS ECC_DED): a "
                                "word it read from DRAM was wrong, and so may be its results "
-                               "(memcal.ecc has the counts; Board.scrub clears them)")
+                               "(memcal.ecc, on a DDR4 card ddr4.ecc, has the counts; "
+                               "Board.scrub clears them)")
         if stats["ecc_ded"] and self._ded0 and not self._ded_said:
             self._ded_said = True
             print("otpu: STATUS ECC_DED was set before this run (an uncorrectable ECC error "
@@ -1218,6 +1292,11 @@ def dram_layout(cfg, image_bytes: int, prog_at: int, image=None, poss=None,
     return d
 
 
+def _nwords(words) -> int:
+    """The longest program's words (one array, or a list of them: one per slice)."""
+    return max(len(w) for w in words) if isinstance(words, (list, tuple)) else len(words)
+
+
 class BoardBackend:
     """Engine backend on the card: images are written once, each token's program is copied to
     the program area right after the image and loaded into IMEM, then run.
@@ -1234,20 +1313,24 @@ class BoardBackend:
                  status: bool = True):
         from opentpu import isa as I
         self.I = I
-        if cfg.S != 1:
-            raise ValueError("the board has one slice: use opentpu.isasim.board_config()")
         self.cfg = cfg
         self.board = Board(transport)
         self.board.scrub()
         info = self.info = self.board.info()
         try:
             check_fits(cfg, info)
+            c = info.get("cfg")
+            if c and c["channels"] != 2:
+                raise ConfigMismatch(f"the bitstream's slices have {c['channels']} memory "
+                                     "channels each: this driver interleaves two")
         except ConfigMismatch:
             self.board.close()
             raise
-        img = np.asarray(images[0], np.uint8)
-        self.image_bytes = len(img)
-        self.prog_at = -(-len(img) // 4096) * 4096
+        # slice s's image in its own DRAM (cfg.S of the device's slices; the others run a HALT:
+        # Board.load_program), every slice's program at prog_at, after the largest image
+        imgs = [np.asarray(images[s], np.uint8) for s in range(cfg.S)]
+        self.image_bytes = max(len(m) for m in imgs)
+        self.prog_at = -(-self.image_bytes // 4096) * 4096
         if self.prog_at + 4 * cfg.IMEM_WORDS > cfg.DRAM_BYTES:
             self.board.close()
             raise MemoryError("no room for the program area")
@@ -1288,7 +1371,8 @@ class BoardBackend:
                                    model=model,
                                    core_khz=info["core_khz"], dram=self._layout()) \
             if status and self.board.lock is not None else None
-        self.board.write(0, img)
+        for s, m in enumerate(imgs):
+            self.board.write(0, m, s)
 
     def _layout(self, next_token: bool = False) -> dict:
         e = self.engine
@@ -1328,19 +1412,25 @@ class BoardBackend:
     def write(self, s: int, addr: int, data: np.ndarray) -> None:
         self._settle()
         a = self._armed
-        if a is not None and addr < a[0] + a[1] and a[0] < addr + np.asarray(data).nbytes:
+        if s == 0 and a is not None and addr < a[0] + a[1] and \
+                a[0] < addr + np.asarray(data).nbytes:
             self._armed = None
-        self.board.write(addr, data)
+        self.board.write(addr, data, s)
 
     def read(self, s: int, addr: int, nbytes: int) -> np.ndarray:
-        return self.board.read(addr, nbytes)
+        return self.board.read(addr, nbytes, s)
+
+    def _assemble(self, programs):
+        """The programs' words: one array (one slice), or slice s's at index s."""
+        if self.cfg.S == 1:
+            return np.asarray(self.I.assemble(programs[0]), np.uint32)
+        return [np.asarray(self.I.assemble(p), np.uint32) for p in programs[:self.cfg.S]]
 
     def prepare(self, programs: list) -> None:
         """Assemble ahead of run(programs). Called from the Engine's compile thread while
         run() of the previous token goes on: one dict entry per program list (dict operations
         are atomic), dropped by run()."""
-        self._prep[id(programs)] = (programs, np.asarray(self.I.assemble(programs[0]),
-                                                         np.uint32))
+        self._prep[id(programs)] = (programs, self._assemble(programs))
 
     runs_words = True           # start() takes assembled words too (the Engine's worker process)
 
@@ -1386,12 +1476,13 @@ class BoardBackend:
             prep = self._prep.pop(id(programs), None)
             while len(self._prep) > 1:              # stale entries (discarded compiles)
                 self._prep.pop(next(iter(self._prep)), None)
-            if isinstance(programs, np.ndarray):
+            if isinstance(programs, np.ndarray) or \
+                    (self.cfg.S > 1 and all(isinstance(w, np.ndarray) for w in programs)):
                 words = programs
             else:
                 words = prep[1] if prep is not None and prep[0] is programs else \
-                    np.asarray(self.I.assemble(programs[0]), np.uint32)
-            if len(words) > self.cfg.IMEM_WORDS:
+                    self._assemble(programs)
+            if _nwords(words) > self.cfg.IMEM_WORDS:
                 raise ValueError("program does not fit IMEM")
             self._resident = None
             self.board.load_program(self.prog_at, words)
@@ -1406,7 +1497,7 @@ class BoardBackend:
         elif stream is None:
             self._armed = None                      # the run may write the region
         self._seen = None
-        self._key = len(self._resident[1])
+        self._key = _nwords(self._resident[1])
         self._expect = self._expects.get(self._key, 0.0)
         self.board.start(trace=self.trace)
         self._running, self._stream = programs, stream

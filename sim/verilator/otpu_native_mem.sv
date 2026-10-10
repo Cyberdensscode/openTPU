@@ -22,7 +22,8 @@
 // cycles, so a busy channel fills the command FIFO and withholds n_cready.
 // Images load from dram_<SID>.bin and dump to dram_out_<SID>.bin, as otpu_dram. With PHYS = 1
 // the files are the channels' own memories instead, as the host sees them: ch<c>.bin (big-endian
-// words, as $fread reads) in, ch<c>_out.bin (little-endian) out, WORDS / 2 words each. The dump
+// words, as $fread reads) in, ch<c>_out.bin (little-endian) out, WORDS / 2 words each (c = 2 SID
+// and 2 SID + 1: slice SID's channels on a multi-slice board). The dump
 // prints each channel's reads, writes, DDR3 row opens and partial writes (MEM ch<c> rd=<n> ...).
 // +nat_trace=FILE writes every command taken, one line each: core cycle, channel, we, beat (the
 // trace sim/verilator/tb_ldc_replay.sv replays through LiteDRAM's controller).
@@ -311,7 +312,7 @@ module otpu_native_mem #(
         // channel c word j (beat j / 16) is logical beat lbeat(j / 16, c)
         for (int c = 0; c < 2; c++) begin
           for (int i = 0; i < WORDS / 2; i++) chm[i] = '0;
-          fd = $fopen($sformatf("%s/ch%0d.bin", dir, c), "rb");
+          fd = $fopen($sformatf("%s/ch%0d.bin", dir, 2 * SID + c), "rb");
           if (fd != 0) begin
             nread = $fread(chm, fd);
             $fclose(fd);
@@ -338,7 +339,7 @@ module otpu_native_mem #(
       $fclose(fd);
     end else begin
       for (int c = 0; c < 2; c++) begin
-        fd = $fopen($sformatf("%s/ch%0d_out.bin", dir, c), "wb");
+        fd = $fopen($sformatf("%s/ch%0d_out.bin", dir, 2 * SID + c), "wb");
         for (int j = 0; j < WORDS / 2; j++) $fwrite(fd, "%u", rdw(lbeat(j / 16, c) * 16 + j % 16));
         $fclose(fd);
       end

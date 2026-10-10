@@ -140,7 +140,7 @@ read_id() {  # the ID register (BAR0 offset 0) through /dev/<node>_user, 8 hex d
 # ---------------------------------------------------------------- --check
 
 check_card() {
-  local bdf="$1" d="/sys/bus/pci/devices/$1" cls drv node id spd wid f miss=""
+  local bdf="$1" d="/sys/bus/pci/devices/$1" cls drv node id spd wid msp mwd f miss=""
   cls="$(cat "$d/class")"
   say "card $bdf: [$(attr "$d" vendor):$(attr "$d" device)] subsystem \
 $(attr "$d" subsystem_vendor):$(attr "$d" subsystem_device) revision $(attr "$d" revision)"
@@ -150,8 +150,10 @@ $(attr "$d" subsystem_vendor):$(attr "$d" subsystem_device) revision $(attr "$d"
   esac
   spd="$(cat "$d/current_link_speed" 2>/dev/null)"; wid="$(cat "$d/current_link_width" 2>/dev/null)"
   msp="$(cat "$d/max_link_speed" 2>/dev/null)"            # the card's own: its bitstream's Gen
-  if [[ -n "$spd" && "$spd" == "$msp" && "$wid" == 8 ]]; then ok "link $spd x$wid (the card's own speed, x8)"
-  else note "link $spd x$wid: the card can do ${msp:-?} x8 (it works; DMA is slower; --rescan or a warm reboot retrains)"; fi
+  mwd="$(cat "$d/max_link_width" 2>/dev/null)"            # and lanes (YPCB-00338 x8, BCU1525 x16)
+  mwd="${mwd:-8}"
+  if [[ -n "$spd" && "$spd" == "$msp" && "$wid" == "$mwd" ]]; then ok "link $spd x$wid (the card's own speed and width)"
+  else note "link $spd x$wid: the card can do ${msp:-?} x$mwd (it works; DMA is slower; --rescan or a warm reboot retrains)"; fi
   drv="$(driver_of "$bdf")"
   if [[ "$drv" == xdma ]]; then ok "bound to xdma"
   else bad "bound to '${drv:-nothing}', not xdma (driver_override: $(cat "$d/driver_override"))"; return; fi

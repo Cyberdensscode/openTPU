@@ -1,5 +1,6 @@
-// Board-level simulation: otpu_board (control registers, slice, the native DRAM adapter) in front
-// of the channels' memory holding their physical images (ch0.bin, ch1.bin): MEM_NATIVE 2 (the
+// Board-level simulation: otpu_board (control registers, S slices, each with the native DRAM
+// adapter) in front of the channels' memory holding their physical images (ch0.bin, ch1.bin; slice
+// s's are ch<2s>.bin and ch<2s+1>.bin): MEM_NATIVE 2 (the
 // default) the build's channels, otpu_mem_ch in front of a LiteDRAM native-port model
 // (otpu_chmem); 1 the native memory model alone (otpu_native_mem) -- driven by a host script
 // (+dir=<d>, <d>/host.txt) -- the same register and memory protocol the PCIe host driver uses (opentpu/host/board.py). Script lines:
@@ -7,14 +8,15 @@
 //   P <addr> <mask> <value>   poll until (read(addr) & mask) == value
 //   R <addr>                  read, printed as "REG <addr> <value>"
 //   C <cycles>                wait
-// Numbers are hex. At the end the channel memories are dumped (ch0_out.bin, ch1_out.bin).
+// Numbers are hex. At the end the channel memories are dumped (ch<c>_out.bin).
 // +trace prints the slice's trace lines (as tb_top; the hardware trace records the same events).
 // The I2C pins are four open-drain lines with pull-ups and nothing else on them; +i2c_hold=<hex>
 // holds lines low from the outside (bits 0..3 as I2C_CTRL, bit4 ALERT0). +calib=<hex>: the
-// channels' calibration flags (default 3: both calibrated); +ded=<hex>: their uncorrectable-ECC
+// channels' calibration flags (default all set: calibrated); +ded=<hex>: their uncorrectable-ECC
 // flags (default 0; STATUS ECC_DED).
 module tb_board;
-  parameter int WORDS      = 1 << 20;     // logical memory words (both channels)
+  parameter int S          = 1;           // slices, two channels each
+  parameter int WORDS      = 1 << 20;     // logical memory words (a slice's two channels)
   parameter int D          = 128;
   parameter int MCOLS      = 4;
   parameter int ACT_ROWS   = MCOLS;
@@ -40,6 +42,8 @@ module tb_board;
   parameter int PLATFORM   = 1;            // CFG_PLATFORM (opentpu/target.py)
   parameter logic [31:0] ARCH_HASH = 32'h0;  // CFG_HASH
   parameter logic [11:0] TEMP = 12'hA1A;  // the XADC code of 45 C
+  parameter int NREG       = 0;            // bit j: channel j through two otpu_native_reg (an SLR
+                                           // crossing's register slices, otpu_bcu_sys SLL)
 
   logic clk = 1'b0, rst = 1'b1, dump = 1'b0;
   always #5 clk = ~clk;
@@ -53,25 +57,25 @@ module tb_board;
   logic [1:0]  bresp, rresp;
   logic [2:0]  led;
 
-  // native channels
-  logic [1:0] ncv, ncr, ncwe, nwv, nwr, nrv;
-  logic [1:0][24:0] nca;
-  logic [1:0][511:0] nwd, nrd;
-  logic [1:0][63:0] nwm;
-  logic [1:0][15:0] nwdone;
-  logic [1:0] nerr;
+  // native channels (slice s on 2s and 2s + 1)
+  logic [2*S-1:0] ncv, ncr, ncwe, nwv, nwr, nrv;
+  logic [2*S-1:0][24:0] nca;
+  logic [2*S-1:0][511:0] nwd, nrd;
+  logic [2*S-1:0][63:0] nwm;
+  logic [2*S-1:0][15:0] nwdone;
+  logic [2*S-1:0] nerr;
 
   // I2C: wired AND of the board's drive-low bits and the outside's holds, pulled up
   logic [3:0] i2c_lo;
   logic [4:0] i2c_hold = '0;
   initial void'($value$plusargs("i2c_hold=%h", i2c_hold));
-  logic [1:0] calib = 2'b11, ded = 2'b00;
+  logic [2*S-1:0] calib = '1, ded = '0;
   initial begin
     void'($value$plusargs("calib=%h", calib));
     void'($value$plusargs("ded=%h", ded));
   end
 
-  otpu_board #(.D(D), .MCOLS(MCOLS), .ACT_ROWS(ACT_ROWS), .ACT_BLOCKS(ACT_BLOCKS), .TMEM_WORDS(TMEM_WORDS),
+  otpu_board #(.S(S), .D(D), .MCOLS(MCOLS), .ACT_ROWS(ACT_ROWS), .ACT_BLOCKS(ACT_BLOCKS), .TMEM_WORDS(TMEM_WORDS),
                .IMEM_WORDS(IMEM_WORDS), .LANES(LANES), .VPU_CL(VPU_CL), .MXU_IMPL(MXU_IMPL), .ULANES(ULANES), .WIN(WIN), .CORE_KHZ(CORE_KHZ),
                .BUILD_ID(BUILD_ID), .DDR_MTS(DDR_MTS), .TRACE_DEPTH(TRACE_DEPTH), .TRACE_QD(TRACE_QD),
                .PQ_WIN(PQ_WIN), .DSTEP(DSTEP), .HOSTCAL(HOSTCAL), .PLATFORM(PLATFORM),
@@ -83,22 +87,60 @@ module tb_board;
     .s_ctl_bresp(bresp), .s_ctl_bvalid(bvalid), .s_ctl_bready(bready),
     .s_ctl_araddr(araddr), .s_ctl_arvalid(arvalid), .s_ctl_arready(arready),
     .s_ctl_rdata(rdata), .s_ctl_rresp(rresp), .s_ctl_rvalid(rvalid), .s_ctl_rready(rready),
-    .n_cvalid(ncv), .n_cready(ncr), .n_cwe(ncwe), .n_caddr(nca), .n_wvalid(nwv), .n_wready(nwr),
-    .n_wdata(nwd), .n_wmask(nwm), .n_rvalid(nrv), .n_rdata(nrd), .n_wdone(nwdone), .n_err(nerr));
+    .n_cvalid(bcv), .n_cready(bcr), .n_cwe(bcwe), .n_caddr(bca), .n_wvalid(bwv), .n_wready(bwr),
+    .n_wdata(bwd), .n_wmask(bwm), .n_rvalid(brv), .n_rdata(brd), .n_wdone(bwdone), .n_err(berr));
 
-  if (MEM_NATIVE == 2) begin : g_ch
-    otpu_chmem #(.WORDS(WORDS), .LAT(LAT), .PHYS(1)) u_mem (
-      .clk, .rst,
-      .n_cvalid(ncv), .n_cready(ncr), .n_cwe(ncwe), .n_caddr(nca), .n_wvalid(nwv),
-      .n_wready(nwr), .n_wdata(nwd), .n_wmask(nwm), .n_rvalid(nrv), .n_rdata(nrd),
-      .n_wdone(nwdone), .n_err(nerr), .dump);
-  end else begin : g_native
-    assign nerr = '0;
-    otpu_native_mem #(.WORDS(WORDS), .LAT(LAT), .PHYS(1)) u_mem (
-      .clk, .rst, .run_rst(1'b0),       // (no pokeb lines: the host writes through the board)
-      .n_cvalid(ncv), .n_cready(ncr), .n_cwe(ncwe), .n_caddr(nca), .n_wvalid(nwv),
-      .n_wready(nwr), .n_wdata(nwd), .n_wmask(nwm), .n_rvalid(nrv), .n_rdata(nrd),
-      .n_wdone(nwdone), .dump);
+  // the board's side of the channels, and the register slices where NREG asks for them
+  logic [2*S-1:0] bcv, bcr, bcwe, bwv, bwr, brv, berr;
+  logic [2*S-1:0][24:0] bca;
+  logic [2*S-1:0][511:0] bwd, brd;
+  logic [2*S-1:0][63:0] bwm;
+  logic [2*S-1:0][15:0] bwdone;
+  for (genvar j = 0; j < 2 * S; j++) begin : g_nreg
+    if (NREG >> j & 1) begin : g_reg
+      logic cv, cr, cwe, wv, wr, rv, err;
+      logic [24:0] ca;
+      logic [511:0] wd, rd;
+      logic [63:0] wm;
+      logic [15:0] wdone;
+      otpu_native_reg u_tx (.clk, .rst,
+        .s_cvalid(bcv[j]), .s_cready(bcr[j]), .s_cwe(bcwe[j]), .s_caddr(bca[j]),
+        .s_wvalid(bwv[j]), .s_wready(bwr[j]), .s_wdata(bwd[j]), .s_wmask(bwm[j]),
+        .s_rvalid(brv[j]), .s_rdata(brd[j]), .s_wdone(bwdone[j]), .s_err(berr[j]),
+        .m_cvalid(cv), .m_cready(cr), .m_cwe(cwe), .m_caddr(ca), .m_wvalid(wv), .m_wready(wr),
+        .m_wdata(wd), .m_wmask(wm), .m_rvalid(rv), .m_rdata(rd), .m_wdone(wdone), .m_err(err));
+      otpu_native_reg u_rx (.clk, .rst,
+        .s_cvalid(cv), .s_cready(cr), .s_cwe(cwe), .s_caddr(ca), .s_wvalid(wv), .s_wready(wr),
+        .s_wdata(wd), .s_wmask(wm), .s_rvalid(rv), .s_rdata(rd), .s_wdone(wdone), .s_err(err),
+        .m_cvalid(ncv[j]), .m_cready(ncr[j]), .m_cwe(ncwe[j]), .m_caddr(nca[j]),
+        .m_wvalid(nwv[j]), .m_wready(nwr[j]), .m_wdata(nwd[j]), .m_wmask(nwm[j]),
+        .m_rvalid(nrv[j]), .m_rdata(nrd[j]), .m_wdone(nwdone[j]), .m_err(nerr[j]));
+    end else begin : g_wire
+      assign ncv[j] = bcv[j]; assign bcr[j] = ncr[j]; assign ncwe[j] = bcwe[j];
+      assign nca[j] = bca[j]; assign nwv[j] = bwv[j]; assign bwr[j] = nwr[j];
+      assign nwd[j] = bwd[j]; assign nwm[j] = bwm[j]; assign brv[j] = nrv[j];
+      assign brd[j] = nrd[j]; assign bwdone[j] = nwdone[j]; assign berr[j] = nerr[j];
+    end
+  end
+
+  for (genvar s = 0; s < S; s++) begin : g_slice
+    localparam int C = 2 * s;
+    if (MEM_NATIVE == 2) begin : g_ch
+      otpu_chmem #(.WORDS(WORDS), .LAT(LAT), .PHYS(1), .SID(s)) u_mem (
+        .clk, .rst,
+        .n_cvalid(ncv[C +: 2]), .n_cready(ncr[C +: 2]), .n_cwe(ncwe[C +: 2]),
+        .n_caddr(nca[C +: 2]), .n_wvalid(nwv[C +: 2]), .n_wready(nwr[C +: 2]),
+        .n_wdata(nwd[C +: 2]), .n_wmask(nwm[C +: 2]), .n_rvalid(nrv[C +: 2]),
+        .n_rdata(nrd[C +: 2]), .n_wdone(nwdone[C +: 2]), .n_err(nerr[C +: 2]), .dump);
+    end else begin : g_native
+      assign nerr[C +: 2] = '0;
+      otpu_native_mem #(.WORDS(WORDS), .LAT(LAT), .PHYS(1), .SID(s)) u_mem (
+        .clk, .rst, .run_rst(1'b0),     // (no pokeb lines: the host writes through the board)
+        .n_cvalid(ncv[C +: 2]), .n_cready(ncr[C +: 2]), .n_cwe(ncwe[C +: 2]),
+        .n_caddr(nca[C +: 2]), .n_wvalid(nwv[C +: 2]), .n_wready(nwr[C +: 2]),
+        .n_wdata(nwd[C +: 2]), .n_wmask(nwm[C +: 2]), .n_rvalid(nrv[C +: 2]),
+        .n_rdata(nrd[C +: 2]), .n_wdone(nwdone[C +: 2]), .dump);
+    end
   end
 
   longint cyc = 0;
