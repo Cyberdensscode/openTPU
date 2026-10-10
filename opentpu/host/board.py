@@ -297,10 +297,15 @@ class XdmaTransport:
             self.close()
             raise
         # BAR0 (1 MiB, the XDMA AXI-Lite master in the block design since the first bitstream)
-        # through its four 64 KiB windows: the control registers (their first 4 KiB), the
-        # LiteDRAM CSRs (R_MEMCAL: memcal; the MIG bitstreams' ECC registers), and the XADC
-        # (0x30000)
-        self.regs = mmap.mmap(fd, 0x40000, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+        # through its 64 KiB windows: the control registers (their first 4 KiB), the LiteDRAM
+        # CSRs (R_MEMCAL: memcal; the MIG bitstreams' ECC registers), the XADC / SYSMON
+        # (0x30000), and on a DDR4 board each DIMM's core's CSRs (R_DDR4: ddr4); the first
+        # four alone if the driver maps less
+        try:
+            self.regs = mmap.mmap(fd, R.R_DDR4 + 4 * R.DDR4_STRIDE, mmap.MAP_SHARED,
+                                  mmap.PROT_READ | mmap.PROT_WRITE)
+        except OSError:
+            self.regs = mmap.mmap(fd, R.R_DDR4, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
         os.close(fd)
         # One 32-bit load / store per register access. A slice of the mmap is copied byte by
         # byte (CPython 3.14): four 1-byte AXI-Lite writes, and otpu_ctrl, which takes the
@@ -902,8 +907,9 @@ class Board:
                 self.t.mem_write(ch, off, z)
         # the ECC counters (STATUS ECC_DED) from here on: a read of a beat not yet written (an
         # earlier run's, a tool's) counted its random check bits as uncorrectable
-        from opentpu.host import memcal
+        from opentpu.host import ddr4, memcal
         memcal.ecc(self.t, clear=True)
+        ddr4.ecc(self.t, clear=True)
         self.t.reg_write(R.R_SCRATCH, R.DRAM_INIT)
         return True
 
@@ -1114,7 +1120,8 @@ class Board:
         if stats["ecc_ded"] and self._ded0 is False:
             raise RuntimeError("an uncorrectable ECC error during the run (STATUS ECC_DED): a "
                                "word it read from DRAM was wrong, and so may be its results "
-                               "(memcal.ecc has the counts; Board.scrub clears them)")
+                               "(memcal.ecc, on a DDR4 card ddr4.ecc, has the counts; "
+                               "Board.scrub clears them)")
         if stats["ecc_ded"] and self._ded0 and not self._ded_said:
             self._ded_said = True
             print("otpu: STATUS ECC_DED was set before this run (an uncorrectable ECC error "

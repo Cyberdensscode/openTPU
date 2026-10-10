@@ -21,7 +21,9 @@ The module's ports (the DDR4 pads are the only I/O):
                              the native ports' clock (otpu_mem_ch's controller side)
     ctl_clk, ctl_rst    in   the CSR port's clock and reset (XDMA's axi_aclk)
     ctl_*               AXI-Lite slave, 16-bit byte address, 32-bit data: the CSRs (csr.csv),
-                        crossing into sys_clk; as the YPCB core's
+                        crossing into sys_clk; as the YPCB core's. The address is the offset in
+                        the CSR region: csr.csv's addresses less its base (0xF000_0000 with
+                        --cpu, whose BIOS ROM is at 0; 0 without), the host's window
     c0_* / c0b_*        the two native ports (the even banks', the odd banks': otpu_mem_ch puts a
                         beat on the port of its bank's parity), in sys_clk, 512-bit data through
                         LiteDRAM's ECC (SECDED per 64-bit word over the 72-bit DIMM):
@@ -49,6 +51,7 @@ is the first bring-up's default: LiteDRAM's controller at 300 MHz on the fabric 
 """
 import argparse
 import json
+import pprint
 import re
 import sys
 from pathlib import Path
@@ -227,12 +230,16 @@ class OTPULiteDRAM4(SoCCore):
         axil_c = AXILiteInterface(data_width=32, address_width=32, clock_domain="ctl")
         axil_s = AXILiteInterface(data_width=32, address_width=32, clock_domain="sys")
         c = platform.request("ctl")
+        # the host's 16-bit offset into the CSR region (with --cpu the ROM is at 0)
+        csr_base = self.mem_map["csr"]
         self.comb += [
-            axil_c.aw.valid.eq(c.awvalid), c.awready.eq(axil_c.aw.ready), axil_c.aw.addr.eq(c.awaddr),
+            axil_c.aw.valid.eq(c.awvalid), c.awready.eq(axil_c.aw.ready),
+            axil_c.aw.addr.eq(c.awaddr | csr_base),
             axil_c.w.valid.eq(c.wvalid), c.wready.eq(axil_c.w.ready), axil_c.w.data.eq(c.wdata),
             axil_c.w.strb.eq(c.wstrb),
             c.bvalid.eq(axil_c.b.valid), axil_c.b.ready.eq(c.bready), c.bresp.eq(axil_c.b.resp),
-            axil_c.ar.valid.eq(c.arvalid), c.arready.eq(axil_c.ar.ready), axil_c.ar.addr.eq(c.araddr),
+            axil_c.ar.valid.eq(c.arvalid), c.arready.eq(axil_c.ar.ready),
+            axil_c.ar.addr.eq(c.araddr | csr_base),
             c.rvalid.eq(axil_c.r.valid), axil_c.r.ready.eq(c.rready), c.rdata.eq(axil_c.r.data),
             c.rresp.eq(axil_c.r.resp),
         ]
@@ -253,7 +260,8 @@ def sdram_init(soc, sys_mhz):
             "read_latency": ps.read_latency, "write_latency": ps.write_latency,
             "rdimm": bool(getattr(ps, "is_rdimm", False)), "phy": "uspddrphy", "memtype": "DDR4",
             "part": PART, "idelay_ref_hz": idelay_ref(sys_mhz * 1e6)}
-    return info, hdr + "\nphy = " + json.dumps(info, indent=1) + "\n"
+    # Python, not JSON (the host exec()s it: "rdimm" is a bool)
+    return info, hdr + "\nphy = " + pprint.pformat(info, sort_dicts=False) + "\n"
 
 
 def append_sources(verilog, sources):

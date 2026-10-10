@@ -53,6 +53,9 @@ CAP_STREAM = 1 << 26
 # (opentpu/host/memcal.py) through their CSRs in the BAR0 window at R_MEMCAL; STATUS CALIB0/1
 # rise when it has. The MIG bitstreams (before LiteDRAM) calibrate themselves.
 CAP_HOSTCAL, R_MEMCAL = 1 << 27, 0x10000
+# A DDR4 board's LiteDRAM cores (the BCU1525: one per DIMM, calibrated by their own CPUs;
+# opentpu/host/ddr4.py): DIMM d's CSRs in BAR0 at R_DDR4 + d x DDR4_STRIDE
+R_DDR4, DDR4_STRIDE = 0x40000, 0x10000
 # CAPS bit30: the decode loop on the card (docs/isa.md RLD, VOP ARGMAX, HALT CHAIN; the
 # generate programs of opentpu/llm/generate.py)
 CAP_GEN = 1 << 30
