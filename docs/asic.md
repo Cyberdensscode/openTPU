@@ -87,7 +87,11 @@ endpoints):
 | systolic | 0 | +0.41 ns | MXU `hi0` -> PE |
 
 Without the skew the macro paths are about -0.5 ns; the enable fanout (-1.8 ns, no macro in it)
-is then the card's limit, as it is the small point's second: on a 30 mm² die it is wire. Next for
+is then the card's limit, as it is the small point's second: on a 30 mm² die it is wire. The fp
+stages' own logic still meets 2.5 ns on the card (fmul s1 -> s2 +0.76 ns, s2 -> the next s1
++0.46, fadd s1 -> s2 +0.95, s2 -> s3 +0.92), while every path into them fails through the
+enable (-1.31 to -1.38 ns, 57-65 levels from the DMA's `fs_k`, `ds_fill`, `pl`); the stage-class
+report stopped there (the container's memory). Next for
 the card: balance the macro clock tree (CTS options, the macros'
 placement next to their muxes), a denser floorplan (35% leaves 5.5 mm of die for 10.7 mm² of
 cells and macros), and Docker with more than 24 GB for global routing.
