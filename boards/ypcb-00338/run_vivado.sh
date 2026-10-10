@@ -26,12 +26,26 @@ root="$(cd "$here/../.." && pwd)"
 speed="${1:-1066}"
 out="${OUT_DIR:-$root/build/vivado}"
 jobs="${JOBS:-8}"
-mcols="${MCOLS:-4}"            # MXU columns (the host reads them from the VERSION register)
-vpu_cl="${VPU_CL:-2}"          # VPU lanes with the composite functions (timing only)
-lanes="${LANES:-8}"            # VPU lanes / TMEM banks (likewise in VERSION)
-act_rows="${ACT_ROWS:-$mcols}" # ACT RAM rows (> MCOLS: MM replay; the ACT_ROWS register)
-dstep="${DSTEP:-1}"            # 0: no DSTEP datapath in the DMA (CAPS bit6 = 0)
-core_mhz="${CORE_MHZ:-$([[ "${FAST:-0}" == 1 ]] && echo 100 || echo 133.33)}"  # accelerator clock (FAST=1: 100)
+# The target (targets/ypcb-00338.toml through opentpu/target.py): the defaults of the knobs below,
+# the platform id and the arch hash the CFG_* registers report. Without a working python3 the
+# built-in defaults stay (the same values) and CFG_HASH reads 0.
+target="${TARGET:-ypcb-00338}"
+if tenv="$(PYTHONPATH="$root" python3 -m opentpu.target env "$target" 2>/dev/null)"; then
+  eval "$tenv"
+else
+  echo "run_vivado: python3 -m opentpu.target env $target failed: built-in defaults, CFG_HASH 0" >&2
+fi
+mcols="${MCOLS:-${T_MCOLS:-4}}"     # MXU columns (the host reads them from the VERSION register)
+vpu_cl="${VPU_CL:-${T_VPU_CL:-2}}"  # VPU lanes with the composite functions (timing only)
+lanes="${LANES:-${T_LANES:-8}}"     # VPU lanes / TMEM banks (likewise in VERSION)
+act_rows="${ACT_ROWS:-$mcols}"      # ACT RAM rows (> MCOLS: MM replay; the ACT_ROWS register)
+dstep="${DSTEP:-${T_DSTEP:-1}}"     # 0: no DSTEP datapath in the DMA (CAPS bit6 = 0)
+mxu="$([[ "${T_MXU_IMPL:-2}" == 0 ]] && echo tree || echo systolic)"   # the MXU's dot product
+core_mhz="${CORE_MHZ:-$([[ "${FAST:-0}" == 1 ]] && echo 100 || echo "${T_CORE_MHZ:-133.33}")}"  # accelerator clock (FAST=1: 100)
+platform="${T_PLATFORM:-1}"
+# CFG_HASH: the arch hash of what this build is (the knobs applied to the target's arch)
+arch_hash="$(PYTHONPATH="$root" python3 -m opentpu.target hash "$target" MCOLS="$mcols" \
+  LANES="$lanes" ACT_ROWS="$act_rows" DSTEP="$dstep" 2>/dev/null || echo 0)"
 # BUILD_ID register: the git commit's first 8 hex digits, taken here (Vivado may run in Docker)
 build_id="${BUILD_ID:-$(git -C "$root" rev-parse HEAD 2>/dev/null | cut -c1-8)}"
 build_id="${build_id:-0}"
@@ -75,7 +89,7 @@ export PCIE_GEN="${PCIE_GEN:-2}"    # read by vivado/bd_native.tcl and userclk1_
 if [[ "${STEP:-}" == impl ]]; then
   run "$here/vivado/build.tcl" "$out" "$jobs" impl "${IMPL_STRATEGY:-}"
 else
-  run "$here/vivado/create_project.tcl" "$speed" "$out" "$mcols" "$core_mhz" "$build_id" "$vpu_cl" "$lanes" "$act_rows" "$dstep"
+  run "$here/vivado/create_project.tcl" "$speed" "$out" "$mcols" "$core_mhz" "$build_id" "$vpu_cl" "$lanes" "$act_rows" "$dstep" "$mxu" "$platform" "$arch_hash"
   run "$here/vivado/build.tcl" "$out" "$jobs" full "${IMPL_STRATEGY:-}"
 fi
 echo "done: $out/otpu.bit"

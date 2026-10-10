@@ -45,22 +45,29 @@ def design_config(**kw) -> Config:
 
 
 def board_config(**kw) -> Config:
-    """The configuration built for the YPCB-00338 board (xc7k480t, 2 x DDR3, PCIe): one slice,
-    128-deep MXU x 4 columns, 8 VPU lanes / TMEM banks, 64K-word TMEM, 128 ACT RAM blocks
-    (K <= 16384), 4K-instruction IMEM, 4 GiB DRAM. OTPU_MCOLS in the environment selects the MXU
-    column count (default 4, as make -C boards/ypcb-00338 bit builds; 2: bit MCOLS=2), OTPU_LANES the VPU lanes / TMEM banks (default 8; bit
-    LANES=16; timing only, the programs do not change), OTPU_PAIR=1 column reuse (MM PAIR /
-    QACT DUP), OTPU_DSTEP=1 the DMA's DSTEP, OTPU_STREAM=1 the stream engine, OTPU_ACT_ROWS the ACT RAM rows (default MCOLS;
-    more: the MXU replays each weight chunk for MCOLS rows at a time). They configure the
-    simulators and the board model; on the card, opentpu.host.board.device_config takes them
-    from the bitstream."""
-    base = dict(S=1, D=128, MCOLS=int(os.environ.get("OTPU_MCOLS", 4)), ACT_BLOCKS=128,
-                LANES=int(os.environ.get("OTPU_LANES", 8)),
-                ACT_ROWS=int(os.environ.get("OTPU_ACT_ROWS", 0)), TMEM_WORDS=1 << 16,
-                IMEM_WORDS=1 << 15, DRAM_BYTES=1 << 32,
-                PAIR=bool(int(os.environ.get("OTPU_PAIR", 0))),
-                DSTEP=bool(int(os.environ.get("OTPU_DSTEP", 0))),
-                STREAM=bool(int(os.environ.get("OTPU_STREAM", 0))))
+    """The configuration of the target the environment selects (opentpu.target.current():
+    OTPU_TARGET, default the YPCB-00338 card, targets/ypcb-00338.toml: one slice, 128-deep MXU
+    x 4 columns, 8 VPU lanes / TMEM banks, 64K-word TMEM, 128 ACT RAM blocks (K <= 16384),
+    4K-instruction IMEM, 4 GiB DRAM). The sizes come from the target. OTPU_MCOLS in the
+    environment selects the MXU column count (default the target's: 4, as make -C
+    boards/ypcb-00338 bit builds; 2: bit MCOLS=2), OTPU_LANES the VPU lanes / TMEM banks (default
+    the target's 8; bit LANES=16; timing only, the programs do not change), OTPU_ACT_ROWS the ACT
+    RAM rows (default MCOLS; more: the MXU replays each weight chunk for MCOLS rows at a time).
+    The optional features stay off unless the environment turns them on, as before targets (the
+    target states the hardware's truth: opentpu.target.config): OTPU_PAIR=1 column reuse (MM
+    PAIR / QACT DUP), OTPU_DSTEP=1 the DMA's DSTEP, OTPU_STREAM=1 the stream engine. They
+    configure the simulators and the board model; on the card,
+    opentpu.host.board.device_config takes them from the bitstream."""
+    from .target import current
+    a, env = current().arch, os.environ
+    base = dict(S=a["S"], D=a["D"], MCOLS=int(env.get("OTPU_MCOLS", a["MCOLS"])),
+                ACT_BLOCKS=a["ACT_BLOCKS"], LANES=int(env.get("OTPU_LANES", a["LANES"])),
+                ACT_ROWS=int(env.get("OTPU_ACT_ROWS", a["ACT_ROWS"])),
+                TMEM_WORDS=a["TMEM_WORDS"], IMEM_WORDS=a["IMEM_WORDS"],
+                DRAM_BYTES=a["DRAM_BYTES"],
+                PAIR=bool(int(env.get("OTPU_PAIR", 0))),
+                DSTEP=bool(int(env.get("OTPU_DSTEP", 0))),
+                STREAM=bool(int(env.get("OTPU_STREAM", 0))))
     base.update(kw)
     return Config(**base)
 

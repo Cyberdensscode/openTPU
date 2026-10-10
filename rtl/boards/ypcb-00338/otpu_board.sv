@@ -32,7 +32,9 @@ module otpu_board #(
   parameter bit HAS_I2C     = 1'b1,    // the I2C pins are wired (CAPS bit2)
   parameter bit CHASH       = 1'b1,    // hashed channel interleave (otpu_native_dram; CAPS bit7)
   parameter bit DSTEP       = 1'b1,    // the DMA's DSTEP datapath (CAPS bit6; 0 leaves it out)
-  parameter bit HOSTCAL     = 1'b0     // the host calibrates the DDR3 controllers (CAPS bit27: LiteDRAM)
+  parameter bit HOSTCAL     = 1'b0,    // the host calibrates the DDR3 controllers (CAPS bit27: LiteDRAM)
+  parameter int PLATFORM    = 0,       // the target's platform id (CFG_PLATFORM; opentpu/target.py)
+  parameter logic [31:0] ARCH_HASH = 32'h0  // the target's arch_hash (CFG_HASH)
 ) (
   input  logic         clk,
   input  logic         rst,            // synchronous, active high
@@ -158,7 +160,12 @@ module otpu_board #(
 
   otpu_ctrl #(.D(D), .MCOLS(MCOLS), .ACT_ROWS(ACT_ROWS), .LANES(LANES), .CORE_KHZ(CORE_KHZ), .BUILD_ID(BUILD_ID),
               .DDR_MTS(DDR_MTS), .TRACE_DEPTH(TRACE_DEPTH), .PQ_WIN(PQ_WIN), .HAS_TEMP(1'b1),
-              .HAS_I2C(HAS_I2C), .CHASH(CHASH), .DSTEP(DSTEP), .HOSTCAL(HOSTCAL)) u_ctrl (
+              .HAS_I2C(HAS_I2C), .CHASH(CHASH), .DSTEP(DSTEP), .HOSTCAL(HOSTCAL),
+              // one slice on the two channels' 2 GiB each (otpu_native_dram): 4 GiB
+              .S(1), .TMEM_WORDS(TMEM_WORDS), .IMEM_WORDS(IMEM_WORDS), .ACT_BLOCKS(ACT_BLOCKS),
+              .DRAM_LOG2(32), .NCH(2), .CH_LOG2(31), .MXU_IMPL(MXU_IMPL), .TMEM_IMPL(0),
+              .VPU_CL(VPU_CL), .ULANES(ULANES), .PLATFORM(PLATFORM),
+              .ARCH_HASH(ARCH_HASH)) u_ctrl (
     .clk, .rst,
     .s_awaddr(c_awaddr), .s_awvalid(c_awvalid), .s_awready(c_awready),
     .s_wdata(c_wdata), .s_wstrb(c_wstrb), .s_wvalid(c_wvalid),

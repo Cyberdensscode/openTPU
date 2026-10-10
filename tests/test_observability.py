@@ -84,7 +84,7 @@ def test_register_map(have_verilator):
                          R_DDR_MTS, R_SCRATCH, R_TRACE_CTRL, R_TRACE_ADDR, 0x0FC, 0x6C, 0x70])
     assert ident == 0x4F545055
     assert ver == (CFG.D << 16) | (CFG.MCOLS << 8) | CFG.LANES
-    assert regmap == 3
+    assert regmap == 4
     # log2 256, log2 1024; WAITW, GEN, STREAM (with DSTEP), run arguments, ACT_ROWS, chash, DSTEP,
     # PAIR, 4-bit, ddr, i2c, temp, trace
     assert caps == (0xC7 << 24) | (8 << 16) | (10 << 8) | 0x80 | 0b1111111
@@ -95,6 +95,26 @@ def test_register_map(have_verilator):
     assert snap == 0 and scr == 0x1234_5678 and taddr == 77
     assert tctl == TRACE_ENABLE | TRACE_STOP_WHEN_FULL     # CLEAR reads 0, not busy
     assert bad == 0xDEADBEEF
+
+
+def test_cfg_registers(have_verilator):
+    """Register map 4: the CFG_* registers report the target's build of the board model's
+    configuration (opentpu/target.py), and the host builds that Config from them."""
+    from opentpu import target as T
+    from opentpu.host.board import Board, device_config
+    t = SimTransport(ch_bytes=1 << 20)
+    info = Board(t).info()
+    c = info["cfg"]
+    assert info["regmap"] == 4
+    assert (c["S"], c["TMEM_WORDS"], c["IMEM_WORDS"], c["ACT_BLOCKS"]) == (1, 1 << 16, 1 << 15, 128)
+    assert (c["DRAM_BYTES"], c["channels"], c["channel_bytes"]) == (1 << 32, 2, 1 << 31)
+    assert (c["MXU_IMPL"], c["TMEM_IMPL"], c["VPU_CL"], c["ULANES"]) == (2, 0, 2, 8)
+    assert c["platform"] == T.current().platform_id
+    cfg = device_config(info)                     # CFG_HASH agrees with the registers' Config
+    assert c["hash"] == T.arch_hash(cfg)
+    assert cfg == T.build_config(T.current(), MCOLS=CFG.MCOLS, LANES=CFG.LANES,
+                                 ACT_ROWS=CFG.act_rows, DSTEP=1)
+    assert t.reg_read(R.R_CFG_WIN0) == 0xDEADBEEF    # reserved
 
 
 def test_register_map_board_defaults(have_verilator):

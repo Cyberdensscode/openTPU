@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from . import simtmp
+from . import target as _target
 
 ROOT = Path(__file__).resolve().parent.parent
 RTL = ROOT / "rtl"
@@ -159,8 +160,9 @@ UARCH = {"WIN": 32, "RPB": 4, "WPB": 2}
 # prefetch FIFO (128 KiB of block RAM: the weight stream runs ahead through the serial
 # norm -> quantize -> MM dependency chains).
 # RPB covers every read lane (8 ports x up to 16 lanes), which selects the slice's shallow
-# write-mask arbiter, as on the board.
-BOARD_UARCH = {"WIN": 16, "RPB": 128, "WPB": 1, "FIFO_DEPTH": 1024}
+# write-mask arbiter, as on the board. The values are the selected target's (OTPU_TARGET,
+# default the card: targets/ypcb-00338.toml; opentpu.target.sim_uarch).
+BOARD_UARCH = _target.sim_uarch(_target.current())
 if os.environ.get("OTPU_UARCH") == "board":
     UARCH = dict(BOARD_UARCH)
 # MXU dot-product implementation (timing only): the 2D systolic array, as the board builds it

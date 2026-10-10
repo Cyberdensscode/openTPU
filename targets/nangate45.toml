@@ -1,0 +1,52 @@
+# openTPU as an ASIC in NanGate45 (FreePDK45; not manufacturable: PPA numbers and a rehearsal
+# for a tapeout; docs/asic.md). The card's architecture, so it runs the card's programs: the
+# same token-exact tests apply to its RTL. ASIC micro-architecture: TMEM in LANES banks of one
+# 1R1W macro each (no per-port copies), the MXU's cells generic (rtl/tech/generic).
+
+[target]
+name = "nangate45"
+kind = "asic"
+platform_id = 256
+description = "NanGate45 ASIC, the YPCB card's architecture (OpenROAD)"
+
+[arch]
+S = 1
+D = 128
+MCOLS = 4
+ACT_BLOCKS = 128
+ACT_ROWS = 0
+TMEM_WORDS = 65536
+IMEM_WORDS = 32768
+DRAM_BYTES = 4294967296
+LANES = 8
+PAIR = true
+DSTEP = true
+STREAM = true
+
+[uarch]
+MXU_IMPL = 2
+MXU_CL = 16
+VPU_CL = 2
+ULANES = 8
+TMEM_IMPL = 1                   # banked: one 1R1W macro per bank
+RPB = 1
+WPB = 1
+WIN = 16
+FIFO_DEPTH = 1024
+TRACE_DEPTH = 0
+PQ_WIN = 1024
+CHASH = true
+
+[tech]
+family = "asic"
+pdk = "nangate45"
+vendor = "open"
+
+[platform]
+board = "asic"
+core_mhz = 400.0                # the synthesis / place-and-route target clock
+mem = "port"                    # the memory ports at the macro boundary
+channels_per_slice = 2
+channel_bytes = 2147483648
+beat_bytes = 64
+host = "port"

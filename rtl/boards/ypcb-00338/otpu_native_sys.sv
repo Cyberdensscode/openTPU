@@ -24,7 +24,9 @@ module otpu_native_sys #(
   parameter int DDR_MTS = 0,
   parameter bit DSTEP = 1'b1,
   parameter bit HOSTCAL = 1'b0,
-  parameter bit XREG = 1'b0
+  parameter bit XREG = 1'b0,
+  parameter int PLATFORM = 0,
+  parameter logic [31:0] ARCH_HASH = 32'h0
 ) (
   // core clock and reset (synchronous, high), XDMA's clock and reset
   input  logic                  clk,
@@ -174,7 +176,7 @@ module otpu_native_sys #(
   otpu_board #(.MCOLS(MCOLS), .ACT_ROWS(ACT_ROWS), .VPU_CL(VPU_CL), .MXU_IMPL(MXU_IMPL),
                .LANES(LANES), .ULANES(ULANES),
                .CORE_KHZ(CORE_KHZ), .BUILD_ID(BUILD_ID), .DDR_MTS(DDR_MTS), .DSTEP(DSTEP),
-               .HOSTCAL(HOSTCAL)) u_board (
+               .HOSTCAL(HOSTCAL), .PLATFORM(PLATFORM), .ARCH_HASH(ARCH_HASH)) u_board (
     .clk, .rst, .ctl_mrst, .calib, .ded, .temp, .led, .i2c_lo, .i2c_pin,
     .s_ctl_awaddr, .s_ctl_awvalid, .s_ctl_awready, .s_ctl_wdata, .s_ctl_wstrb, .s_ctl_wvalid,
     .s_ctl_wready, .s_ctl_bresp, .s_ctl_bvalid, .s_ctl_bready, .s_ctl_araddr, .s_ctl_arvalid,

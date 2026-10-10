@@ -1,5 +1,5 @@
 // Host control registers (AXI4-Lite slave, reached from the host through the PCIe bridge's
-// BAR). All in the core clock domain. Register map version 3 (docs/observability.md: the
+// BAR). All in the core clock domain. Register map version 4 (docs/observability.md: the
 // contract with the host); 12 address bits are decoded (the map repeats every 4 KiB).
 //
 //   0x00 ID        RO  0x4F545055 ("OTPU")
@@ -35,7 +35,7 @@
 //   0x30 SW_WR     RO  scalar (QST) write requests taken
 //   0x34 B_STALL   RO  cycles a port B request waited for the memory
 //   0x38 SCRATCH   RW  (host bring-up test)
-//   0x3C REGMAP    RO  register map version (3)
+//   0x3C REGMAP    RO  register map version (4; 3 before the CFG_* registers)
 //   0x40 CAPS      RO  bit0 trace buffer, bit1 temperature, bit2 I2C pins, bit3 DDR_MTS,
 //                      bit4 4-bit MM weights (MM flags WF, docs/isa.md), bit5 column reuse (MM
 //                      PAIR / QACT DUP), bit6 DSTEP (the DMA's DeltaNet head step), bit7
@@ -55,6 +55,16 @@
 //   0x58 ACT_ROWS  RO  ACT RAM rows: the most rows of one MM (build parameter; CAPS bit24)
 //   0x60 + 4k      RW  ARG0..ARG7: the run's arguments, R8..R15 when RUN rises (CAPS bit25;
 //                      docs/isa.md "Arguments"); reset 0
+//   0x80 CFG_SLICES   RO  slices S (version 4: the configuration the target file built,
+//                         opentpu/target.py; docs/targets.md)
+//   0x84 CFG_TMEM     RO  TMEM words per slice
+//   0x88 CFG_IMEM     RO  IMEM words per slice (8 per instruction)
+//   0x8C CFG_ACT      RO  ACT RAM blocks
+//   0x90 CFG_DRAM     RO  [7:0] log2 DRAM bytes per slice, [15:8] memory channels per slice,
+//                         [23:16] log2 bytes a slice addresses per channel
+//   0x94 CFG_UARCH    RO  [3:0] MXU_IMPL, [7:4] TMEM_IMPL, [15:8] VPU_CL, [23:16] ULANES
+//   0x98 CFG_PLATFORM RO  the target's platform id (1 YPCB-00338, 2 BCU1525; 256 and up ASICs)
+//   0x9C CFG_HASH     RO  opentpu.target.arch_hash of the target's Config at build time
 //   0x100 + 8k     RO  free-running counter k's shadow (64 bits, low word first), k =
 //                      UPTIME RUNNING MXU_BUSY MXU_MAC VPU_BUSY QNT_BUSY DMA_BUSY TMEM_DENY
 //                      DRAM_RD DRAM_WR DRAM_WAIT INSTR MXU_STARVE (version 3); cleared by
@@ -86,7 +96,21 @@ module otpu_ctrl #(
   parameter bit HAS_I2C = 1'b1,          // CAPS bit2: the I2C pins are wired (otpu_fpga_top_ld)
   parameter bit CHASH = 1'b0,            // CAPS bit7: the hashed channel interleave (otpu_native_dram)
   parameter bit DSTEP = 1'b1,            // CAPS bit6 and bit26: the stream engine (DSTEP, STREAM)
-  parameter bit HOSTCAL = 1'b0           // CAPS bit27: the host calibrates the DDR3 controllers
+  parameter bit HOSTCAL = 1'b0,          // CAPS bit27: the host calibrates the DDR3 controllers
+  // the configuration registers (CFG_*, register map 4): the target's values
+  parameter int S          = 1,
+  parameter int TMEM_WORDS = 1 << 16,
+  parameter int IMEM_WORDS = 1 << 15,
+  parameter int ACT_BLOCKS = 128,
+  parameter int DRAM_LOG2  = 32,         // log2 DRAM bytes per slice
+  parameter int NCH        = 2,          // memory channels per slice
+  parameter int CH_LOG2    = 31,         // log2 bytes a slice addresses per channel
+  parameter int MXU_IMPL   = 2,
+  parameter int TMEM_IMPL  = 0,
+  parameter int VPU_CL     = 2,
+  parameter int ULANES     = 8,
+  parameter int PLATFORM   = 0,
+  parameter logic [31:0] ARCH_HASH = 32'h0
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -290,7 +314,7 @@ module otpu_ctrl #(
       10'h00C: r_d <= n_awr;
       10'h00D: r_d <= n_bst;
       10'h00E: r_d <= scratch;
-      10'h00F: r_d <= 32'd3;
+      10'h00F: r_d <= 32'd4;
       10'h010: r_d <= CAPS;
       10'h011: r_d <= 32'(CORE_KHZ);
       10'h012: r_d <= BUILD_ID;
@@ -300,6 +324,14 @@ module otpu_ctrl #(
       10'h016: r_d <= 32'(ACT_ROWS);
       10'h018, 10'h019, 10'h01A, 10'h01B, 10'h01C, 10'h01D, 10'h01E, 10'h01F:
         r_d <= arg[r_a[2:0]];
+      10'h020: r_d <= 32'(S);
+      10'h021: r_d <= 32'(TMEM_WORDS);
+      10'h022: r_d <= 32'(IMEM_WORDS);
+      10'h023: r_d <= 32'(ACT_BLOCKS);
+      10'h024: r_d <= {8'd0, 8'(CH_LOG2), 8'(NCH), 8'(DRAM_LOG2)};
+      10'h025: r_d <= {8'd0, 8'(ULANES), 8'(VPU_CL), 4'(TMEM_IMPL), 4'(MXU_IMPL)};
+      10'h026: r_d <= 32'(PLATFORM);
+      10'h027: r_d <= ARCH_HASH;
       10'h080: r_d <= {28'd0, tr_busy, tr_stop, 1'b0, tr_en};
       10'h081: r_d <= tr_count;
       10'h082: r_d <= tr_drop;

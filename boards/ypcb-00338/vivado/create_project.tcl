@@ -1,6 +1,6 @@
 # Create the Vivado project for openTPU on the YPCB-00338: the LiteDRAM core
 # (boards/ypcb-00338/litedram/), each channel behind otpu_mem_ch (bd_native.tcl, otpu_fpga_top_ld).
-#   vivado -mode batch -source create_project.tcl -tclargs [DDR_SPEED] [OUT_DIR] [MCOLS] [CORE_MHZ] [BUILD_ID] [VPU_CL] [LANES] [ACT_ROWS] [DSTEP] [MXU]
+#   vivado -mode batch -source create_project.tcl -tclargs [DDR_SPEED] [OUT_DIR] [MCOLS] [CORE_MHZ] [BUILD_ID] [VPU_CL] [LANES] [ACT_ROWS] [DSTEP] [MXU] [PLATFORM] [ARCH_HASH]
 # The defaults build MCOLS=4 and the systolic MXU.
 # DDR_SPEED: 1066 only (the LiteDRAM core is generated for DDR3-1066: tools/litedram/gen_core.py).
 # OUT_DIR: default ../../../build/vivado (repository build/).
@@ -23,6 +23,11 @@ set DSTEP [expr {[llength $argv] > 8 ? [lindex $argv 8] : 1}]
 # MXU: the MXU's dot product (docs/mxu_systolic.md): systolic (MXU_IMPL 2, the default) or tree (0)
 set MXU [expr {[llength $argv] > 9 ? [lindex $argv 9] : "systolic"}]
 set MXU_IMPL [expr {$MXU eq "tree" ? 0 : 2}]
+# PLATFORM, ARCH_HASH: the CFG_PLATFORM / CFG_HASH registers (run_vivado.sh: the target file,
+# targets/ypcb-00338.toml, through opentpu/target.py; ARCH_HASH 8 hex digits)
+set PLATFORM [expr {[llength $argv] > 10 ? [lindex $argv 10] : 1}]
+set ARCH_HASH [expr {[llength $argv] > 11 ? [lindex $argv 11] : 0}]
+if {![regexp {^[0-9a-fA-F]{1,8}$} $ARCH_HASH]} { set ARCH_HASH 0 }
 if {$BUILD_ID eq ""} {
   if {[catch {exec git -C $root rev-parse HEAD} BUILD_ID]} { set BUILD_ID 0 }
   set BUILD_ID [string range $BUILD_ID 0 7]
@@ -32,7 +37,7 @@ if {![regexp {^[0-9a-fA-F]{1,8}$} $BUILD_ID]} { set BUILD_ID 0 }
 # divider steps of its 800 MHz VCO), for the CORE_KHZ register
 set VCO 800
 set CORE_KHZ [expr {round($VCO * 1000.0 / (round(double($VCO) / $CORE_MHZ * 8) / 8.0))}]
-puts "CORE_KHZ $CORE_KHZ, BUILD_ID $BUILD_ID, MXU_IMPL $MXU_IMPL"
+puts "CORE_KHZ $CORE_KHZ, BUILD_ID $BUILD_ID, MXU_IMPL $MXU_IMPL, PLATFORM $PLATFORM, ARCH_HASH $ARCH_HASH"
 
 create_project -force otpu $out -part xc7k480tffg1156-2
 # The block design's IP synthesis (minutes: xdma above all) in a cache shared by every build on
@@ -77,7 +82,7 @@ source $here/bd_native.tcl   ;# sets PCIE_GEN (environment, run_vivado.sh) for t
 make_wrapper -files [get_files otpu_bd.bd] -top
 add_files -norecurse [glob $out/otpu.gen/sources_1/bd/otpu_bd/hdl/otpu_bd_wrapper.v]
 set_property top otpu_fpga_top_ld [current_fileset]
-set_property generic "MCOLS=$MCOLS ACT_ROWS=$ACT_ROWS VPU_CL=$VPU_CL LANES=$LANES CORE_KHZ=$CORE_KHZ BUILD_ID=32'h$BUILD_ID DDR_MTS=$DDR_SPEED DSTEP=1'b$DSTEP MXU_IMPL=$MXU_IMPL PCIE_GEN=$PCIE_GEN" [current_fileset]
+set_property generic "MCOLS=$MCOLS ACT_ROWS=$ACT_ROWS VPU_CL=$VPU_CL LANES=$LANES CORE_KHZ=$CORE_KHZ BUILD_ID=32'h$BUILD_ID DDR_MTS=$DDR_SPEED DSTEP=1'b$DSTEP MXU_IMPL=$MXU_IMPL PCIE_GEN=$PCIE_GEN PLATFORM=$PLATFORM ARCH_HASH=32'h$ARCH_HASH" [current_fileset]
 
 # ---- constraints: the board (otpu_top_ld.xdc) and the core's pads, VREF and synchronizers
 # (otpu_litedram.xdc); then, after the IP's constraints, as unmanaged Tcl on the implemented

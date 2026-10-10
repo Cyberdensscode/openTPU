@@ -6,7 +6,7 @@ register is 32 bits. The control block decodes 12 address bits (4 KiB; the map r
 the 64 KiB BAR). Reads answer a few cycles after the address (the data path is registered);
 undefined offsets read 0xDEADBEEF.
 
-## Register map (version 3)
+## Register map (version 4)
 
 The version 1 registers keep their offsets. Version 3 adds one free-running counter,
 MXU_STARVE (0x160); everything else is as in version 2. A version 2 bitstream reads 0xDEADBEEF
@@ -32,7 +32,7 @@ DDR3 speed as unknown.
 | 0x030 | SW_WR | RO | scalar (QST) write requests taken (run) |
 | 0x034 | B_STALL | RO | cycles a port B request waited (run) |
 | 0x038 | SCRATCH | RW | host bring-up test |
-| 0x03C | REGMAP | RO | register map version (3; 2 before MXU_STARVE) |
+| 0x03C | REGMAP | RO | register map version (4; 3 before the CFG_* registers, 2 before MXU_STARVE) |
 | 0x040 | CAPS | RO | bit0 trace buffer present, bit1 temperature present, bit2 I2C pins present, bit3 DDR_MTS present, bit4 the MXU runs 4-bit weights (docs/quant.md), bit5 column reuse: MM PAIR / QACT DUP (docs/isa.md), bit6 DSTEP: the DMA's DeltaNet head step (docs/isa.md), bit7 CHASH: the hashed channel interleave, [15:8] log2(trace depth), [23:16] log2(P/Q window cycles), bit24 ACT_ROWS present, bit25 run arguments ARG0..7 (docs/isa.md), bit26 STREAM: the stream engine runs STREAM's hardware subset (docs/stream.md, docs/isa.md), bit27 reserved for HOSTCAL: LiteDRAM controllers, calibrated by the host through BAR0 0x10000 (branch litedram-int), bit28 / bit29 proposed for the flash controller and the reboot (docs/flash.md, a draft), bit30 reserved for GEN: the decode loop's instructions RLD, VOP ARGMAX, HALT CHAIN (docs/isa.md, docs/autodecode.md; branch autodecode), bit31 WAITW: the DMA waits for a word the host writes (docs/isa.md; branch waitw). CAPS is then full: a new flag needs a second capability register |
 | 0x044 | CORE_KHZ | RO | accelerator clock in kHz (a build parameter; the host turns cycles into time with it) |
 | 0x048 | BUILD_ID | RO | a build parameter: the first 8 hex digits of the git commit |
@@ -41,6 +41,15 @@ DDR3 speed as unknown.
 | 0x054 | DDR_MTS | RO | a build parameter: the DDR3 data rate the MIGs were generated for, in MT/s (800, 1066, 1300, ...; `make bit DDR=`). Valid when CAPS bit3 is set |
 | 0x058 | ACT_ROWS | RO | a build parameter: the ACT RAM rows, the most rows of one MM (`make bit ACT_ROWS=`; docs/isa.md). Valid when CAPS bit24 is set; otherwise MCOLS |
 | 0x060 + 4k | ARG0..ARG7 | R / W | the run's arguments: R8..R15 of the sequencer at the start of every run (docs/isa.md "Arguments"); reset 0, kept across runs. Present when CAPS bit25 is set |
+| 0x080 | CFG_SLICES | RO | (version 4: the configuration of the target the build came from, docs/targets.md) slices S |
+| 0x084 | CFG_TMEM | RO | TMEM words per slice |
+| 0x088 | CFG_IMEM | RO | IMEM words per slice (8 per instruction) |
+| 0x08C | CFG_ACT | RO | ACT RAM blocks |
+| 0x090 | CFG_DRAM | RO | [7:0] log2 DRAM bytes per slice, [15:8] memory channels per slice, [23:16] log2 bytes a slice addresses per channel |
+| 0x094 | CFG_UARCH | RO | [3:0] MXU_IMPL, [7:4] TMEM_IMPL, [15:8] VPU_CL, [23:16] ULANES |
+| 0x098 | CFG_PLATFORM | RO | the target's platform id (1 YPCB-00338, 2 BCU1525, 256 and up ASICs) |
+| 0x09C | CFG_HASH | RO | `opentpu.target.arch_hash` of the build's Config; the host checks it against the Config it builds from these registers (`device_config`) |
+| 0x0A0 + 4s | (reserved) | | slice s's DRAM window, for platforms with more memory per channel than a slice addresses (docs/targets.md) |
 
 Build parameters (`make -C boards/ypcb-00338 bit`): CORE_KHZ is computed from CORE_MHZ the way
 the block design rounds it (the MMCM divides 800 MHz in steps of 1/8: 100 → 100000, 80 →

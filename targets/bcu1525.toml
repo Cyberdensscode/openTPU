@@ -1,0 +1,59 @@
+# The BCU1525 (Bitmain; the SQRL XCU1525 and Xilinx VCU1525 are the same board): Virtex
+# UltraScale+ VU9P, four DDR4 DIMM slots (up to 4 x 16 GB), PCIe Gen3 x16. Two slices, each on
+# two DDR4 channels through the same two-channel adapter as the YPCB slice (docs/bcu1525.md;
+# docs/superpowers/specs/2026-10-10-multi-target-design.md D8). Not yet built: the values below
+# are the bring-up plan (a development build at 100 MHz first).
+
+[target]
+name = "bcu1525"
+kind = "fpga"
+platform_id = 2
+description = "BCU1525: xcvu9p, 4 x DDR4 DIMM, XDMA Gen3; 2 slices x 2 channels"
+
+[arch]
+S = 2
+D = 128
+MCOLS = 4
+ACT_BLOCKS = 128
+ACT_ROWS = 0
+TMEM_WORDS = 65536
+IMEM_WORDS = 32768
+DRAM_BYTES = 4294967296         # per slice: 32-bit DRAM addresses (2 GiB of each of its channels)
+LANES = 8
+PAIR = true
+DSTEP = true
+STREAM = true
+
+[uarch]
+MXU_IMPL = 2
+MXU_CL = 16
+VPU_CL = 2
+ULANES = 8
+TMEM_IMPL = 0
+RPB = 0
+WPB = 1
+WIN = 16
+FIFO_DEPTH = 1024
+TRACE_DEPTH = 16384
+PQ_WIN = 1024
+CHASH = true
+
+[tech]
+family = "xilinxus"             # rtl/tech/xilinxus: DSP48E2 cells
+part = "xcvu9p-fsgd2104-2L-e"
+vendor = "xilinx"
+
+[platform]
+board = "bcu1525"
+core_mhz = 100.0
+mem = "ddr4"
+mem_mts = 2400
+mem_ctrl = "litedram"
+hostcal = false
+channels_per_slice = 2
+channel_bytes = 2147483648      # addressed per channel by a slice (a DIMM holds up to 16 GiB)
+channel_phys_bytes = 17179869184
+beat_bytes = 64
+host = "pcie"
+pcie_gen = 3
+pcie_lanes = 16

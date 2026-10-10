@@ -512,6 +512,14 @@ class SimTransport:
              "MXU_IMPL": rtlsim.UARCH.get("MXU_IMPL", 2),
              "MEM_NATIVE": 2 if native == "ld" else 1}
         p.update(self.params)
+        # the configuration registers (register map 4) as the target's build of this
+        # configuration reports them (run_vivado.sh: opentpu.target build_config / arch_hash)
+        from opentpu.target import arch_hash, build_config, current
+        t = current()
+        p.setdefault("PLATFORM", t.platform_id)
+        p.setdefault("ARCH_HASH", "32'h%08x" % arch_hash(build_config(
+            t, MCOLS=p["MCOLS"], LANES=p["LANES"], ACT_ROWS=p["ACT_ROWS"],
+            DSTEP=p.get("DSTEP", 1))))
         exe = rtlsim.build("tb_board", srcs, p)
         with simtmp.tempdir("otpu_board_") as d:
             for c in (0, 1):
@@ -706,14 +714,14 @@ class Board:
     def info(self) -> dict:
         """D / MCOLS / LANES, STATUS, calibration and, with register map 2: CAPS, CORE_KHZ,
         BUILD_ID, the die temperature and the DDR3 data rate (None where the bitstream lacks
-        them)."""
+        them); with map 4 the configuration registers ("cfg": regs.cfg; None before)."""
         v, st, rm = self.t.reg_read_many([R.R_VERSION, R_STATUS, R.R_REGMAP])
         d = {"D": v >> 16, "MCOLS": (v >> 8) & 0xFF, "LANES": v & 0xFF, "status": st,
              "calib": [bool(st & ST_CALIB0), bool(st & ST_CALIB1)],
              "calibrated": bool(st & ST_CALIB0) and bool(st & ST_CALIB1),
              "running": bool(st & ST_RUN) and not st & ST_HALTED,
              "regmap": R.regmap(rm), "caps": None, "core_khz": None, "build_id": None,
-             "temp_c": None, "ddr_mts": None, "act_rows": (v >> 8) & 0xFF}
+             "temp_c": None, "ddr_mts": None, "act_rows": (v >> 8) & 0xFF, "cfg": None}
         if d["regmap"] >= 2:
             cp, khz, bid, tp, mts = self.t.reg_read_many([R.R_CAPS, R.R_CORE_KHZ, R.R_BUILD_ID,
                                                           R.R_TEMP, R.R_DDR_MTS])
@@ -723,6 +731,8 @@ class Board:
                      ddr_mts=(mts or None) if cp & R.CAP_DDR else None)
             if cp & R.CAP_ACT:
                 d["act_rows"] = self.t.reg_read(R.R_ACT_ROWS)
+        if d["regmap"] >= R.CFG_SINCE:
+            d["cfg"] = R.cfg(self.t.reg_read_many(list(R.CFG_REGS)))
         self._info = d
         return d
 
@@ -1083,11 +1093,15 @@ class ConfigMismatch(RuntimeError):
 
 
 def device_config(info: dict, **kw):
-    """The board_config of the bitstream that `info` (Board.info()) describes: MCOLS and LANES
-    come from its VERSION register, PAIR from CAPS bit5, DSTEP from bit6 and STREAM from bit26,
-    so the card needs no OTPU_MCOLS / OTPU_LANES / OTPU_PAIR / OTPU_DSTEP / OTPU_STREAM. When one is set in the environment it
-    must name the bitstream's value (ConfigMismatch otherwise). Keyword arguments set other fields (DRAM_BYTES)."""
+    """The Config of the bitstream that `info` (Board.info()) describes: MCOLS and LANES come
+    from its VERSION register, PAIR from CAPS bit5, DSTEP from bit6 and STREAM from bit26, and
+    with register map 4 the slices, TMEM, IMEM, ACT RAM and DRAM sizes from its CFG_* registers
+    (before map 4: the YPCB-00338's, the current target's), so the card needs no OTPU_MCOLS /
+    OTPU_LANES / OTPU_PAIR / OTPU_DSTEP / OTPU_STREAM. When one is set in the environment it must
+    name the bitstream's value (ConfigMismatch otherwise). Keyword arguments set other fields
+    (DRAM_BYTES)."""
     from opentpu.isasim import board_config
+    from opentpu.target import arch_hash
     for k in ("MCOLS", "LANES"):
         env = os.environ.get(f"OTPU_{k}")
         if env is not None and int(env) != info[k]:
@@ -1106,14 +1120,41 @@ def device_config(info: dict, **kw):
                                  f"OTPU_{k}={env}: unset OTPU_{k} (the host follows the "
                                  f"bitstream)")
     rows = info.get("act_rows") or 0              # 0: MCOLS rows (no MM replay)
-    cfg = board_config(**{"MCOLS": info["MCOLS"], "LANES": info["LANES"], "PAIR": pair,
-                          "DSTEP": dstep, "STREAM": stream,
-                          "ACT_ROWS": rows if rows > info["MCOLS"] else 0,
-                          **kw})
+    dev = {"MCOLS": info["MCOLS"], "LANES": info["LANES"], "PAIR": pair, "DSTEP": dstep,
+           "STREAM": stream, "ACT_ROWS": rows if rows > info["MCOLS"] else 0}
+    c = info.get("cfg")
+    if c:                                         # register map 4: the device says the rest
+        dev.update(D=info["D"], **{k: c[k] for k in ("S", "TMEM_WORDS", "IMEM_WORDS",
+                                                     "ACT_BLOCKS", "DRAM_BYTES")})
+    cfg = board_config(**dev)
+    if c and c["hash"] and arch_hash(cfg) != c["hash"]:
+        raise ConfigMismatch(f"the bitstream's CFG_HASH {c['hash']:08x} is not the hash of the "
+                             f"configuration its registers report ({arch_hash(cfg):08x}): the "
+                             f"host and the build disagree on the Config's fields "
+                             f"(opentpu/target.py arch_hash)")
     if info["D"] != cfg.D:
         raise ConfigMismatch(f"the bitstream has D={info['D']}, the board configuration "
                              f"D={cfg.D}: not a YPCB-00338 openTPU build")
-    return cfg
+    return replace(cfg, **kw) if kw else cfg
+
+
+def check_fits(cfg, info: dict) -> None:
+    """Raise ConfigMismatch unless programs compiled for `cfg` run on the device `info`
+    describes: the same MXU, lanes and ACT RAM rows, and (register map 4) no more slices, TMEM,
+    IMEM, ACT RAM blocks or DRAM than it has."""
+    rows = info.get("act_rows") or info["MCOLS"]
+    if (info["D"], info["MCOLS"], info["LANES"], rows) != \
+            (cfg.D, cfg.MCOLS, cfg.LANES, cfg.act_rows):
+        raise ConfigMismatch(f"the bitstream is D={info['D']} MCOLS={info['MCOLS']} "
+                             f"LANES={info['LANES']}, the configuration D={cfg.D} "
+                             f"MCOLS={cfg.MCOLS} LANES={cfg.LANES} (use device_config)")
+    c = info.get("cfg")
+    if not c:
+        return
+    for k in ("S", "TMEM_WORDS", "IMEM_WORDS", "ACT_BLOCKS", "DRAM_BYTES"):
+        if getattr(cfg, k) > c[k]:
+            raise ConfigMismatch(f"the programs need {k}={getattr(cfg, k)} and the device has "
+                                 f"{c[k]} (use device_config)")
 
 
 # ------------------------------------------------------------------------------ Engine backend
@@ -1181,12 +1222,11 @@ class BoardBackend:
         self.board = Board(transport)
         self.board.scrub()
         info = self.info = self.board.info()
-        if (info["D"], info["MCOLS"], info["LANES"], info.get("act_rows") or info["MCOLS"]) != \
-                (cfg.D, cfg.MCOLS, cfg.LANES, cfg.act_rows):
+        try:
+            check_fits(cfg, info)
+        except ConfigMismatch:
             self.board.close()
-            raise ConfigMismatch(f"the bitstream is D={info['D']} MCOLS={info['MCOLS']} "
-                                 f"LANES={info['LANES']}, the configuration D={cfg.D} "
-                                 f"MCOLS={cfg.MCOLS} LANES={cfg.LANES} (use device_config)")
+            raise
         img = np.asarray(images[0], np.uint8)
         self.image_bytes = len(img)
         self.prog_at = -(-len(img) // 4096) * 4096

@@ -424,16 +424,23 @@ def run(a, t, dev: str, sim: bool) -> tuple[list[Row], list[str]]:
             if i["MCOLS"] not in (2, 4) or i["LANES"] not in (8, 16):
                 bad.append(f"VERSION {v[1]:#x}")
             if i["regmap"] >= 2:
-                if v[2] not in (2, 3):
+                if v[2] not in (2, 3, 4):
                     bad.append(f"REGMAP {v[2]}")
                 if not 10_000 <= v[4] <= 300_000:
                     bad.append(f"CORE_KHZ {v[4]}")
                 if i["caps"]["trace"] and not 8 <= (v[3] >> 8 & 0xFF) <= 16:
                     bad.append(f"CAPS {v[3]:#x}")
-                if i["caps"]["ddr"] and not 300 <= (i["ddr_mts"] or 0) <= 2133:
+                if i["caps"]["ddr"] and not 300 <= (i["ddr_mts"] or 0) <= 3200:
                     bad.append(f"DDR_MTS {i['ddr_mts']}")
                 if v[7] != R.UNMAPPED:
                     bad.append(f"undefined offset 0xFFC reads {v[7]:#x}, want 0xdeadbeef")
+            c = i.get("cfg")
+            if c:                                   # register map 4: the configuration
+                pow2 = lambda x: x > 0 and not x & (x - 1)
+                if not (1 <= c["S"] <= 64 and pow2(c["TMEM_WORDS"]) and pow2(c["IMEM_WORDS"])
+                        and c["ACT_BLOCKS"] > 0 and 1 <= c["channels"] <= 16
+                        and c["DRAM_BYTES"] <= 1 << 32 and c["platform"]):
+                    bad.append(f"CFG {c}")
             if v[6] & ~0xFF:
                 bad.append(f"STATUS reserved bits {v[6]:#x}")
             return not bad, "; ".join(bad) or (

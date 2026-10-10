@@ -37,6 +37,8 @@ module tb_board;
   parameter int MEM_NATIVE = 2;            // the channels: 2 otpu_chmem (otpu_mem_ch and a LiteDRAM
                                            // model), 1 otpu_native_mem
   parameter bit HOSTCAL    = 1'b0;         // CAPS bit27 (the host calibrates the controllers)
+  parameter int PLATFORM   = 1;            // CFG_PLATFORM (opentpu/target.py)
+  parameter logic [31:0] ARCH_HASH = 32'h0;  // CFG_HASH
   parameter logic [11:0] TEMP = 12'hA1A;  // the XADC code of 45 C
 
   logic clk = 1'b0, rst = 1'b1, dump = 1'b0;
@@ -72,7 +74,8 @@ module tb_board;
   otpu_board #(.D(D), .MCOLS(MCOLS), .ACT_ROWS(ACT_ROWS), .ACT_BLOCKS(ACT_BLOCKS), .TMEM_WORDS(TMEM_WORDS),
                .IMEM_WORDS(IMEM_WORDS), .LANES(LANES), .VPU_CL(VPU_CL), .MXU_IMPL(MXU_IMPL), .ULANES(ULANES), .WIN(WIN), .CORE_KHZ(CORE_KHZ),
                .BUILD_ID(BUILD_ID), .DDR_MTS(DDR_MTS), .TRACE_DEPTH(TRACE_DEPTH), .TRACE_QD(TRACE_QD),
-               .PQ_WIN(PQ_WIN), .DSTEP(DSTEP), .HOSTCAL(HOSTCAL)) dut (
+               .PQ_WIN(PQ_WIN), .DSTEP(DSTEP), .HOSTCAL(HOSTCAL), .PLATFORM(PLATFORM),
+               .ARCH_HASH(ARCH_HASH)) dut (
     .clk, .rst, .ctl_mrst(1'b0), .calib, .ded, .temp(TEMP), .led,
     .i2c_lo, .i2c_pin(~({1'b0, i2c_lo} | i2c_hold)),
     .s_ctl_awaddr(awaddr), .s_ctl_awvalid(awvalid), .s_ctl_awready(awready),

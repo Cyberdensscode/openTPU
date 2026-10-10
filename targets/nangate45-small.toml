@@ -1,0 +1,50 @@
+# A small openTPU in NanGate45 for fast flow iterations, and the shape of a shuttle-sized die
+# (docs/asic.md): 32-deep MXU x 2 columns, 4 lanes, 64 KiB TMEM, 1 K instructions.
+
+[target]
+name = "nangate45-small"
+kind = "asic"
+platform_id = 257
+description = "NanGate45 ASIC, a small architecture (D=32, MCOLS=2, 4 lanes)"
+
+[arch]
+S = 1
+D = 32
+MCOLS = 2
+ACT_BLOCKS = 32
+ACT_ROWS = 0
+TMEM_WORDS = 16384
+IMEM_WORDS = 8192
+DRAM_BYTES = 268435456
+LANES = 4
+PAIR = false
+DSTEP = false
+STREAM = false
+
+[uarch]
+MXU_IMPL = 2
+MXU_CL = 16
+VPU_CL = 1
+ULANES = 4
+TMEM_IMPL = 1
+RPB = 1
+WPB = 1
+WIN = 16
+FIFO_DEPTH = 64
+TRACE_DEPTH = 0
+PQ_WIN = 1024
+CHASH = false
+
+[tech]
+family = "asic"
+pdk = "nangate45"
+vendor = "open"
+
+[platform]
+board = "asic"
+core_mhz = 400.0
+mem = "port"
+channels_per_slice = 1
+channel_bytes = 268435456
+beat_bytes = 16
+host = "port"

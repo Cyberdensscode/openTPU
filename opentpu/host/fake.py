@@ -1,6 +1,7 @@
 """FakeTransport: an in-memory card for tests and demos (otpu-smi --fake).
 
-It implements the register protocol the driver uses -- register map 3 (or 2: no MXU_STARVE; or
+It implements the register protocol the driver uses -- register map 3 (or 4: the CFG_*
+registers; or 2: no MXU_STARVE; or
 1, regmap=1: 8-bit address decode, 0xDEADBEEF for registers v1 does not have) -- over two
 channel memories in RAM.
 It computes nothing: a run takes `run_s` seconds of wall time (HALTED rises then), reports
@@ -15,7 +16,9 @@ out of the buffer) and TRACE_DROP = `trace_drop`.
 With `i2c` (two fake_i2c.OpenDrainBus, e.g. fake_i2c.card_buses()) CAPS announces the I2C pins
 and I2C_CTRL / I2C_IN drive and read those bus models. With `ddr_mts` CAPS bit3 announces the
 DDR_MTS register; without it the register reads 0xDEADBEEF, as on older bitstreams. With
-`args` CAPS bit25 announces the ARG0..7 registers (kept, read back), with `gen` CAPS bit30
+`args` CAPS bit25 announces the ARG0..7 registers (kept, read back), with regmap=4 the CFG_*
+registers report `cfg` (regs.cfg's keys; default the current target's single-slice values with
+the CFG_HASH its build would report), with `gen` CAPS bit30
 the decode loop's instructions (it runs nothing either way), with `chash` CAPS bit7 the hashed
 channel interleave (the run's logits pieces land by that map). `calib` (STATUS CALIB0,
 CALIB1): CTRL takes RUN only while both are set, as the RTL; `ecc_ded`: STATUS ECC_DED (set
@@ -38,6 +41,23 @@ RATES = {"RUNNING": 0.80, "MXU_BUSY": 0.60, "MXU_MAC": 0.50, "VPU_BUSY": 0.12,
          "DRAM_WR": 0.02, "DRAM_WAIT": 0.20, "INSTR": 0.005, "MXU_STARVE": 0.08}
 
 
+def _target_cfg(D: int, MCOLS: int, LANES: int, pair: bool, dstep: bool, stream: bool) -> dict:
+    """The CFG_* registers of the current target's build with these VERSION / CAPS values."""
+    from ..target import arch_hash, current
+    t = current()
+    a, u, p = t.arch, t.uarch, t.platform
+    cfg = dict(S=a["S"], TMEM_WORDS=a["TMEM_WORDS"], IMEM_WORDS=a["IMEM_WORDS"],
+               ACT_BLOCKS=a["ACT_BLOCKS"], DRAM_BYTES=a["DRAM_BYTES"],
+               channels=p["channels_per_slice"], channel_bytes=p["channel_bytes"],
+               MXU_IMPL=u["MXU_IMPL"], TMEM_IMPL=u["TMEM_IMPL"], VPU_CL=u["VPU_CL"],
+               ULANES=u["ULANES"], platform=t.platform_id)
+    from ..isasim import Config
+    full = Config(**{**a, "D": D, "MCOLS": MCOLS, "LANES": LANES, "ACT_ROWS": 0, "PAIR": pair,
+                     "DSTEP": dstep, "STREAM": stream})
+    cfg["hash"] = arch_hash(full)
+    return cfg
+
+
 class FakeTransport:
     batched = False
 
@@ -50,7 +70,8 @@ class FakeTransport:
                  i2c: list | None = None, ddr_mts: int | None = None,
                  w4: bool = True, pair: bool = False, dstep: bool = False,
                  args: bool = False, stream: bool = False, gen: bool = False,
-                 chash: bool = False, calib: tuple = (True, True), ecc_ded: bool = False):
+                 chash: bool = False, calib: tuple = (True, True), ecc_ded: bool = False,
+                 cfg: dict | None = None):
         self.ch = [np.zeros(ch_bytes, np.uint8) for _ in range(2)]
         self.v, self.devname, self.dev = regmap, devname, devname and f"/dev/{devname}"
         self.run_s, self.cycles_per_run = run_s, cycles
@@ -63,6 +84,7 @@ class FakeTransport:
             D, MCOLS, LANES = (c.D if D is None else D, c.MCOLS if MCOLS is None else MCOLS,
                                c.LANES if LANES is None else LANES)
         self.version = D << 16 | MCOLS << 8 | LANES
+        self.cfg_words = R.cfg_words(cfg or _target_cfg(D, MCOLS, LANES, pair, dstep, stream))
         self.i2c = i2c
         self.ddr_mts = ddr_mts          # None: a bitstream without the DDR_MTS register
         self.w4 = w4                    # CAPS bit4: the MXU runs 4-bit weights
@@ -185,6 +207,8 @@ class FakeTransport:
             return 0
         if off == R.R_REGMAP:
             return self.v
+        if self.v >= R.CFG_SINCE and off in R.CFG_REGS:
+            return self.cfg_words[R.CFG_REGS.index(off)]
         if off == R.R_CAPS:
             return (R.CAP_TRACE | R.CAP_TEMP | (R.CAP_I2C if self.i2c else 0)
                     | (R.CAP_DDR if self.ddr_mts else 0) | (R.CAP_W4 if self.w4 else 0)

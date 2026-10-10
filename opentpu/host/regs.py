@@ -5,7 +5,9 @@ decode 8 address bits: an unknown register reads 0xDEADBEEF, and an offset >= 0x
 into 0x00..0xFF (so the counters and the trace registers must not be read before REGMAP says
 2). REGMAP (0x3C) reads 0xDEADBEEF on version 1; 0 is treated the same (a map with the
 register tied off). Version 3 adds the MXU_STARVE counter; a version 2 bitstream reads
-0xDEADBEEF there, so the host reads only counters(regmap).
+0xDEADBEEF there, so the host reads only counters(regmap). Version 4 adds the configuration
+registers CFG_* (0x80..0x9C: the target the bitstream was built from, opentpu/target.py), from
+which the host builds its Config (board.device_config); before it, the YPCB-00338's values.
 """
 from __future__ import annotations
 
@@ -56,6 +58,36 @@ CAP_HOSTCAL, R_MEMCAL = 1 << 27, 0x10000
 CAP_GEN = 1 << 30
 CAP_WAITW = 1 << 31              # WAITW: the DMA waits for a word the host writes (docs/isa.md)
 TEMP_VALID = 1 << 31
+
+# ---- version 4: the configuration (otpu_ctrl CFG_*; docs/targets.md)
+CFG_SINCE = 4
+R_CFG_SLICES, R_CFG_TMEM, R_CFG_IMEM, R_CFG_ACT = 0x80, 0x84, 0x88, 0x8C
+R_CFG_DRAM, R_CFG_UARCH, R_CFG_PLATFORM, R_CFG_HASH = 0x90, 0x94, 0x98, 0x9C
+CFG_REGS = (R_CFG_SLICES, R_CFG_TMEM, R_CFG_IMEM, R_CFG_ACT, R_CFG_DRAM, R_CFG_UARCH,
+            R_CFG_PLATFORM, R_CFG_HASH)
+# reserved: the slices' DRAM windows (0xA0 + 4s), for platforms with more memory per channel than
+# a slice addresses (docs/targets.md)
+R_CFG_WIN0 = 0xA0
+
+
+def cfg(vals: list[int]) -> dict:
+    """The CFG_* registers' values (in CFG_REGS order) -> the configuration they report."""
+    s, tmem, imem, act, dram, ua, plat, h = vals
+    return {"S": s, "TMEM_WORDS": tmem, "IMEM_WORDS": imem, "ACT_BLOCKS": act,
+            "DRAM_BYTES": 1 << (dram & 0xFF), "channels": (dram >> 8) & 0xFF,
+            "channel_bytes": 1 << ((dram >> 16) & 0xFF),
+            "MXU_IMPL": ua & 0xF, "TMEM_IMPL": (ua >> 4) & 0xF, "VPU_CL": (ua >> 8) & 0xFF,
+            "ULANES": (ua >> 16) & 0xFF, "platform": plat, "hash": h}
+
+
+def cfg_words(c: dict) -> list[int]:
+    """cfg()'s inverse: the register values for a configuration (the fake card's)."""
+    return [c["S"], c["TMEM_WORDS"], c["IMEM_WORDS"], c["ACT_BLOCKS"],
+            (c["DRAM_BYTES"] - 1).bit_length() | c["channels"] << 8
+            | (c["channel_bytes"] - 1).bit_length() << 16,
+            c["MXU_IMPL"] | c["TMEM_IMPL"] << 4 | c["VPU_CL"] << 8 | c["ULANES"] << 16,
+            c["platform"], c["hash"]]
+
 
 # free-running 64-bit counters: shadows latched by a SNAP write; low word at the offset
 COUNTERS = {"UPTIME": 0x100, "RUNNING": 0x108, "MXU_BUSY": 0x110, "MXU_MAC": 0x118,
