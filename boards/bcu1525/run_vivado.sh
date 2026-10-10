@@ -4,9 +4,10 @@
 #   S=2 MCOLS=4 VPU_CL=2 LANES=8 ACT_ROWS=MCOLS DSTEP=1   the accelerator (S slices, two DDR4 channels each)
 #   CORE_MHZ=100 (the default: development builds at 100 MHz until the design runs; FAST=1: Vivado's
 #   default strategies)   PCIE_LANES=16|8 (Gen3)   TMEM_URAM=0|1 (the TMEM in UltraRAM)   BUILD_ID
-#   OUT_DIR   JOBS   STEP=impl   IMPL_STRATEGY
+#   OUT_DIR   JOBS   STEP=impl   IMPL_STRATEGY   PREFLIGHT=1|0
 # The VU9P is outside Vivado's free tier: the license must cover it, and the Virtex UltraScale+
-# device files must be installed (Vivado's installer, "Virtex UltraScale+").
+# device files must be installed (Vivado's installer, "Virtex UltraScale+"). The preflight
+# (scripts/preflight.tcl, about a minute) checks both first and stops with what is missing.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
@@ -40,6 +41,19 @@ export PCIE_LANES="${PCIE_LANES:-16}"
 export TMEM_URAM="${TMEM_URAM:-0}"     # 1: the TMEM copies in UltraRAM (vivado/tmem_uram.xdc)
 run() { local script="$1"; shift
   vivado -mode batch -nojournal -log "$out/$(basename "$script" .tcl).log" -source "$script" -tclargs "$@"; }
+if [[ "${PREFLIGHT:-1}" != 0 ]]; then
+  part="${T_PART:-xcvu9p-fsgd2104-2L-e}"
+  if ! command -v vivado > /dev/null; then
+    echo "run_vivado: no vivado on PATH (source <Vivado>/settings64.sh)" >&2; exit 2
+  fi
+  if ! (cd "$out" && vivado -mode batch -nojournal -nolog -source "$here/scripts/preflight.tcl" \
+          -tclargs "$part") > "$out/preflight.log" 2>&1; then
+    grep -E "PREFLIGHT|ERROR" "$out/preflight.log" >&2 || tail -20 "$out/preflight.log" >&2
+    echo "run_vivado: preflight failed ($out/preflight.log); PREFLIGHT=0 skips it" >&2
+    exit 2
+  fi
+  grep "PREFLIGHT ok" "$out/preflight.log" >&2
+fi
 if [[ "${STEP:-}" == impl ]]; then
   run "$here/vivado/build.tcl" "$out" "$jobs" impl "${IMPL_STRATEGY:-}"
 else

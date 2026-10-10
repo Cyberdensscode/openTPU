@@ -14,7 +14,7 @@ Stages stop at the first failure, with a hint. Each builds on the previous one:
                of a beat never written since power-up hangs
   4 regs       SCRATCH register write / read
   5 addr       walking address bits and random patterns on each channel (raw channel
-               addresses: bottom, middle, top)
+               addresses: bottom, middle, top; every slice's channels)
   6 pattern    random data through the 64-byte channel interleave, unaligned edges, the top
                of DRAM (logical addresses near 4 GiB); sub-beat host updates on each channel
                (merged into whole beats on the host: XdmaTransport.mem_write)
@@ -213,9 +213,15 @@ def main(argv=None) -> int:
         t.reg_write(R_SCRATCH, was)                       # Board.scrub's marker
         return got == vals, "SCRATCH " + ("ok" if got == vals else f"read {got}")
 
+    def channels():
+        """Every memory channel: two per slice (a register map 4 bitstream's CFG_SLICES, the
+        BCU1525's four), the YPCB's two before it."""
+        c = board.info().get("cfg")
+        return range(c["S"] * c["channels"] if c else 2)
+
     def addr():
         msgs = []
-        for c in (0, 1):
+        for c in channels():
             for check in (address_lines, channel_patterns):
                 ok, m = check(t, c, ch_bytes)
                 if not ok:
@@ -228,7 +234,7 @@ def main(argv=None) -> int:
         regions = [(0, m), (m + 12345, 1000), (2 * m + 60, 70), (top // 2 - 4096, 8192),
                    (top - 2 * m, m), (top - 100, 100)]
         ok, msg = pattern_test(board, regions)
-        for c in (0, 1):
+        for c in channels():
             if ok:
                 ok, m2 = partial_writes(t, c)
                 msg += "; " + m2

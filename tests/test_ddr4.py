@@ -148,3 +148,21 @@ def test_ddr4_status_ecc_and_bist_on_a_fake_card(capsys):
     ypcb.ecc = True
     assert not ddr4.present(ypcb) and ddr4.ecc(ypcb) is None
     assert not ddr4.present(FakeTransport(devname=None, regmap=4, cfg=_bcu_cfg()))
+
+
+def test_selftest_checks_every_channel_of_a_two_slice_card(monkeypatch, capsys):
+    """otpu-selftest's address stage walks every slice's channels (the BCU1525's four), not
+    only the YPCB's two (the config stage is left out: its DRAM size is the card's, not the
+    fake's 1 MiB channels)."""
+    from opentpu.host import selftest
+
+    def some(self, name, fn, stage=selftest.Runner.stage):
+        return stage(self, name, fn) if name in ("link", "regs", "addr") else None
+    monkeypatch.setattr(selftest.Runner, "stage", some)
+    monkeypatch.setattr(selftest, "CH_BYTES", 1 << 20)
+    monkeypatch.setattr(selftest, "XdmaTransport",
+                        lambda dev: FakeTransport(devname="fakebcu", regmap=4, cfg=_bcu_cfg(),
+                                                  ch_bytes=1 << 20))
+    selftest.main([])
+    line = [s for s in capsys.readouterr().out.splitlines() if "addr" in s][0]
+    assert "[PASS]" in line and "channel 3 ok" in line, line

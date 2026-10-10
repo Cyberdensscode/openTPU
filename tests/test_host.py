@@ -1577,6 +1577,9 @@ def test_diag_link_is_the_cards_own_speed_at_x8():
     ok, msg = link_verdict((gen1, "8", gen2, "8"))
     assert not ok and "5.0 GT/s" in msg
     assert not link_verdict((gen2, "4", gen2, "8"))[0]
+    gen3 = "8.0 GT/s PCIe"                              # the BCU1525: Gen3 x16
+    assert link_verdict((gen3, "16", gen3, "16"))[0]
+    assert not link_verdict((gen3, "8", gen3, "16"))[0]
 
 
 def test_diag_sim_registers_and_memory_pass(have_verilator, tmp_path, no_cfg_env):
