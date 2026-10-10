@@ -35,7 +35,9 @@ module otpu_ram_tiled #(
   localparam int NN = N / TN;                         // depth tiles
   localparam int TA = $clog2(TN);
   initial if (NN * TN != N) $fatal(1, "otpu_ram_tiled: %0d words is not a multiple of %0d", N, NMAX);
-  logic [NN-1:0][W-1:0] q;
+  // each depth tile's read data (unpacked: Verilator 5.047 read q[rbank] of a packed [NN][W]
+  // wrongly here, W 40, N 8192; tests/test_tech_ram.py)
+  logic [W-1:0] q [NN];
   logic [(NN > 1 ? $clog2(NN) : 1)-1:0] rbank;   // the tile the last read read
   // the depth tile an address is in (0 with one tile)
   localparam int BW = (NN > 1) ? $clog2(NN) : 1;
