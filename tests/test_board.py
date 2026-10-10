@@ -130,6 +130,64 @@ def test_writes_during_a_run_move_run_h2c_per_call(addr, n, chash):
     assert np.array_equal(b.read(0, len(ref)), ref)
 
 
+def test_channel_map_from_the_cfg_registers():
+    """Register map 4: channel j = 2s + c (slice s's channel c) at j x the bytes a slice
+    addresses per channel; the YPCB-00338's two are BASE, as before map 4."""
+    from opentpu.host.board import channel_map
+    ypcb = {"cfg": {"S": 1, "channels": 2, "channel_bytes": 1 << 31}}
+    assert channel_map(ypcb) == BASE == channel_map({"cfg": None}) == channel_map(None)
+    bcu = {"cfg": {"S": 2, "channels": 2, "channel_bytes": 1 << 31}}
+    assert channel_map(bcu) == (0, 1 << 31, 2 << 31, 3 << 31)
+
+
+def _bcu_cfg() -> dict:
+    """The CFG_* registers of the BCU1525's build (targets/bcu1525.toml)."""
+    from opentpu.target import arch_hash, build_config, load
+    t = load("bcu1525")
+    a, u, p = t.arch, t.uarch, t.platform
+    return dict(S=a["S"], TMEM_WORDS=a["TMEM_WORDS"], IMEM_WORDS=a["IMEM_WORDS"],
+                ACT_BLOCKS=a["ACT_BLOCKS"], DRAM_BYTES=a["DRAM_BYTES"],
+                channels=p["channels_per_slice"], channel_bytes=p["channel_bytes"],
+                MXU_IMPL=u["MXU_IMPL"], TMEM_IMPL=u["TMEM_IMPL"], VPU_CL=u["VPU_CL"],
+                ULANES=u["ULANES"], platform=t.platform_id, hash=arch_hash(build_config(t)))
+
+
+def test_two_slices_on_a_fake_card():
+    """A two-slice bitstream (the BCU1525's CFG_* registers): slice s's DRAM on the card's
+    channels 2s and 2s + 1, the XDMA channel map from them; one program loads into slice 0
+    and a HALT into slice 1, a list gives each slice its own (the shorter padded with NOPs to
+    the shared PROG_N); a run reports every slice's ICOUNT."""
+    from opentpu import isa as I
+    from opentpu.host.board import XdmaTransport, channel_map
+    from opentpu.host.fake import FakeTransport
+    f = FakeTransport(devname=None, regmap=4, cfg=_bcu_cfg(), ch_bytes=1 << 16)
+    b = Board(f, lock=False)
+    i = b.info()
+    assert b.slices == 2 and len(f.ch) == 4
+    assert channel_map(i) == (0, 1 << 31, 2 << 31, 3 << 31)
+    assert XdmaTransport.bases == BASE
+    x = np.arange(1000, dtype=np.uint32).view(np.uint8)
+    b.write(256, x, 1)
+    assert not f.ch[0].any() and not f.ch[1].any() and f.ch[2].any() and f.ch[3].any()
+    assert np.array_equal(b.read(256, len(x), 1), x)
+    y = np.arange(37, dtype=np.uint8)
+    b.write(100, y)
+    assert np.array_equal(b.read(100, 37), y) and np.array_equal(b.read(256, len(x), 1), x)
+    w = np.asarray(I.assemble([I.nop(), I.nop(), I.halt()]), np.uint32)
+    b.load_program(4096, w)
+    halt = np.asarray(I.assemble([I.halt()]), np.uint32)
+    assert f.regs[R.R_PROG_N] == 3
+    assert np.array_equal(b.read(4096, 4 * len(w)).view(np.uint32), w)
+    assert np.array_equal(b.read(4096, 4 * len(w), 1).view(np.uint32),
+                          np.concatenate([halt, np.zeros(len(w) - len(halt), np.uint32)]))
+    assert b.run()["instructions"] == [3, 3]
+    b.load_program(8192, [halt, w])
+    assert np.array_equal(b.read(8192, 4 * len(w), 1).view(np.uint32), w)
+    assert np.array_equal(b.read(8192, 4 * len(halt)).view(np.uint32), halt)
+    with pytest.raises(ValueError, match="3 programs for a bitstream of 2 slices"):
+        b.load_program(8192, [w, w, w])
+
+
 # ------------------------------------------------------------------------------ board model
 CFG = board_config(DRAM_BYTES=1 << 22)
 
@@ -388,6 +446,36 @@ def test_tiny_qwen3_on_board_model(have_verilator, formats):
         a, b = isa.step(tok), brd.step(tok)
         assert np.array_equal(a.view(np.uint32), b.view(np.uint32))
     assert brd.stats[-1]["cycles"] > 0
+
+
+def test_tiny_qwen3_two_slices_on_board_model(have_verilator):
+    """The BCU1525's board (otpu_board S = 2: two slices, each on its two channels, one
+    control block, the collective unit between them; SimTransport(target="bcu1525")) runs a
+    tiny Qwen3 split over two slices: logits bit-identical to the ISA simulator at S = 2, and
+    each slice's DRAM, read back through the host's channel map, the ISA simulator's."""
+    from opentpu.llm.qwen3 import Engine, Spec
+    torch.manual_seed(0)
+    hc = transformers.Qwen3Config(hidden_size=256, num_hidden_layers=2, num_attention_heads=4,
+                                  num_key_value_heads=2, head_dim=128, intermediate_size=512,
+                                  vocab_size=1000, rms_norm_eps=1e-6, rope_theta=1e6,
+                                  tie_word_embeddings=True, max_position_embeddings=4096)
+    mdl = transformers.Qwen3ForCausalLM(hc).float().eval()
+    W = {k: v.float().numpy() for k, v in mdl.state_dict().items()}
+    spec = Spec(256, 2, 4, 2, 128, 512, 1000)
+    cfg = board_config(DRAM_BYTES=1 << 23, S=2)
+    isa = Engine(spec, W, cap=256, cfg=cfg)
+    tr = SimTransport(ch_bytes=cfg.DRAM_BYTES // 2, stall=20, seed=5, target="bcu1525")
+    brd = Engine(spec, W, cap=256, cfg=cfg,
+                 backend=lambda c, imgs: BoardBackend(c, imgs, transport=tr))
+    assert brd.backend.info["cfg"]["S"] == 2 and brd.backend.info["cfg"]["platform"] == 2
+    for tok in (11, 222):
+        a, b = isa.step(tok), brd.step(tok)
+        assert np.array_equal(a.view(np.uint32), b.view(np.uint32))
+        st = brd.stats[-1]
+        assert st["cycles"] > 0 and st["instructions"] == isa.stats[-1]["instructions"]
+    n = isa.image.nbytes
+    for s in range(2):
+        assert np.array_equal(brd.backend.read(s, 0, n), isa.backend.machine.slices[s].dram[:n])
 
 
 def test_tiny_qwen3_generate_on_board_model(have_verilator):
