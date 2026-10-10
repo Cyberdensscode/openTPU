@@ -60,9 +60,9 @@ make these numbers from a run.
 
 | | nangate45-small | nangate45 (the card's arch) |
 |---|---|---|
-| stage | routed, final report (signoff extraction) | (running) |
-| die | 2.65 x 2.65 mm = 7.02 mm² | |
-| standard cells | 1.18 mm², 590 K instances (20.8% of the core): 94 K flip-flops 0.43 mm², 373 K gates 0.66 mm² | |
+| stage | routed, final report (signoff extraction) | synthesis and floorplan (placement running) |
+| die | 2.65 x 2.65 mm = 7.02 mm² | 5.53 x 5.53 mm = 30.6 mm² |
+| standard cells | 1.18 mm², 590 K instances (20.8% of the core): 94 K flip-flops 0.43 mm², 373 K gates 0.66 mm² | 4.04 mm², 1.76 M instances after synthesis (17.0% of the core) |
 | macros | 27, 233 KiB, 1.31 mm² | 113, 1126 KiB, 6.62 mm² |
 | register to register | 2.39 ns: **419 MHz** (no violation at 2.5 ns) | |
 | with the ports | 2.95 ns: 339 MHz (one endpoint: `sw_req`) | |
@@ -88,8 +88,12 @@ Area per unit after synthesis (before placement's buffers), nangate45-small, mm�
 | ACT RAM | 0.031 | 0.026 | 0.005 |
 | collective unit | 0.010 | | 0.010 |
 
-The banked TMEM's logic (bank muxes, copy selection, the write stage) is 19 K um²: its cost is the
-three copies' macros.
+nangate45 (the card's arch), mm²: TMEM 4.053 (macros 4.000: 48 x 4096x32), MXU 1.993 (0.951; 128 x 4
+systolic, logic 1.042), DMA with the stream engine 1.420 (0.150), VPU 1.161 (0.040), sequencer
+1.082 (IMEM 0.858), ACT RAM 0.645 (0.617), quantizer 0.364, collective unit 0.014.
+
+The banked TMEM's logic (bank muxes, copy selection, the write stage) is 19 K um² (small) and 53 K
+um² (card): its cost is the three copies' macros, 38% of the card's synthesized area.
 
 ### Critical paths
 
