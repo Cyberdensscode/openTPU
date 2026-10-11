@@ -37,8 +37,9 @@ def pytest_configure(config):
     # mid-run (fix-core's omarchy gate: the progcache tests and a wall-clock test failed, and
     # passed again with a --basetemp of their own); removed at the end, as pytest's own are
     if config.option.basetemp is None:
-        config.option.basetemp = os.path.join(
-            tempfile.gettempdir(), f"pytest-of-{getpass.getuser()}", f"pid-{os.getpid()}")
+        parent = os.path.join(tempfile.gettempdir(), f"pytest-of-{getpass.getuser()}")
+        os.makedirs(parent, exist_ok=True)      # pytest makes the basetemp, not its parent
+        config.option.basetemp = os.path.join(parent, f"pid-{os.getpid()}")
         config._otpu_basetemp = config.option.basetemp
     # and a device-lock / status directory of its own (opentpu/host/runstate.py, default
     # /tmp/otpu; the tests that check it set theirs): a fake board one gate left open held
