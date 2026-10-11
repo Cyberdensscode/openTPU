@@ -270,6 +270,35 @@ def test_least_recently_used_go_over_the_cap_and_none_under_the_floor(ckpt, cach
     assert IC.last[0] == "skip" and IC.stats["skip"] == 1 and len(_entries(cache)) == 3
 
 
+def test_slow_builds_outlive_quick_ones_over_the_cap(ckpt, cache, monkeypatch):
+    """An entry's header keeps its build's seconds; over the cap each build second per GB counts
+    as KEEP_S of later use: a slow build used a while ago stays while a quick one used since goes,
+    and a stale entry (unused for longer than its build buys) goes first. An entry without the
+    field is the least recently used rule's."""
+    import json
+    import struct
+    import time
+    _engine(ckpt)
+    (f,) = _entries(cache)
+    assert IC._build_s(f) > 0
+    f.unlink()
+    monkeypatch.setattr(IC, "KEEP_S", 2.0**-18)     # a page-sized entry: KEEP_S per build second
+    t = time.time() - 10000
+    (cache / "ab").mkdir()
+    ents = {}
+    for name, build_s, used in (("none", None, t + 1000), ("stale", 1000, t - 5000),
+                                ("quick", 0, t + 3000), ("slow", 5000, t)):
+        e = cache / "ab" / f"{name}.img"
+        head = b"" if build_s is None else \
+            IC.MAGIC + struct.pack("<Q", 20) + json.dumps({"build_s": build_s}).encode().ljust(20)
+        e.write_bytes(head.ljust(IC.PAGE, b"\0"))
+        os.utime(e, (used, used))
+        ents[name] = e
+    monkeypatch.setenv("OTPU_IMG_CACHE_GB", str(3 * IC.PAGE / 2**30))
+    IC._evict(cache)
+    assert {n for n, e in ents.items() if e.exists()} == {"quick", "slow"}
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root writes a read-only directory")
 def test_a_cache_it_cannot_write_is_no_error(ckpt, cache):
     """A cache directory the process cannot write (another user's, a full disk): its entries

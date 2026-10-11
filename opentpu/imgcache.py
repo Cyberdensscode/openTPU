@@ -24,7 +24,10 @@ caches and state regions are zeros, and are not stored) and the arrays. A hit re
 into zeroed images. The cache: OTPU_IMG_CACHE=<dir>, or 0 for none; by default the img
 directory beside the 4-bit matrices' (qcache.cache_dir(): ~/otpu-build/qcache/img on a host
 with ~/otpu-build; none when OTPU_IMAGE_CACHE=0). Entries are written to a temporary name, then
-renamed. The least recently used go when the cache passes CAP_BYTES (OTPU_IMG_CACHE_GB), and
+renamed. Entries go when the cache passes CAP_BYTES (OTPU_IMG_CACHE_GB), in the order of their
+last use, where each second of build per GB an entry took (its header's build_s) counts as KEEP_S
+of later use: an image that costs minutes to build (gemma-4-E4B-it's, 287 s for 7.1 GB) outlives
+one that costs seconds (Qwen3.5-0.8B's, 16 s for 1.8 GB) opened a day later, and
 nothing is written that would leave under FREE_FLOOR of free disk (OTPU_IMG_CACHE_FREE_GB).
 `stats` counts hits, misses, writes and skipped writes; `last` is the latest build's (how:
 "hit", "miss" (built and stored), "skip" (built, not stored) or "off"; seconds).
@@ -45,6 +48,7 @@ from . import progcache as PC
 from . import qcache as QC
 
 CAP_BYTES = 16 << 30            # the cache's size (OTPU_IMG_CACHE_GB overrides)
+KEEP_S = 3600.0                 # s of later use each build second per GB buys an entry (eviction)
 FREE_FLOOR = 20 << 30           # free disk a write must leave (OTPU_IMG_CACHE_FREE_GB)
 PAGE = 4096                     # zeros are left out in whole pages
 MAGIC = b"OTPUIMG1"
@@ -131,11 +135,13 @@ def build(image, W, layout) -> list[np.ndarray]:
         return images
     stats["miss"] += 1
     before = _attrs(image)
+    tb = time.perf_counter()
     images = image.build(W)
+    secs = time.perf_counter() - tb
     left = _left(before, _attrs(image), W)
     if left is None:
         stats["skip"] += 1
-    stored = left is not None and _store(d, f, images, left)
+    stored = left is not None and _store(d, f, images, left, secs)
     last = ("miss" if stored else "skip", time.perf_counter() - t0)
     return images
 
@@ -204,14 +210,15 @@ def _bytes(a) -> np.ndarray:
     return np.ascontiguousarray(a).view(np.uint8).reshape(-1)
 
 
-def _store(d: Path, f: Path, images: list, left: dict) -> bool:
+def _store(d: Path, f: Path, images: list, left: dict, build_s: float = 0.0) -> bool:
     """Write the entry (True), or not: under the free-disk floor, or a write that failed (the
-    disk full, no permission: the image is built, not kept)."""
+    disk full, no permission: the image is built, not kept). build_s: the build's seconds (what
+    a miss would cost again: the eviction's weight)."""
     images = [_bytes(img) for img in images]
     slices = [{"nbytes": len(img), "runs": _runs(img)} for img in images]
     arrays = {p: {"dtype": v.dtype.str, "shape": list(v.shape)}
               for p, (kind, v) in left.items() if kind == "array"}
-    meta = {"slices": slices, "arrays": arrays,
+    meta = {"build_s": round(build_s, 2), "slices": slices, "arrays": arrays,
             "json": {p: v for p, (kind, v) in left.items() if kind == "json"},
             "weights": [p for p, (kind, _) in left.items() if kind == "weights"]}
     size = sum(n for s in slices for _, n in s["runs"]) + \
@@ -286,8 +293,21 @@ def _read(src, out: np.ndarray) -> None:
         got += n
 
 
+def _build_s(p: Path) -> float:
+    """An entry's build seconds (its header's build_s; 0 for an entry without one)."""
+    try:
+        with open(p, "rb") as src:
+            if src.read(8) != MAGIC:
+                return 0.0
+            return float(json.loads(src.read(struct.unpack("<Q", src.read(8))[0]))
+                         .get("build_s", 0.0))
+    except (OSError, ValueError, struct.error):
+        return 0.0
+
+
 def _evict(d: Path) -> None:
-    """Drop the least recently used entries while the cache is over its size (to 90% of it)."""
+    """While the cache is over its size, drop entries (to 90% of it): the least recently used
+    first, each build second per GB of an entry counting as KEEP_S of later use."""
     cap = int(float(os.environ.get("OTPU_IMG_CACHE_GB", CAP_BYTES / 2**30)) * 2**30)
     ents = []
     for p in d.glob("*/*.img"):
@@ -297,7 +317,8 @@ def _evict(d: Path) -> None:
             st = p.stat()
         except FileNotFoundError:
             continue
-        ents.append((st.st_mtime, st.st_size, p))
+        keep = KEEP_S * _build_s(p) / (max(st.st_size, PAGE) / 2**30)
+        ents.append((st.st_mtime + keep, st.st_size, p))
     total = sum(e[1] for e in ents)
     if total <= cap:
         return

@@ -520,9 +520,13 @@ elements) in numpy on one core. Two changes since:
   no weight is converted, hashed or quantized. An entry stores each slice's runs of nonzero
   4 KiB pages: the KV caches are not stored. The cache is `~/otpu-build/qcache/img` (beside
   `mxu` and `prog`; `OTPU_IMG_CACHE=<dir>`, `0` turns it off, as `OTPU_IMAGE_CACHE=0` does); it
-  keeps 16 GB (`OTPU_IMG_CACHE_GB`), drops the least recently used entries first and writes
-  nothing that would leave under 20 GB of free disk (`OTPU_IMG_CACHE_FREE_GB`). A new KV
-  capacity, configuration, format or tree builds again, from the 4-bit cache.
+  keeps 16 GB (`OTPU_IMG_CACHE_GB`) and writes nothing that would leave under 20 GB of free
+  disk (`OTPU_IMG_CACHE_FREE_GB`). Over the size it drops the least recently used entries
+  first, each second of build per GB an entry took counting as an hour of later use
+  (`imgcache.KEEP_S`): gemma-4-E4B-it's image (287 s, 7.1 GB) outlives Qwen3.5-0.8B's (16 s,
+  1.8 GB) opened up to a day later. The card host sets 30 GB and 6 GB (its `~/.bashrc`), room for
+  every chat model's image (~33 GB in all on 2026-10-10). A new KV capacity, configuration,
+  format or tree builds again, from the 4-bit cache.
 
 LFM2-2.6B fp4 with its int8 head (`--cap 2048`, the card's configuration), on omarchy (16
 threads, shared with other agents' jobs, 2026-10-08):
