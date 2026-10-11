@@ -92,6 +92,7 @@ def run_front(streams, vops, rels, tm0, rng, tmp_path, wbuf):
     R = rtlsim.RTL
     exe = rtlsim.build("tb_se_vpu", [R / "vpu/otpu_fp.sv", R / "vpu/otpu_fpipe.sv",
                                      R / "top/otpu_pkg.sv", R / "vpu/otpu_vtree.sv",
+                                     R / "tech/generic/otpu_tech_ram.sv",
                                      R / "vpu/otpu_se_comp.sv", R / "vpu/otpu_se_tail.sv",
                                      R / "vpu/otpu_vpu.sv", rtlsim.TB / "tb_se_vpu.sv"],
                         {"WBUF": int(wbuf)})
