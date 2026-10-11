@@ -139,32 +139,54 @@ sampling; else the host picks the first token from the logits).
 
 Run on 2026-10-09 on opentpu with build 1025907f (133.33 MHz, Gen2 x8), Qwen3-0.6B int8, cap
 2048, using `tools/serve_bench.py`. Each client streams a greedy chat of 128 tokens
-(`ignore_eos`) unless the row says sampled.
+(`ignore_eos`) unless the row says sampled. Three trees: requests in turns (70ec5139), batched
+with a program compiled per step (f99acce6), batched with span programs and feed runs
+(6c3a1c75, with the feed-kind fix of 40fa0062).
 
-| clients | time-sliced (tree 70ec5139) | batched, 8 slots (tree f99acce6) | TTFT median / max (batched) |
-|---|---|---|---|
-| 1 | 25.0 tok/s | 23.9 tok/s | 0.26 / 0.26 s |
-| 2 | 24.2 | 41.9 | 0.23 / 0.36 s |
-| 4 | 24.0 | 53.3 | 0.44 / 1.06 s |
-| 8 | 23.8 | 50.1 | 0.95 / 3.51 s |
-| 8, sampled (temperature 0.7, top-k 20, top-p 0.8) | | 46.3 | 0.77 / 1.98 s |
+| clients | in turns | batched, per-step programs | batched, span programs | TTFT median / max (span) |
+|---|---|---|---|---|
+| 1 | 25.0 tok/s | 23.9 tok/s | 24.6 tok/s | 0.24 / 0.24 s |
+| 2 | 24.2 | 41.9 | 44.4 | 0.23 / 0.37 s |
+| 4 | 24.0 | 53.3 | 77.7 | 0.56 / 0.56 s |
+| 8 | 23.8 | 50.1 | 75.7 | 1.19 / 1.78 s |
+| 8, sampled (temperature 0.7, top-k 20, top-p 0.8) | | 46.3 | 78.5 | 0.60 / 0.60 s |
 
 - **Correctness.** Four prompts alone, then together. Every reply is equal to its own, and a
-  repeat too (`check: PASS` in both runs). Contexts were swapped through the staged copies
-  (time-sliced) and decoded in batched steps.
-- **Time-sliced.** About 49 ms per context switch.
-- **Batched.** 764 steps averaged 4.1 rows (the 8-client runs as two groups of four) and
-  ~85 ms a step. A 4-row run takes ~70 ms of wall time, against a decode step's 39.
+  repeat too (`check: PASS` in every run).
+- **In turns.** About 49 ms per context switch.
+- **Batched steps** (`tools/batch_bench.py`, 8 slots, 16 steps per case): the card's run of a
+  step against its wall time. Per-step programs left the card idle while the host compiled
+  the next one (a 4-row step: 44 ms on the card, 71.5 ms wall at context 64; 58.5 and 136 ms
+  at 1024). With span programs:
+
+  | rows | context 64: tok/s | card / wall per run | context 1024: tok/s | card / wall per run |
+  |---|---|---|---|---|
+  | 1 | 24.1 | 39.5 / 41.5 ms | 21.8 | 43.1 / 46.0 ms |
+  | 2 | 45.1 | 41.6 / 44.3 ms | 37.4 | 48.8 / 53.4 ms |
+  | 4 | 79.1 | 46.3 / 50.6 ms | 56.7 | 60.6 / 70.5 ms |
+  | 8 (two runs of 4) | 79.2 | 91.3 / 101 ms a step | 54.7 | 121 / 146 ms a step |
+  | 4, sampled | 77.1 | 46.8 / 51.9 ms | 57.1 | 61.2 / 70.1 ms |
+
+  The decode loop alone (`generate_card`) makes 25.3 tok/s at context 64. Eight rows in one
+  run cost two runs of four on the card: the MXU takes MCOLS = 4 rows per pass of the
+  weights, so four rows a run is the most a pass gives (~1.45 M cycles a token at a short
+  context). A trace of a 4-row step's first 250 k cycles shows the MXU busy 95%. The wall
+  time over the card's at context 1024 is mostly each case's first program, compiled inline
+  and paid over only 16 steps (a program serves up to 256).
+- **Prefill.** Feed runs fed 84 tok/s of 64-token prompts and 93 tok/s of 1024-token ones,
+  on any slot (slot 0's prompt runs: 47.5 and 65 tok/s).
 - **A conversation's turns** (each re-sends the history, max 128 tokens a reply), against the
   same prompt with nothing saved:
 
   | turn | prompt tokens | cached | TTFT | TTFT cold |
   |---|---|---|---|---|
-  | 3 | 157 | 121 | 0.37 s | 1.44 s |
-  | 4 | 196 | 153 | 0.45 s | 1.80 s |
+  | 3 | 157 | 121 | 0.46 s | 1.56 s |
+  | 4 | 196 | 153 | 0.50 s | 2.02 s |
 
   Qwen3's template renders a past reply without the empty thinking block its generation prompt
   had, so each turn feeds the last reply again (as otpu-chat).
+- **A KV store of 50 MB of RAM** (`--kv-ram-gb 0.05`, 1 GB of disk): `check: PASS`, the same
+  turns, and `/generate` replied.
 
 ## Tests
 
