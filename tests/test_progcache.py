@@ -95,6 +95,48 @@ def test_the_key_sees_the_host_modules_the_programs_take(monkeypatch):
                     assert "/".join(m) + ".py" in keyed, (f, m)
 
 
+def test_the_key_leaves_out_the_tools_no_build_runs(monkeypatch):
+    """An edit to a profiler, trace, reference or RTL simulation module (UNKEYED) keeps the
+    cached programs and images; one to the compiler misses. No keyed module imports an UNKEYED
+    one, at module level or in a function, but runtime's RTL run (rtlsim: a run, not a build)."""
+    import ast
+    from pathlib import Path
+    root = Path(PC.__file__).resolve().parent
+    k = PC.key(("spec", 512), ("gen", 1))
+    read = Path.read_bytes
+
+    def edited(name):
+        return lambda f: read(f) + (b"\n# changed\n" if f == root / name else b"")
+
+    for name, misses in (("lens.py", False), ("rtlsim.py", False), ("compiler.py", True)):
+        monkeypatch.setattr(PC, "_SRC", None)
+        monkeypatch.setattr(Path, "read_bytes", edited(name))
+        assert (PC.key(("spec", 512), ("gen", 1)) != k) == misses, name
+    monkeypatch.undo()
+    unkeyed = {u[:-3].replace("/", ".") for u in PC.UNKEYED}
+    allowed = {("runtime.py", "rtlsim")}
+    for f in PC.keyed():
+        rel = f.relative_to(root)
+        pkg = list(rel.parts[:-1])
+        for node in ast.walk(ast.parse(f.read_text())):
+            if isinstance(node, ast.Import):
+                mods = [a.name.split(".")[1:] for a in node.names if a.name.startswith("opentpu.")]
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module.split(".") if node.module else []
+                if node.level:
+                    mod = pkg[:len(pkg) - node.level + 1] + mod
+                elif mod[:1] == ["opentpu"]:
+                    mod = mod[1:]
+                else:
+                    continue
+                mods = [mod] + [mod + [a.name] for a in node.names]
+            else:
+                continue
+            for m in mods:
+                if ".".join(m) in unkeyed:
+                    assert (rel.as_posix(), ".".join(m)) in allowed, (rel.as_posix(), m)
+
+
 def test_engines_share_the_bucket_programs(tmp_path, monkeypatch):
     """A second engine of the layout in this process compiles none of the generate loop's and
     resident decode's bucket programs; after clear() (a new process) one reads them from the

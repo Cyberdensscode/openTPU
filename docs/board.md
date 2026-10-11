@@ -512,7 +512,8 @@ elements) in numpy on one core. Two changes since:
   through `imgcache.build`, keyed by the checkpoint (its files' names, sizes, modification times
   and safetensors headers), the layout (Spec, configuration, KV capacity, prefill rows, formats,
   lookup tables), the `OTPU_*` variables the sources read, the source of every module but
-  `opentpu/host` and the numpy and torch versions. A hit reads the image back with what the
+  `opentpu/host` and `progcache.UNKEYED` (the profilers, traces, reference math and RTL
+  simulation: an edit to `opentpu/lens.py` keeps the cache) and the numpy and torch versions. A hit reads the image back with what the
   build left for the host (an int8 embedding table kept on the host, Gemma 4's PLE records), and
   no weight is converted, hashed or quantized. An entry stores each slice's runs of nonzero
   4 KiB pages: the KV caches are not stored. The cache is `~/otpu-build/qcache/img` (beside

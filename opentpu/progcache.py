@@ -6,8 +6,9 @@ A program is a function of the image's layout and of what is compiled. The layou
 Spec, Config, KV capacity, batch, rows, attention block and image keywords (formats, lookup tables,
 expert slots, the image's own choices: Engine._image_kw). What is compiled is a tuple naming the
 program and its arguments (("gen", blocks, ...)). The key hashes both, the source of the compiler
-and the kernels (every module of opentpu but opentpu/host, and the host modules whose constants the
-programs take: HOST_KEYED) and the OTPU_* environment (some kernels read it, e.g. OTPU_FORMATS,
+and the kernels (every module of opentpu but opentpu/host and the tools that decide no program word
+or image byte (UNKEYED: the profilers, the traces, the reference math, the RTL simulation), and the
+host modules whose constants the programs take: HOST_KEYED) and the OTPU_* environment (some kernels read it, e.g. OTPU_FORMATS,
 OTPU_MLP_UNROLL_BODIES): any change misses.
 
 `get(layout, what, compile)` returns the cached value or compile()'s, which it keeps. A value is
@@ -54,6 +55,11 @@ RUNTIME_ENV = ("OTPU_PROG_CACHE", "OTPU_PROG_CACHE_GB", "OTPU_IMAGE_CACHE", "OTP
 # the host modules the compiler, kernels and models import: opentpu/host/offload.py's LINE, TAG,
 # RUN, Layout and RowLayout place the mailboxes, slots and tags the programs address
 HOST_KEYED = ("host/offload.py",)
+# the modules no image build or compile runs (a profile of opentpu.lens, a hardware trace, the
+# reference math, the RTL simulation a run takes): an edit to one keeps every cached program and
+# image (tests/test_progcache.py: no other module imports one, but runtime's RTL run)
+UNKEYED = ("hwtrace.py", "lens.py", "profile.py", "reference.py", "rtlsim.py", "simtmp.py",
+           "llm/rtl_backend.py")
 stats = {"memory": 0, "disk": 0, "compile": 0, "write": 0}
 _mem: dict = {}
 _SRC: str | None = None
@@ -76,12 +82,12 @@ def cache_dir() -> Path | None:
 
 
 def keyed() -> list[Path]:
-    """The modules source() hashes: every module of opentpu but opentpu/host (the compiler, the
-    kernels, the models' layouts and kernels), and HOST_KEYED."""
+    """The modules source() hashes: every module of opentpu but opentpu/host and UNKEYED (the
+    compiler, the kernels, the models' layouts and kernels), and HOST_KEYED."""
     root = Path(__file__).resolve().parent
-    return [f for f in sorted(root.rglob("*.py"))
-            if not f.relative_to(root).as_posix().startswith("host/")
-            or f.relative_to(root).as_posix() in HOST_KEYED]
+    rel = {f: f.relative_to(root).as_posix() for f in sorted(root.rglob("*.py"))}
+    return [f for f, r in rel.items()
+            if (not r.startswith("host/") and r not in UNKEYED) or r in HOST_KEYED]
 
 
 def source() -> str:
