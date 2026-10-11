@@ -6,9 +6,7 @@ others; a prompt sharing a prefix with another slot's context takes its pages by
 one sharing a saved context from the store; more requests than slots wait for one; a lone
 request in slot 0 runs the card's decode loop; stop strings and cancels end requests."""
 import dataclasses
-import threading
 
-import numpy as np
 import pytest
 
 from opentpu.llm.qwen3 import PREFILL_ROWS, Engine, device_config
@@ -150,7 +148,7 @@ def test_the_coming_steps_rows_are_told_ahead():
     for it in range(5):                         # the loop's feed runs, iteration by iteration
         b = w.budget
         while w.prefilling and b > 0:
-            b -= w._prefill_run(w.prefilling[0], b)
+            b -= w._prefill_run(w.prefilling[0])
         joined.append([r.slot for r in rs if r not in w.prefilling])
     assert joined == [[s1], [s1], [s1], [s1], [s1, s2]]
     assert eng.poss[s1] == 8 and eng.poss[s2] == 29

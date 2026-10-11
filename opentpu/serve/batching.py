@@ -57,6 +57,7 @@ class BatchWorker(SC.Worker):
         self.slot_dirty = [False] * B
         self.slot_used = [0.0] * B
         self.steps = BA.Steps(eng)
+        self.steps.warm()
         self.prefilling: list = []                # requests being fed, oldest first
         self.stats.update(steps=0, step_rows=0, step_runs=0, slot_copies=0, card_loops=0,
                           step_s=0.0)
@@ -89,7 +90,7 @@ class BatchWorker(SC.Worker):
                 self._ahead()
                 budget = self.budget
                 while self.prefilling and budget > 0:   # the oldest prompts, up to the budget
-                    budget -= self._prefill_run(self.prefilling[0], budget)
+                    budget -= self._prefill_run(self.prefilling[0])
                 dec = [r for r in self.running if r.finish is None and r.next is not None
                        and r not in self.prefilling]
                 if dec:
@@ -176,13 +177,13 @@ class BatchWorker(SC.Worker):
         self.stats["switch_s"] += time.perf_counter() - t0
 
     # ---- prefill and decode
-    def _prefill_run(self, r: SC.Request, budget: int) -> int:
-        """One feed run of r's prompt (up to MCOLS tokens, from a multiple of it on, at most
-        `budget`); the tokens fed."""
+    def _prefill_run(self, r: SC.Request) -> int:
+        """One feed run of r's prompt (up to MCOLS tokens, to the next multiple of it); the
+        tokens fed."""
         t0 = time.perf_counter()
         q = self.steps.feed_rows()
         p = self.eng.poss[r.slot]
-        part = r._feed[:min(q - p % q, budget)]
+        part = r._feed[:q - p % q]              # (a whole run: the budget may go over by less)
         self.steps.feed(r.slot, part)
         del r._feed[:len(part)]
         r.fed += part
@@ -207,13 +208,16 @@ class BatchWorker(SC.Worker):
                 rows.append((x.slot, len(x.fed) + k))
                 kinds.append(self.steps.kinds.get(x.slot) if x._bset else
                              BA.kind_of(self._samp(x)))
+        q = self.steps.feed_rows()
         left = [len(x._feed) for x in self.prefilling]
+        at = [self.eng.poss[x.slot] for x in self.prefilling]
         i = 0
         for it in range(k + 1):
             b = self.budget
-            while i < len(left) and b > 0:
-                n = min(left[i], b)
+            while i < len(left) and b > 0:      # (_prefill_run's runs)
+                n = min(left[i], q - at[i] % q)
                 left[i] -= n
+                at[i] += n
                 b -= n
                 if left[i] == 0:
                     x = self.prefilling[i]
@@ -230,7 +234,7 @@ class BatchWorker(SC.Worker):
             rows, kinds = self._rows_at(k)
             if not rows or any(p >= self.eng.cap for _, p in rows):
                 continue
-            if len(rows) == 1 and rows[0][0] == 0:
+            if len(rows) == 1 and rows[0][0] == 0 and not self.waiting and not self.prefilling:
                 continue                        # (the card's decode loop)
             self.steps.prefetch_rows(rows, kinds)
 

@@ -45,7 +45,7 @@ from ..compiler import Affine, CompileError, RunVar, Tensor, current, vt_tile
 from . import generate as G
 
 GREEDY = None
-LIVE = 16                       # live programs kept (row sets that may run again)
+LIVE = 64                       # live programs kept (row sets that may run again)
 PAD_AHEAD = 4                   # a padded group's own program: compiled for this many steps on
 FEED = "feed"                   # a row that only feeds its token (a prompt's): no LM head, no pick
 
@@ -262,7 +262,7 @@ class Steps:
         self._fit: dict = {}              # signature (kinds, buckets) -> the program fits IMEM
         self._ready: dict = {}            # key -> programs (compiled, not run yet)
         self._next: dict = {}             # key -> Future of its programs
-        # (slots, kinds) -> (positions at step 0, span, programs), the least recently used first
+        # (slots, kinds, positions at step 0) -> (span, programs), the least recently used first
         self._live: OrderedDict = OrderedDict()
         self._pool = None
         self._words = bool(getattr(eng.backend, "runs_words", False)) and eng.cfg.S == 1
@@ -436,7 +436,7 @@ class Steps:
             return
         if self._fit_of(self._sig(key)) is False:
             return
-        while len(self._next) > 8:               # (keys that never came)
+        while len(self._next) > 16:              # (keys that never came)
             self._next.pop(next(iter(self._next))).result()
         rows, kinds, n = key
         if eng._procs and eng._ready is not None and eng._ready.done():
@@ -454,17 +454,15 @@ class Steps:
         rows = tuple(grp)
         slots = tuple(s for s, _ in rows)
         kinds = tuple(self.kinds.get(s) for s in slots) if kinds is None else tuple(kinds)
-        live = self._live.get((slots, kinds))
-        if live is not None:
-            self._live.move_to_end((slots, kinds))
-        if live is None:
-            return None
-        base, n, progs = live
-        d = {p - b for (_, p), b in zip(rows, base)}
-        if len(d) != 1:
-            return None
-        t = d.pop()
-        return (progs, t) if 0 <= t < n else None
+        for k in reversed(list(self._live)):
+            if k[0] != slots or k[1] != kinds:
+                continue
+            n, progs = self._live[k]
+            d = {p - b for (_, p), b in zip(rows, k[2])}
+            if len(d) == 1 and 0 <= (t := d.pop()) < n:
+                self._live.move_to_end(k)
+                return progs, t
+        return None
 
     def _take(self, grp, kinds=None, adv: int = 1):
         """grp's programs and its step word: the live program's, or a new one made live (and
@@ -474,21 +472,33 @@ class Steps:
         if got is not None:
             self.timing["reused"] += 1
             return got
-        key = self._key(grp, kinds)
+        base = self._canon(grp, kinds)
+        key = self._key(base, kinds)
         progs = self._get(key)
         self.timing["programs"] += 1
         rows, kinds, n = key
         slots = tuple(s for s, _ in rows)
-        self._live[(slots, kinds)] = (tuple(p for _, p in rows), n, progs)
-        self._live.move_to_end((slots, kinds))
+        k = (slots, kinds, tuple(p for _, p in rows))
+        self._live[k] = (n, progs)
+        self._live.move_to_end(k)
         while len(self._live) > LIVE:
             self._live.popitem(last=False)
-        if n:
-            d = -(-n // adv) * adv
+        if n and (len(grp) == self.feed_rows() or any(k != FEED for k in kinds)):
+            d = -(-n // adv) * adv              # (not after a prompt's partial feed run)
             nxt = [(s, p + d) for s, p in rows]
             if all(p < self.eng.cap for _, p in nxt):
                 self._prefetch(self._key(nxt, kinds))
-        return progs, 0
+        return progs, grp[0][1] - rows[0][1]
+
+    def _canon(self, grp, kinds) -> list:
+        """The rows a new program for grp is compiled at: a feed run's from its attention
+        block's start plus its phase in feed_rows() (so that one program serves every prompt's
+        runs on that slot in that block), else grp's own positions."""
+        if not self.span_steps or kinds is None or any(k != FEED for k in kinds):
+            return list(grp)
+        blk, q, p = self.eng.block, self.feed_rows(), grp[0][1]
+        b = (p // blk) * blk + p % q
+        return [(s, b + j) for j, (s, _) in enumerate(grp)]
 
     def feed_rows(self) -> int:
         """Tokens a feed run takes: the MXU's columns (one pass of every weight)."""
@@ -510,10 +520,20 @@ class Steps:
             self._go(grp, (FEED,) * n, tokens[i:i + n], None, n)
             i += n
 
+    def warm(self) -> None:
+        """Compile in the background each slot's feed program of the first attention block
+        (every prompt's first runs; a server's first requests)."""
+        q, kinds = self.feed_rows(), (FEED,) * self.feed_rows()
+        for s in range(self.a["B"]):
+            self._prefetch(self._key([(s, j) for j in range(q)], kinds))
+
     def prefetch_feed(self, slot: int, p: int, n: int) -> None:
-        """Compile ahead the feed run of n tokens (< feed_rows()) at p: a prompt's last run."""
+        """Compile ahead the feed run of n tokens (< feed_rows()) at p: a prompt's last run
+        (unless a live program serves it)."""
         if 0 < n:
-            self._prefetch(self._key([(slot, p + j) for j in range(n)], (FEED,) * n))
+            grp, kinds = [(slot, p + j) for j in range(n)], (FEED,) * n
+            if self._serving(grp, kinds) is None:
+                self._prefetch(self._key(self._canon(grp, kinds), kinds))
 
     def _go(self, grp, kinds, toks, uni, adv, ahead_key=None):
         """One run of grp (its live program or a new one) with tokens toks, uniforms uni (or
@@ -569,7 +589,7 @@ class Steps:
             return None
         slots = {s for s, _ in grp}
         pos = dict(grp)
-        for (lslots, lkinds), (base, n, _) in reversed(list(self._live.items())):
+        for (lslots, lkinds, base), (n, _) in reversed(list(self._live.items())):
             extra = [s for s in lslots if s not in slots]
             if not extra or not slots <= set(lslots) or any(s not in free for s in extra):
                 continue

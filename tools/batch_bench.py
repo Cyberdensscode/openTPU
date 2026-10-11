@@ -203,9 +203,11 @@ def traced(eng, st, nxt, counts, khz, out) -> dict:
 
         def instrs(R=R):
             slots = tuple(range(R))
-            base, n, _ = st._live[(slots, tuple(st.kinds.get(s) for s in slots))]
-            return BA.compile_step(eng.image, st.a, list(zip(slots, base)),
-                                   [st.kinds.get(s) for s in slots], eng.block, n)
+            kinds = tuple(st.kinds.get(s) for s in slots)
+            base, n = next((k[2], v[0]) for k, v in reversed(list(st._live.items()))
+                           if k[:2] == (slots, kinds))  # (the program the traced run took)
+            return BA.compile_step(eng.image, st.a, list(zip(slots, base)), list(kinds),
+                                   eng.block, n)
         for s in range(R):
             st.set_sampling(s, None)
         stepR()                                         # (compiled, then traced)
