@@ -6,7 +6,8 @@
 #     LANES ACT_ROWS DSTEP S PLATFORM ARCH_HASH DDR_MTS
 # (run_vivado.sh takes them from the target, targets/bcu1525.toml; the RTL list below is
 # opentpu.target sources("bcu1525"): tests/test_target.py)
-# Environment: PCIE_LANES (bd.tcl), OTPU_FAST (development strategies), OTPU_IP_CACHE.
+# Environment: PCIE_LANES (bd.tcl), OTPU_FAST (development strategies), OTPU_IP_CACHE, OTPU_PART
+# (another part, for scripts/synth_check.tcl: without the VU9P's pin constraints).
 # The VU9P needs a Vivado license that covers it (not the free tier) and the Virtex UltraScale+
 # device files installed.
 
@@ -27,7 +28,8 @@ set PLATFORM [expr {[llength $argv] > 9 ? [lindex $argv 9] : 2}]
 set ARCH_HASH [expr {[llength $argv] > 10 ? [lindex $argv 10] : 0}]
 if {![regexp {^[0-9a-fA-F]{1,8}$} $ARCH_HASH]} { set ARCH_HASH 0 }
 set DDR_MTS [expr {[llength $argv] > 11 ? [lindex $argv 11] : 1600}]
-set PART xcvu9p-fsgd2104-2L-e
+set VU9P xcvu9p-fsgd2104-2L-e
+set PART [expr {[info exists ::env(OTPU_PART)] && $::env(OTPU_PART) ne "" ? $::env(OTPU_PART) : $VU9P}]
 if {$BUILD_ID eq ""} {
   if {[catch {exec git -C $root rev-parse HEAD} BUILD_ID]} { set BUILD_ID 0 }
   set BUILD_ID [string range $BUILD_ID 0 7]
@@ -81,7 +83,21 @@ set_property generic "S=$S MCOLS=$MCOLS ACT_ROWS=$ACT_ROWS VPU_CL=$VPU_CL LANES=
 # ---- constraints: the pins (scripts/gen_pins.py), the top's clocks and crossings; each DDR4
 # core's own (LiteX's false paths, by names inside the core: scoped to otpu_ld4)
 set cons $root/boards/bcu1525/constraints
-add_files -fileset constrs_1 -norecurse [concat [glob $cons/*.xdc] [list $ld/otpu_ld4.xdc]]
+set xdcs [glob $cons/*.xdc]
+if {$PART ne $VU9P} {                     ;# another package: the VU9P's pins do not exist there
+  set xdcs [lsearch -all -inline -not $xdcs *pins.xdc]
+  # but the clocks (and the PERST false path) stay: the top's and the IPs' timing constraints name them
+  set fi [open $cons/bcu1525_pins.xdc]
+  set fo [open $out/bcu1525_clocks.xdc w]
+  foreach l [split [read $fi] "\n"] {
+    if {[regexp {^(create_clock|set_false_path) } $l]} { puts $fo $l }
+  }
+  close $fi
+  close $fo
+  lappend xdcs $out/bcu1525_clocks.xdc
+  puts "part $PART: the VU9P's pin constraints left out (its clocks kept: $out/bcu1525_clocks.xdc)"
+}
+add_files -fileset constrs_1 -norecurse [concat $xdcs [list $ld/otpu_ld4.xdc]]
 set_property SCOPED_TO_REF otpu_ld4 [get_files $ld/otpu_ld4.xdc]
 # TMEM_URAM=1 (environment, run_vivado.sh): the TMEM copies in UltraRAM (a synthesis property:
 # vivado/tmem_uram.xdc)

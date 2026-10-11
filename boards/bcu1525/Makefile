@@ -9,6 +9,8 @@
 #                   core.json's packages; RVSHIM: a directory whose riscv64-unknown-elf-* work)
 #   make ipcheck    the block design and the DDR4 core in Vivado on PART (any UltraScale+ part with a
 #                   PCIE4 block: the free tier's xcku5p-ffvb676-2-e until a VU9P license exists)
+#   make synthcheck the whole project synthesized on PART (scripts/synth_check.tcl: the top against
+#                   the generated block design wrapper, the DSP48E2 mapping, Vivado's utilization)
 #   make bit        Vivado batch build (S, MCOLS, CORE_MHZ=100, PCIE_LANES=16, FAST=1: run_vivado.sh)
 #   make impl       rerun implementation on the existing project
 #   make program    JTAG load over the board's FT4232H (openFPGALoader -b vcu1525; BIT=path)
@@ -35,7 +37,7 @@ RTL := $(addprefix $(ROOT)/rtl/, vpu/otpu_fp.sv vpu/otpu_fpipe.sv top/otpu_pkg.s
 LINT := verilator --lint-only -Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNUSEDSIGNAL \
   -Wno-UNUSEDPARAM -DSYNTHESIS sim/unisim_dsp48e2_stub.sv sim/unisim_stubs.sv
 
-.PHONY: lint pins core ipcheck bit impl program flash
+.PHONY: lint pins core ipcheck synthcheck bit impl program flash
 lint:
 	python3 scripts/check_offline.py
 	$(LINT) --top-module otpu_fpga_top_bcu $(RTL) sim/otpu_bd_wrapper_stub.sv \
@@ -54,6 +56,10 @@ core:
 ipcheck:
 	vivado -mode batch -nojournal -log $(OUT)_ipcheck.log -source vivado/ip_check.tcl \
 	  -tclargs $(PART) $(OUT)_ipcheck $(IPCHECK_STEPS)
+
+synthcheck:
+	vivado -mode batch -nojournal -log $(OUT)_synthcheck.log -source scripts/synth_check.tcl \
+	  -tclargs $(PART) $(OUT)_synthcheck
 
 bit:
 	./run_vivado.sh
