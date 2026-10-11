@@ -67,6 +67,7 @@ class Request:
     stop_strs: tuple = ()
     at: int | None = None
     rid: str = ""
+    skip_special: bool = True         # the text without the tokenizer's special tokens
     # progress (the worker's)
     out: list = field(default_factory=list)
     text: str = ""
@@ -366,7 +367,7 @@ class Worker:
         r.next = t
         self.stats["generated"] += 1
         if r._detok is None:
-            r._detok = Detok(_Locked(self.tok, self.tok_lock))
+            r._detok = _Detok(_Locked(self.tok, self.tok_lock), r.skip_special)
         r.text += r._detok.add(t)
         cut = None
         for s in r.stop_strs:
@@ -472,6 +473,17 @@ class Worker:
         return {**q, **self.stats, "device_context": len(self.dev),
                 "kv_store": self.store.usage(), "prefix_cache": self.cache.usage(),
                 "kvio": dict(self.io.stats)}
+
+
+class _Detok(Detok):
+    """chat.Detok, the special tokens' text kept or skipped."""
+
+    def __init__(self, tok, skip: bool):
+        super().__init__(tok)
+        self.skip = skip
+
+    def _dec(self, ids) -> str:
+        return self.tok.decode(ids, skip_special_tokens=self.skip)
 
 
 class _Locked:
