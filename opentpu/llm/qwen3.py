@@ -2371,6 +2371,18 @@ class Engine:
         self.pos = t
         return t
 
+    def adopt(self, pos: int, seq: int = 0) -> None:
+        """Sequence `seq`'s KV caches and state were written from outside (the server's KV
+        store putting a saved context back, opentpu/serve/kvio.py): it continues from `pos`.
+        The snapshots, another context's, are dropped; precompiles in flight are waited for."""
+        if not 0 <= pos <= self.cap:
+            raise ValueError(f"position {pos} outside the KV cache (cap {self.cap})")
+        self._drain()
+        self.poss[seq] = pos
+        if self._snaps is not None and seq == 0:
+            self._snaps.at.clear()
+            self._snaps.host.clear()
+
     def step(self, token: int, on_start=None, sink=None) -> np.ndarray:
         """Feed one token at the next position; returns the logits [vocab] for the next one.
         on_start() is called once the device runs (host work that can overlap the run: the
