@@ -61,7 +61,8 @@ class BlobStore:
         with self.lock:
             return key in self.ram or key in self.spilling or key in self.disk
 
-    def put(self, key: str, data: np.ndarray) -> None:
+    def put(self, key: str, data: np.ndarray, durable: bool = False) -> None:
+        """durable: on disk too as soon as the writer gets to it (kept in RAM)."""
         data = np.ascontiguousarray(data).view(np.uint8).reshape(-1)
         with self.lock:
             if key in self.ram:
@@ -69,7 +70,20 @@ class BlobStore:
             self.ram[key] = data
             self.ram_used += len(data)
             self.stats["put"] += 1
+            if durable and self._q is not None and key not in self.disk:
+                self._q.put(("copy", key))
             self._evict_ram()
+
+    def persist(self) -> None:
+        """Every blob onto disk (a server's shutdown: a later one finds them), as the disk's
+        budget allows, most recently used last."""
+        if self._q is None:
+            return
+        with self.lock:
+            for k in self.ram:
+                if k not in self.disk:
+                    self._q.put(("copy", k))
+        self.flush()
 
     def get(self, key: str) -> np.ndarray | None:
         with self.lock:
@@ -160,15 +174,30 @@ class BlobStore:
             elif self.dir is not None and len(data) <= self.disk_bytes:
                 self.spilling[key] = data           # written by the writer thread
                 self.spill_used += len(data)
-                self._q.put(key)
+                self._q.put(("spill", key))
                 self.stats["spilled"] += 1
             else:
                 self._dropped(key)
 
     def _writer(self) -> None:
         while True:
-            key = self._q.get()
+            how, key = self._q.get()
             try:
+                if how == "copy":                   # a RAM blob's file (it stays in RAM)
+                    with self.lock:
+                        data = self.ram.get(key)
+                    if data is not None and key not in self.disk:
+                        tmp = self.dir / f".{key}.tmp"
+                        data.tofile(tmp)
+                        os.replace(tmp, self._path(key))
+                        with self.lock:
+                            if key in self.ram and key not in self.disk:
+                                self.disk[key] = len(data)
+                                self.disk_used += len(data)
+                                self._evict_disk()
+                            elif key not in self.disk:
+                                self._unlink(key)
+                    continue
                 with self.lock:
                     data = self.spilling.get(key)
                 if data is not None:
@@ -357,9 +386,10 @@ class PrefixCache:
                 self._remove(next(iter(self.entries.values())))
         return e
 
-    def restore(self, io, match: Match) -> int:
+    def restore(self, io, match: Match, have: int = 0) -> int:
         """Write the pages (and state) of match.entry for its first match.k tokens into the
-        device's caches; returns k (0: nothing restored, a blob gone)."""
+        device's caches, but the whole pages within its first `have` positions (the device
+        holds those tokens there already); returns k (0: nothing restored, a blob gone)."""
         e, k = match.entry, match.k
         if e is None or k == 0:
             return 0
@@ -367,7 +397,7 @@ class PrefixCache:
         need = -(-k // P)
         writes = []
         with self.lock:
-            for i in range(need):
+            for i in range(min(have, k) // P, need):
                 if i < len(e.pages):
                     d = self.store.get(e.pages[i])
                     if d is None:
@@ -449,7 +479,7 @@ class PrefixCache:
         meta = json.dumps({"pages": e.pages, "tail": e.tail, "m": e.m}).encode()
         rec = np.frombuffer(len(meta).to_bytes(8, "little") + meta + _tok_bytes(e.tokens),
                             np.uint8)
-        self.store.put(e.key, rec)
+        self.store.put(e.key, rec, durable=True)
 
     def _load(self) -> None:
         """Entries an earlier server saved on disk (whose blobs are all still there)."""
