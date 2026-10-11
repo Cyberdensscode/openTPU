@@ -417,8 +417,7 @@ class Worker:
             t = r.next
             if card:
                 def stop() -> bool:
-                    return (r.finish is not None or r.cancelled.is_set()
-                            or (self._others(r) and len(r.out) - k0 >= self.quantum))
+                    return r.finish is not None or r.cancelled.is_set() or self._yield(r, k0)
                 r.fed.append(t)
                 got = eng.generate_card(t, n, stop_ids=sorted(r.stop_ids),
                                         on_token=lambda x: self._emit(r, x), stop=stop,
@@ -441,9 +440,17 @@ class Worker:
                         break
             if eng.pos != len(r.fed):
                 raise RuntimeError(f"the device is at {eng.pos}, the context has {len(r.fed)}")
-            if self._others(r) and len(r.out) - k0 >= self.quantum:
+            if self._yield(r, k0):
                 break
         self.stats["decode_s"] += time.perf_counter() - t0
+
+    def _yield(self, r: Request, k0: int) -> bool:
+        """r's turn ends: a new request can start (its prefill first: time to first token), or
+        r has decoded its quantum while others run."""
+        done = len(r.out) - k0
+        if self.waiting and len(self.running) < self.max_running and done > 0:
+            return True
+        return self._others(r) and done >= self.quantum
 
     def _end(self, r: Request, why: str) -> None:
         with self.cv:
