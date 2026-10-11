@@ -64,6 +64,7 @@ class BatchWorker(SC.Worker):
     # ---- the loop
     def _loop(self) -> None:
         while True:
+            self._trim()
             with self.cv:
                 while not self._stop and not self.waiting and not self.running:
                     self.cv.wait()

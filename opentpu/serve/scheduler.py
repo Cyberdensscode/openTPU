@@ -37,6 +37,7 @@ from ..llm import generate as G
 from . import kvio as KV
 from . import store as ST
 
+STATS_KEEP = 1024       # the engine's per-run stats kept
 QUANTUM = 32            # tokens a running request decodes per turn while others wait
 CHUNK = 64              # tokens per decode run on a backend that does not poll stop() mid-run
 
@@ -196,8 +197,16 @@ class Worker:
             return len(self.waiting) + len(self.running)
 
     # ---- the loop
+    def _trim(self) -> None:
+        """The engine's per-run stats, the last STATS_KEEP (a server runs for days; between
+        iterations, so no engine call is slicing them)."""
+        st = getattr(self.eng, "stats", None)
+        if isinstance(st, list) and len(st) > 4 * STATS_KEEP:
+            del st[:-STATS_KEEP]
+
     def _loop(self) -> None:
         while True:
+            self._trim()
             with self.cv:
                 while not self._stop and not self.waiting and not self.running:
                     self.cv.wait()
