@@ -56,11 +56,13 @@ outside. Two clock figures: **register to register** (`report_clock_min_period`:
 and **with the ports** (the worst slack including the paths into and out of the block's ports,
 whose budget is a guess until the platform around the block exists). Power is OpenSTA's vectorless
 estimate (default activities) at 400 MHz. `tools/asic/flow.py report` and `tools/asic/paths.py`
-make these numbers from a run.
+make these numbers from a run. nangate45-small is the reference point: the same run with a native
+ORFS of the same date (f395e4b6, OpenROAD 26Q4-110-g91e5f5ff2f) gives the same within the tools'
+noise (422 / 341 MHz, 0.79 W, 0 DRC), and its reports are in `asic/nangate45/results/small/`.
 
 | | nangate45-small | nangate45 (the card's arch) |
 |---|---|---|
-| stage | routed, final report (signoff extraction) | CTS (global routing ran out of memory: 24 GB peak, Docker's VM has 23.4) |
+| stage | routed, final report (signoff extraction) | CTS; global routing ends congested (below) |
 | die | 2.65 x 2.65 mm = 7.02 mm² | 5.53 x 5.53 mm = 30.6 mm² |
 | standard cells | 1.18 mm², 590 K instances (20.8% of the core): 94 K flip-flops 0.43 mm², 373 K gates 0.66 mm² | 4.36 mm², 2.02 M instances (18.3% of the core; 1.76 M after synthesis) |
 | macros | 27, 233 KiB, 1.31 mm² | 113, 1126 KiB, 6.62 mm² |
@@ -91,10 +93,19 @@ is then the card's limit, as it is the small point's second: on a 30 mm² die it
 stages' own logic still meets 2.5 ns on the card (fmul s1 -> s2 +0.76 ns, s2 -> the next s1
 +0.46, fadd s1 -> s2 +0.95, s2 -> s3 +0.92), while every path into them fails through the
 enable (-1.31 to -1.38 ns, 57-65 levels from the DMA's `fs_k`, `ds_fill`, `pl`); the stage-class
-report stopped there (the container's memory). Next for
-the card: balance the macro clock tree (CTS options, the macros'
-placement next to their muxes), a denser floorplan (35% leaves 5.5 mm of die for 10.7 mm² of
-cells and macros), and Docker with more than 24 GB for global routing.
+report stopped there (the container's memory).
+
+**The card's global routing** (native ORFS, 62 GB) ends congested: GRT-0116 after its 30
+congestion iterations, 176 K overflow left and not shrinking, 4 h 22 min at a 31.7 GB peak; the
+whole run took 7 hours to there. The macro placer packs the ACT RAM's 32 macros (128 x 128,
+136 x 137 um, about 270 pins on one edge each) into the die's bottom-left corner, 0.6 x 1.1 mm with
+60 um channels, and the ACT RAM's 4096-bit read data (`act_rdata`) and its own mux nets cannot
+leave it: the overflow is there. Global placement saw it coming (routability mode: "could not
+reach target", weighted congestion 1.60). Next for the card: a floorplan that spreads the ACT
+macros or faces their pins outward (wider channels and halos, the macro placer's boundary weight,
+or placed macros), balance the macro clock tree (CTS options, the macros' placement next to their
+muxes), and a denser floorplan (35% leaves 5.5 mm of die for 10.7 mm² of cells and macros). For
+now nangate45-small is the ASIC reference; the card's point is the stress case.
 
 The final power-grid check failed on one row segment (PSM-0069: 26 um boxed in by macros,
 narrower than the M4 straps' pitch, its rails unconnected; 14 cells); the run finished with the
@@ -180,3 +191,4 @@ clock on the operator) pays once those are fixed, from about 540 MHz.
 - The macros are CACTI-fitted estimates (`tools/asic/fakeram.py`), not a compiler's; a real PDK's
   1R1W macros (IHP SG13G2, commercial) replace them through `rtl/tech/asic`'s leaves.
 - Power is vectorless; a VCD from the Verilator RTL (a decode token) would give real activities.
+- **The card's floorplan**: its global routing ends congested around the ACT RAM's macros (above).
