@@ -25,6 +25,7 @@ the decode loop's (generate.reference_pick on the logits with the same uniform).
 """
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -78,8 +79,7 @@ def kind_of(samp) -> tuple | None:
 
 @ol.jit
 def batch_step(m, rows, kinds, block: int, area: dict):
-    from .qwen3 import _attention_rows, _embed_word, _layers, _lm_head_rows, _mlp, \
-        head_rows_chunk
+    from .qwen3 import _attention_rows, _embed_word, _layers, _mlp, head_rows_chunk
     b = current()
     spec, R = m.spec, len(rows)
     if R > area["B"]:
@@ -101,7 +101,7 @@ def batch_step(m, rows, kinds, block: int, area: dict):
         x.set(_mlp(x, lw, spec))
     del c, s_
     # the sinks: one per row
-    chunk = head_rows_chunk(R)
+    chunk = area.get("chunk") or head_rows_chunk(R)
     g0 = m.gen
     uni = Tensor(area["uni"], (area["B"],), (1,))
     consts, sts, sinks = {}, [], []
@@ -120,9 +120,7 @@ def batch_step(m, rows, kinds, block: int, area: dict):
                                   "pb": area["pb"][slot]}, uni=uni, iota=g0.iota)
         sinks.append(G.Sampler(b, m, g, samp, st, None, consts[kind], u_at=r))
         sts.append(st)
-    m.lm_sinks = sinks
-    _lm_head_rows(x, m, spec, list(range(R)))
-    m.lm_sinks = None
+    _head(x, m, spec, sinks, chunk)
     del x
     for r, sk in enumerate(sinks):
         t = sk.token()
@@ -130,6 +128,20 @@ def batch_step(m, rows, kinds, block: int, area: dict):
         if kinds[r] is not GREEDY:
             sk.after(t)
         del t
+
+
+def _head(x, m, spec, sinks, chunk: int) -> None:
+    """The final norm and this slice's LM head rows for every row of x, each chunk's logits
+    handed to every row's sink (qwen3._lm_head_rows with the chunk given)."""
+    from ..kernels.lib import rmsnorm
+    sid = ol.program_id()
+    xs = ol.quantize(rmsnorm(x, ol.load(m.g_final), spec.eps))
+    for c0 in range(0, m.v_loc, chunk):
+        n = min(chunk, m.v_loc - c0)
+        y = ol.dot(xs, m.head[c0:c0 + n, :])
+        for r, sk in enumerate(sinks):
+            sk(y[r:r + 1, :], sid * m.v_loc + c0)
+        del y
 
 
 class _Key:
@@ -174,6 +186,9 @@ class Steps:
         self._next = None                 # (key, Future)
         self._pool = None
         self.runs = 0
+        # where a step's time goes: device cycles, the host's waits for programs (compiles
+        # not ready), the whole runs
+        self.timing = {"cycles": 0, "compile_wait_s": 0.0, "compiled_inline": 0, "run_s": 0.0}
 
     def set_sampling(self, slot: int, samp, context=()) -> None:
         """Slot `slot` picks greedily (samp None) or with samp (generate.Sampling): its state
@@ -236,13 +251,18 @@ class Steps:
     def _program(self, key):
         if key in self._ready:
             return self._ready.pop(key)
+        t0 = time.perf_counter()
         nxt, self._next = self._next, None
-        if nxt is not None:
-            k, fut = nxt
-            res = fut.result()
-            if k == key:
-                return res
-        return self._compile(key)
+        try:
+            if nxt is not None:
+                k, fut = nxt
+                res = fut.result()
+                if k == key:
+                    return res
+            self.timing["compiled_inline"] += 1
+            return self._compile(key)
+        finally:
+            self.timing["compile_wait_s"] += time.perf_counter() - t0
 
     def _prefetch(self, key) -> None:
         eng = self.eng
@@ -299,6 +319,7 @@ class Steps:
                         ahead_key = k1
                     elif self._fit.get(self._sig(k1)) is False:
                         ahead_key = self._key(self.plan(nxt_rows)[0])
+            t0 = time.perf_counter()
             start = getattr(eng.backend, "start", None)
             if start is not None:
                 start(progs)
@@ -307,6 +328,8 @@ class Steps:
             else:
                 st = eng.backend.run(progs)
                 self._prefetch(ahead_key)
+            self.timing["run_s"] += time.perf_counter() - t0
+            self.timing["cycles"] += int((st or {}).get("cycles") or 0)
             eng.stats.append(dict(st or {}, rows=len(grp)))
             self.runs += 1
             got = eng.backend.read(0, a["tout"], 4 * len(grp)).view(np.float32)

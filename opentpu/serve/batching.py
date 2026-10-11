@@ -295,6 +295,11 @@ class BatchWorker(SC.Worker):
 
     def usage(self) -> dict:
         u = super().usage()
+        tm = dict(self.steps.timing)
+        khz = (getattr(self.eng.backend, "info", None) or {}).get("core_khz")
+        if khz:
+            tm["device_s"] = round(tm["cycles"] / (khz * 1e3), 3)
+        u["step_timing"] = tm
         u["slots"] = [{"slot": s, "context": len(self.slot_dev[s]),
                        "request": getattr(self.slot_req[s], "rid", None)}
                       for s in range(self.B)]
