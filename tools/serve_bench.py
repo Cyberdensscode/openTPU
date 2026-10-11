@@ -119,13 +119,14 @@ def correctness(cl: Client, n: int, max_tokens: int) -> dict:
     return out
 
 
-def throughput(cl: Client, level: int, max_tokens: int) -> dict:
+def throughput(cl: Client, level: int, max_tokens: int, sampled: bool = False) -> dict:
+    """level clients at once; greedy, or sampled with the model's defaults (seeded)."""
     res = [None] * level
 
     def run(i):
         q = QUESTIONS[i % len(QUESTIONS)] + f" (client {i})"
-        res[i] = cl.chat_stream(_msgs(q), max_tokens=max_tokens, temperature=0,
-                                ignore_eos=True)
+        kw = {"seed": i} if sampled else {"temperature": 0}
+        res[i] = cl.chat_stream(_msgs(q), max_tokens=max_tokens, ignore_eos=True, **kw)
     t0 = time.perf_counter()
     ts = [threading.Thread(target=run, args=(i,)) for i in range(level)]
     for t in ts:
@@ -137,7 +138,7 @@ def throughput(cl: Client, level: int, max_tokens: int) -> dict:
     ttft = [r["ttft"] for r in res if r["ttft"] is not None]
     rates = [((r["usage"] or {}).get("completion_tokens", 1) - 1) / r["decode_s"]
              for r in res if r["decode_s"] > 0]
-    return {"clients": level, "wall_s": round(wall, 2), "generated": gen,
+    return {"clients": level, "sampled": sampled, "wall_s": round(wall, 2), "generated": gen,
             "aggregate_tok_s": round(gen / wall, 2),
             "ttft_s": {"min": round(min(ttft), 3), "median": round(statistics.median(ttft), 3),
                        "max": round(max(ttft), 3)},
@@ -174,6 +175,8 @@ def main(argv=None):
     ap.add_argument("--check-prompts", type=int, default=4)
     ap.add_argument("--check-tokens", type=int, default=48)
     ap.add_argument("--levels", default="1,2,4,8")
+    ap.add_argument("--sampled-levels", default="8",
+                    help="levels run again with the model's sampling (seeded)")
     ap.add_argument("--turns", type=int, default=4)
     ap.add_argument("--wait", type=float, default=900, help="seconds to wait for /health")
     ap.add_argument("--out")
@@ -198,8 +201,9 @@ def main(argv=None):
               {k: v for k, v in rep["check"].items() if k != "solo"}, flush=True)
     if "throughput" not in skip:
         rep["throughput"] = []
-        for lv in [int(x) for x in a.levels.split(",") if x]:
-            x = throughput(cl, lv, a.max_tokens)
+        for lv, smp in [(int(x), False) for x in a.levels.split(",") if x] + \
+                [(int(x), True) for x in a.sampled_levels.split(",") if x]:
+            x = throughput(cl, lv, a.max_tokens, smp)
             rep["throughput"].append(x)
             print("throughput:", x, flush=True)
     if "conversation" not in skip:
