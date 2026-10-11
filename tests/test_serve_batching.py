@@ -127,28 +127,38 @@ def test_stop_strings_and_cancel_in_slots():
         w.stop()
 
 
-def test_the_coming_steps_rows_are_told_ahead():
-    """_rows_at: with a feed budget of 8 tokens an iteration, prompts of 9 and 30 tokens (8 and
-    29 fed in feed runs, their last tokens in steps) join the steps in iterations 0 and 4, each
-    row one position on per iteration; then the feed runs give exactly that."""
+@pytest.mark.parametrize("mixed", [False, True])
+def test_the_coming_steps_rows_are_told_ahead(mixed):
+    """_rows_at: prompts of 9 and 30 tokens with a feed budget of 8 an iteration. The first is
+    fed by the budget in iteration 0 and decodes in its step; the second is then fed by the
+    budget (8 tokens an iteration), or with mixed runs rides that step's spare rows (MCOLS - 1
+    tokens each), and decodes from the step after its last. The rows predicted at the start
+    are the rows each iteration's step takes."""
     eng, W, spec, cfg1 = _setup()
-    w = BW.BatchWorker(eng, _Tok(), prefill_budget=8)
+    w = BW.BatchWorker(eng, _Tok(), prefill_budget=8, mixed=mixed)
     ps = _prompts(9, [9, 30])
     rs = [SC.Request(p, max_new=20, sampling=SC.Sampling(0.0, 0, 1.0, 1.0, None),
                      stop_ids=frozenset({-1})) for p in ps]
     for r in rs:
         w.running.append(r)
         w._bind(r)
-    s1, s2 = rs[0].slot, rs[1].slot
-    assert w._rows_at(0) == ([(s1, 8)], [None])
-    assert w._rows_at(1)[0] == [(s1, 9)]
-    assert w._rows_at(3)[0] == [(s1, 11)]
-    assert w._rows_at(4)[0] == sorted([(s1, 12), (s2, 29)])
-    joined = []
-    for it in range(5):                         # the loop's feed runs, iteration by iteration
-        b = w.budget
-        while w.prefilling and b > 0:
-            b -= w._prefill_run(w.prefilling[0])
-        joined.append([r.slot for r in rs if r not in w.prefilling])
-    assert joined == [[s1], [s1], [s1], [s1], [s1, s2]]
-    assert eng.poss[s1] == 8 and eng.poss[s2] == 29
+    q = w.steps.feed_rows()
+    if mixed:                                   # iterations until the second decodes
+        n = 1 + -(-(len(ps[1]) - 1) // (q - 1))
+    else:
+        n = -(-(len(ps[1]) - 1) // w.budget)
+    pred = {k: w._rows_at(k)[0] for k in range(n + 1)}
+    seen = []
+    run, mix = w.steps.run, w.steps.mixed
+    w.steps.run = lambda rows, *a, **k: (seen.append(list(rows)), run(rows, *a, **k))[1]
+    w.steps.mixed = lambda rows, *a, **k: (seen.append(list(rows)), mix(rows, *a, **k))[1]
+    for it in range(n + 1):                     # the loop's body
+        m = w._mixed_step() if w.prefilling and w.mixed else "no"
+        if m != "ran":
+            b = w.budget if m == "no" else 1
+            while w.prefilling and b > 0:
+                b -= w._prefill_run(w.prefilling[0])
+            w._decode_step(w._decoding())
+    assert seen == [pred[k] for k in range(n + 1)]
+    assert seen[-1] == sorted([(rs[0].slot, 8 + n), (rs[1].slot, 29)])
+

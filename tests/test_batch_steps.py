@@ -293,3 +293,38 @@ def test_a_leaving_rows_slot_pads_until_the_new_program():
             want.append(int(np.argmax(lg)))
             lg = e.step(want[-1])
         assert got[s] == want, s
+
+
+def test_mixed_runs_feed_a_prompt_beside_decoding_rows():
+    """Decoding rows and a prompt's feed rows in one run (two run-time values: the decoding
+    rows advance one a run, the feed rows k): the decoding rows' tokens are their decodes, the
+    fed prompt's last token then picks its greedy decode; one program serves the prompt's runs
+    (its feed rows compiled at their block's start)."""
+    eng, single, spec = _engines()
+    st = BA.Steps(eng)
+    ps = _prompts(11, [13, 9, 23])
+    got = {}
+    for s in (0, 1):
+        got[s] = [int(np.argmax(eng.prefill(ps[s], seq=s)))]
+        st.set_sampling(s, None)
+    st.set_sampling(2, None)
+    feed = list(ps[2][:-1])                     # slot 2's prompt, 2 tokens a run beside them
+    p0 = st.timing["programs"]
+    while feed:
+        k = min(2, len(feed))
+        rows = [(s, eng.poss[s]) for s in (0, 1)]
+        assert st.mixed_ready(rows, 2, k)
+        out = st.mixed(rows, [got[0][-1], got[1][-1]], None, 2, feed[:k])
+        del feed[:k]
+        for s, t in zip((0, 1), out):
+            got[s].append(t)
+    assert eng.poss[2] == len(ps[2]) - 1
+    assert st.timing["programs"] - p0 == 1, st.timing     # 11 runs of 2 tokens, one program
+    got[2] = [st.run([(2, eng.poss[2])], [ps[2][-1]])[0]]
+    for s, p in enumerate(ps):
+        e = single()
+        lg, want = e.prefill(p), []
+        for _ in range(len(got[s])):
+            want.append(int(np.argmax(lg)))
+            lg = e.step(want[-1])
+        assert got[s] == want, s

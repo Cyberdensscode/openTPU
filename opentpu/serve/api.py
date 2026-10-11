@@ -715,6 +715,10 @@ def main(argv=None):
                     help="batched slots: prompt tokens fed per iteration, between decode steps "
                          "(more: shorter time to first token, longer pauses of the decoding "
                          "requests)")
+    ap.add_argument("--mixed", action="store_true",
+                    help="batched slots: feed a prompt in the spare rows of the decoding "
+                         "requests' steps too (shorter worst pauses; on the card longer "
+                         "typical ones and time to first token: docs/serve.md)")
     ap.add_argument("--quantum", type=int, default=SC.QUANTUM,
                     help="tokens a request decodes per turn while others wait")
     ap.add_argument("--max-queue", type=int, default=256)
@@ -749,7 +753,7 @@ def _main(a):
     from .batching import BatchWorker, batches
     if batches(eng):
         w = BatchWorker(eng, tok, store=store, model_key=mk, quantum=a.quantum,
-                        prefill_budget=a.chunked_prefill_size).start()
+                        prefill_budget=a.chunked_prefill_size, mixed=a.mixed).start()
     else:
         w = SC.Worker(eng, tok, store=store, model_key=mk, max_running=a.max_running,
                       quantum=a.quantum).start()

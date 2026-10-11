@@ -63,7 +63,7 @@ def alloc(image, cfg, B: int, base: int) -> dict:
         x = o
         o = -(-(o + n) // 128) * 128
         return x
-    io = take(4 * (2 * R + 1))              # the host's words: one write per run
+    io = take(4 * (2 * R + 2))              # the host's words: one write per run
     a["io"], a["tin"], a["uni"], a["step"] = io, io, io + 4 * R, io + 8 * R
     a["tout"] = take(4 * R)
     a["st"] = [take(4 * G.STATE_WORDS) for _ in range(B)]
@@ -93,22 +93,51 @@ def kind_of(samp) -> tuple | None:
     return None if samp is None else samp.key
 
 
-def step_rows(rows, span: int, block: int, zmask: int, cap: int) -> list:
+def _mixed(kinds) -> bool:
+    """Feed rows beside picking ones (a run with two run-time values)."""
+    return any(k == FEED for k in kinds) and any(k != FEED for k in kinds)
+
+
+def _offsets(rows, base, kinds, n):
+    """The run-time value(s) a program compiled at `base` with span n serves rows at: t (all
+    rows at base + t, t < n), or with n = (span, feed span) (t, f): the picking rows at
+    base + t, the feed rows at base + f; None if it does not."""
+    if not isinstance(n, tuple):
+        d = {p - b for (_, p), b in zip(rows, base)}
+        t = d.pop() if len(d) == 1 else -1
+        return t if 0 <= t < n else None
+    out = []
+    for feed, m in ((False, n[0]), (True, n[1])):
+        d = {p - b for (_, p), b, k in zip(rows, base, kinds) if (k == FEED) == feed}
+        t = d.pop() if len(d) == 1 else -1
+        if not 0 <= t < m:
+            return None
+        out.append(t)
+    return tuple(out)
+
+
+def step_rows(rows, span, block: int, zmask: int, cap: int, kinds=None) -> list:
     """rows [(slot, position)] at step 0 -> [(slot, qwen3.RunPos)] at position + t, t the
     run-time step below span, one RunVar for every row (each row's bucket: the blocks up to
-    its position's, the last one masked at position + t, as RunPos's)."""
+    its position's, the last one masked at position + t, as RunPos's). span (n, m) with kinds:
+    the picking rows' t below n, the feed rows' own run-time value f below m (a mixed run:
+    the rows advance at their own rates)."""
     from ..kernels.attention import Bucket
     from .qwen3 import RunPos
-    t = RunVar("tpos", bound=span)
+    n, m = span if isinstance(span, tuple) else (span, span)
+    t = RunVar("tpos", bound=n)
+    f = RunVar("fpos", bound=m) if isinstance(span, tuple) else t
     out = []
-    for s, p in rows:
+    for i, (s, p) in enumerate(rows):
+        feed = kinds is not None and kinds[i] == FEED
+        v, span = (f, m) if feed else (t, n)
         if (p % block) + span > block:
             raise CompileError(f"position {p} + {span} steps crosses an attention block")
         rp = object.__new__(RunPos)
         rp.blocks, rp.block, rp.lo = p // block + 1, block, p
         rp.t0 = (rp.blocks - 1) * block
-        rp.tpos, rp.pos = t + (p - rp.t0), t + p
-        rp.bucket = Bucket(rp.blocks, Affine(zmask + 4 * (cap - 1 - p)) + t * -4)
+        rp.tpos, rp.pos = v + (p - rp.t0), v + p
+        rp.bucket = Bucket(rp.blocks, Affine(zmask + 4 * (cap - 1 - p)) + v * -4)
         out.append((s, rp))
     return out
 
@@ -125,11 +154,11 @@ def batch_step(m, rows, kinds, block: int, area: dict, span: int = 0):
         if s in last and (last[s][0] != p - 1 or last[s][1] != FEED):    # the last feed
             raise CompileError(f"slot {s}: rows at consecutive positions, only its last picks")
         last[s] = (p, kind)
-    if span:                                    # the run's step: a TMEM word for the RLDs
-        rows = step_rows(rows, span, block, area["zmask"], area["cap"])
-        stw = ol.load(Tensor(area["step"], (1,), (1,)))
+    if span:                                    # the run's step: TMEM words for the RLDs
+        rows = step_rows(rows, span, block, area["zmask"], area["cap"], kinds)
+        stw = ol.load(Tensor(area["step"], (2,), (1,)))
         at = b.stack[-1][-1]
-        b.run_words = {"tpos": stw.base}
+        b.run_words = {"tpos": stw.base, "fpos": stw.base + 1}
     x = ol.empty([R, m.xr.shape[1]], dense=True)
     c = ol.empty([R, m.cosr.shape[1]], dense=True)
     s_ = ol.empty([R, m.sinr.shape[1]], dense=True)
@@ -308,12 +337,16 @@ class Steps:
     def _key(self, rows, kinds=None):
         rows = tuple((int(s), int(p)) for s, p in rows)
         kinds = tuple(self.kinds.get(s) for s, _ in rows) if kinds is None else tuple(kinds)
+        if _mixed(kinds) and self.span_steps:   # (the picking rows' span, the feed rows')
+            return rows, kinds, (self.span([r for r, k in zip(rows, kinds) if k != FEED]),
+                                 self.span([r for r, k in zip(rows, kinds) if k == FEED]))
         return rows, kinds, self.span(rows)
 
     def _sig(self, key):
         rows, kinds, n = key
         blk = self.eng.block
-        return tuple(sorted(zip(map(repr, kinds), (p // blk for _, p in rows)))), bool(n)
+        return (tuple(sorted(zip(map(repr, kinds), (p // blk for _, p in rows)))),
+                2 if isinstance(n, tuple) else bool(n))
 
     def _compile(self, key):
         rows, kinds, n = key
@@ -458,22 +491,35 @@ class Steps:
             if k[0] != slots or k[1] != kinds:
                 continue
             n, progs = self._live[k]
-            d = {p - b for (_, p), b in zip(rows, k[2])}
-            if len(d) == 1 and 0 <= (t := d.pop()) < n:
+            t = _offsets(rows, k[2], kinds, n)
+            if t is not None:
                 self._live.move_to_end(k)
                 return progs, t
         return None
 
+    def _coming(self, grp, kinds):
+        """A program compiled or compiling (not live yet) that serves grp at some offset: its
+        key, or None (the latest first)."""
+        slots = tuple(s for s, _ in grp)
+        kinds = tuple(self.kinds.get(s) for s in slots) if kinds is None else tuple(kinds)
+        for key in list(self._ready)[::-1] + list(self._next)[::-1]:
+            rows, kk, n = key
+            if kk == kinds and tuple(s for s, _ in rows) == slots and n and \
+                    _offsets(tuple(grp), tuple(p for _, p in rows), kinds, n) is not None:
+                return key
+        return None
+
     def _take(self, grp, kinds=None, adv: int = 1):
-        """grp's programs and its step word: the live program's, or a new one made live (and
-        its successor compiled ahead: each row where the program's span ends, the rows
-        advancing `adv` positions a run)."""
+        """grp's programs and its step word: the live program's, or a new one made live (one
+        compiled ahead that serves grp, else grp's own; and its successor compiled ahead:
+        each row where the program's span ends, the rows advancing `adv` positions a run)."""
         got = self._serving(grp, kinds)
         if got is not None:
             self.timing["reused"] += 1
             return got
-        base = self._canon(grp, kinds)
-        key = self._key(base, kinds)
+        key = self._coming(grp, kinds)
+        if key is None:
+            key = self._key(self._canon(grp, kinds), kinds)
         progs = self._get(key)
         self.timing["programs"] += 1
         rows, kinds, n = key
@@ -483,6 +529,8 @@ class Steps:
         self._live.move_to_end(k)
         while len(self._live) > LIVE:
             self._live.popitem(last=False)
+        if isinstance(n, tuple):                # (a mixed run's: no successor)
+            return progs, _offsets(tuple(grp), tuple(p for _, p in rows), kinds, n)
         if n and (len(grp) == self.feed_rows() or any(k != FEED for k in kinds)):
             d = -(-n // adv) * adv              # (not after a prompt's partial feed run)
             nxt = [(s, p + d) for s, p in rows]
@@ -494,9 +542,17 @@ class Steps:
         """The rows a new program for grp is compiled at: a feed run's from its attention
         block's start plus its phase in feed_rows() (so that one program serves every prompt's
         runs on that slot in that block), else grp's own positions."""
-        if not self.span_steps or kinds is None or any(k != FEED for k in kinds):
+        if not self.span_steps or kinds is None or not any(k == FEED for k in kinds):
             return list(grp)
-        blk, q, p = self.eng.block, self.feed_rows(), grp[0][1]
+        blk = self.eng.block
+        if _mixed(kinds):                       # the feed rows from their block's start
+            fp = next(p for (_, p), k in zip(grp, kinds) if k == FEED)
+            b, j, out = (fp // blk) * blk, 0, []
+            for (s, p), k in zip(grp, kinds):
+                out.append((s, p) if k != FEED else (s, b + j))
+                j += k == FEED
+            return out
+        q, p = self.feed_rows(), grp[0][1]
         b = (p // blk) * blk + p % q
         return [(s, b + j) for j, (s, _) in enumerate(grp)]
 
@@ -542,12 +598,12 @@ class Steps:
         progs, t = self._take(grp, kinds, adv)
         Rm = a["R"]
         c0 = time.perf_counter()
-        io = np.zeros(2 * Rm + 1, np.float32)
+        io = np.zeros(2 * Rm + 2, np.float32)
         io[:len(grp)] = toks
         if uni is not None:
             io[Rm:Rm + len(grp)] = np.minimum(np.asarray(uni, np.float32),
                                               np.float32(1 - 2.0 ** -24))
-        io[2 * Rm] = t
+        io[2 * Rm], io[2 * Rm + 1] = t if isinstance(t, tuple) else (t, 0)
         for s in range(eng.cfg.S):
             eng.backend.write(s, a["io"], io)
         t0 = time.perf_counter()
@@ -577,6 +633,58 @@ class Steps:
         return out
 
     # ---- the step
+    def _mixed_group(self, rows, fslot: int, k: int):
+        eng = self.eng
+        rows = [(int(s), int(p)) for s, p in rows]
+        grp = rows + [(fslot, eng.poss[fslot] + j) for j in range(k)]
+        return grp, tuple(self.kinds.get(s) for s, _ in rows) + (FEED,) * k
+
+    def mixed_ready(self, rows, fslot: int, k: int) -> bool | None:
+        """Whether the mixed run of rows and k feed rows of fslot (mixed) has its program at
+        hand: True (live, compiled, or compiled ahead and done; with no compile pipeline,
+        compiled now), False (compiling: started now for the rows one step on, the feed rows'
+        base being their block's), None (it does not fit IMEM)."""
+        eng = self.eng
+        grp, kinds = self._mixed_group(rows, fslot, k)
+        if self._serving(grp, kinds) is not None:
+            return True
+        key = self._coming(grp, kinds)          # compiled or compiling ahead, serving grp
+        if key is None:
+            key = self._key(self._canon(grp, kinds), kinds)
+            if self._fit_of(self._sig(key)) is False:
+                return None
+            if eng.pipeline or eng._procs:      # for the rows one step on (it serves this
+                one = [(s, p + 1) for s, p in grp[:len(rows)]] + grp[len(rows):]   # span)
+                if all(p < eng.cap for _, p in one):
+                    self._prefetch(self._key(self._canon(one, kinds), kinds))
+                return False
+        elif key in self._next and not self._next[key].done():
+            return False
+        sig = self._sig(key)
+        if self._fit_of(sig) is None or key not in self._ready:
+            progs = self._get(key)
+            self._fit[sig] = self._size(progs) <= self.limit
+            if not self._fit[sig]:
+                return None
+            self._ready[key] = progs
+        return self._fit_of(sig) is not False
+
+    def mixed(self, rows, tokens, uniforms, fslot: int, ftoks) -> list[int]:
+        """One run of the decoding rows (as run's, one group) and a prompt's feed rows: fslot's
+        next len(ftoks) positions, in the MXU pass's spare rows. Its program takes two run-time
+        values (the decoding rows advance one a run, the feed rows len(ftoks)) and has its
+        feed rows compiled at their attention block's start, so it serves the prompt's runs;
+        compiled inline unless mixed_ready said True. Returns the decoding rows' picks."""
+        eng = self.eng
+        for s, p in rows:
+            if p != eng.poss[s] or p >= eng.cap:
+                raise ValueError(f"slot {s} is at {eng.poss[s]}, not {p}")
+        grp, kinds = self._mixed_group(rows, fslot, len(ftoks))
+        uni = None if uniforms is None else list(uniforms) + [0.5] * len(ftoks)
+        got = self._go(grp, kinds, list(tokens) + [int(t) for t in ftoks], uni, 1)
+        self.timing["mixed"] = self.timing.get("mixed", 0) + 1
+        return [int(t) for t in got[:len(rows)]]
+
     def _pad(self, grp, free):
         """A live program that serves grp and rows of free slots (a request left: its slot's
         row stays, fed a dummy token past its context, its pick dropped) while grp's own

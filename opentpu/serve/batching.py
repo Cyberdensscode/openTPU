@@ -41,7 +41,8 @@ def batches(eng) -> bool:
 
 class BatchWorker(SC.Worker):
     def __init__(self, eng, tok, store=None, model_key: str = "model", ram_bytes: int = 4 << 30,
-                 area=False, quantum: int = SC.QUANTUM, prefill_budget: int = PREFILL_BUDGET):
+                 area=False, quantum: int = SC.QUANTUM, prefill_budget: int = PREFILL_BUDGET,
+                 mixed: bool = False):
         if not batches(eng):
             raise ValueError("BatchWorker needs Engine(batch=B > 1, batch_area=True)")
         B = eng.batch
@@ -51,6 +52,7 @@ class BatchWorker(SC.Worker):
             raise ValueError("batched slots hold KV caches only (no recurrent state)")
         self.B = B
         self.budget = max(1, int(prefill_budget))
+        self.mixed = bool(mixed)
         self.ios = [self.io] + [KV.ContextIO(eng, seq=s, area=self.io.area) for s in range(1, B)]
         self.slot_req: list = [None] * B          # the request in each slot
         self.slot_dev: list = [[] for _ in range(B)]   # the tokens each slot's caches hold
@@ -88,13 +90,16 @@ class BatchWorker(SC.Worker):
                     if r.finish is None:
                         self._bind(r)
                 self._ahead()
-                budget = self.budget
-                while self.prefilling and budget > 0:   # the oldest prompts, up to the budget
-                    budget -= self._prefill_run(self.prefilling[0])
-                dec = [r for r in self.running if r.finish is None and r.next is not None
-                       and r not in self.prefilling]
-                if dec:
-                    self._decode_step(dec)
+                mixed = self._mixed_step() if self.prefilling and self.mixed else "no"
+                if mixed != "ran":
+                    # the oldest prompts up to the budget; one feed run while a mixed run's
+                    # program compiles
+                    budget = self.budget if mixed == "no" else 1
+                    while self.prefilling and budget > 0:
+                        budget -= self._prefill_run(self.prefilling[0])
+                    dec = self._decoding()
+                    if dec:
+                        self._decode_step(dec)
                 for r in [r for r in self.running if r.finish is not None]:
                     self._end(r, r.finish)
             except BaseException as e:            # every running request fails; the server
@@ -199,8 +204,9 @@ class BatchWorker(SC.Worker):
     def _rows_at(self, k: int):
         """The decode rows (slot, position) and kinds of the step k iterations on, as far as
         they can be told: the decoding requests that have not reached max_tokens by then, k
-        positions on, and the prompts the feed budget finishes by then, from their last token
-        on (stop tokens and new requests cannot be told)."""
+        positions on, and the prompts fed by then (the feed budget's runs, or a mixed step's
+        spare rows), from their last token on (stop tokens, new requests and a mixed step
+        waiting for its program cannot be told)."""
         rows, kinds = [], []
         for x in self.running:
             if x.finish is None and x.next is not None and x not in self.prefilling \
@@ -211,19 +217,26 @@ class BatchWorker(SC.Worker):
         q = self.steps.feed_rows()
         left = [len(x._feed) for x in self.prefilling]
         at = [self.eng.poss[x.slot] for x in self.prefilling]
-        i = 0
+        i, ndec = 0, len(rows)
         for it in range(k + 1):
-            b = self.budget
-            while i < len(left) and b > 0:      # (_prefill_run's runs)
-                n = min(left[i], q - at[i] % q)
+            # _mixed_step's spare rows (the prompt done then decodes from the next step), else
+            # the budget's feed runs (it decodes in this one)
+            mixed = self.mixed and 0 < ndec < q
+            b = q - ndec if mixed else self.budget
+            while i < len(left) and b > 0:
+                n = min(left[i], b if mixed else q - at[i] % q)
                 left[i] -= n
                 at[i] += n
                 b -= n
                 if left[i] == 0:
-                    x = self.prefilling[i]
-                    rows.append((x.slot, len(x.prompt) - 1 + (k - it)))
-                    kinds.append(BA.kind_of(self._samp(x)))
+                    x, j = self.prefilling[i], it + mixed
+                    if j <= k:
+                        rows.append((x.slot, len(x.prompt) - 1 + (k - j)))
+                        kinds.append(BA.kind_of(self._samp(x)))
+                    ndec += 1
                     i += 1
+                if mixed:
+                    break
         order = sorted(range(len(rows)), key=lambda j: rows[j][0])     # as _decode_step's
         return [rows[j] for j in order], [kinds[j] for j in order]
 
@@ -247,43 +260,87 @@ class BatchWorker(SC.Worker):
         k = s.top_k if 0 < s.top_k <= G.K_MAX else G.K_MAX
         return G.Sampling(s.temperature, k, s.top_p, max(1.0, s.repetition_penalty))
 
-    def _decode_step(self, dec: list) -> None:
-        eng = self.eng
+    def _decoding(self) -> list:
+        """The requests that decode this step, in slot order (a row set's program key)."""
+        dec = [r for r in self.running if r.finish is None and r.next is not None
+               and r not in self.prefilling]
         for r in dec:
-            if len(r.fed) >= eng.cap:
+            if len(r.fed) >= self.eng.cap:
                 r.finish = "length"
-        dec = sorted((r for r in dec if r.finish is None), key=lambda r: r.slot)
-        if not dec:                             # (rows in slot order: a row set's program key)
-            return
-        if len(dec) == 1 and dec[0].slot == 0 and not self.waiting and not self.prefilling \
-                and eng.can_generate:
-            return self._card_loop(dec[0])
-        t0 = time.perf_counter()
+        return sorted((r for r in dec if r.finish is None), key=lambda r: r.slot)
+
+    def _set_sampling(self, dec) -> None:
         for r in dec:
             if not r._bset:
                 self.steps.set_sampling(r.slot, self._samp(r), list(r.fed) + [r.next])
                 r._bset = True
-        rows = [(r.slot, len(r.fed)) for r in dec]
-        toks = [r.next for r in dec]
+
+    def _inputs(self, dec):
+        """The step's rows, tokens and uniforms (each slot's sampling set on its first)."""
+        self._set_sampling(dec)
         uni = None
         if any(self._samp(r) is not None for r in dec):
             uni = [float(self._sampler(r).rng.random()) if self._samp(r) is not None else 0.0
                    for r in dec]
-        n0 = self.steps.runs
-        out = self.steps.run(rows, toks, uni, free=set(self._free_slots()))
+        return [(r.slot, len(r.fed)) for r in dec], [r.next for r in dec], uni
+
+    def _outputs(self, dec, out, t0: float, runs: int) -> None:
         self.stats["steps"] += 1
-        self.stats["step_rows"] += len(rows)
-        self.stats["step_runs"] += self.steps.runs - n0
+        self.stats["step_rows"] += len(dec)
+        self.stats["step_runs"] += runs
         for r, t in zip(dec, out):
             r.fed.append(r.next)
             self._emit(r, t)
-            if r.finish is None and t in r.stop_ids:      # (_emit ends it)
-                pass
         dt = time.perf_counter() - t0
         self.stats["step_s"] += dt
         self.stats["decode_s"] += dt
         for r in dec:
             self.slot_used[r.slot] = time.monotonic()
+
+    def _decode_step(self, dec: list) -> None:
+        if not dec:
+            return
+        if len(dec) == 1 and dec[0].slot == 0 and not self.waiting and not self.prefilling \
+                and self.eng.can_generate:
+            return self._card_loop(dec[0])
+        t0 = time.perf_counter()
+        rows, toks, uni = self._inputs(dec)
+        n0 = self.steps.runs
+        out = self.steps.run(rows, toks, uni, free=set(self._free_slots()))
+        self._outputs(dec, out, t0, self.steps.runs - n0)
+
+    def _mixed_step(self) -> str:
+        """With fewer decoding requests than an MXU pass's rows and a prompt being fed: one run
+        of their step with the oldest prompt's next tokens in the spare rows (Steps.mixed), so
+        the decoding requests do not wait for its feed runs. "ran"; "pending" (its program
+        compiles: one feed run this time, then the step); "no" (none applies)."""
+        dec = self._decoding()
+        q = self.steps.feed_rows()
+        if not dec or len(dec) >= q:
+            return "no"
+        r = self.prefilling[0]
+        p = self.eng.poss[r.slot]
+        k = min(q - len(dec), len(r._feed), self.eng.block - p % self.eng.block)
+        self._set_sampling(dec)                 # (the rows' kinds: the program's key)
+        ready = self.steps.mixed_ready([(x.slot, len(x.fed)) for x in dec], r.slot, k)
+        if not ready:
+            return "no" if ready is None else "pending"
+        t0 = time.perf_counter()
+        rows, toks, uni = self._inputs(dec)
+        n0 = self.steps.runs
+        part = r._feed[:k]
+        out = self.steps.mixed(rows, toks, uni, r.slot, part)
+        del r._feed[:k]
+        r.fed += part
+        r.prefill_tokens += k
+        self.stats["prefill_tokens"] += k
+        self.stats["mixed_runs"] = self.stats.get("mixed_runs", 0) + 1
+        if r.cancelled.is_set():
+            r.finish = "abort"
+        if not r._feed or r.finish is not None:
+            self.prefilling.remove(r)
+        self._outputs(dec, out, t0, self.steps.runs - n0)
+        return "ran"
 
     def _card_loop(self, r: SC.Request) -> None:
         """r alone, in slot 0: the card's decode loop until it ends or another request comes."""
