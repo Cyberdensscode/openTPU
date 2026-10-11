@@ -164,11 +164,12 @@ with a program compiled per step (f99acce6), batched with span programs and feed
   | 1 | 24.1 | 39.5 / 41.5 ms | 21.8 | 43.1 / 46.0 ms |
   | 2 | 45.1 | 41.6 / 44.3 ms | 37.4 | 48.8 / 53.4 ms |
   | 4 | 79.1 | 46.3 / 50.6 ms | 56.7 | 60.6 / 70.5 ms |
-  | 8 (two runs of 4) | 79.2 | 91.3 / 101 ms a step | 54.7 | 121 / 146 ms a step |
+  | 8 | 79.2 | 91.3 / 101 ms (one run of 8) | 54.7 | 121 / 146 ms (two runs of 4) |
   | 4, sampled | 77.1 | 46.8 / 51.9 ms | 57.1 | 61.2 / 70.1 ms |
 
   The decode loop alone (`generate_card`) makes 25.3 tok/s at context 64. Eight rows in one
-  run cost two runs of four on the card: the MXU takes MCOLS = 4 rows per pass of the
+  run cost two runs of four on the card (at context 1024 their program no longer fits IMEM,
+  and they run as two): the MXU takes MCOLS = 4 rows per pass of the
   weights, so four rows a run is the most a pass gives (~1.45 M cycles a token at a short
   context). A trace of a 4-row step's first 250 k cycles shows the MXU busy 95%. The wall
   time over the card's at context 1024 is mostly each case's first program, compiled inline
