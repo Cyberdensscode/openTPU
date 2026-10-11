@@ -2,7 +2,7 @@
 through OpenROAD-flow-scripts, for PPA numbers.
 
     python3 tools/asic/flow.py prep POINT       # macros, the macro map, the ORFS design
-    python3 tools/asic/flow.py run POINT        # ORFS in Docker (openroad/orfs, amd64)
+    python3 tools/asic/flow.py run POINT        # ORFS: native (ORFS_HOME), else Docker
     python3 tools/asic/flow.py report POINT     # area, timing, power -> report.json
     python3 tools/asic/flow.py all POINT        # the three
     python3 tools/asic/flow.py points           # the design points
@@ -18,16 +18,20 @@ build/asic/<point>/:
     work/          ORFS's WORK_HOME (logs/, reports/, results/, objects/)
     report.json    the PPA summary
 
-prep elaborates the design once with yosys (slang) on this machine, with the leaves as
-parameterised black boxes, to list the RAM tiles the design instantiates (kind, words, bits);
-the macros and the map follow from that list. run needs Docker (on Apple silicon, Docker Desktop
-runs the amd64 image under Rosetta) and mounts the tree at its own path.
+run uses a native OpenROAD-flow-scripts where ORFS_HOME names one (a clone with its tools built:
+asic/nangate45/README.md), else ORFS's Docker image (ORFS_IMAGE; on Apple silicon Docker Desktop
+runs the amd64 image under Rosetta), which mounts the tree at its own path. prep elaborates the
+design once with yosys and slang, with the leaves as parameterised black boxes, to list the RAM
+tiles the design instantiates (kind, words, bits); the macros and the map follow from that list.
+Its yosys: YOSYS, else ORFS_HOME's (slang built in), else yosys on PATH (with the slang plugin).
 """
 from __future__ import annotations
 
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -40,7 +44,32 @@ import fakeram  # noqa: E402
 from opentpu import target as T  # noqa: E402
 
 IMAGE = os.environ.get("ORFS_IMAGE", "openroad/orfs:latest")
-YOSYS = os.environ.get("YOSYS", "yosys")
+
+
+def orfs_home() -> Path | None:
+    """The native OpenROAD-flow-scripts ORFS_HOME names (checked: its env.sh and the openroad
+    build_openroad.sh --local installs), or None: Docker."""
+    h = os.environ.get("ORFS_HOME")
+    if not h:
+        return None
+    p = Path(h).expanduser()
+    if not (p / "env.sh").exists() or not (p / "tools/install/OpenROAD/bin/openroad").exists():
+        raise RuntimeError(f"ORFS_HOME={h}: no built OpenROAD-flow-scripts there (env.sh, "
+                           "tools/install/OpenROAD/bin/openroad; asic/nangate45/README.md)")
+    return p
+
+
+def yosys() -> str:
+    """prep's yosys: YOSYS, else the native ORFS's own (slang built in), else yosys on PATH."""
+    if os.environ.get("YOSYS"):
+        return os.environ["YOSYS"]
+    h = orfs_home()
+    if h and (h / "tools/install/yosys/bin/yosys").exists():
+        return str(h / "tools/install/yosys/bin/yosys")
+    if not shutil.which("yosys"):
+        raise RuntimeError("no yosys: set ORFS_HOME (ORFS's yosys) or YOSYS, or put yosys with "
+                           "the slang plugin on PATH (asic/nangate45/README.md)")
+    return "yosys"
 
 # The design points: a target (its arch / uarch: otpu_asic_top's parameters; its core_mhz: the
 # clock the SDC asks for), the floorplan's utilisation, and a variant's source edits (rewrite:
@@ -109,7 +138,10 @@ def probe(point: str) -> list[fakeram.Macro]:
     dump = o / "src" / "probe_cells.txt"
     script = (f"read_slang -D SYNTHESIS --keep-hierarchy --ignore-assertions {files} "
               f"--top otpu_asic_top {gp}; tee -q -o {dump} dump t:otpu_sram_*")
-    r = subprocess.run([YOSYS, "-m", "slang", "-q", "-p", script], capture_output=True, text=True)
+    ys = yosys()
+    r = subprocess.run([ys, "-m", "slang", "-q", "-p", script], capture_output=True, text=True)
+    if r.returncode != 0 and "Can't load module" in r.stdout + r.stderr:   # slang built in (ORFS's)
+        r = subprocess.run([ys, "-q", "-p", script], capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"yosys probe failed:\n{r.stdout[-3000:]}\n{r.stderr[-3000:]}")
     tiles: dict[tuple, int] = {}
@@ -239,7 +271,14 @@ def prep(point: str) -> list[fakeram.Macro]:
     return macros
 
 
-def run(point: str, cpus: int = 6, target: str = "finish") -> int:
+def run(point: str, cpus: int | None = None, target: str = "finish") -> int:
+    """ORFS's make on the point's design, up to target; cpus: ORFS's NUM_CORES (and the
+    container's CPUs), by default every core natively, 6 in Docker."""
+    orfs = orfs_home()
+    if not orfs and not shutil.which("docker"):
+        raise RuntimeError("no ORFS: set ORFS_HOME to a built OpenROAD-flow-scripts, or install "
+                           "Docker for its image (asic/nangate45/README.md)")
+    cpus = cpus or (os.cpu_count() if orfs else 6)
     o = out_dir(point)
     (o / "work").mkdir(parents=True, exist_ok=True)
     # ORFS_CLEAN=floorplan (or place, cts, ...): redo from that stage (config changes do not);
@@ -247,11 +286,15 @@ def run(point: str, cpus: int = 6, target: str = "finish") -> int:
     stage = os.environ.get("ORFS_CLEAN")
     clean = (f"make DESIGN_CONFIG={o / 'config.mk'} WORK_HOME={o / 'work'} clean_{stage} && "
              if stage else "")
-    cmd = ["docker", "run", "--rm", "--platform", "linux/amd64", f"--cpus={cpus}",
-           "-v", f"{ROOT}:{ROOT}", "-w", str(ROOT), IMAGE, "bash", "-lc",
-           f"cd /OpenROAD-flow-scripts && source env.sh >/dev/null 2>&1; cd flow && "
-           f"{clean}make DESIGN_CONFIG={o / 'config.mk'} WORK_HOME={o / 'work'} NUM_CORES={cpus} "
-           f"{os.environ.get('ORFS_VARS', '')} {target}"]
+    make = (f"{clean}make DESIGN_CONFIG={o / 'config.mk'} WORK_HOME={o / 'work'} "
+            f"NUM_CORES={cpus} {os.environ.get('ORFS_VARS', '')} {target}")
+    if orfs:
+        cmd = ["bash", "-c",
+               f"cd {shlex.quote(str(orfs))} && source env.sh >/dev/null 2>&1; cd flow && {make}"]
+    else:
+        cmd = ["docker", "run", "--rm", "--platform", "linux/amd64", f"--cpus={cpus}",
+               "-v", f"{ROOT}:{ROOT}", "-w", str(ROOT), IMAGE, "bash", "-lc",
+               f"cd /OpenROAD-flow-scripts && source env.sh >/dev/null 2>&1; cd flow && {make}"]
     with open(o / "run.log", "w") as log:
         return subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT).returncode
 
@@ -345,7 +388,7 @@ def main(argv: list[str]) -> None:
     point = argv[1]
     if point not in POINTS:
         sys.exit(f"unknown point {point}: {', '.join(POINTS)}")
-    cpus = int(os.environ.get("ORFS_CPUS", "6"))
+    cpus = int(os.environ["ORFS_CPUS"]) if os.environ.get("ORFS_CPUS") else None
     if argv[0] in ("prep", "all"):
         prep(point)
     if argv[0] in ("run", "all"):

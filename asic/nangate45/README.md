@@ -7,18 +7,40 @@ design choices and the results.
 
 ## Tools
 
-Nothing to install on the host beyond Docker and yosys:
+OpenROAD-flow-scripts (ORFS: OpenROAD, OpenSTA, yosys with slang, KLayout, and the `nangate45`
+platform with its standard cells and fakeram45 macros), built natively (recommended) or as ORFS's
+Docker image.
 
-- **OpenROAD-flow-scripts** in Docker: `docker pull --platform linux/amd64 openroad/orfs:latest`
-  (6.5 GB; the image is amd64 only, Docker Desktop on Apple silicon runs it under Rosetta: ORFS's
-  `gcd` example takes 1.5 minutes). It holds OpenROAD, OpenSTA, yosys with slang and the
-  `nangate45` platform (standard cells, the fakeram45 macros).
-- **yosys with the slang plugin** on the host (`yosys -m slang`; the oss-cad-suite has it; `YOSYS`
-  names another binary): `prep` elaborates the design once to list its RAM tiles.
+**Native** (Linux; the reference run: Ubuntu 26.04 on x86-64). Build ORFS once and point `ORFS_HOME` at it; `flow.py` uses its OpenROAD
+and its yosys, nothing else is needed on `PATH`:
 
-omarchy has Docker, but its user is not in the `docker` group (adding it needs sudo there:
-`sudo usermod -aG docker $USER`, the user's call), so the flow runs on the Mac. Give Docker
-Desktop at least 16 GB (the small point peaks near 10 GB in global routing).
+```
+git clone https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts.git
+cd OpenROAD-flow-scripts
+git checkout f395e4b6ba30355564ab26997a01cb844678a65e   # the revision of the reference results
+git submodule update --init --recursive
+sudo ./etc/DependencyInstaller.sh -base                    # system packages
+./etc/DependencyInstaller.sh -common -prefix=$PWD/dependencies
+./build_openroad.sh --local --threads $(nproc)             # yosys + OpenROAD into tools/install
+export ORFS_HOME=$PWD
+```
+
+The build takes about 20 minutes on 20 cores. ORFS's `flow/designs/nangate45/gcd` example checks
+it (`make DESIGN_CONFIG=designs/nangate45/gcd/config.mk` in `flow/` after `source env.sh`: about
+30 s). `-base` supports Ubuntu 20.04-24.04 (and RHEL-family systems); on a newer Ubuntu it stops at
+KLayout, after the system packages. There, install KLayout and the flow's Python packages from the
+distribution (`sudo apt-get install klayout python3-pandas python3-numpy python3-click
+python3-yaml`; KLayout 0.30.0 works). The steps `-base` then skips only install KLayout's release
+package and Docker, which the native flow does not use.
+
+**Docker** (any host with Docker; Apple silicon runs the amd64 image under Rosetta, several times
+slower): `docker pull --platform linux/amd64 openroad/orfs:latest` (6.5 GB) and leave `ORFS_HOME`
+unset. `run` starts the container with the tree mounted at its own path. `prep` still runs on the
+host: it needs yosys with the slang plugin there (`yosys -m slang`, e.g. from the OSS CAD Suite;
+`YOSYS` names another binary).
+
+**Resources.** nangate45-small: 15 GB of memory at its peak and 81 minutes on 20 cores natively
+(the reference run below). The card's point needs more than 32 GB (global routing) and many hours.
 
 ## Run
 
@@ -33,7 +55,8 @@ python3 tools/asic/paths.py small 300 6_final      # the critical paths by unit 
 python3 tools/asic/paths.py small 300 4_cts        # the same, after CTS (placement parasitics)
 ```
 
-`ORFS_CPUS` (default 6) is the container's CPUs and ORFS's NUM_CORES; `ORFS_IMAGE` the image.
+`ORFS_CPUS` is ORFS's NUM_CORES (and the container's CPUs): every core natively, 6 in Docker by
+default. `ORFS_IMAGE` is the Docker image.
 `make` resumes from the stage files that exist: an interrupted `run` continues where it stopped
 (after a config change, clean from the stage it affects). The sources are the worktree's own: an
 RTL file newer than the run's synthesis makes `make` start over from synthesis; to run one stage
@@ -82,3 +105,19 @@ the same with otpu_fpipe's LM 3 and LA 6 (see `docs/asic.md`: without retiming t
 `units` (area per unit after synthesis, with its macros' share), the macros and their area, and
 ORFS's metrics per stage. `paths_<stage>.txt*` / `.json` (`paths.py`): the worst paths, every
 endpoint's worst slack, the stage classes. ORFS's own logs, reports and results are in `work/`.
+
+## Reference results
+
+`results/small/`: nangate45-small through this flow with the ORFS revision above (OpenROAD
+26Q4-110-g91e5f5ff2f, yosys 0.68+): `report.json` (`flow.py report`), ORFS's final report
+`6_finish.rpt` and the routed layout. A run of the same sources and tools should match it within
+the tools' run-to-run noise (a few MHz). `docs/asic.md` has the analysis.
+
+## Where to start
+
+`docs/asic.md` ("Open problems") lists the known limits: the ports' combinational paths, the
+sequencer's dispatch path, the grant fanout behind the stall-by-enable design, power from real
+activities instead of vectorless, real 1R1W macros instead of the fitted ones, and the card point's
+floorplan (its global routing ends congested). For a change to the flow (`config_mk` in
+`tools/asic/flow.py`, `tapcell.tcl`) or to the RTL, run nangate45-small and compare its
+`report.json` with `results/small/`.

@@ -1,8 +1,13 @@
 """tools/asic/flow.py and paths.py without OpenROAD: the design points come from the targets and
-name only otpu_asic_top's parameters; the constraints; the paths' units, stages and kinds."""
+name only otpu_asic_top's parameters; the constraints; native ORFS or Docker, and prep's yosys; the
+paths' units, stages and kinds."""
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools" / "asic"))
@@ -43,6 +48,58 @@ def test_sdc_asks_the_targets_clock():
     sdc = flow.sdc("card")
     assert f"set clk_period {flow.clock_ns('card')}" in sdc
     assert "create_clock -name core_clock" in sdc and "[get_ports clk]" in sdc
+
+
+def _orfs(d: Path) -> Path:
+    """A built ORFS as orfs_home checks it: env.sh, the installed openroad."""
+    (d / "tools/install/OpenROAD/bin").mkdir(parents=True)
+    (d / "env.sh").write_text("")
+    (d / "tools/install/OpenROAD/bin/openroad").write_text("")
+    return d
+
+
+def test_run_native_else_docker(tmp_path, monkeypatch):
+    """ORFS_HOME (a built ORFS) runs make in it, on every core unless told; without it the
+    Docker image on 6 CPUs; an ORFS_HOME without the built tools, or neither, says what to set."""
+    cmds = []
+    monkeypatch.setattr(flow, "out_dir", lambda p: tmp_path / p)
+    monkeypatch.setattr(flow.subprocess, "run",
+                        lambda cmd, **k: cmds.append(cmd) or subprocess.CompletedProcess(cmd, 0))
+    orfs = _orfs(tmp_path / "orfs")
+    monkeypatch.setenv("ORFS_HOME", str(orfs))
+    assert flow.run("small") == 0
+    assert cmds[-1][:2] == ["bash", "-c"] and cmds[-1][2].startswith(f"cd {orfs} && source env.sh")
+    assert f"DESIGN_CONFIG={tmp_path / 'small' / 'config.mk'} " in cmds[-1][2]
+    assert f"NUM_CORES={os.cpu_count()} " in cmds[-1][2] and cmds[-1][2].endswith(" finish")
+    flow.run("small", 3, "cts")
+    assert "NUM_CORES=3 " in cmds[-1][2] and cmds[-1][2].endswith(" cts")
+    (orfs / "tools/install/OpenROAD/bin/openroad").unlink()
+    with pytest.raises(RuntimeError, match="ORFS_HOME"):
+        flow.run("small")
+    monkeypatch.delenv("ORFS_HOME")
+    monkeypatch.setattr(flow.shutil, "which", lambda n: f"/usr/bin/{n}")
+    flow.run("small")
+    assert cmds[-1][0] == "docker" and "--cpus=6" in cmds[-1] and flow.IMAGE in cmds[-1]
+    assert "NUM_CORES=6 " in cmds[-1][-1]
+    monkeypatch.setattr(flow.shutil, "which", lambda n: None)
+    with pytest.raises(RuntimeError, match="ORFS_HOME"):
+        flow.run("small")
+
+
+def test_prep_yosys(tmp_path, monkeypatch):
+    """YOSYS, else the native ORFS's own yosys, else the one on PATH; none is an error."""
+    monkeypatch.delenv("YOSYS", raising=False)
+    monkeypatch.delenv("ORFS_HOME", raising=False)
+    monkeypatch.setattr(flow.shutil, "which", lambda n: None)
+    with pytest.raises(RuntimeError, match="no yosys"):
+        flow.yosys()
+    orfs = _orfs(tmp_path / "orfs")
+    (orfs / "tools/install/yosys/bin").mkdir(parents=True)
+    (orfs / "tools/install/yosys/bin/yosys").write_text("")
+    monkeypatch.setenv("ORFS_HOME", str(orfs))
+    assert flow.yosys() == str(orfs / "tools/install/yosys/bin/yosys")
+    monkeypatch.setenv("YOSYS", "/opt/oss-cad-suite/bin/yosys")
+    assert flow.yosys() == "/opt/oss-cad-suite/bin/yosys"
 
 
 def test_paths_units_and_stages():
