@@ -136,11 +136,11 @@ def build(image, W, layout) -> list[np.ndarray]:
         last = ("hit", time.perf_counter() - t0)
         return images
     stats["miss"] += 1
-    before = _attrs(image)
+    before = _attrs(image, W)
     tb = time.perf_counter()
     images = image.build(W)
     secs = time.perf_counter() - tb
-    left = _left(before, _attrs(image), W)
+    left = _left(before, _attrs(image, W), W)
     if left is None:
         stats["skip"] += 1
     stored = left is not None and _store(d, f, images, left, secs)
@@ -149,13 +149,15 @@ def build(image, W, layout) -> list[np.ndarray]:
 
 
 # ---- what a build leaves on the image
-def _attrs(image) -> dict:
+def _attrs(image, W) -> dict:
     """The image's attributes and its dict attributes' entries ("name" and "name.key") as
-    objects (a shallow look: a value replaced shows, an array filled in place does not)."""
+    objects (a shallow look: a value replaced shows, an array filled in place does not); not
+    the weights' entries (W kept on the image, Gemma 4's _W, comes back as itself on a hit: a
+    lazy W's items() reads every tensor as fp32, qwen3.LazyWeights, the streamed MoE models')."""
     out = {}
     for n, v in vars(image).items():
         out[n] = v
-        if isinstance(v, dict):
+        if isinstance(v, dict) and v is not W:
             for k, x in v.items():
                 if isinstance(k, str):
                     out[f"{n}.{k}"] = x

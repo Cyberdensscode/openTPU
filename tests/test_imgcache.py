@@ -135,6 +135,27 @@ def test_a_build_leaving_something_else_is_not_cached(ckpt, cache, monkeypatch):
     assert IC.stats["skip"] == 2 and _entries(cache) == []
 
 
+def test_a_build_keeping_lazy_weights_reads_none_of_them(ckpt, cache, monkeypatch):
+    """A build that keeps the weights on the image (Gemma 4's _W) given lazy ones
+    (qwen3.LazyWeights, a dict whose items() reads every tensor as fp32: the streamed MoE
+    models'): the cache reads none of the tensors and stores none, the entry is written, and a
+    hit hands the weights back. (gemma-4-26B-A4B-it's image was never cached on the card host:
+    its 597 tensors, read again after each build, made an entry too big for the disk.)"""
+    from opentpu.llm.qwen3 import LazyWeights
+    build = Image.build
+
+    def keep(self, W):
+        self._W = W
+        return build(self, W)
+    monkeypatch.setattr(Image, "build", keep)
+    monkeypatch.setattr(LazyWeights, "items", lambda self: pytest.fail("a tensor read"))
+    W = LazyWeights(ckpt)
+    _engine(ckpt, W=W)
+    assert IC.last[0] == "miss" and len(_entries(cache)) == 1
+    b = _engine(ckpt, W=W)
+    assert IC.last[0] == "hit" and b.image._W is W
+
+
 def test_a_moe_streaming_its_experts_from_a_hit(tmp_path, cache):
     """A tiny Qwen3.5-MoE checkpoint with two expert slots a layer (the experts stream from the
     host's server, which reads them from the weights): the hit's image is the build's, and
