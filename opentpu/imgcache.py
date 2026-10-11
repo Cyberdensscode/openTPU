@@ -27,8 +27,10 @@ with ~/otpu-build; none when OTPU_IMAGE_CACHE=0). Entries are written to a tempo
 renamed. Entries go when the cache passes CAP_BYTES (OTPU_IMG_CACHE_GB), in the order of their
 last use, where each second of build per GB an entry took (its header's build_s) counts as KEEP_S
 of later use: an image that costs minutes to build (gemma-4-E4B-it's, 287 s for 7.1 GB) outlives
-one that costs seconds (Qwen3.5-0.8B's, 16 s for 1.8 GB) opened a day later, and
-nothing is written that would leave under FREE_FLOOR of free disk (OTPU_IMG_CACHE_FREE_GB).
+one that costs seconds (Qwen3.5-0.8B's, 16 s for 1.8 GB) opened a day later. A write that
+would leave under FREE_FLOOR of free disk (OTPU_IMG_CACHE_FREE_GB) first drops the entries it
+outranks in that order when they make the room (a former tree's, after a host code swap), else
+it is not written and none is dropped.
 `stats` counts hits, misses, writes and skipped writes; `last` is the latest build's (how:
 "hit", "miss" (built and stored), "skip" (built, not stored) or "off"; seconds).
 """
@@ -211,9 +213,10 @@ def _bytes(a) -> np.ndarray:
 
 
 def _store(d: Path, f: Path, images: list, left: dict, build_s: float = 0.0) -> bool:
-    """Write the entry (True), or not: under the free-disk floor, or a write that failed (the
-    disk full, no permission: the image is built, not kept). build_s: the build's seconds (what
-    a miss would cost again: the eviction's weight)."""
+    """Write the entry (True), or not: under the free-disk floor though the entries it outranks
+    were dropped (_room), or a write that failed (the disk full, no permission: the image is
+    built, not kept). build_s: the build's seconds (what a miss would cost again: the eviction's
+    weight)."""
     images = [_bytes(img) for img in images]
     slices = [{"nbytes": len(img), "runs": _runs(img)} for img in images]
     arrays = {p: {"dtype": v.dtype.str, "shape": list(v.shape)}
@@ -228,7 +231,8 @@ def _store(d: Path, f: Path, images: list, left: dict, build_s: float = 0.0) -> 
     tmp = f.with_name(f".{f.stem}.{os.getpid()}.img")
     try:
         f.parent.mkdir(parents=True, exist_ok=True)
-        if shutil.disk_usage(f.parent).free - size < free:
+        short = free + size - shutil.disk_usage(f.parent).free
+        if short > 0 and not _room(d, short, _score(time.time(), build_s, size)):
             stats["skip"] += 1
             return False
         with open(tmp, "wb") as out:
@@ -305,10 +309,14 @@ def _build_s(p: Path) -> float:
         return 0.0
 
 
-def _evict(d: Path) -> None:
-    """While the cache is over its size, drop entries (to 90% of it): the least recently used
-    first, each build second per GB of an entry counting as KEEP_S of later use."""
-    cap = int(float(os.environ.get("OTPU_IMG_CACHE_GB", CAP_BYTES / 2**30)) * 2**30)
+def _score(used: float, build_s: float, size: int) -> float:
+    """An entry's place in the eviction order (the lowest goes first): its last use, each build
+    second per GB counting as KEEP_S of later use."""
+    return used + KEEP_S * build_s / (max(size, PAGE) / 2**30)
+
+
+def _ranked(d: Path) -> list:
+    """The entries as (score, size, path), in the eviction order."""
     ents = []
     for p in d.glob("*/*.img"):
         if p.name.startswith("."):
@@ -317,13 +325,35 @@ def _evict(d: Path) -> None:
             st = p.stat()
         except FileNotFoundError:
             continue
-        keep = KEEP_S * _build_s(p) / (max(st.st_size, PAGE) / 2**30)
-        ents.append((st.st_mtime + keep, st.st_size, p))
+        ents.append((_score(st.st_mtime, _build_s(p), st.st_size), st.st_size, p))
+    return sorted(ents)
+
+
+def _evict(d: Path) -> None:
+    """While the cache is over its size, drop entries (to 90% of it) in the eviction order."""
+    cap = int(float(os.environ.get("OTPU_IMG_CACHE_GB", CAP_BYTES / 2**30)) * 2**30)
+    ents = _ranked(d)
     total = sum(e[1] for e in ents)
     if total <= cap:
         return
-    for _, size, p in sorted(ents):
+    for _, size, p in ents:
         if total <= 0.9 * cap:
             break
         p.unlink(missing_ok=True)
         total -= size
+
+
+def _room(d: Path, need: int, score: float) -> bool:
+    """Free `need` bytes of disk for an entry of this score (True): drop the entries it outranks,
+    in the eviction order, until they make the room; none when all of them would not (False)."""
+    drop, freed = [], 0
+    for s, size, p in _ranked(d):
+        if freed >= need or s >= score:
+            break
+        drop.append(p)
+        freed += size
+    if freed < need:
+        return False
+    for p in drop:
+        p.unlink(missing_ok=True)
+    return True

@@ -299,6 +299,44 @@ def test_slow_builds_outlive_quick_ones_over_the_cap(ckpt, cache, monkeypatch):
     assert {n for n, e in ents.items() if e.exists()} == {"quick", "slow"}
 
 
+def test_a_write_under_the_floor_drops_what_it_outranks(ckpt, cache, monkeypatch):
+    """Under the cache's size, a write that would leave under OTPU_IMG_CACHE_FREE_GB of free disk
+    drops the entries below it in the eviction order (a former tree's, unused since) until it
+    fits, and keeps those above it (a slow build); when dropping all it outranks would not make
+    the room, it is not written and none is dropped."""
+    import json
+    import struct
+    import time
+    import types
+    _engine(ckpt)
+    (f,) = _entries(cache)
+    n = f.stat().st_size
+    f.unlink()
+    t = time.time() - 1000
+    (cache / "ab").mkdir()
+
+    def entry(name, build_s):
+        e = cache / "ab" / f"{name}.img"
+        head = b"" if build_s is None else \
+            IC.MAGIC + struct.pack("<Q", 20) + json.dumps({"build_s": build_s}).encode().ljust(20)
+        e.write_bytes(head.ljust(n, b"\0"))
+        os.utime(e, (t, t))
+        return e
+
+    old, slow = entry("old", None), entry("slow", 10**9)
+    floor = 1 << 30
+    disk = floor + 2.5 * n                  # room for two entries over the floor, not three
+    monkeypatch.setenv("OTPU_IMG_CACHE_FREE_GB", "1")
+    monkeypatch.setattr(IC.shutil, "disk_usage", lambda _: types.SimpleNamespace(
+        free=int(disk - sum(p.stat().st_size for p in cache.rglob("*.img")))))
+    _engine(ckpt)
+    assert IC.last[0] == "miss" and not old.exists() and slow.exists()
+    old2 = entry("old2", None)
+    monkeypatch.setenv("OTPU_IMG_CACHE_FREE_GB", "2")
+    _engine(ckpt, cap=512)
+    assert IC.last[0] == "skip" and old2.exists() and len(_entries(cache)) == 3
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root writes a read-only directory")
 def test_a_cache_it_cannot_write_is_no_error(ckpt, cache):
     """A cache directory the process cannot write (another user's, a full disk): its entries
