@@ -194,18 +194,22 @@ def test_component_configs_are_consistent():
 
 
 def test_every_module_has_a_component():
-    """Every RTL file of the board build is some unit component's (otpu_full aside, which may
-    change them all); otpu_dram.sv is the simulation's DRAM, not in the build."""
+    """Every RTL file of the card's build (the target ypcb-00338's file list) is some unit
+    component's (otpu_full aside, which may change all of rtl/); the other targets' files (the
+    BCU1525's, the ASIC's, the other cell families) and the simulation's DRAM are not in it."""
     import fnmatch
+    from opentpu import target
     comps = [yaml.safe_load(p.read_text())
              for p in (ROOT / "tools" / "tourney" / "components").glob("*.yaml")]
     rtl = [str(p.relative_to(ROOT)) for p in (ROOT / "rtl").rglob("*.sv")]
+    card = [f"rtl/{f}" for f in target.sources("ypcb-00338")]
+    assert set(card) <= set(rtl)
     unit = [g for c in comps if c["name"] != "otpu_full" for g in c["allowed"]]
     full = next(c for c in comps if c["name"] == "otpu_full")
     for f in rtl:
         assert any(fnmatch.fnmatch(f, g) for g in full["allowed"]), f
-        if f != "rtl/mem/otpu_dram.sv":
-            assert any(fnmatch.fnmatch(f, g) for g in unit), f
+    for f in card:
+        assert any(fnmatch.fnmatch(f, g) for g in unit), f
     # the components that can change the DSTEP datapath run its RTL test
     for c in comps:
         if any(fnmatch.fnmatch(f, g) for g in c["allowed"]
@@ -776,9 +780,11 @@ def test_fmax_prompt_and_xunit(tmp_path):
     assert "PATH-LIST" in p and "CONG-TABLE" in p and "122.97 MHz" in p
     assert "straight to the full build" in p and "=== rtl/top/otpu_slice.sv ===" in p
     assert AG.expand(ROOT, ["rtl/boards/ypcb-00338/*.sv"]) == [
-        f"rtl/boards/ypcb-00338/{n}.sv" for n in (
-            "otpu_afifo", "otpu_axi_split2", "otpu_board", "otpu_ctrl", "otpu_fpga_top_ld",
-            "otpu_mem_ch", "otpu_native_sys", "otpu_trace")]
+        f"rtl/boards/ypcb-00338/{n}.sv" for n in ("otpu_fpga_top_ld", "otpu_native_sys")]
+    assert AG.expand(ROOT, ["rtl/shell/*.sv"]) == [
+        f"rtl/shell/{n}.sv" for n in (
+            "otpu_afifo", "otpu_axi_split2", "otpu_board", "otpu_ctrl", "otpu_mem_ch",
+            "otpu_trace")]
 
 
 # ------------------------------------------------------------------------------ fmax: the round's full build
