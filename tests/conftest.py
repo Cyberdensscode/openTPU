@@ -40,12 +40,22 @@ def pytest_configure(config):
         config.option.basetemp = os.path.join(
             tempfile.gettempdir(), f"pytest-of-{getpass.getuser()}", f"pid-{os.getpid()}")
         config._otpu_basetemp = config.option.basetemp
+    # and a device-lock / status directory of its own (opentpu/host/runstate.py, default
+    # /tmp/otpu; the tests that check it set theirs): a fake board one gate left open held
+    # /tmp/otpu/fake0.lock, and a gate beside it on omarchy failed test_board's run-clock test
+    # with DeviceBusy. Not under the basetemp, which pytest empties on its first tmp_path.
+    config._otpu_run_dir = os.path.join(tempfile.gettempdir(),
+                                        f"otpu-run-{getpass.getuser()}-{os.getpid()}")
+    os.environ["OTPU_RUN_DIR"] = config._otpu_run_dir
 
 
 def pytest_unconfigure(config):
     own = getattr(config, "_otpu_basetemp", None)
     if own:
         shutil.rmtree(own, ignore_errors=True)
+    run = getattr(config, "_otpu_run_dir", None)
+    if run:
+        shutil.rmtree(run, ignore_errors=True)
 
 
 def pytest_collection_modifyitems(config, items):
