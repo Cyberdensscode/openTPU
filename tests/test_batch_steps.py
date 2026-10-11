@@ -141,8 +141,9 @@ def test_rows_split_into_groups_that_fit_imem():
     for s, p in zip(slots, ps):
         nxt[s] = int(np.argmax(eng.prefill(p, seq=s)))
         st.set_sampling(s, None)
-    one = len(BA.compile_step(eng.image, eng.bat, [(0, eng.poss[0])], [None], eng.block)[0])
-    st.limit = one + 8
+    one = max(len(BA.compile_step(eng.image, eng.bat, [(s, eng.poss[s])], [None], eng.block,
+                                  st.span([(s, eng.poss[s])]))[0]) for s in slots)
+    st.limit = one + 2
     rows = [(s, eng.poss[s]) for s in slots]
     assert [len(g) for g in st.plan(rows)] == [1, 1, 1]
     got = {s: [nxt[s]] for s in slots}
@@ -158,3 +159,32 @@ def test_rows_split_into_groups_that_fit_imem():
             lg = e.step(want[-1])
         assert got[s] == want, s
     assert st.runs == 12
+
+
+def test_one_program_serves_a_span_of_steps_across_blocks():
+    """A program serves its rows' steps (the step word t) until a row reaches the end of its
+    attention block; that row then runs in the next block's program. The tokens are each
+    sequence's decode; programs are compiled per span, not per step."""
+    eng, single, spec = _engines()
+    blk = eng.block
+    slots = [0, 2]
+    ps = _prompts(4, [blk - 3, 12])
+    st = BA.Steps(eng)
+    nxt = {}
+    for s, p in zip(slots, ps):
+        nxt[s] = int(np.argmax(eng.prefill(p, seq=s)))
+        st.set_sampling(s, None)
+    assert st.span([(0, eng.poss[0]), (2, eng.poss[2])]) == 3
+    got = {s: [nxt[s]] for s in slots}
+    for _ in range(8):
+        out = st.run([(s, eng.poss[s]) for s in slots], [got[s][-1] for s in slots])
+        for s, t in zip(slots, out):
+            got[s].append(t)
+    for s, p in zip(slots, ps):
+        e = single()
+        lg, want = e.prefill(p), []
+        for _ in range(9):
+            want.append(int(np.argmax(lg)))
+            lg = e.step(want[-1])
+        assert got[s] == want, s
+    assert st.timing["programs"] == 2 and st.timing["reused"] == 6, st.timing

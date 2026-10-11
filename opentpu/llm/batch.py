@@ -7,21 +7,29 @@ continuous batching, opentpu/serve/scheduler.py).
 
 The batch area (DRAM past the image, Engine(batch_area=True)):
 
-    tin[B]    the rows' input token ids (fp32 words, the host's)
+    io        tin[B] the rows' input token ids (fp32 words), uni[B] the rows' uniforms (sampled
+              rows; the host's generator of each request), step (the run's step, below): the
+              host's, one write per run
     tout[B]   the rows' picked token ids (the device's)
-    uni[B]    the rows' uniforms (sampled rows; the host's generator of each request)
     per slot: st[STATE_WORDS] (the sampler's words: top-k, log2(e) / T, top-p, the penalty R
               and 1 / R), lg[V] (the sampler's logits), pa[V], pb[V] (the repetition
               penalty's factors over the sequence's context, generate.py's)
 
-A step's program (compile_step) takes compile-time rows (slot, position) and per row a kind:
-None (greedy: ARGMAX) or a Sampling key (kmax, penalty); the tokens come from tin (the
-embedding rows gathered or loaded on the device from the image's tables, the RoPE rows from
-its tables), every layer is qwen3's rows kernel (each row appends its K / V to its slot's cache
-and attends over its own positions), and the LM head hands each chunk to every row's sink. The
-row's pick goes to tout[r]; a sampled row with a penalty adds it to its slot's context. Per row
-the arithmetic is the decode step's (qwen3_rows: bit-identical to step()), and the sampler is
-the decode loop's (generate.reference_pick on the logits with the same uniform).
+A step's program (compile_step) takes rows (slot, position) and per row a kind: None (greedy:
+ARGMAX) or a Sampling key (kmax, penalty); the tokens come from tin (the embedding rows gathered
+or loaded on the device from the image's tables, the RoPE rows from its tables), every layer is
+qwen3's rows kernel (each row appends its K / V to its slot's cache and attends over its own
+positions), and the LM head hands each chunk to every row's sink. The row's pick goes to
+tout[r]; a sampled row with a penalty adds it to its slot's context. Per row the arithmetic is
+the decode step's (qwen3_rows: bit-identical to step()), and the sampler is the decode loop's
+(generate.reference_pick on the logits with the same uniform).
+
+With a span n, the program serves n steps of its rows: row r is at position p_r + t, t the
+run-time step (0 <= t < n) in the io block's step word, which the program loads and multiplies
+into its argument and address registers (RLD; qwen3.RunWords' way). Every row's position adds
+the same t, so the rows share those registers. n keeps every row in its attention block and
+V^T tile (Steps.span), so a program serves ~block / (R + 1) steps on average: the host
+compiles one per span, ahead, instead of one per step.
 """
 from __future__ import annotations
 
@@ -32,7 +40,7 @@ import numpy as np
 
 from .. import isa as I
 from .. import language as ol
-from ..compiler import CompileError, Tensor, current
+from ..compiler import Affine, CompileError, RunVar, Tensor, current, vt_tile
 from . import generate as G
 
 GREEDY = None
@@ -41,7 +49,8 @@ GREEDY = None
 def alloc(image, cfg, B: int, base: int) -> dict:
     """The batch area's addresses for B slots from `base` (bytes; page-aligned end)."""
     V = G._vpad(image.spec)
-    a = {"B": B, "base": base, "V": V}
+    a = {"B": B, "base": base, "V": V, "cap": image.cap,
+         "zmask": (image.lookup or {}).get("zmask", 0)}
     o = base
 
     def take(n):
@@ -49,7 +58,9 @@ def alloc(image, cfg, B: int, base: int) -> dict:
         x = o
         o = -(-(o + n) // 128) * 128
         return x
-    a["tin"], a["tout"], a["uni"] = take(4 * B), take(4 * B), take(4 * B)
+    io = take(4 * (2 * B + 1))              # the host's words: one write per run
+    a["io"], a["tin"], a["uni"], a["step"] = io, io, io + 4 * B, io + 8 * B
+    a["tout"] = take(4 * B)
     a["st"] = [take(4 * G.STATE_WORDS) for _ in range(B)]
     a["lg"] = [take(4 * V) for _ in range(B)]
     a["pa"] = [take(4 * V) for _ in range(B)]
@@ -77,8 +88,28 @@ def kind_of(samp) -> tuple | None:
     return None if samp is None else samp.key
 
 
+def step_rows(rows, span: int, block: int, zmask: int, cap: int) -> list:
+    """rows [(slot, position)] at step 0 -> [(slot, qwen3.RunPos)] at position + t, t the
+    run-time step below span, one RunVar for every row (each row's bucket: the blocks up to
+    its position's, the last one masked at position + t, as RunPos's)."""
+    from ..kernels.attention import Bucket
+    from .qwen3 import RunPos
+    t = RunVar("tpos", bound=span)
+    out = []
+    for s, p in rows:
+        if (p % block) + span > block:
+            raise CompileError(f"position {p} + {span} steps crosses an attention block")
+        rp = object.__new__(RunPos)
+        rp.blocks, rp.block, rp.lo = p // block + 1, block, p
+        rp.t0 = (rp.blocks - 1) * block
+        rp.tpos, rp.pos = t + (p - rp.t0), t + p
+        rp.bucket = Bucket(rp.blocks, Affine(zmask + 4 * (cap - 1 - p)) + t * -4)
+        out.append((s, rp))
+    return out
+
+
 @ol.jit
-def batch_step(m, rows, kinds, block: int, area: dict):
+def batch_step(m, rows, kinds, block: int, area: dict, span: int = 0):
     from .qwen3 import _attention_rows, _embed_word, _layers, _mlp, head_rows_chunk
     b = current()
     spec, R = m.spec, len(rows)
@@ -86,12 +117,18 @@ def batch_step(m, rows, kinds, block: int, area: dict):
         raise CompileError(f"{R} rows for {area['B']} slots")
     if len({s for s, _ in rows}) != R:
         raise CompileError("a step feeds each slot one row")
+    if span:                                    # the run's step: a TMEM word for the RLDs
+        rows = step_rows(rows, span, block, area["zmask"], area["cap"])
+        stw = ol.load(Tensor(area["step"], (1,), (1,)))
+        at = b.stack[-1][-1]
+        b.run_words = {"tpos": stw.base}
     x = ol.empty([R, m.xr.shape[1]], dense=True)
     c = ol.empty([R, m.cosr.shape[1]], dense=True)
     s_ = ol.empty([R, m.sinr.shape[1]], dense=True)
     for r, (_, p) in enumerate(rows):
-        ol.load(m.cos_t[p:p + 1, :], out=c[r:r + 1, :])
-        ol.load(m.sin_t[p:p + 1, :], out=s_[r:r + 1, :])
+        q = p.pos if span else p
+        ol.load(m.cos_t[q:q + 1, :], out=c[r:r + 1, :])
+        ol.load(m.sin_t[q:q + 1, :], out=s_[r:r + 1, :])
     tk = ol.load(Tensor(area["tin"], (R,), (1,)))
     for r in range(R):
         x[r:r + 1, :].set(_embed_word(m, tk[r:r + 1]))
@@ -128,6 +165,14 @@ def batch_step(m, rows, kinds, block: int, area: dict):
         if kinds[r] is not GREEDY:
             sk.after(t)
         del t
+    if span:                                    # the arguments from the step word, at the start
+        body = b.stack[-1]
+        i = next(j for j, x_ in enumerate(body) if x_ is at) + 1
+        body[i:i] = [I.rld(15 - k, b.run_words[v.name], mul=int(c_),
+                           comment=f"argument {c_}*{v.name}")
+                     for k, (v, c_) in enumerate(b.run_args)]
+        b.run_words = None
+        del stw
 
 
 def _head(x, m, spec, sinks, chunk: int) -> None:
@@ -152,43 +197,54 @@ class _Key:
         self.key = (kmax, pen)
 
 
-def compile_step(image, area: dict, rows, kinds, block: int) -> list:
-    """One program per slice: the batched step for rows [(slot, position)] of kinds."""
+def compile_step(image, area: dict, rows, kinds, block: int, span: int = 0) -> list:
+    """One program per slice: the batched step for rows [(slot, position)] of kinds; with a
+    span, for the steps t < span at positions + t (the step word: t)."""
     rows, kinds = [(int(s), int(p)) for s, p in rows], list(kinds)
     return [batch_step.trace(image.cfg, s, {"m": image.descriptors(s), "rows": rows,
-                                            "kinds": kinds, "block": block, "area": area})
+                                            "kinds": kinds, "block": block, "area": area,
+                                            "span": span})
             .finish() for s in range(image.cfg.S)]
 
 
-def _worker_step(rows, kinds, area):
+def _worker_step(rows, kinds, area, span=0):
     """The engine's compile worker process: compile_step, assembled (one slice)."""
     from .qwen3 import _WORKER
     image, block = _WORKER
-    return np.asarray(I.assemble(compile_step(image, area, rows, kinds, block)[0]), np.uint32)
+    return np.asarray(I.assemble(compile_step(image, area, rows, kinds, block, span)[0]),
+                      np.uint32)
 
 
 class Steps:
     """An Engine's batched steps (Engine(batch=B, batch_area=True)): each slot's sampling
     (set_sampling), the step (run). A step's rows run in groups whose program fits IMEM (the
     LM head's sinks grow it per row: 4 rows of Qwen3-0.6B with sampling and a penalty fit, 8
-    greedy ones do not), found by compiling and kept per (kinds, attention buckets); the next
-    group's program is compiled while the device runs the current one (on the engine's
-    compile worker, or a thread)."""
+    greedy ones do not), found by compiling and kept per (kinds, attention buckets).
 
-    def __init__(self, eng):
+    span (default): a program serves its rows for `span(rows)` steps (the run's step in the io
+    block), so the same program runs again, loaded in IMEM already, until a row reaches the
+    end of its attention block; the next one (each row there) is compiled ahead as soon as a
+    program starts serving, on the engine's compile worker or a thread. span=False: one
+    program per step (positions at compile time), the next step's compiled while a step runs."""
+
+    def __init__(self, eng, span: bool = True):
         if getattr(eng, "bat", None) is None:
             raise ValueError("batched steps need Engine(batch=B > 1, batch_area=True)")
         self.eng, self.a = eng, eng.bat
+        self.span_steps = bool(span)
         self.kinds: dict = {}             # slot -> its kind
         self.limit = eng.cfg.IMEM_WORDS // 8
-        self._fit: dict = {}              # (kinds, buckets) -> the program fits IMEM
-        self._ready: dict = {}            # key -> programs (compiled for a fit check)
-        self._next = None                 # (key, Future)
+        self._fit: dict = {}              # signature (kinds, buckets) -> the program fits IMEM
+        self._ready: dict = {}            # key -> programs (compiled, not run yet)
+        self._next: dict = {}             # key -> Future of its programs
+        self._live: dict = {}             # (slots, kinds) -> (positions at step 0, span, programs)
         self._pool = None
+        self._words = bool(getattr(eng.backend, "runs_words", False)) and eng.cfg.S == 1
         self.runs = 0
         # where a step's time goes: device cycles, the host's waits for programs (compiles
-        # not ready), the whole runs
-        self.timing = {"cycles": 0, "compile_wait_s": 0.0, "compiled_inline": 0, "run_s": 0.0}
+        # not ready), the whole runs; programs compiled, runs of a program already loaded
+        self.timing = {"cycles": 0, "compile_wait_s": 0.0, "compiled_inline": 0, "run_s": 0.0,
+                       "programs": 0, "reused": 0}
 
     def set_sampling(self, slot: int, samp, context=()) -> None:
         """Slot `slot` picks greedily (samp None) or with samp (generate.Sampling): its state
@@ -212,21 +268,47 @@ class Steps:
                 eng.backend.write(s, a["pb"][slot], pb)
 
     # ---- programs
+    def span(self, rows) -> int:
+        """The steps one program serves from rows' positions: each row stays in its attention
+        block and its V^T tile, below the capacity (0: span off)."""
+        if not self.span_steps:
+            return 0
+        eng = self.eng
+        blk, tb = eng.block, vt_tile(eng.cap)
+        return max(1, min(min(blk - p % blk, tb - p % tb, eng.cap - p) for _, p in rows))
+
     def _key(self, rows):
-        return tuple((int(s), int(p)) for s, p in rows), tuple(self.kinds.get(s) for s, _ in rows)
+        rows = tuple((int(s), int(p)) for s, p in rows)
+        return rows, tuple(self.kinds.get(s) for s, _ in rows), self.span(rows)
 
     def _sig(self, key):
-        rows, kinds = key
+        rows, kinds, n = key
         blk = self.eng.block
-        return tuple(sorted(zip(map(repr, kinds), (p // blk for _, p in rows))))
+        return tuple(sorted(zip(map(repr, kinds), (p // blk for _, p in rows)))), bool(n)
 
     def _compile(self, key):
-        rows, kinds = key
-        progs = compile_step(self.eng.image, self.a, rows, kinds, self.eng.block)
-        prep = getattr(self.eng.backend, "prepare", None)
-        if prep is not None:
-            prep(progs)
+        rows, kinds, n = key
+        progs = compile_step(self.eng.image, self.a, rows, kinds, self.eng.block, n)
+        if self._words:                 # assembled once: the backend loads the words as they are
+            return np.asarray(I.assemble(progs[0]), np.uint32)
         return progs
+
+    def _size(self, progs) -> int:
+        return len(progs) // 8 if isinstance(progs, np.ndarray) else len(progs[0])
+
+    def _get(self, key):
+        """key's programs: compiled ahead, or now."""
+        if key in self._ready:
+            return self._ready.pop(key)
+        t0 = time.perf_counter()
+        try:
+            fut = self._next.pop(key, None)
+            if fut is not None:
+                return fut.result()
+            self.timing["compiled_inline"] += 1
+            return self._compile(key)
+        finally:
+            self.timing["compile_wait_s"] += time.perf_counter() - t0
 
     def plan(self, rows) -> list[list]:
         """The step's rows in groups whose programs fit IMEM."""
@@ -236,9 +318,8 @@ class Steps:
         if sig not in self._fit:
             if len(self._ready) > 8:
                 self._ready.clear()
-            progs = self._compile(key)
-            n = len(progs[0]) if isinstance(progs[0], list) else len(progs[0]) // 8
-            self._fit[sig] = n <= self.limit
+            progs = self._get(key)
+            self._fit[sig] = self._size(progs) <= self.limit
             if self._fit[sig]:
                 self._ready[key] = progs
         if self._fit[sig] or len(rows) == 1:
@@ -248,45 +329,68 @@ class Steps:
         h = -(-len(rows) // 2)
         return self.plan(rows[:h]) + self.plan(rows[h:])
 
-    def _program(self, key):
-        if key in self._ready:
-            return self._ready.pop(key)
-        t0 = time.perf_counter()
-        nxt, self._next = self._next, None
-        try:
-            if nxt is not None:
-                k, fut = nxt
-                res = fut.result()
-                if k == key:
-                    return res
-            self.timing["compiled_inline"] += 1
-            return self._compile(key)
-        finally:
-            self.timing["compile_wait_s"] += time.perf_counter() - t0
-
     def _prefetch(self, key) -> None:
+        """Compile key's programs in the background (if not there or on the way already)."""
         eng = self.eng
-        if key is None or key in self._ready or (self._next is not None and self._next[0] == key):
+        if key is None or key in self._ready or key in self._next:
             return
-        if self._next is not None:
-            self._next[1].result()
-            self._next = None
+        if self._fit.get(self._sig(key)) is False:
+            return
+        while len(self._next) > 4:               # (keys that never came)
+            self._next.pop(next(iter(self._next))).result()
+        rows, kinds, n = key
         if eng._procs and eng._ready is not None and eng._ready.done():
-            self._next = (key, eng._pool.submit(_worker_step, key[0], key[1], self.a))
+            self._next[key] = eng._pool.submit(_worker_step, rows, kinds, self.a, n)
             return
         if not eng.pipeline:
             return
         if self._pool is None:
             from concurrent.futures import ThreadPoolExecutor
             self._pool = ThreadPoolExecutor(1, thread_name_prefix="otpu-batch-compile")
-        self._next = (key, self._pool.submit(self._compile, key))
+        self._next[key] = self._pool.submit(self._compile, key)
+
+    def _serving(self, grp):
+        """(programs, t) of a live program that serves grp at its step t, or None."""
+        rows = tuple(grp)
+        slots, kinds = tuple(s for s, _ in rows), tuple(self.kinds.get(s) for s in
+                                                        (s for s, _ in rows))
+        live = self._live.get((slots, kinds))
+        if live is None:
+            return None
+        base, n, progs = live
+        d = {p - b for (_, p), b in zip(rows, base)}
+        if len(d) != 1:
+            return None
+        t = d.pop()
+        return (progs, t) if 0 <= t < n else None
+
+    def _take(self, grp):
+        """grp's programs and its step word: the live program's, or a new one made live (and
+        its successor, each row at its end, compiled ahead)."""
+        got = self._serving(grp)
+        if got is not None:
+            self.timing["reused"] += 1
+            return got
+        key = self._key(grp)
+        progs = self._get(key)
+        self.timing["programs"] += 1
+        rows, kinds, n = key
+        slots = tuple(s for s, _ in rows)
+        if len(self._live) > 16:
+            self._live.clear()
+        self._live[(slots, kinds)] = (tuple(p for _, p in rows), n, progs)
+        if n:
+            nxt = [(s, p + n) for s, p in rows]
+            if all(p < self.eng.cap for _, p in nxt):
+                self._prefetch(self._key(nxt))
+        return progs, 0
 
     # ---- the step
     def run(self, rows, tokens, uniforms=None, ahead=True) -> list[int]:
         """Feed tokens[r] to slot rows[r][0] at its position rows[r][1] (the slot's next);
         returns each row's picked token. uniforms: the sampled rows' (one per row). ahead:
-        while a group runs, compile the next one (after the last, the next step's first, each
-        row one position on)."""
+        while a group runs, compile the next group's program (span off: after the last, the
+        next step's first, each row one position on)."""
         eng, a = self.eng, self.a
         rows = [(int(s), int(p)) for s, p in rows]
         for s, p in rows:
@@ -299,21 +403,23 @@ class Steps:
         groups = self.plan(rows)
         nxt_rows = [(s, p + 1) for s, p in rows if p + 1 < eng.cap]
         out = {}
+        B = a["B"]
         for gi, grp in enumerate(groups):
-            key = self._key(grp)
-            progs = self._program(key)
-            tin = np.asarray([tok[s] for s, _ in grp], np.float32)
+            progs, t = self._take(grp)
+            io = np.zeros(2 * B + 1, np.float32)
+            io[:len(grp)] = [tok[s] for s, _ in grp]
+            if uni is not None:
+                io[B:B + len(grp)] = np.minimum(np.asarray([uni[x] for x, _ in grp], np.float32),
+                                                np.float32(1 - 2.0 ** -24))
+            io[2 * B] = t
             for s in range(eng.cfg.S):
-                eng.backend.write(s, a["tin"], tin)
-                if uni is not None:
-                    u = np.minimum(np.asarray([uni[x] for x, _ in grp], np.float32),
-                                   np.float32(1 - 2.0 ** -24))
-                    eng.backend.write(s, a["uni"], u)
+                eng.backend.write(s, a["io"], io)
             ahead_key = None
             if ahead:
                 if gi + 1 < len(groups):
-                    ahead_key = self._key(groups[gi + 1])
-                elif nxt_rows:
+                    if self._serving(groups[gi + 1]) is None:
+                        ahead_key = self._key(groups[gi + 1])
+                elif nxt_rows and not self.span_steps:
                     k1 = self._key(nxt_rows)
                     if self._fit.get(self._sig(k1)):
                         ahead_key = k1
@@ -333,13 +439,14 @@ class Steps:
             eng.stats.append(dict(st or {}, rows=len(grp)))
             self.runs += 1
             got = eng.backend.read(0, a["tout"], 4 * len(grp)).view(np.float32)
-            for (s, _), t in zip(grp, got):
-                out[s] = int(t)
+            for (s, _), t_ in zip(grp, got):
+                out[s] = int(t_)
                 eng.poss[s] += 1
         return [out[s] for s, _ in rows]
 
     def drop(self) -> None:
-        """Forget the program compiled ahead."""
-        if self._next is not None:
-            self._next[1].result()
-            self._next = None
+        """Forget the programs compiled ahead and the live ones."""
+        for fut in self._next.values():
+            fut.result()
+        self._next.clear()
+        self._live.clear()

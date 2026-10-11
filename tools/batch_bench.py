@@ -57,18 +57,21 @@ def main(argv=None):
     st = BA.Steps(eng)
     res = []
 
-    def case(name, fn, tokens_per_run):
+    def case(name, fn):
+        """fn() -> (runs, tokens)."""
         k = len(eng.stats)
         t0 = time.perf_counter()
-        runs = fn()
+        runs, toks = fn()
         wall = time.perf_counter() - t0
         cyc = [x.get("cycles") or 0 for x in eng.stats[k:]]
         dev = sum(cyc) / (khz * 1e3) if khz else 0.0
-        row = {"case": name, "runs": runs, "Mcyc_run": round(np.mean(cyc) / 1e6, 3) if cyc else None,
-               "Mcyc_tok": round(sum(cyc) / 1e6 / max(1, runs * tokens_per_run), 3),
+        row = {"case": name, "runs": runs, "tokens": toks,
+               "Mcyc_run": round(np.mean(cyc) / 1e6, 3) if cyc else None,
+               "Mcyc_tok": round(sum(cyc) / 1e6 / max(1, toks), 3),
                "wall_ms_run": round(1e3 * wall / max(1, runs), 2),
                "device_ms_run": round(1e3 * dev / max(1, runs), 2) if khz else None,
-               "tok_s": round(runs * tokens_per_run / wall, 2)}
+               "host_ms_run": round(1e3 * (wall - dev) / max(1, runs), 2) if khz else None,
+               "tok_s": round(toks / wall, 2)}
         res.append(row)
         print(json.dumps(row), flush=True)
 
@@ -76,8 +79,8 @@ def main(argv=None):
     def loop():
         got = eng.generate_card(nxt[0], a.reps * 4)
         nxt[0] = got[-1]
-        return len(got) / 4                     # (runs: tokens / 4, to compare per token)
-    case("generate_card slot 0 (per 4 tokens)", loop, 4)
+        return 1, len(got)
+    case("generate_card slot 0", loop)
     for kind in ("greedy", "sampled"):
         samp = None if kind == "greedy" else G.Sampling(0.7, 20, 0.8, 1.0)
         for s in range(a.slots):
@@ -94,13 +97,16 @@ def main(argv=None):
                     out = st.run(rows, [nxt[s] for s in range(R)], u)
                     for s in range(R):
                         nxt[s] = out[s]
-                return st.runs - n0
-            case(f"step {kind} R={R}", steps, R)
+                return st.runs - n0, a.reps * R
+            p0 = dict(st.timing)
+            case(f"step {kind} R={R}", steps)
             groups = len(st.plan([(s, eng.poss[s]) for s in range(R)]))
             res[-1]["groups"] = groups
-            res[-1]["Mcyc_tok"] = round(res[-1]["Mcyc_run"] * res[-1]["runs"] /
-                                        (a.reps * R), 3) if res[-1]["Mcyc_run"] else None
-            print(f"   (groups per step: {groups})", flush=True)
+            res[-1]["programs"] = st.timing["programs"] - p0["programs"]
+            res[-1]["compile_wait_ms"] = round(1e3 * (st.timing["compile_wait_s"] -
+                                                      p0["compile_wait_s"]), 1)
+            print(f"   (groups per step: {groups}, programs {res[-1]['programs']}, compile "
+                  f"wait {res[-1]['compile_wait_ms']} ms)", flush=True)
     print("timing:", st.timing, flush=True)
     prof = {}
     if a.trace:
@@ -128,13 +134,15 @@ def traced(eng, st, nxt, counts, khz, out) -> dict:
         return {}
     res = {}
 
-    def one(name, fn):
+    def one(name, fn, instrs=None):
         be.trace = {"keep": "first"}
         try:
             fn()
         finally:
             be.trace = None
         programs, stats = be.last
+        if instrs is not None:                  # (the run loaded assembled words)
+            programs = instrs()
         p = PR.parse(HL.records_to_trace(stats["trace"]["records"], programs), eng.cfg,
                      programs, name)
         last = p.cycles
@@ -167,13 +175,20 @@ def traced(eng, st, nxt, counts, khz, out) -> dict:
         lg = eng.step(nxt[0])
         nxt[0] = int(np.argmax(lg))
     one("decode step", step0)
+    from opentpu.llm import batch as BA
     for R in counts:
         def stepR(R=R):
             st.run([(s, eng.poss[s]) for s in range(R)], [nxt[s] for s in range(R)])
+
+        def instrs(R=R):
+            slots = tuple(range(R))
+            base, n, _ = st._live[(slots, tuple(st.kinds.get(s) for s in slots))]
+            return BA.compile_step(eng.image, st.a, list(zip(slots, base)),
+                                   [st.kinds.get(s) for s in slots], eng.block, n)
         for s in range(R):
             st.set_sampling(s, None)
         stepR()                                         # (compiled, then traced)
-        one(f"step greedy R={R}", stepR)
+        one(f"step greedy R={R}", stepR, instrs)
     return res
 
 
