@@ -1,0 +1,162 @@
+# otpu-serve: an OpenAI-style server on the card
+
+`otpu-serve` serves one model on the card to any number of clients over an OpenAI-compatible
+HTTP API. It keeps every user's context, on the card while it runs and in the host's RAM and
+on disk after that, and it decodes several users' requests together in one run of the card.
+In that it follows SGLang: a prefix cache of contexts (SGLang's RadixAttention), a hierarchy of
+memory under it (its HiCache: GPU, host RAM, disk), and continuous batching.
+
+```sh
+otpu-serve --model qwen3 --backend board                     # http://127.0.0.1:8000/v1
+otpu-serve --model qwen3 --backend board --kv-ram-gb 8 --kv-disk-gb 32 --kv-dir /data/kv
+otpu-serve --model lfm2 --backend board --port 8001          # one sequence: requests in turns
+```
+
+Any OpenAI client works against it (the `openai` Python package, checked: models, chat plain and
+streamed with usage, completions):
+
+```python
+from openai import OpenAI
+c = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="none")
+r = c.chat.completions.create(model="Qwen3-0.6B", messages=[{"role": "user", "content": "Hi!"}])
+```
+
+## The API
+
+| Route | |
+|---|---|
+| `POST /v1/chat/completions` | the chat template as otpu-chat renders it; `stream` (SSE), `n`, `max_tokens` / `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `repetition_penalty`, `seed`, `stop` (strings), `stop_token_ids`, `ignore_eos`, `stream_options.include_usage`, `chat_template_kwargs.enable_thinking`, `skip_special_tokens`; content as a string or text parts |
+| `POST /v1/completions` | a prompt string or token ids, `echo`, the same sampling and stops |
+| `GET /v1/models` | the model, its context length (`max_model_len`) |
+| `GET /v1/stats` | the queue, throughput, the slots, the KV store and prefix cache, the steps' timing |
+| `GET /health`, `GET /get_model_info` | |
+| `POST /flush_cache` | forget every saved context and what idle slots hold |
+
+`usage.prompt_tokens_details.cached_tokens` counts the prompt tokens the server did not feed
+(the card or the store held them). Sampling defaults are the model's (otpu-chat's: the
+checkpoint's generation_config.json, or its family's), and a request's fields override them. A
+top-k above 64 (or none) is 64, the most the card's sampler takes. `--reasoning-parser qwen3`
+moves a reply's `<think> ... </think>` to `reasoning_content`, also while it streams. `--api-key`
+(or `OTPU_API_KEY`) requires `Authorization: Bearer <key>`. Not supported: tools, images,
+logprobs, `suffix`; `presence_penalty` and `frequency_penalty` are ignored.
+
+## The KV cache: pages, the store, the prefix cache
+
+**A context's bytes** (`opentpu/serve/kvio.py`). Every positional KV cache keeps the positions
+`[0, n)` in contiguous byte ranges:
+
+- K's first n rows, and its scales;
+- V^T's first `ceil(n / 256)` tiles, since V^T is stored in tiles of 256 tokens, each `[d, 256]`
+  contiguous (`compiler.KVDesc`);
+- V's first n scales.
+
+A **page** is 256 positions of every cache of every layer: 15.1 MB for Qwen3-0.6B. Page i
+holds what the tokens `[0, 256 (i + 1))` put there and nothing else, so contexts with a common
+prefix share its whole pages. A context of n tokens is:
+
+- its whole pages;
+- its last partial page;
+- the state the KV caches do not hold (`Image.state_regions`: Qwen3.5's DeltaNet states, LFM2's
+  convolution rings, Gemma 4's sliding rings).
+
+Writing the pages back and setting the position (`Engine.adopt`) gives the context bit for bit,
+as `Engine.rollback` does. On the card, a save or restore is staged: LD / ST copy programs
+gather a page's ~900 regions into an area of the DRAM past the program area, and one DMA moves
+it. Each region's own DMA would cost ~30 us of set-up.
+
+**The store** (`opentpu/serve/store.py`, `BlobStore`). Pages and tails live in host RAM up to
+`--kv-ram-gb`. Past that, the least recently used go to files under `--kv-dir`, written by a
+thread, up to `--kv-disk-gb`; past that they are dropped. A blob read from disk comes back into
+RAM. An active request's blobs are pinned. The entries are written through to disk, and at
+shutdown the RAM goes too, so a server started on the same directory continues the contexts
+saved before. The directory is keyed by the model, its formats and layout.
+
+**The prefix cache** (`PrefixCache`). Entries are the contexts saved, by their tokens; a page's
+key hashes the tokens up to its end. `match(prompt)` finds where the card can continue a
+prompt:
+
+- for a model whose KV caches hold the whole context, any common prefix of a saved context (its
+  pages up to there; what lies past is overwritten);
+- for a model with state, the end of a saved context that the prompt continues.
+
+A prompt always feeds its last token, whose logits pick the first one of the reply.
+
+## Requests at once
+
+**Batched, in KV slots** (`opentpu/serve/batching.py`, `BatchWorker`: Qwen3 and the Llama-likes,
+`--slots`, default 8). The image holds B sequences' KV caches (`Engine(batch=B,
+batch_area=True)`). Each iteration of the worker:
+
+1. Waiting requests take free slots: the one holding the longest prefix of the prompt, else
+   slot 0, else the least recently used. The prompt continues the longest prefix found in that
+   slot, in another slot (its pages copied on the card, no PCIe) or in the store. A slot's
+   context is saved to the store before it is overwritten.
+2. One run of the oldest prompt being fed (chunked prefill: decoding requests wait one run at
+   most).
+3. One batched step for every decoding request (`opentpu/llm/batch.py`):
+   - a run feeds each one its token from DRAM; the embedding rows are gathered and the RoPE
+     rows loaded from the image's tables;
+   - every weight streams once for all of them;
+   - the LM head hands each chunk to every row's sink: the decode loop's `Greedy`, or its
+     `Sampler` with the slot's words (top-k, temperature, top-p, repetition penalty) and the
+     request's uniform;
+   - the picks go to DRAM.
+
+   The host writes the tokens and reads one word per request: no logits leave the card, and
+   the host computes nothing of the model.
+
+A request decoding alone in slot 0 runs the card's decode loop instead (`generate_card`),
+halted after the token in flight when another arrives. A step's rows run in groups whose program
+fits IMEM. The LM head's sinks and each row's attention grow it, so four rows of Qwen3-0.6B fit
+early in the context and fewer late in it.
+
+**In turns** (`opentpu/serve/scheduler.py`, `Worker`: LFM2, Qwen3.5, Gemma 4, the streamed
+MoEs, whose images hold one sequence). The requests (`--max-running` at once) take the card in
+turns of `--quantum` tokens. Each switch saves the outgoing context's new pages and tail and
+restores the incoming one. A request running alone runs to its end.
+
+## Measured on the card
+
+Run on 2026-10-09 on opentpu with build 1025907f (133.33 MHz, Gen2 x8), Qwen3-0.6B int8, cap
+2048, using `tools/serve_bench.py`. Each client streams a greedy chat of 128 tokens
+(`ignore_eos`) unless the row says sampled.
+
+| clients | time-sliced (tree 70ec5139) | batched, 8 slots (tree f99acce6) | TTFT median / max (batched) |
+|---|---|---|---|
+| 1 | 25.0 tok/s | 23.9 tok/s | 0.26 / 0.26 s |
+| 2 | 24.2 | 41.9 | 0.23 / 0.36 s |
+| 4 | 24.0 | 53.3 | 0.44 / 1.06 s |
+| 8 | 23.8 | 50.1 | 0.95 / 3.51 s |
+| 8, sampled (temperature 0.7, top-k 20, top-p 0.8) | | 46.3 | 0.77 / 1.98 s |
+
+- **Correctness.** Four prompts alone, then together. Every reply is equal to its own, and a
+  repeat too (`check: PASS` in both runs). Contexts were swapped through the staged copies
+  (time-sliced) and decoded in batched steps.
+- **Time-sliced.** About 49 ms per context switch.
+- **Batched.** 764 steps averaged 4.1 rows (the 8-client runs as two groups of four) and
+  ~85 ms a step. A 4-row run takes ~70 ms of wall time, against a decode step's 39.
+- **A conversation's turns** (each re-sends the history, max 128 tokens a reply), against the
+  same prompt with nothing saved:
+
+  | turn | prompt tokens | cached | TTFT | TTFT cold |
+  |---|---|---|---|---|
+  | 3 | 157 | 121 | 0.37 s | 1.44 s |
+  | 4 | 196 | 153 | 0.45 s | 1.80 s |
+
+  Qwen3's template renders a past reply without the empty thinking block its generation prompt
+  had, so each turn feeds the last reply again (as otpu-chat).
+
+## Tests
+
+All on the ISA simulator with tiny models.
+
+- `tests/test_serve_kvio.py`: save and restore bit for bit (Qwen3, LFM2, Qwen3.5 on one and two
+  slices, direct and staged), partial restores, shared pages.
+- `test_serve_store.py`: the tiers, pins, restart, the prefix cache.
+- `test_serve_scheduler.py`: requests in turns equal their fresh runs, prefixes from the device
+  and the store, stop strings, cancels, a store on disk across workers.
+- `test_batch_steps.py`: greedy rows each sequence's decode, sampled rows the decode loop's pick,
+  IMEM groups.
+- `test_serve_batching.py`: requests in slots equal their fresh runs, a prefix copied between
+  slots and restored from the store, a seeded sampled request the same alone and batched.
+- `test_serve_api.py`: the HTTP API end to end with concurrent clients.
