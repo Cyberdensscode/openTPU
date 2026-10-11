@@ -145,7 +145,7 @@ def test_the_coming_steps_rows_are_told_ahead():
     assert w._rows_at(0) == ([(s1, 8)], [None])
     assert w._rows_at(1)[0] == [(s1, 9)]
     assert w._rows_at(3)[0] == [(s1, 11)]
-    assert w._rows_at(4)[0] == [(s1, 12), (s2, 29)]
+    assert w._rows_at(4)[0] == sorted([(s1, 12), (s2, 29)])
     joined = []
     for it in range(5):                         # the loop's feed runs, iteration by iteration
         b = w.budget

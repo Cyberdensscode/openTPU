@@ -46,6 +46,7 @@ from . import generate as G
 
 GREEDY = None
 LIVE = 16                       # live programs kept (row sets that may run again)
+PAD_AHEAD = 4                   # a padded group's own program: compiled for this many steps on
 FEED = "feed"                   # a row that only feeds its token (a prompt's): no LM head, no pick
 
 
@@ -269,8 +270,9 @@ class Steps:
         # where a step's time goes: device cycles, the host's waits for programs (compiles
         # not ready), the whole runs; programs compiled, runs of a program already loaded
         self.timing = {"cycles": 0, "compile_wait_s": 0.0, "compiled_inline": 0, "run_s": 0.0,
-                       "programs": 0, "reused": 0, "write_s": 0.0, "start_s": 0.0,
-                       "wait_s": 0.0, "read_s": 0.0}
+                       "programs": 0, "reused": 0, "padded": 0, "write_s": 0.0,
+                       "start_s": 0.0, "wait_s": 0.0, "read_s": 0.0}
+        self._pad_to: dict = {}           # (slots, kinds) -> the rows its padding waits for
 
     def set_sampling(self, slot: int, samp, context=()) -> None:
         """Slot `slot` picks greedily (samp None) or with samp (generate.Sampling): its state
@@ -337,24 +339,43 @@ class Steps:
         finally:
             self.timing["compile_wait_s"] += time.perf_counter() - t0
 
+    def _blocks(self, rows, kinds=None) -> list:
+        """rows (and kinds) by blocks of feed_rows() slots, in slot order."""
+        q = self.feed_rows()
+        kinds = [None] * len(rows) if kinds is None else list(kinds)
+        out = {}
+        for r, k in zip(rows, kinds):
+            out.setdefault(r[0] // q, ([], []))
+            out[r[0] // q][0].append(r)
+            out[r[0] // q][1].append(k)
+        return [out[b] for b in sorted(out)]
+
     def plan_known(self, rows, kinds) -> list[list] | None:
         """plan's groups for rows of kinds when every group's IMEM fit is known (else None),
         compiling nothing."""
-        rows, kinds = list(rows), list(kinds)
-        fit = self._fit.get(self._sig(self._key(rows, kinds)))
+        out = []
+        for br, bk in self._blocks(rows, kinds):
+            g = self._fit_known(br, bk)
+            if g is None:
+                return None
+            out += g
+        return out
+
+    def _fit_known(self, rows, kinds):
+        fit = self._fit_of(self._sig(self._key(rows, kinds)))
         if fit is None:
             return None
         if fit or len(rows) == 1:
             return [rows] if fit else None
         h = -(-len(rows) // 2)
-        a, b = self.plan_known(rows[:h], kinds[:h]), self.plan_known(rows[h:], kinds[h:])
+        a, b = self._fit_known(rows[:h], kinds[:h]), self._fit_known(rows[h:], kinds[h:])
         return None if a is None or b is None else a + b
 
     def prefetch_rows(self, rows, kinds) -> None:
         """Compile ahead a coming step's programs: rows of kinds (a slot's kind may change by
-        then) in plan's groups, or all of them while their IMEM fit is unknown (plan then takes
-        the compile for its fit check)."""
-        groups = self.plan_known(rows, kinds) or [list(rows)]
+        then) in plan's groups, or each block's rows while their IMEM fit is unknown (plan
+        then takes the compile for its fit check)."""
+        groups = self.plan_known(rows, kinds) or [br for br, _ in self._blocks(rows, kinds)]
         k = dict(zip((s for s, _ in rows), kinds))
         for g in groups:
             kg = tuple(k[s] for s, _ in g)
@@ -362,10 +383,38 @@ class Steps:
                 self._prefetch(self._key(g, kg))
 
     def plan(self, rows) -> list[list]:
-        """The step's rows in groups whose programs fit IMEM."""
+        """The step's rows in groups whose programs fit IMEM: each block of feed_rows() slots'
+        rows (an MXU pass takes that many rows: more in a run cost another pass; and a row
+        that leaves changes its block's program only), halved while a program does not fit."""
+        out = []
+        for br, _ in self._blocks(list(rows)):
+            out += self._plan_fit(br)
+        return out
+
+    def _fit_of(self, sig):
+        """sig's IMEM fit: known, or told by a known one (fewer rows of the same kinds and
+        buckets make a smaller program: a subset of a fit fits, a superset of a misfit does
+        not), else None."""
+        if sig in self._fit:
+            return self._fit[sig]
+        from collections import Counter
+        c = Counter(sig[0])
+        for k, fit in self._fit.items():
+            if k[1] != sig[1]:
+                continue
+            ck = Counter(k[0])
+            if fit and not c - ck:
+                return True
+            if not fit and not ck - c:
+                return False
+        return None
+
+    def _plan_fit(self, rows) -> list[list]:
         rows = list(rows)
         key = self._key(rows)
         sig = self._sig(key)
+        if self._fit_of(sig) is not None:
+            self._fit.setdefault(sig, self._fit_of(sig))
         if sig not in self._fit:
             if len(self._ready) > 8:
                 self._ready.clear()
@@ -378,14 +427,14 @@ class Steps:
                 raise CompileError(f"one row's step does not fit IMEM ({self.limit})")
             return [rows]
         h = -(-len(rows) // 2)
-        return self.plan(rows[:h]) + self.plan(rows[h:])
+        return self._plan_fit(rows[:h]) + self._plan_fit(rows[h:])
 
     def _prefetch(self, key) -> None:
         """Compile key's programs in the background (if not there or on the way already)."""
         eng = self.eng
         if key is None or key in self._ready or key in self._next:
             return
-        if self._fit.get(self._sig(key)) is False:
+        if self._fit_of(self._sig(key)) is False:
             return
         while len(self._next) > 8:               # (keys that never came)
             self._next.pop(next(iter(self._next))).result()
@@ -508,11 +557,47 @@ class Steps:
         return out
 
     # ---- the step
-    def run(self, rows, tokens, uniforms=None, ahead=True) -> list[int]:
+    def _pad(self, grp, free):
+        """A live program that serves grp and rows of free slots (a request left: its slot's
+        row stays, fed a dummy token past its context, its pick dropped) while grp's own
+        program is not ready: (its rows, kinds), or None. grp's own program is compiled for
+        PAD_AHEAD steps on, once."""
+        eng = self.eng
+        kinds = tuple(self.kinds.get(s) for s, _ in grp)
+        key = self._key(grp, kinds)
+        if self._serving(grp, kinds) is not None or key in self._ready or key in self._next:
+            return None
+        slots = {s for s, _ in grp}
+        pos = dict(grp)
+        for (lslots, lkinds), (base, n, _) in reversed(list(self._live.items())):
+            extra = [s for s in lslots if s not in slots]
+            if not extra or not slots <= set(lslots) or any(s not in free for s in extra):
+                continue
+            lk = dict(zip(lslots, lkinds))
+            if any(lk[s] != k for (s, _), k in zip(grp, kinds)):
+                continue
+            ts = {pos.get(s, eng.poss[s]) - b for s, b in zip(lslots, base)}
+            if len(ts) != 1:
+                continue
+            t = ts.pop()
+            if not 0 <= t < n or any(eng.poss[s] >= eng.cap for s in extra):
+                continue
+            sk = (tuple(sorted(slots)), kinds)
+            ahead = [(s, p + PAD_AHEAD) for s, p in grp]
+            if self._pad_to.get(sk, (None,))[0] is None or \
+                    min(p for _, p in self._pad_to[sk]) <= min(p for _, p in grp):
+                if all(p < eng.cap for _, p in ahead):
+                    self._prefetch(self._key(ahead, kinds))
+                    self._pad_to[sk] = ahead
+            return [(s, b + t) for s, b in zip(lslots, base)], tuple(lkinds)
+        return None
+
+    def run(self, rows, tokens, uniforms=None, ahead=True, free=()) -> list[int]:
         """Feed tokens[r] to slot rows[r][0] at its position rows[r][1] (the slot's next);
         returns each row's picked token. uniforms: the sampled rows' (one per row). ahead:
         while a group runs, compile the next group's program (span off: after the last, the
-        next step's first, each row one position on)."""
+        next step's first, each row one position on). free: slots with no request, whose
+        rows may pad a live program while a group's own one compiles (_pad)."""
         eng = self.eng
         rows = [(int(s), int(p)) for s, p in rows]
         for s, p in rows:
@@ -537,6 +622,16 @@ class Steps:
                         ahead_key = k1
                     elif self._fit.get(self._sig(k1)) is False:
                         ahead_key = self._key(self.plan(nxt_rows)[0])
+            pad = self._pad(grp, set(free)) if free and self.span_steps else None
+            if pad is not None:
+                ext, lk = pad
+                self.timing["padded"] += 1
+                got = self._go(ext, lk, [tok.get(s, 0) for s, _ in ext],
+                               [uni.get(s, 0.5) if uni else 0.5 for s, _ in ext], 1, ahead_key)
+                for (s, _), t_ in zip(ext, got):
+                    if s in tok:
+                        out[s] = int(t_)
+                continue
             got = self._go(grp, None, [tok[s] for s, _ in grp],
                            None if uni is None else [uni[x] for x, _ in grp], 1, ahead_key)
             for (s, _), t_ in zip(grp, got):

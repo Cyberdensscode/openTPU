@@ -257,3 +257,39 @@ def test_feed_kinds_from_another_process():
     rows = [(1, 8 + j) for j in range(4)]
     progs = BA.compile_step(eng.image, eng.bat, rows, [kind] * 4, eng.block, 4)
     assert len(progs[0]) > 0
+
+
+def test_a_leaving_rows_slot_pads_until_the_new_program():
+    """A row leaves a 3-row group: the other two run in the live program for PAD_AHEAD steps,
+    the free slot's row fed a dummy token past its context, then in their own program (compiled
+    for that step): their tokens are their decodes; the left slot's context is intact."""
+    eng, single, spec = _engines()
+    eng.pipeline = True
+    st = BA.Steps(eng)
+    slots, ps = [0, 1, 2], _prompts(10, [11, 14, 9])
+    got = {}
+    for s, p in zip(slots, ps):
+        got[s] = [int(np.argmax(eng.prefill(p, seq=s)))]
+        st.set_sampling(s, None)
+    for _ in range(2):
+        out = st.run([(s, eng.poss[s]) for s in slots], [got[s][-1] for s in slots])
+        for s, t in zip(slots, out):
+            got[s].append(t)
+    n1 = eng.poss[1]                           # slot 1 leaves here
+    live = [0, 2]
+    for _ in range(BA.PAD_AHEAD + 2):
+        out = st.run([(s, eng.poss[s]) for s in live], [got[s][-1] for s in live], free={1})
+        for s, t in zip(live, out):
+            got[s].append(t)
+    assert st.timing["padded"] == BA.PAD_AHEAD, st.timing
+    assert eng.poss[1] == n1 + BA.PAD_AHEAD
+    eng.adopt(n1, seq=1)                       # slot 1's context goes on as if never padded
+    for _ in range(2):
+        got[1].append(st.run([(1, eng.poss[1])], [got[1][-1]])[0])
+    for s, p in zip(slots, ps):
+        e = single()
+        lg, want = e.prefill(p), []
+        for _ in range(len(got[s])):
+            want.append(int(np.argmax(lg)))
+            lg = e.step(want[-1])
+        assert got[s] == want, s

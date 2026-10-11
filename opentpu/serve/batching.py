@@ -219,7 +219,8 @@ class BatchWorker(SC.Worker):
                     rows.append((x.slot, len(x.prompt) - 1 + (k - it)))
                     kinds.append(BA.kind_of(self._samp(x)))
                     i += 1
-        return rows, kinds
+        order = sorted(range(len(rows)), key=lambda j: rows[j][0])     # as _decode_step's
+        return [rows[j] for j in order], [kinds[j] for j in order]
 
     def _ahead(self) -> None:
         """Compile ahead this iteration's and the next one's steps when their rows differ from
@@ -246,8 +247,8 @@ class BatchWorker(SC.Worker):
         for r in dec:
             if len(r.fed) >= eng.cap:
                 r.finish = "length"
-        dec = [r for r in dec if r.finish is None]
-        if not dec:
+        dec = sorted((r for r in dec if r.finish is None), key=lambda r: r.slot)
+        if not dec:                             # (rows in slot order: a row set's program key)
             return
         if len(dec) == 1 and dec[0].slot == 0 and not self.waiting and not self.prefilling \
                 and eng.can_generate:
@@ -264,7 +265,7 @@ class BatchWorker(SC.Worker):
             uni = [float(self._sampler(r).rng.random()) if self._samp(r) is not None else 0.0
                    for r in dec]
         n0 = self.steps.runs
-        out = self.steps.run(rows, toks, uni)
+        out = self.steps.run(rows, toks, uni, free=set(self._free_slots()))
         self.stats["steps"] += 1
         self.stats["step_rows"] += len(rows)
         self.stats["step_runs"] += self.steps.runs - n0
