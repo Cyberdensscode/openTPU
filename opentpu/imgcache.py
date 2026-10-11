@@ -10,8 +10,9 @@ and safetensors headers of its config.json and weight files), the Image's class,
 (the Engine's: Spec, Config, KV capacity, batch, prefill rows, attention block, the image
 keywords: formats, lookup tables, expert slots and the image's own choices), the OTPU_*
 environment (progcache.keyed_env: some layouts read it, e.g. OTPU_FORMATS), the source of every
-module of opentpu but opentpu/host (progcache.source: the models, kernels and quantizers), and
-the numpy and torch versions. A W that is not a checkpoint's (the tests' dicts) is not cached.
+module of opentpu but opentpu/host, opentpu/serve and progcache.UNKEYED's tools
+(progcache.source: the models, kernels and quantizers), and the numpy and torch versions. A W
+that is not a checkpoint's (the tests' dicts) is not cached.
 
 What the build leaves on the Image is its attributes (and the entries of its dict attributes)
 that the build added or replaced: arrays are stored with the images, the weights themselves
