@@ -241,12 +241,12 @@ def main(argv=None):
     P.step(Q.Engine, "_decode", "compile-wait")
     b_write = B.Board.write
 
-    def board_write(self, addr, data):                  # the program's DMA in load_program
+    def board_write(self, addr, data, *a, **k):         # the program's DMA in load_program
         if P.stack[-1] != "imem-load":
-            return b_write(self, addr, data)
+            return b_write(self, addr, data, *a, **k)
         P.stack.append("prog-upload")
         try:
-            return b_write(self, addr, data)
+            return b_write(self, addr, data, *a, **k)
         finally:
             P.stack.pop()
     B.Board.write = board_write
