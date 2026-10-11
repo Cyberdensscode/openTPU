@@ -6,10 +6,11 @@ A program is a function of the image's layout and of what is compiled. The layou
 Spec, Config, KV capacity, batch, rows, attention block and image keywords (formats, lookup tables,
 expert slots, the image's own choices: Engine._image_kw). What is compiled is a tuple naming the
 program and its arguments (("gen", blocks, ...)). The key hashes both, the source of the compiler
-and the kernels (every module of opentpu but opentpu/host and the tools that decide no program word
-or image byte (UNKEYED: the profilers, the traces, the reference math, the RTL simulation), and the
-host modules whose constants the programs take: HOST_KEYED) and the OTPU_* environment (some kernels read it, e.g. OTPU_FORMATS,
-OTPU_MLP_UNROLL_BODIES): any change misses.
+and the kernels (every module of opentpu but opentpu/host, opentpu/serve and the tools that
+decide no program word or image byte (UNKEYED: the profilers, the traces, the reference math, the
+RTL simulation), and the host modules whose constants the programs take: HOST_KEYED) and the
+OTPU_* environment (some kernels read it, e.g. OTPU_FORMATS, OTPU_MLP_UNROLL_BODIES): any change
+misses.
 
 `get(layout, what, compile)` returns the cached value or compile()'s, which it keeps. A value is
 (programs, run_args): programs one per slice (a list of Instr, or its assembled words, as the
@@ -82,12 +83,13 @@ def cache_dir() -> Path | None:
 
 
 def keyed() -> list[Path]:
-    """The modules source() hashes: every module of opentpu but opentpu/host and UNKEYED (the
-    compiler, the kernels, the models' layouts and kernels), and HOST_KEYED."""
+    """The modules source() hashes: every module of opentpu but opentpu/host, opentpu/serve (the
+    card's drivers, the API server) and UNKEYED (the compiler, the kernels, the models' layouts
+    and kernels), and HOST_KEYED."""
     root = Path(__file__).resolve().parent
     rel = {f: f.relative_to(root).as_posix() for f in sorted(root.rglob("*.py"))}
     return [f for f, r in rel.items()
-            if (not r.startswith("host/") and r not in UNKEYED) or r in HOST_KEYED]
+            if (not r.startswith(("host/", "serve/")) and r not in UNKEYED) or r in HOST_KEYED]
 
 
 def source() -> str:

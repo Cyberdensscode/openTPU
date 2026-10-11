@@ -78,7 +78,7 @@ def test_the_key_sees_the_host_modules_the_programs_take(monkeypatch):
         monkeypatch.setattr(Path, "read_bytes", edited(name))
         assert (PC.key(("spec", 512), ("gen", 1)) != k) == misses, name
     keyed = {f.relative_to(root).as_posix() for f in PC.keyed()}
-    for f in root.rglob("*.py"):
+    for f in PC.keyed():                        # (opentpu/serve's are not keyed)
         rel = f.relative_to(root).parts
         if rel[0] == "host":
             continue

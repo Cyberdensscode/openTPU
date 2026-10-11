@@ -104,7 +104,7 @@ LONG_TEXT = (
 LONG_TOKENS = 240                             # the long prompt's tokens, at most
 ATTN_BLOCK = 256                              # the attention bucket (opentpu.llm.qwen3's)
 DATE = datetime.date(2026, 9, 29)             # "today" for chat templates that state it
-EXCLUDE = ("host/", "lens.py", "lens_app.html", "rtlsim.py", "hwtrace.py")
+EXCLUDE = ("host/", "serve/", "lens.py", "lens_app.html", "rtlsim.py", "hwtrace.py")
 # host code the models import into the reference's path (opentpu.llm.*, kernels/mailbox.py:
 # LINE, Layout, RowLayout, ExpertServer: the mailbox, PLE rows, MoE serving)
 HOST_IN_REF = ("host/offload.py",)
