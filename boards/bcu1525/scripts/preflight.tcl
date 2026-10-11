@@ -4,10 +4,24 @@
 # that covers it (the VU9P is outside the free tier): a one-register design is synthesized and
 # optimized on the part, which asks for the device's Synthesis and Implementation licenses.
 #   vivado -mode batch -nojournal -nolog -source preflight.tcl -tclargs PART
-# Exit 0 (PREFLIGHT ok), 2 (the part is not installed), 3 (no license for it).
+# Exit 0 (PREFLIGHT ok), 2 (the part is not installed), 3 (no license for it: synthesis refused, or
+# the device files installed but the part hidden, as Vivado hides the parts no license enables).
 set part [expr {[llength $argv] ? [lindex $argv 0] : "xcvu9p-fsgd2104-2L-e"}]
 puts "PREFLIGHT: Vivado [version -short], part $part"
 if {![llength [get_parts -quiet $part]]} {
+  # Vivado lists only the parts a license enables: with the device files installed (their
+  # family's directory under data/parts) a missing part is the license's
+  set dirs {xcvu virtexuplus xcku kintexuplus xczu zynquplus xcau artixuplus}
+  set pre [string range $part 0 3]
+  if {[dict exists $dirs $pre] && [file isdirectory [file join $::env(XILINX_VIVADO) data parts \
+                                                       xilinx [set fam [dict get $dirs $pre]]]]} {
+    puts "PREFLIGHT FAILED: the $fam device files are installed but Vivado lists no $part: no\
+          license enables it (Vivado lists only the parts its licenses cover). The VU9P needs a\
+          paid license (Vivado ML Enterprise, or one locked to the device); check the Vivado License\
+          Manager (vlm) and XILINXD_LICENSE_FILE (a node-locked license is bound to one network\
+          interface's MAC)."
+    exit 3
+  }
   set fams [lsort -unique [get_property -quiet FAMILY [get_parts -quiet]]]
   puts "PREFLIGHT FAILED: the part $part is not installed in this Vivado (installed families:\
         $fams). Add the Virtex UltraScale+ devices: the Vivado installer, or Help > Add Design\

@@ -151,7 +151,7 @@ connect_bd_intf_net [get_bd_intf_pins xdma_0/M_AXI] [get_bd_intf_pins sc_dma/S00
 foreach p $dmas {
   set m [create_bd_intf_port -mode Master -vlnv xilinx.com:interface:aximm_rtl:1.0 $p]
   set_property -dict [list CONFIG.PROTOCOL AXI4 CONFIG.DATA_WIDTH 128 CONFIG.ADDR_WIDTH 33 \
-    CONFIG.ID_WIDTH 0 CONFIG.HAS_BURST 0 CONFIG.HAS_LOCK 0 CONFIG.HAS_PROT 0 CONFIG.HAS_CACHE 0 \
+    CONFIG.HAS_BURST 0 CONFIG.HAS_LOCK 0 CONFIG.HAS_PROT 0 CONFIG.HAS_CACHE 0 \
     CONFIG.HAS_QOS 0 CONFIG.HAS_REGION 0 CONFIG.FREQ_HZ $XDMA_HZ] $m
   connect_bd_intf_net [get_bd_intf_pins sc_dma/M0[string index $p end]_AXI] $m
 }
@@ -166,7 +166,7 @@ set_property CONFIG.FREQ_HZ $XDMA_HZ [get_bd_ports xdma_aclk]
 set sysmon [create_bd_cell -type ip -vlnv [ip_vlnv system_management_wiz] sysmon]
 set_property -dict [list CONFIG.INTERFACE_SELECTION {Enable_AXI} \
   CONFIG.DCLK_FREQUENCY [expr {int(ceil($CORE_HZ / 1.0e6))}] \
-  CONFIG.SEQUENCER_MODE {Off} CONFIG.CHANNEL_ENABLE_VP_VN {false} \
+  CONFIG.SEQUENCER_MODE {Default} CONFIG.CHANNEL_ENABLE_VP_VN {false} \
   CONFIG.ENABLE_TEMP_BUS {true} CONFIG.OT_ALARM {false} CONFIG.USER_TEMP_ALARM {false} \
   CONFIG.VCCINT_ALARM {false} CONFIG.VCCAUX_ALARM {false}] $sysmon
 connect_bd_net [get_bd_pins clk_wiz_0/core_clk] [get_bd_pins sysmon/s_axi_aclk]
@@ -217,6 +217,10 @@ foreach {k want} [list pf0_device_id 7028 pf0_class_code 120000 pf0_subsystem_id
 foreach p $dmas {
   set w [get_property CONFIG.DATA_WIDTH [get_bd_intf_ports $p]]
   if {$w != 128} { error "$p is $w bits, expected 128 (otpu_mem_ch's XDMA side)" }
+  # read-only on a master port (the SmartConnect sets it): the top has no ID signals, and
+  # otpu_mem_ch answers in order
+  set id [get_property CONFIG.ID_WIDTH [get_bd_intf_ports $p]]
+  if {$id != 0} { error "$p has $id ID bits, expected none (otpu_fpga_top_bcu wires no IDs)" }
 }
 puts "M_AXI_DMA0..3: 128 bits from XDMA's $AXI_BITS"
 save_bd_design

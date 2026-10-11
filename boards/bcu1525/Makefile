@@ -20,6 +20,7 @@ ROOT := $(abspath ../..)
 LITEX_VENV ?= $(HOME)/eda/litex-venv
 RVSHIM ?= $(HOME)/eda/rvshim
 PART ?= xcku5p-ffvb676-2-e
+IPCHECK_STEPS ?= bd,bdsynth,ld4
 OUT ?= $(ROOT)/build/vivado_bcu1525
 BIT ?= $(OUT)/otpu.bit
 MCS ?= $(OUT)/otpu.mcs
@@ -52,7 +53,7 @@ core:
 
 ipcheck:
 	vivado -mode batch -nojournal -log $(OUT)_ipcheck.log -source vivado/ip_check.tcl \
-	  -tclargs $(PART) $(OUT)_ipcheck bd,ld4
+	  -tclargs $(PART) $(OUT)_ipcheck $(IPCHECK_STEPS)
 
 bit:
 	./run_vivado.sh
