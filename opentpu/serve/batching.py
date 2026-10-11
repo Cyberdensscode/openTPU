@@ -8,10 +8,12 @@ Each iteration of the loop:
    (its pages copied on the device), or in the KV store (host RAM, then disk); a slot's context
    that would be overwritten is saved to the store first;
 2. one run of the oldest prompt still being fed (chunked prefill: the decoding requests wait one
-   run at most); its last run's logits give the request's first token;
+   run at most): up to MCOLS of its tokens, every weight streamed once, no LM head
+   (batch.Steps.feed). A prompt feeds all but its last token this way;
 3. one batched step for every decoding request (opentpu/llm/batch.py): a run feeds each one its
    token and picks its next on the device, greedy or with its own sampling; the host reads one
-   word per request.
+   word per request. A request's first step feeds its prompt's last token, so its first token
+   is picked on the device too: the host never reads logits.
 
 A request that decodes alone in slot 0 with nothing waiting runs the card's decode loop instead
 (Engine.generate_card), halted after the token in flight when another arrives. Requests past
@@ -23,13 +25,10 @@ from __future__ import annotations
 import time
 import traceback
 
-import numpy as np
-
 from ..llm import batch as BA
 from ..llm import generate as G
 from . import kvio as KV
 from . import scheduler as SC
-from . import store as ST
 
 
 def batches(eng) -> bool:
@@ -55,7 +54,6 @@ class BatchWorker(SC.Worker):
         self.slot_used = [0.0] * B
         self.steps = BA.Steps(eng)
         self.prefilling: list = []                # requests being fed, oldest first
-        self._gens: dict = {}                     # request -> its prefill_chunks generator
         self.stats.update(steps=0, step_rows=0, step_runs=0, slot_copies=0, card_loops=0,
                           step_s=0.0)
 
@@ -100,7 +98,7 @@ class BatchWorker(SC.Worker):
                 self._reset_device()
 
     def _reset_device(self) -> None:
-        self.prefilling, self._gens = [], {}
+        self.prefilling = []
         self.steps.drop()
         for s in range(self.B):
             self.slot_req[s], self.slot_dev[s], self.slot_dirty[s] = None, [], False
@@ -157,32 +155,37 @@ class BatchWorker(SC.Worker):
         self.stats["prompt_tokens"] += len(want)
         self.slot_req[s], self.slot_dev[s], self.slot_dirty[s] = r, r.fed, True
         self.slot_used[s] = time.monotonic()
-        self.prefilling.append(r)
-        self._gens[r] = self.eng.prefill_chunks(want[k:], seq=s)
+        r._feed = list(want[k:-1])               # fed in runs; the last token, a step's row
+        r.next = want[-1]
+        r.prefill_tokens += 1
+        self.stats["prefill_tokens"] += 1
+        if r._feed:
+            self.prefilling.append(r)
+            q = self.steps.feed_rows()
+            p, n = k, len(r._feed)
+            head = min(n, (q - p % q) % q)
+            self.steps.prefetch_feed(s, p + n - (n - head) % q, (n - head) % q)
         r._bset = False
         self.stats["switch_s"] += time.perf_counter() - t0
 
     # ---- prefill and decode
     def _prefill_run(self, r: SC.Request) -> None:
+        """One feed run of r's prompt (up to MCOLS tokens, from a multiple of it on)."""
         t0 = time.perf_counter()
-        try:
-            part, logits = next(self._gens[r])
-        except StopIteration:                    # (an empty rest: not reached, limit keeps one)
-            part, logits = [], None
+        q = self.steps.feed_rows()
+        p = self.eng.poss[r.slot]
+        part = r._feed[:q - p % q]
+        self.steps.feed(r.slot, part)
+        del r._feed[:len(part)]
         r.fed += part
         r.prefill_tokens += len(part)
         self.stats["prefill_tokens"] += len(part)
         self.stats["prefill_s"] += time.perf_counter() - t0
         if r.cancelled.is_set():
             r.finish = "abort"
-        if len(r.fed) < len(r.prompt) and r.finish is None:
+        if r._feed and r.finish is None:
             return
         self.prefilling.remove(r)
-        self._gens.pop(r, None)
-        if r.finish is not None:
-            return
-        t = int(np.argmax(logits)) if r.sampling.greedy else int(self._sampler(r)(logits, r.fed))
-        self._emit(r, t)
 
     def _samp(self, r: SC.Request):
         """The request's sampling on the device: None (greedy) or a generate.Sampling (top-k
@@ -266,9 +269,6 @@ class BatchWorker(SC.Worker):
             self.slot_used[s] = time.monotonic()
         if r in self.prefilling:
             self.prefilling.remove(r)
-            gen = self._gens.pop(r, None)
-            if gen is not None:
-                gen.close()
         super()._end(r, why)
 
     def stop(self, persist: bool = True) -> None:

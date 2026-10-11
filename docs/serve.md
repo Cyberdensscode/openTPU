@@ -91,8 +91,9 @@ batch_area=True)`). Each iteration of the worker:
    slot 0, else the least recently used. The prompt continues the longest prefix found in that
    slot, in another slot (its pages copied on the card, no PCIe) or in the store. A slot's
    context is saved to the store before it is overwritten.
-2. One run of the oldest prompt being fed (chunked prefill: decoding requests wait one run at
-   most).
+2. One feed run of the oldest prompt being fed (chunked prefill: decoding requests wait one run
+   at most): up to MCOLS (4) of its tokens, every weight streamed once, no LM head
+   (`Steps.feed`). A prompt feeds all but its last token this way.
 3. One batched step for every decoding request (`opentpu/llm/batch.py`):
    - a run feeds each one its token from DRAM; the embedding rows are gathered and the RoPE
      rows loaded from the image's tables;
@@ -102,18 +103,32 @@ batch_area=True)`). Each iteration of the worker:
      request's uniform;
    - the picks go to DRAM.
 
-   The host writes the tokens and reads one word per request: no logits leave the card, and
-   the host computes nothing of the model.
+   A request's first step feeds its prompt's last token, so its first token is picked on the
+   card too. The host writes the tokens and reads one word per request: no logits leave the
+   card, and the host computes nothing of the model.
 
 A request decoding alone in slot 0 runs the card's decode loop instead (`generate_card`),
 halted after the token in flight when another arrives. A step's rows run in groups whose program
 fits IMEM. The LM head's sinks and each row's attention grow it, so four rows of Qwen3-0.6B fit
 early in the context and fewer late in it.
 
+**Span programs.** A step's program would take its rows' positions at compile time, and the
+host's compile of a 4-row step (~50-130 ms on the card host's i7-4790, growing with the context)
+took longer than the card's run of it (44-59 ms). Instead, a program serves its rows for a span
+of steps: row r is at position p_r + t, where t is the run's step in a DRAM word that the
+program loads and multiplies into its argument and address registers (RLD, as the prompt runs
+do). All rows add the same t, so they share those registers. The span ends where a row reaches
+the end of its attention block (256 tokens); until then the same program runs again, already
+in IMEM. The next one is compiled ahead as soon as a program starts serving. A feed run's
+program serves its slot's runs through an attention block the same way, its rows advancing by
+MCOLS a run.
+
 **In turns** (`opentpu/serve/scheduler.py`, `Worker`: LFM2, Qwen3.5, Gemma 4, the streamed
 MoEs, whose images hold one sequence). The requests (`--max-running` at once) take the card in
 turns of `--quantum` tokens. Each switch saves the outgoing context's new pages and tail and
-restores the incoming one. A request running alone runs to its end.
+restores the incoming one. A request running alone runs to its end. The prompt is fed but its
+last token, which the card's decode loop feeds and picks from (when the loop takes the request's
+sampling; else the host picks the first token from the logits).
 
 ## Measured on the card
 
@@ -156,7 +171,7 @@ All on the ISA simulator with tiny models.
 - `test_serve_scheduler.py`: requests in turns equal their fresh runs, prefixes from the device
   and the store, stop strings, cancels, a store on disk across workers.
 - `test_batch_steps.py`: greedy rows each sequence's decode, sampled rows the decode loop's pick,
-  IMEM groups.
+  IMEM groups, span programs across attention blocks, feed runs then the last token's pick.
 - `test_serve_batching.py`: requests in slots equal their fresh runs, a prefix copied between
   slots and restored from the store, a seeded sampled request the same alone and batched.
 - `test_serve_api.py`: the HTTP API end to end with concurrent clients.

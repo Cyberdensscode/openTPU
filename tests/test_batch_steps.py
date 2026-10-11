@@ -188,3 +188,40 @@ def test_one_program_serves_a_span_of_steps_across_blocks():
             lg = e.step(want[-1])
         assert got[s] == want, s
     assert st.timing["programs"] == 2 and st.timing["reused"] == 6, st.timing
+
+
+def test_feed_runs_then_the_last_token_picks_on_the_device():
+    """A prompt fed in feed runs (MCOLS tokens, no LM head; from a multiple of MCOLS on, across
+    an attention block) but its last token, which a step's row feeds: its pick and the next
+    ones are the prompt's greedy decode. A feed program serves its block's runs."""
+    eng, single, spec = _engines()
+    blk = eng.block
+    st = BA.Steps(eng)
+    q = st.feed_rows()
+    ps = {1: _prompts(6, [blk + 10])[0], 3: _prompts(7, [7])[0]}
+    for s, p in ps.items():
+        eng.prefill(p[:3], seq=s)               # (a cached prefix: the feed starts unaligned)
+        st.set_sampling(s, None)
+    p0 = st.timing["programs"]
+    for s, p in ps.items():
+        st.feed(s, p[3:-1])
+        assert eng.poss[s] == len(p) - 1
+    # slot 1: a head run (1 token to the multiple of q), a program per block, the last run's
+    # (blk + 10 - 1 - 3 - 1 = blk + 5 tokens: 1 + blk + 4); slot 3: a head run of 1, then 2
+    assert st.timing["programs"] - p0 <= 3 + 2, st.timing
+    got = {s: [] for s in ps}
+    nxt = {s: p[-1] for s, p in ps.items()}
+    for _ in range(4):
+        rows = [(s, eng.poss[s]) for s in ps]
+        out = st.run(rows, [nxt[s] for s, _ in rows])
+        for (s, _), t in zip(rows, out):
+            got[s].append(t)
+            nxt[s] = t
+    for s, p in ps.items():
+        e = single()
+        lg, want = e.prefill(p), []
+        for _ in range(4):
+            want.append(int(np.argmax(lg)))
+            lg = e.step(want[-1])
+        assert got[s] == want, s
+    assert q == eng.cfg.MCOLS

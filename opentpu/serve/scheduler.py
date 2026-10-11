@@ -338,15 +338,27 @@ class Worker:
                                    s.seed, s.repetition_penalty, self.softcap)
         return r._pick
 
+    def _card_picks(self, r: Request) -> bool:
+        """The device's decode loop picks r's tokens (greedy, or a sampling it takes)."""
+        if not getattr(self.eng, "can_generate", False):
+            return False
+        return r.sampling.greedy or G.Sampling.fits(**self._sampler(r).params)
+
     def _prefill(self, r: Request) -> None:
+        """Feed r's prompt from r.fed on. When the device's loop picks r's tokens, all but its
+        last token, which becomes r.next: the decode loop feeds it and picks the first token
+        on the device (no logits to the host); else the host picks it from the logits."""
         t0 = time.perf_counter()
         ids = r.prompt
         n = len(r.fed)
-        at = r.at if self.stateful and r.at is not None and n < r.at < len(ids) else None
+        last = len(ids) - 1 if self._card_picks(r) else len(ids)
+        at = r.at if self.stateful and r.at is not None and n < r.at < last else None
         cut = [at] if at is not None else []
         logits = None
         self.stats["prompt_tokens"] += len(ids)
-        for a, b in zip([n] + cut, cut + [len(ids)]):
+        for a, b in zip([n] + cut, cut + [last]):
+            if a >= b:
+                continue
             kw = {} if b == len(ids) else {"logits": False}
             for part, logits in self.eng.prefill_chunks(ids[a:b], **kw):
                 r.fed += part
@@ -360,6 +372,11 @@ class Worker:
                 self.cache.save(self.io, list(r.fed))
                 self.stats["saves"] += 1
         self.stats["prefill_s"] += time.perf_counter() - t0
+        if last < len(ids):                     # (the prompt's last token: the decode feeds it)
+            r.next = ids[-1]
+            r.prefill_tokens += 1
+            self.stats["prefill_tokens"] += 1
+            return
         t = int(np.argmax(logits)) if r.sampling.greedy else \
             int(self._sampler(r)(logits, r.fed))
         self._emit(r, t)

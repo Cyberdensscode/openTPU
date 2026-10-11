@@ -51,11 +51,28 @@ def main(argv=None):
     khz = (getattr(eng.backend, "info", None) or {}).get("core_khz") or 0
     r = np.random.default_rng(0)
     nxt = []
-    for s in range(a.slots):
-        p = [int(x) for x in r.integers(1000, 20000, a.context)]
-        nxt.append(int(np.argmax(eng.prefill(p, seq=s))))
     st = BA.Steps(eng)
     res = []
+    pre = {"prompt_runs": [0, 0.0, 0], "rows": [0, 0.0, 0], "feed": [0, 0.0, 0]}
+    for s in range(a.slots):                    # slot 0: the prompt runs; 1: the rows kernel
+        p = [int(x) for x in r.integers(1000, 20000, a.context)]  # (a program per run); the
+        k = len(eng.stats)                                         # others: feed runs + a step
+        t0 = time.perf_counter()
+        if s < 2:
+            nxt.append(int(np.argmax(eng.prefill(p, seq=s))))
+        else:
+            st.set_sampling(s, None)
+            st.feed(s, p[:-1])
+            nxt.append(st.run([(s, eng.poss[s])], [p[-1]])[0])
+        x = pre["prompt_runs" if s == 0 else "rows" if s == 1 else "feed"]
+        x[0] += len(p)
+        x[1] += time.perf_counter() - t0
+        x[2] += sum((y or {}).get("cycles") or 0 for y in eng.stats[k:])
+    for name, (n, w, cyc) in pre.items():
+        row = {"case": f"prefill {name}", "tokens": n, "tok_s": round(n / w, 1) if w else None,
+               "device_s": round(cyc / (khz * 1e3), 3) if khz else None, "wall_s": round(w, 3)}
+        res.append(row)
+        print(json.dumps(row), flush=True)
 
     def case(name, fn):
         """fn() -> (runs, tokens)."""
