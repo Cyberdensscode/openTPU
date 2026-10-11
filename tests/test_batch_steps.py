@@ -246,3 +246,14 @@ def test_a_joining_rows_step_is_compiled_ahead():
     e = single()
     e.prefill(ps[1])
     assert a[1] == int(np.argmax(e.step(nxt[2])))
+
+
+def test_feed_kinds_from_another_process():
+    """A feed row's kind as the compile worker process gets it (unpickled: an equal string, not
+    the same object) compiles as FEED."""
+    import pickle
+    eng, single, spec = _engines()
+    kind = pickle.loads(pickle.dumps("".join(["fe", "ed"])))
+    rows = [(1, 8 + j) for j in range(4)]
+    progs = BA.compile_step(eng.image, eng.bat, rows, [kind] * 4, eng.block, 4)
+    assert len(progs[0]) > 0

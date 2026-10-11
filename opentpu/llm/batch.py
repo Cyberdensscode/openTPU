@@ -34,6 +34,7 @@ compiles one per span, ahead, instead of one per step.
 from __future__ import annotations
 
 import time
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import numpy as np
@@ -44,6 +45,7 @@ from ..compiler import Affine, CompileError, RunVar, Tensor, current, vt_tile
 from . import generate as G
 
 GREEDY = None
+LIVE = 16                       # live programs kept (row sets that may run again)
 FEED = "feed"                   # a row that only feeds its token (a prompt's): no LM head, no pick
 
 
@@ -119,7 +121,7 @@ def batch_step(m, rows, kinds, block: int, area: dict, span: int = 0):
         raise CompileError(f"{R} rows for a run of {area['R']}")
     last = {}
     for (s, p), kind in zip(rows, kinds):      # a slot's rows: consecutive positions, all but
-        if s in last and (last[s][0] != p - 1 or last[s][1] is not FEED):    # the last feed
+        if s in last and (last[s][0] != p - 1 or last[s][1] != FEED):    # the last feed
             raise CompileError(f"slot {s}: rows at consecutive positions, only its last picks")
         last[s] = (p, kind)
     if span:                                    # the run's step: a TMEM word for the RLDs
@@ -259,7 +261,8 @@ class Steps:
         self._fit: dict = {}              # signature (kinds, buckets) -> the program fits IMEM
         self._ready: dict = {}            # key -> programs (compiled, not run yet)
         self._next: dict = {}             # key -> Future of its programs
-        self._live: dict = {}             # (slots, kinds) -> (positions at step 0, span, programs)
+        # (slots, kinds) -> (positions at step 0, span, programs), the least recently used first
+        self._live: OrderedDict = OrderedDict()
         self._pool = None
         self._words = bool(getattr(eng.backend, "runs_words", False)) and eng.cfg.S == 1
         self.runs = 0
@@ -402,6 +405,8 @@ class Steps:
         slots = tuple(s for s, _ in rows)
         kinds = tuple(self.kinds.get(s) for s in slots) if kinds is None else tuple(kinds)
         live = self._live.get((slots, kinds))
+        if live is not None:
+            self._live.move_to_end((slots, kinds))
         if live is None:
             return None
         base, n, progs = live
@@ -424,9 +429,10 @@ class Steps:
         self.timing["programs"] += 1
         rows, kinds, n = key
         slots = tuple(s for s, _ in rows)
-        if len(self._live) > 16:
-            self._live.clear()
         self._live[(slots, kinds)] = (tuple(p for _, p in rows), n, progs)
+        self._live.move_to_end((slots, kinds))
+        while len(self._live) > LIVE:
+            self._live.popitem(last=False)
         if n:
             d = -(-n // adv) * adv
             nxt = [(s, p + d) for s, p in rows]
