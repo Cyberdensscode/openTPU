@@ -31,6 +31,9 @@ from . import kvio as KV
 from . import scheduler as SC
 
 
+AHEAD_JOIN = 3          # feed runs before a prompt's end that the step it joins is compiled
+
+
 def batches(eng) -> bool:
     """The engine runs batched steps."""
     return getattr(eng, "bat", None) is not None
@@ -184,8 +187,26 @@ class BatchWorker(SC.Worker):
         if r.cancelled.is_set():
             r.finish = "abort"
         if r._feed and r.finish is None:
+            self._ahead_join(r)
             return
         self.prefilling.remove(r)
+
+    def _ahead_join(self, r: SC.Request) -> None:
+        """A few runs before r's prompt is fed, compile the step it joins: the decoding
+        requests that many steps on, r's row at its prompt's last token (an iteration runs one
+        feed run and one step)."""
+        q = self.steps.feed_rows()
+        n, p = len(r._feed), self.eng.poss[r.slot]
+        head = min(n, (q - p % q) % q)
+        m = (1 if head else 0) + -(-(n - head) // q)
+        if not 1 <= m <= AHEAD_JOIN or self.prefilling[0] is not r:
+            return
+        dec = [x for x in self.running if x.finish is None and x.next is not None
+               and x not in self.prefilling and x.slot is not None]
+        rows = [(x.slot, len(x.fed) + m) for x in dec] + [(r.slot, len(r.prompt) - 1)]
+        kinds = [self.steps.kinds.get(x.slot) for x in dec] + [BA.kind_of(self._samp(r))]
+        if all(p_ < self.eng.cap for _, p_ in rows):
+            self.steps.prefetch_rows(rows, kinds)
 
     def _samp(self, r: SC.Request):
         """The request's sampling on the device: None (greedy) or a generate.Sampling (top-k

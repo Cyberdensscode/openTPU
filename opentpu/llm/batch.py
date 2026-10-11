@@ -333,6 +333,30 @@ class Steps:
         finally:
             self.timing["compile_wait_s"] += time.perf_counter() - t0
 
+    def plan_known(self, rows, kinds) -> list[list] | None:
+        """plan's groups for rows of kinds when every group's IMEM fit is known (else None),
+        compiling nothing."""
+        rows, kinds = list(rows), list(kinds)
+        fit = self._fit.get(self._sig(self._key(rows, kinds)))
+        if fit is None:
+            return None
+        if fit or len(rows) == 1:
+            return [rows] if fit else None
+        h = -(-len(rows) // 2)
+        a, b = self.plan_known(rows[:h], kinds[:h]), self.plan_known(rows[h:], kinds[h:])
+        return None if a is None or b is None else a + b
+
+    def prefetch_rows(self, rows, kinds) -> None:
+        """Compile ahead a coming step's programs: rows of kinds (a slot's kind may change by
+        then) in plan's groups, or all of them while their IMEM fit is unknown (plan then takes
+        the compile for its fit check)."""
+        groups = self.plan_known(rows, kinds) or [list(rows)]
+        k = dict(zip((s for s, _ in rows), kinds))
+        for g in groups:
+            kg = tuple(k[s] for s, _ in g)
+            if self._serving(g, kg) is None:
+                self._prefetch(self._key(g, kg))
+
     def plan(self, rows) -> list[list]:
         """The step's rows in groups whose programs fit IMEM."""
         rows = list(rows)
@@ -359,7 +383,7 @@ class Steps:
             return
         if self._fit.get(self._sig(key)) is False:
             return
-        while len(self._next) > 4:               # (keys that never came)
+        while len(self._next) > 8:               # (keys that never came)
             self._next.pop(next(iter(self._next))).result()
         rows, kinds, n = key
         if eng._procs and eng._ready is not None and eng._ready.done():

@@ -225,3 +225,24 @@ def test_feed_runs_then_the_last_token_picks_on_the_device():
             lg = e.step(want[-1])
         assert got[s] == want, s
     assert q == eng.cfg.MCOLS
+
+
+def test_a_joining_rows_step_is_compiled_ahead():
+    """prefetch_rows compiles a coming step's program (a slot joining the decoding ones) in the
+    background: the step then compiles nothing inline, and its tokens are the decode's."""
+    eng, single, spec = _engines()
+    eng.pipeline = True                         # (a compile thread on the simulator)
+    st = BA.Steps(eng)
+    ps = _prompts(8, [13, 21])
+    nxt = {}
+    for s, p in zip([0, 2], ps):
+        nxt[s] = int(np.argmax(eng.prefill(p, seq=s)))
+        st.set_sampling(s, None)
+    st.run([(0, eng.poss[0])], [nxt[0]])        # slot 0 decodes alone ...
+    st.prefetch_rows([(0, eng.poss[0]), (2, eng.poss[2])], [None, None])
+    inline = st.timing["compiled_inline"]
+    a = st.run([(0, eng.poss[0]), (2, eng.poss[2])], [nxt[0], nxt[2]])   # ... slot 2 joins
+    assert st.timing["compiled_inline"] == inline, st.timing
+    e = single()
+    e.prefill(ps[1])
+    assert a[1] == int(np.argmax(e.step(nxt[2])))
