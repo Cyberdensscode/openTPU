@@ -124,7 +124,10 @@ do). All rows add the same t, so they share those registers. The span ends where
 the end of its attention block (256 tokens); until then the same program runs again, already
 in IMEM. The next one is compiled ahead as soon as a program starts serving, and so are the
 steps whose rows the worker can tell ahead (a prompt the feed budget finishes, a request
-reaching max_tokens). A feed run's
+reaching max_tokens). A step's rows run in blocks of MCOLS slots (an MXU pass takes MCOLS rows:
+more rows in a run cost another pass), so a request that leaves changes its block's program
+only; and until that block's new program is compiled (for a few steps on), the live one runs
+on with the free slot's row fed a dummy token past its saved context, its pick dropped. A feed run's
 program serves its slot's runs through an attention block the same way, its rows advancing by
 MCOLS a run.
 
@@ -186,8 +189,17 @@ with a program compiled per step (f99acce6), batched with span programs and feed
 
   Qwen3's template renders a past reply without the empty thinking block its generation prompt
   had, so each turn feeds the last reply again (as otpu-chat).
-- **A KV store of 50 MB of RAM** (`--kv-ram-gb 0.05`, 1 GB of disk): `check: PASS`, the same
-  turns, and `/generate` replied.
+- **A KV store of 50 MB of RAM** (`--kv-ram-gb 0.05`, tree 0e2d8cf6). Sixteen users, each
+  with two turns of up to 64 tokens: every user's first turn at once, then every second turn
+  at once (`serve_bench --users 16`). The store spilled 26 contexts to disk (260 MB in 54
+  files), and 14 second turns found their first turn's context on disk, 2 in RAM (18 ms of
+  disk reads in all). Three second turns run again with the cache flushed gave the same
+  replies, so the contexts came back bit for bit (`users: PASS`, `check: PASS`). A second turn
+  reuses only its first turn's prompt (22 of ~105 tokens): Qwen3's template renders the past
+  reply without the generation prompt's empty thinking block, so the reply is fed again.
+- **Host time per run** (tree 0e2d8cf6, 32 steps a case): the io write 0.2-0.3 ms, the start
+  0.06 ms, the picks' read 0.1-0.2 ms; the wait is the card's time within 0.1 ms. A 4-row
+  step: 79.8 tok/s greedy, 79.1 sampled.
 
 ## Tests
 
@@ -199,7 +211,8 @@ All on the ISA simulator with tiny models.
 - `test_serve_scheduler.py`: requests in turns equal their fresh runs, prefixes from the device
   and the store, stop strings, cancels, a store on disk across workers.
 - `test_batch_steps.py`: greedy rows each sequence's decode, sampled rows the decode loop's pick,
-  IMEM groups, span programs across attention blocks, feed runs then the last token's pick.
+  IMEM groups, span programs across attention blocks, feed runs then the last token's pick, a
+  joining row's program compiled ahead, a leaving row's slot padding the live program.
 - `test_serve_batching.py`: requests in slots equal their fresh runs, a prefix copied between
   slots and restored from the store, a seeded sampled request the same alone and batched.
 - `test_serve_api.py`: the HTTP API end to end with concurrent clients.
