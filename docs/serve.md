@@ -88,9 +88,11 @@ A prompt always feeds its last token, whose logits pick the first one of the rep
 `--slots`, default 8). The image holds B sequences' KV caches (`Engine(batch=B,
 batch_area=True)`). Each iteration of the worker:
 
-1. Waiting requests take free slots: the one holding the longest prefix of the prompt, else
-   slot 0, else the least recently used. The prompt continues the longest prefix found in that
-   slot, in another slot (its pages copied on the card, no PCIe) or in the store. A slot's
+1. Waiting requests take free slots: one in the block of MCOLS slots holding the most
+   requests (a step runs each block in a run of its own, so four requests in one block take
+   one run a step, spread over two they take two); then the one holding the longest prefix of
+   the prompt, slot 0, the least recently used. The prompt continues the longest prefix found
+   in that slot, in another slot (its pages copied on the card, no PCIe) or in the store. A slot's
    context is saved to the store before it is overwritten.
 2. Feed runs of the prompts being fed, oldest first, up to `--chunked-prefill-size` tokens
    (default 64, SGLang's chunked prefill; more: a shorter time to first token, longer pauses
@@ -130,6 +132,14 @@ only; and until that block's new program is compiled (for a few steps on), the l
 on with the free slot's row fed a dummy token past its saved context, its pick dropped. A feed run's
 program serves its slot's runs through an attention block the same way, its rows advancing by
 MCOLS a run.
+
+**Mixed runs** (`--mixed`, off by default). With fewer decoding requests than MCOLS, a step's
+MXU pass has spare rows, and a prompt being fed can take them: one run of the decoding rows
+and the oldest prompt's next tokens (`Steps.mixed`). Its program takes two run-time values
+(the decoding rows advance one a run, the feed rows as many as they are) and has its feed
+rows at their attention block's start, so it serves the prompt's runs. While it compiles, the
+iteration does one feed run. The decoding requests then never wait for a whole feed budget;
+but a prompt advances only by the spare rows a run, so it takes longer to its first token.
 
 **In turns** (`opentpu/serve/scheduler.py`, `Worker`: LFM2, Qwen3.5, Gemma 4, the streamed
 MoEs, whose images hold one sequence). The requests (`--max-running` at once) take the card in
@@ -197,6 +207,40 @@ with a program compiled per step (f99acce6), batched with span programs and feed
   replies, so the contexts came back bit for bit (`users: PASS`, `check: PASS`). A second turn
   reuses only its first turn's prompt (22 of ~105 tokens): Qwen3's template renders the past
   reply without the generation prompt's empty thinking block, so the reply is fed again.
+- **Requests coming and going** (16 users, two turns each, 8 slots): their row sets change
+  at every join and leave. In tree 0e2d8cf6 the 16 users compiled 74 of 129 step programs
+  inline (4.9 s of waits in 62 s). With rows in slot order and blocks, feed programs shared by
+  every prompt (one per slot and attention block), and the coming steps compiled ahead, the
+  whole serve_bench (staged tree 6e591560, 2026-10-09 20:17) compiled 14 of 86 inline, 1.08 s
+  of waits in 124 s; `users: PASS`, every other part as before (4 / 8 clients 77.6 / 74.8
+  tok/s, 8 sampled 81.1).
+- **Models in turns** (staged tree 6e591560, `--levels 1,4`, a 3-turn conversation): every
+  check passed.
+
+  | model | 1 client | 4 clients | turn 3: cached / prompt tokens, TTFT (cold) |
+  |---|---|---|---|
+  | LFM2.5-230M | 64.3 tok/s | 61.5 | 217 / 232, 0.08 s (0.75 s) |
+  | Qwen3.5-0.8B (DeltaNet state) | 18.7 | 17.6 | 168 / 315, 3.53 s (4.32 s) |
+
+  LFM2's template renders a past reply as it was generated, so a turn reuses all but its new
+  message. Qwen3.5's state lets a turn continue only a saved context's end: the reply's start,
+  where the next turn's rendering parts.
+- **Clients arriving one by one** (`serve_bench --arrivals 4`: four clients 1.5 s apart, 128
+  tokens each; the gaps are between a client's streamed tokens). A prompt's feed runs hold the
+  decoding requests for up to `--chunked-prefill-size` tokens (~45 ms a run of four).
+  Mixed runs (`--mixed`) cut that pause but feed the prompt only in the spare rows, and they
+  starve the prompts when most slots are being fed. Measured with the whole bench on a fresh
+  server each (staged tree peb89a31, 2026-10-09 21:06), blocks packed:
+
+  | | gap p50 / p99 / max | TTFT | 4 clients at once | 16 users' second turns: TTFT median |
+  |---|---|---|---|---|
+  | default | 45 / 302 / 345 ms | 0.30-0.39 s | 78.3 tok/s | 7.6 s |
+  | `--mixed` | 45 / 104 / 145 ms | 0.32-1.21 s | 70.9 tok/s | 12.3 s |
+
+  Before a request took a slot in the busiest block (staged tree m11b6d45, `--mixed`), the
+  same part run after the others had its gaps' median at 81 ms, two runs' time: the earlier
+  parts had left the least recently used slots in both blocks. Packed, each of the part's 184
+  steps took one run.
 - **Host time per run** (tree 0e2d8cf6, 32 steps a case): the io write 0.2-0.3 ms, the start
   0.06 ms, the picks' read 0.1-0.2 ms; the wait is the card's time within 0.1 ms. A 4-row
   step: 79.8 tok/s greedy, 79.1 sampled.
@@ -212,7 +256,11 @@ All on the ISA simulator with tiny models.
   and the store, stop strings, cancels, a store on disk across workers.
 - `test_batch_steps.py`: greedy rows each sequence's decode, sampled rows the decode loop's pick,
   IMEM groups, span programs across attention blocks, feed runs then the last token's pick, a
-  joining row's program compiled ahead, a leaving row's slot padding the live program.
+  joining row's program compiled ahead, a leaving row's slot padding the live program, a feed
+  row's kind from the compile process, mixed runs (a prompt fed beside decoding rows).
 - `test_serve_batching.py`: requests in slots equal their fresh runs, a prefix copied between
-  slots and restored from the store, a seeded sampled request the same alone and batched.
-- `test_serve_api.py`: the HTTP API end to end with concurrent clients.
+  slots and restored from the store, a seeded sampled request the same alone and batched, the
+  coming steps' rows told ahead (with and without mixed runs) as the loop then takes them,
+  requests packed into a block of slots.
+- `test_serve_api.py`: the HTTP API end to end with concurrent clients, 64 connections at
+  once, SGLang's `/generate`.
