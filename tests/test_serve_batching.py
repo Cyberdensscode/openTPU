@@ -21,9 +21,9 @@ torch = pytest.importorskip("torch")
 CAP = 512
 
 
-def _setup(B=4):
+def _setup(B=4, **kw):
     W, spec, cfg1 = _model("qwen3")
-    cfg = device_config(spec, CAP, batch=B, rows=PREFILL_ROWS, lookup=True, S=1)
+    cfg = device_config(spec, CAP, batch=B, rows=PREFILL_ROWS, lookup=True, S=1, **kw)
     cfg = dataclasses.replace(cfg, DRAM_BYTES=2 * cfg.DRAM_BYTES)
     eng = Engine(spec, W, cap=CAP, cfg=cfg, batch=B, resident=True, prompt_runs=True,
                  batch_area=True)
@@ -162,3 +162,20 @@ def test_the_coming_steps_rows_are_told_ahead(mixed):
     assert seen == [pred[k] for k in range(n + 1)]
     assert seen[-1] == sorted([(rs[0].slot, 8 + n), (rs[1].slot, 29)])
 
+
+def test_requests_pack_into_a_block_of_slots():
+    """A step runs each block of feed_rows() slots in a run of its own: a request takes a free
+    slot in the block holding the most requests, before one holding a longer prefix of its
+    prompt (copied on the device instead) or the least recently used."""
+    eng, W, spec, cfg1 = _setup(B=8, MCOLS=4)                    # (the card's: two blocks)
+    w = BW.BatchWorker(eng, _Tok())
+    q = w.steps.feed_rows()
+    assert q == 4
+    w.slot_used = [0.0 if s >= q else 1.0 for s in range(8)]     # (the other block's older)
+    rs = [SC.Request(p, max_new=4) for p in _prompts(13, [9] * q)]
+    w.slot_dev[q] = list(rs[1].prompt[:5])                         # (rs[1]'s prefix there)
+    for r in rs:
+        w.running.append(r)
+        w._bind(r)
+    assert sorted(r.slot for r in rs) == list(range(q))
+    assert rs[1].cached == 5 and w.stats["slot_copies"] == 1

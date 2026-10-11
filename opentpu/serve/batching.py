@@ -137,9 +137,14 @@ class BatchWorker(SC.Worker):
         limit = len(want) - 1
         free = self._free_slots()
         common = [self._common(self.slot_dev[s], want) for s in range(self.B)]
-        # the slot: the free one holding the longest prefix, else slot 0 when free (the card's
-        # loop runs there), else the least recently used
-        s = max(free, key=lambda x: (min(common[x], limit), x == 0, -self.slot_used[x]))
+        # the slot: one in the block of feed_rows() slots (an MXU pass's rows; a step runs each
+        # block in a run of its own) holding the most requests, so that they take the fewest
+        # runs; then the one holding the longest prefix (another slot's is copied on the card),
+        # slot 0 (the card's loop runs there), the least recently used
+        q = self.steps.feed_rows()
+        held = [sum(y // q == x // q for y in range(self.B) if self.slot_req[y] is not None)
+                for x in range(self.B)]
+        s = max(free, key=lambda x: (held[x], min(common[x], limit), x == 0, -self.slot_used[x]))
         own = min(common[s], limit)
         other = max((x for x in range(self.B) if x != s), key=lambda x: common[x], default=None)
         k_other = min(common[other], limit) if other is not None else 0
