@@ -521,12 +521,14 @@ elements) in numpy on one core. Two changes since:
   4 KiB pages: the KV caches are not stored. The cache is `~/otpu-build/qcache/img` (beside
   `mxu` and `prog`; `OTPU_IMG_CACHE=<dir>`, `0` turns it off, as `OTPU_IMAGE_CACHE=0` does); it
   keeps 16 GB (`OTPU_IMG_CACHE_GB`). Over the size it drops the least recently used entries
-  first, each second of build per GB an entry took counting as an hour of later use
-  (`imgcache.KEEP_S`): gemma-4-E4B-it's image (287 s, 7.1 GB) outlives Qwen3.5-0.8B's (16 s,
-  1.8 GB) opened up to a day later. A write that would leave under 20 GB of free disk
-  (`OTPU_IMG_CACHE_FREE_GB`) first drops the entries below it in that order, if they make the
-  room, else it is not written: after a host code swap the former tree's entries (29 GB on the
-  card host on 2026-10-11, its disk 11 GB free) make way for the new tree's. The card host sets
+  first, each second of build per GB an entry of this tree took counting as an hour of later
+  use (`imgcache.KEEP_S`; the entry's header keeps its build's seconds and its tree,
+  `progcache.source()`): gemma-4-E4B-it's image (287 s, 7.1 GB) outlives Qwen3.5-0.8B's (16 s,
+  1.8 GB) opened up to a day later, while another tree's entry goes by its last use alone. A
+  write that would leave under 20 GB of free disk (`OTPU_IMG_CACHE_FREE_GB`) first drops the
+  entries below it in that order, if they make the room, else it is not written: after a host
+  code swap the former tree's entries (29 GB on the card host on 2026-10-11, its disk 11 GB
+  free) make way for the new tree's. The card host sets
   30 GB and 6 GB (its `~/.bashrc`), room for every chat model's image (~33 GB in all on
   2026-10-10). A new KV capacity, configuration, format or tree builds again, from the 4-bit
   cache.

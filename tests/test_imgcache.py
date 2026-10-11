@@ -7,6 +7,7 @@ off switches."""
 import dataclasses
 import json
 import os
+import struct
 
 import numpy as np
 import pytest
@@ -291,13 +292,18 @@ def test_least_recently_used_go_over_the_cap_and_none_under_the_floor(ckpt, cach
     assert IC.last[0] == "skip" and IC.stats["skip"] == 1 and len(_entries(cache)) == 3
 
 
+def _head(**h) -> bytes:
+    """An entry's MAGIC and header, page-sized."""
+    head = json.dumps(h).encode()
+    return (IC.MAGIC + struct.pack("<Q", len(head)) + head).ljust(IC.PAGE, b"\0")
+
+
 def test_slow_builds_outlive_quick_ones_over_the_cap(ckpt, cache, monkeypatch):
-    """An entry's header keeps its build's seconds; over the cap each build second per GB counts
-    as KEEP_S of later use: a slow build used a while ago stays while a quick one used since goes,
-    and a stale entry (unused for longer than its build buys) goes first. An entry without the
-    field is the least recently used rule's."""
-    import json
-    import struct
+    """An entry's header keeps its build's seconds and its tree (src); over the cap each build
+    second per GB of this tree's entries counts as KEEP_S of later use: a slow build used a while
+    ago stays while a quick one used since goes, and a stale entry (unused for longer than its
+    build buys) goes first. An entry of another tree (a former one's, after a host code swap) or
+    without the fields is the least recently used rule's."""
     import time
     _engine(ckpt)
     (f,) = _entries(cache)
@@ -307,12 +313,13 @@ def test_slow_builds_outlive_quick_ones_over_the_cap(ckpt, cache, monkeypatch):
     t = time.time() - 10000
     (cache / "ab").mkdir()
     ents = {}
-    for name, build_s, used in (("none", None, t + 1000), ("stale", 1000, t - 5000),
-                                ("quick", 0, t + 3000), ("slow", 5000, t)):
+    for name, build_s, src, used in (("none", None, None, t + 1000),
+                                     ("stale", 1000, PC.source(), t - 5000),
+                                     ("former", 5000, "0" * 32, t),
+                                     ("quick", 0, PC.source(), t + 3000),
+                                     ("slow", 5000, PC.source(), t)):
         e = cache / "ab" / f"{name}.img"
-        head = b"" if build_s is None else \
-            IC.MAGIC + struct.pack("<Q", 20) + json.dumps({"build_s": build_s}).encode().ljust(20)
-        e.write_bytes(head.ljust(IC.PAGE, b"\0"))
+        e.write_bytes(bytes(IC.PAGE) if build_s is None else _head(build_s=build_s, src=src))
         os.utime(e, (used, used))
         ents[name] = e
     monkeypatch.setenv("OTPU_IMG_CACHE_GB", str(3 * IC.PAGE / 2**30))
@@ -325,8 +332,6 @@ def test_a_write_under_the_floor_drops_what_it_outranks(ckpt, cache, monkeypatch
     drops the entries below it in the eviction order (a former tree's, unused since) until it
     fits, and keeps those above it (a slow build); when dropping all it outranks would not make
     the room, it is not written and none is dropped."""
-    import json
-    import struct
     import time
     import types
     _engine(ckpt)
@@ -338,8 +343,7 @@ def test_a_write_under_the_floor_drops_what_it_outranks(ckpt, cache, monkeypatch
 
     def entry(name, build_s):
         e = cache / "ab" / f"{name}.img"
-        head = b"" if build_s is None else \
-            IC.MAGIC + struct.pack("<Q", 20) + json.dumps({"build_s": build_s}).encode().ljust(20)
+        head = bytes(IC.PAGE) if build_s is None else _head(build_s=build_s, src=PC.source())
         e.write_bytes(head.ljust(n, b"\0"))
         os.utime(e, (t, t))
         return e

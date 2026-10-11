@@ -25,9 +25,11 @@ into zeroed images. The cache: OTPU_IMG_CACHE=<dir>, or 0 for none; by default t
 directory beside the 4-bit matrices' (qcache.cache_dir(): ~/otpu-build/qcache/img on a host
 with ~/otpu-build; none when OTPU_IMAGE_CACHE=0). Entries are written to a temporary name, then
 renamed. Entries go when the cache passes CAP_BYTES (OTPU_IMG_CACHE_GB), in the order of their
-last use, where each second of build per GB an entry took (its header's build_s) counts as KEEP_S
-of later use: an image that costs minutes to build (gemma-4-E4B-it's, 287 s for 7.1 GB) outlives
-one that costs seconds (Qwen3.5-0.8B's, 16 s for 1.8 GB) opened a day later. A write that
+last use, where each second of build per GB an entry of this tree took (its header's build_s;
+src, progcache.source()) counts as KEEP_S of later use: an image that costs minutes to build
+(gemma-4-E4B-it's, 287 s for 7.1 GB) outlives one that costs seconds (Qwen3.5-0.8B's, 16 s for
+1.8 GB) opened a day later, while another tree's (a former one's after a host code swap: nothing
+opens it here again) goes by its last use alone. A write that
 would leave under FREE_FLOOR of free disk (OTPU_IMG_CACHE_FREE_GB) first drops the entries it
 outranks in that order when they make the room (a former tree's, after a host code swap), else
 it is not written and none is dropped.
@@ -223,7 +225,7 @@ def _store(d: Path, f: Path, images: list, left: dict, build_s: float = 0.0) -> 
     slices = [{"nbytes": len(img), "runs": _runs(img)} for img in images]
     arrays = {p: {"dtype": v.dtype.str, "shape": list(v.shape)}
               for p, (kind, v) in left.items() if kind == "array"}
-    meta = {"build_s": round(build_s, 2), "slices": slices, "arrays": arrays,
+    meta = {"build_s": round(build_s, 2), "src": PC.source(), "slices": slices, "arrays": arrays,
             "json": {p: v for p, (kind, v) in left.items() if kind == "json"},
             "weights": [p for p, (kind, _) in left.items() if kind == "weights"]}
     size = sum(n for s in slices for _, n in s["runs"]) + \
@@ -300,15 +302,16 @@ def _read(src, out: np.ndarray) -> None:
 
 
 def _build_s(p: Path) -> float:
-    """An entry's build seconds (its header's build_s; 0 for an entry without one)."""
+    """An entry's build seconds (its header's build_s) when it is this tree's (its header's src,
+    progcache.source()); 0 for another tree's and for an entry without them."""
     try:
-        with open(p, "rb") as src:
-            if src.read(8) != MAGIC:
+        with open(p, "rb") as f:
+            if f.read(8) != MAGIC:
                 return 0.0
-            return float(json.loads(src.read(struct.unpack("<Q", src.read(8))[0]))
-                         .get("build_s", 0.0))
+            head = json.loads(f.read(struct.unpack("<Q", f.read(8))[0]))
     except (OSError, ValueError, struct.error):
         return 0.0
+    return float(head.get("build_s", 0.0)) if head.get("src") == PC.source() else 0.0
 
 
 def _score(used: float, build_s: float, size: int) -> float:
