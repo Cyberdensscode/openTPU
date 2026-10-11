@@ -11,6 +11,10 @@ standard library only, so it runs from the card host's venv).
 3. A conversation's turns: each turn re-sends the history; its prompt tokens the server already
    held (usage.prompt_tokens_details.cached_tokens) and its TTFT against the same prompt with
    the cache flushed.
+4. Users (--users N, more than the slots): every user's first turn at once, then every user's
+   second turn at once: the tokens the server held for each (its context from a slot, host RAM
+   or disk), the KV store's tiers; then a few second turns again with the cache flushed: the
+   same replies (greedy), so the contexts came back bit for bit.
 """
 from __future__ import annotations
 
@@ -166,6 +170,53 @@ def conversation(cl: Client, turns: int, max_tokens: int) -> list:
     return out
 
 
+def _all(n, fn) -> list:
+    """fn(i) for i < n, each in its own thread at once."""
+    res = [None] * n
+
+    def run(i):
+        res[i] = fn(i)
+    ts = [threading.Thread(target=run, args=(i,)) for i in range(n)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    return res
+
+
+def users(cl: Client, n: int, max_tokens: int, checks: int = 3) -> dict:
+    hist = [[{"role": "user", "content": f"I am user {i}. " + QUESTIONS[i % len(QUESTIONS)]}]
+            for i in range(n)]
+    t1 = _all(n, lambda i: cl.chat_stream(hist[i], max_tokens=max_tokens, temperature=0))
+    for i in range(n):
+        hist[i] += [{"role": "assistant", "content": t1[i]["text"]},
+                    {"role": "user", "content": "Tell me more, briefly."}]
+    s0 = cl.get("/v1/stats")[1]
+    t2 = _all(n, lambda i: cl.chat_stream(hist[i], max_tokens=max_tokens, temperature=0))
+    s1 = cl.get("/v1/stats")[1]
+    cl.post("/flush_cache", {})
+    cold = [cl.chat_stream(hist[i], max_tokens=max_tokens, temperature=0) for i in range(checks)]
+    p1 = [(r["usage"] or {}).get("prompt_tokens", 0) for r in t1]
+    cached = [(r["usage"] or {}).get("prompt_tokens_details", {}).get("cached_tokens", 0)
+              for r in t2]
+    equal = [c["text"] == r["text"] for c, r in zip(cold, t2)]
+    ks = s1.get("kv_store", {})
+    k0 = s0.get("kv_store", {})
+    out = {"users": n, "turn1_prompt_median": statistics.median(p1),
+           "turn2_prompt_median": statistics.median(
+               (r["usage"] or {}).get("prompt_tokens", 0) for r in t2),
+           "turn2_cached": {"min": min(cached), "median": statistics.median(cached)},
+           "turn2_ttft_median": round(statistics.median(r["ttft"] for r in t2), 3),
+           "cold_ttft_median": round(statistics.median(c["ttft"] for c in cold), 3),
+           "cold_equal": equal,
+           "store": {k: ks.get(k) for k in ("ram_bytes", "ram_blobs", "disk_bytes",
+                                            "disk_blobs", "spilled", "dropped")},
+           "turn2_store_hits": {"ram": ks.get("ram_hits", 0) - k0.get("ram_hits", 0),
+                                "disk": ks.get("disk_hits", 0) - k0.get("disk_hits", 0)}}
+    out["pass"] = all(equal) and min(cached) >= min(p1) // 2
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--host", default="127.0.0.1")
@@ -178,9 +229,12 @@ def main(argv=None):
     ap.add_argument("--sampled-levels", default="8",
                     help="levels run again with the model's sampling (seeded)")
     ap.add_argument("--turns", type=int, default=4)
+    ap.add_argument("--users", type=int, default=16, help="users of the users part (0: none)")
+    ap.add_argument("--user-tokens", type=int, default=64, help="max tokens of a user's reply")
     ap.add_argument("--wait", type=float, default=900, help="seconds to wait for /health")
     ap.add_argument("--out")
-    ap.add_argument("--skip", default="", help="parts to skip: check,throughput,conversation")
+    ap.add_argument("--skip", default="",
+                    help="parts to skip: check,throughput,conversation,users")
     a = ap.parse_args(argv)
     cl = Client(a.host, a.port, a.api_key)
     t0 = time.time()
@@ -210,12 +264,16 @@ def main(argv=None):
         rep["conversation"] = conversation(cl, a.turns, a.max_tokens)
         for i, x in enumerate(rep["conversation"]):
             print(f"turn {i + 1}:", x, flush=True)
+    if "users" not in skip and a.users:
+        rep["users"] = users(cl, a.users, a.user_tokens)
+        print("users:", "PASS" if rep["users"]["pass"] else "FAIL", rep["users"], flush=True)
     rep["stats"] = cl.get("/v1/stats")[1]
     print("stats:", json.dumps(rep["stats"])[:2000], flush=True)
     if a.out:
         with open(a.out, "w") as f:
             json.dump(rep, f, indent=1)
-    return 0 if rep.get("check", {}).get("pass", True) else 1
+    ok = rep.get("check", {}).get("pass", True) and rep.get("users", {}).get("pass", True)
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
