@@ -127,3 +127,30 @@ def test_stop_strings_and_cancel_in_slots():
         assert all(x is None for x in w.slot_req)
     finally:
         w.stop()
+
+
+def test_the_coming_steps_rows_are_told_ahead():
+    """_rows_at: with a feed budget of 8 tokens an iteration, prompts of 9 and 30 tokens (8 and
+    29 fed in feed runs, their last tokens in steps) join the steps in iterations 0 and 4, each
+    row one position on per iteration; then the feed runs give exactly that."""
+    eng, W, spec, cfg1 = _setup()
+    w = BW.BatchWorker(eng, _Tok(), prefill_budget=8)
+    ps = _prompts(9, [9, 30])
+    rs = [SC.Request(p, max_new=20, sampling=SC.Sampling(0.0, 0, 1.0, 1.0, None),
+                     stop_ids=frozenset({-1})) for p in ps]
+    for r in rs:
+        w.running.append(r)
+        w._bind(r)
+    s1, s2 = rs[0].slot, rs[1].slot
+    assert w._rows_at(0) == ([(s1, 8)], [None])
+    assert w._rows_at(1)[0] == [(s1, 9)]
+    assert w._rows_at(3)[0] == [(s1, 11)]
+    assert w._rows_at(4)[0] == [(s1, 12), (s2, 29)]
+    joined = []
+    for it in range(5):                         # the loop's feed runs, iteration by iteration
+        b = w.budget
+        while w.prefilling and b > 0:
+            b -= w._prefill_run(w.prefilling[0], b)
+        joined.append([r.slot for r in rs if r not in w.prefilling])
+    assert joined == [[s1], [s1], [s1], [s1], [s1, s2]]
+    assert eng.poss[s1] == 8 and eng.poss[s2] == 29

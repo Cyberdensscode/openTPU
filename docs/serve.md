@@ -92,9 +92,11 @@ batch_area=True)`). Each iteration of the worker:
    slot 0, else the least recently used. The prompt continues the longest prefix found in that
    slot, in another slot (its pages copied on the card, no PCIe) or in the store. A slot's
    context is saved to the store before it is overwritten.
-2. One feed run of the oldest prompt being fed (chunked prefill: decoding requests wait one run
-   at most): up to MCOLS (4) of its tokens, every weight streamed once, no LM head
-   (`Steps.feed`). A prompt feeds all but its last token this way.
+2. Feed runs of the prompts being fed, oldest first, up to `--chunked-prefill-size` tokens
+   (default 64, SGLang's chunked prefill; more: a shorter time to first token, longer pauses
+   of the decoding requests). A feed run takes up to MCOLS (4) tokens of a prompt, every
+   weight streamed once, no LM head (`Steps.feed`). A prompt feeds all but its last token
+   this way.
 3. One batched step for every decoding request (`opentpu/llm/batch.py`):
    - a run feeds each one its token from DRAM; the embedding rows are gathered and the RoPE
      rows loaded from the image's tables;
@@ -120,7 +122,9 @@ of steps: row r is at position p_r + t, where t is the run's step in a DRAM word
 program loads and multiplies into its argument and address registers (RLD, as the prompt runs
 do). All rows add the same t, so they share those registers. The span ends where a row reaches
 the end of its attention block (256 tokens); until then the same program runs again, already
-in IMEM. The next one is compiled ahead as soon as a program starts serving. A feed run's
+in IMEM. The next one is compiled ahead as soon as a program starts serving, and so are the
+steps whose rows the worker can tell ahead (a prompt the feed budget finishes, a request
+reaching max_tokens). A feed run's
 program serves its slot's runs through an attention block the same way, its rows advancing by
 MCOLS a run.
 

@@ -31,7 +31,7 @@ from . import kvio as KV
 from . import scheduler as SC
 
 
-AHEAD_JOIN = 3          # feed runs before a prompt's end that the step it joins is compiled
+PREFILL_BUDGET = 64     # prompt tokens fed per iteration (SGLang's chunked prefill size)
 
 
 def batches(eng) -> bool:
@@ -41,7 +41,7 @@ def batches(eng) -> bool:
 
 class BatchWorker(SC.Worker):
     def __init__(self, eng, tok, store=None, model_key: str = "model", ram_bytes: int = 4 << 30,
-                 area=False, quantum: int = SC.QUANTUM):
+                 area=False, quantum: int = SC.QUANTUM, prefill_budget: int = PREFILL_BUDGET):
         if not batches(eng):
             raise ValueError("BatchWorker needs Engine(batch=B > 1, batch_area=True)")
         B = eng.batch
@@ -50,6 +50,7 @@ class BatchWorker(SC.Worker):
         if self.stateful:
             raise ValueError("batched slots hold KV caches only (no recurrent state)")
         self.B = B
+        self.budget = max(1, int(prefill_budget))
         self.ios = [self.io] + [KV.ContextIO(eng, seq=s, area=self.io.area) for s in range(1, B)]
         self.slot_req: list = [None] * B          # the request in each slot
         self.slot_dev: list = [[] for _ in range(B)]   # the tokens each slot's caches hold
@@ -84,8 +85,10 @@ class BatchWorker(SC.Worker):
                 for r in admit:
                     if r.finish is None:
                         self._bind(r)
-                if self.prefilling:
-                    self._prefill_run(self.prefilling[0])
+                self._ahead()
+                budget = self.budget
+                while self.prefilling and budget > 0:   # the oldest prompts, up to the budget
+                    budget -= self._prefill_run(self.prefilling[0], budget)
                 dec = [r for r in self.running if r.finish is None and r.next is not None
                        and r not in self.prefilling]
                 if dec:
@@ -172,12 +175,13 @@ class BatchWorker(SC.Worker):
         self.stats["switch_s"] += time.perf_counter() - t0
 
     # ---- prefill and decode
-    def _prefill_run(self, r: SC.Request) -> None:
-        """One feed run of r's prompt (up to MCOLS tokens, from a multiple of it on)."""
+    def _prefill_run(self, r: SC.Request, budget: int) -> int:
+        """One feed run of r's prompt (up to MCOLS tokens, from a multiple of it on, at most
+        `budget`); the tokens fed."""
         t0 = time.perf_counter()
         q = self.steps.feed_rows()
         p = self.eng.poss[r.slot]
-        part = r._feed[:q - p % q]
+        part = r._feed[:min(q - p % q, budget)]
         self.steps.feed(r.slot, part)
         del r._feed[:len(part)]
         r.fed += part
@@ -186,26 +190,46 @@ class BatchWorker(SC.Worker):
         self.stats["prefill_s"] += time.perf_counter() - t0
         if r.cancelled.is_set():
             r.finish = "abort"
-        if r._feed and r.finish is None:
-            self._ahead_join(r)
-            return
-        self.prefilling.remove(r)
+        if not r._feed or r.finish is not None:
+            self.prefilling.remove(r)
+        return max(1, len(part))
 
-    def _ahead_join(self, r: SC.Request) -> None:
-        """A few runs before r's prompt is fed, compile the step it joins: the decoding
-        requests that many steps on, r's row at its prompt's last token (an iteration runs one
-        feed run and one step)."""
-        q = self.steps.feed_rows()
-        n, p = len(r._feed), self.eng.poss[r.slot]
-        head = min(n, (q - p % q) % q)
-        m = (1 if head else 0) + -(-(n - head) // q)
-        if not 1 <= m <= AHEAD_JOIN or self.prefilling[0] is not r:
-            return
-        dec = [x for x in self.running if x.finish is None and x.next is not None
-               and x not in self.prefilling and x.slot is not None]
-        rows = [(x.slot, len(x.fed) + m) for x in dec] + [(r.slot, len(r.prompt) - 1)]
-        kinds = [self.steps.kinds.get(x.slot) for x in dec] + [BA.kind_of(self._samp(r))]
-        if all(p_ < self.eng.cap for _, p_ in rows):
+    def _rows_at(self, k: int):
+        """The decode rows (slot, position) and kinds of the step k iterations on, as far as
+        they can be told: the decoding requests that have not reached max_tokens by then, k
+        positions on, and the prompts the feed budget finishes by then, from their last token
+        on (stop tokens and new requests cannot be told)."""
+        rows, kinds = [], []
+        for x in self.running:
+            if x.finish is None and x.next is not None and x not in self.prefilling \
+                    and x.slot is not None and x.max_new - len(x.out) > k:
+                rows.append((x.slot, len(x.fed) + k))
+                kinds.append(self.steps.kinds.get(x.slot) if x._bset else
+                             BA.kind_of(self._samp(x)))
+        left = [len(x._feed) for x in self.prefilling]
+        i = 0
+        for it in range(k + 1):
+            b = self.budget
+            while i < len(left) and b > 0:
+                n = min(left[i], b)
+                left[i] -= n
+                b -= n
+                if left[i] == 0:
+                    x = self.prefilling[i]
+                    rows.append((x.slot, len(x.prompt) - 1 + (k - it)))
+                    kinds.append(BA.kind_of(self._samp(x)))
+                    i += 1
+        return rows, kinds
+
+    def _ahead(self) -> None:
+        """Compile ahead this iteration's and the next one's steps when their rows differ from
+        the last step's (a prompt joins, a request reaches max_tokens)."""
+        for k in (0, 1):
+            rows, kinds = self._rows_at(k)
+            if not rows or any(p >= self.eng.cap for _, p in rows):
+                continue
+            if len(rows) == 1 and rows[0][0] == 0:
+                continue                        # (the card's decode loop)
             self.steps.prefetch_rows(rows, kinds)
 
     def _samp(self, r: SC.Request):

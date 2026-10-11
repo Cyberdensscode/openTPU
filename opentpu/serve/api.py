@@ -709,6 +709,10 @@ def main(argv=None):
     ap.add_argument("--max-running", type=int, default=8,
                     help="without slots: requests that run in turns at once (the others "
                          "queue)")
+    ap.add_argument("--chunked-prefill-size", type=int, default=64,
+                    help="batched slots: prompt tokens fed per iteration, between decode steps "
+                         "(more: shorter time to first token, longer pauses of the decoding "
+                         "requests)")
     ap.add_argument("--quantum", type=int, default=SC.QUANTUM,
                     help="tokens a request decodes per turn while others wait")
     ap.add_argument("--max-queue", type=int, default=256)
@@ -742,7 +746,8 @@ def _main(a):
                          a.kv_dir + f"/{mk}" if a.kv_disk_gb > 0 else None)
     from .batching import BatchWorker, batches
     if batches(eng):
-        w = BatchWorker(eng, tok, store=store, model_key=mk, quantum=a.quantum).start()
+        w = BatchWorker(eng, tok, store=store, model_key=mk, quantum=a.quantum,
+                        prefill_budget=a.chunked_prefill_size).start()
     else:
         w = SC.Worker(eng, tok, store=store, model_key=mk, max_running=a.max_running,
                       quantum=a.quantum).start()
