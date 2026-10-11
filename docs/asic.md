@@ -99,12 +99,20 @@ report stopped there (the container's memory).
 congestion iterations, 176 K overflow left and not shrinking, 4 h 22 min at a 31.7 GB peak; the
 whole run took 7 hours to there. The macro placer packs the ACT RAM's 32 macros (128 x 128,
 136 x 137 um, about 270 pins on one edge each) into the die's bottom-left corner, 0.6 x 1.1 mm with
-60 um channels, and the ACT RAM's 4096-bit read data (`act_rdata`) and its own mux nets cannot
-leave it: the overflow is there. Global placement saw it coming (routability mode: "could not
-reach target", weighted congestion 1.60). Next for the card: a floorplan that spreads the ACT
-macros or faces their pins outward (wider channels and halos, the macro placer's boundary weight,
-or placed macros), balance the macro clock tree (CTS options, the macros' placement next to their
-muxes), and a denser floorplan (35% leaves 5.5 mm of die for 10.7 mm² of cells and macros). For
+60 um channels. The router's congestion report puts nearly all the overflow along that block's
+inner edge and just past it (x 0.4-1.0 mm, y 0-1.4 mm); the nets in its markers are the ACT RAM's
+own (141 K), its 4096-bit read data to the MXU (`act_rdata`, 100 K), the MXU's (39 K) and the
+block's port B data (16 K). Global placement saw it coming (routability mode: "could not reach
+target", weighted congestion 1.60). Spacing the macros does not help: 40 um halos and 150 um
+channels give 1.69, and with the macro placer's boundary weight off and the channels on every side
+1.67. A lower placement density does: the target is 0.28 while the cells fill under a fifth of the
+core, and with `PLACE_DENSITY_LB_ADDON` 0.02 (target 0.22, the macros where they were) global
+placement reaches its routability target (weighted congestion under 1.01 with 0.24% of the tiles
+overflowed; 1.18 at its end) at the same wire length. Global routing has not been run on it. Next
+for the card: route that placement (then the RTL between the ACT RAM and the MXU, the 4096-bit
+bus and the ACT RAM's read muxing, if it still congests); balance the macro clock tree (CTS
+options, the macros' placement next to their muxes); and a smaller die (35% core utilization
+leaves 5.5 mm of die for 10.7 mm² of cells and macros). For
 now nangate45-small is the ASIC reference; the card's point is the stress case.
 
 The final power-grid check failed on one row segment (PSM-0069: 26 um boxed in by macros,
@@ -191,4 +199,5 @@ clock on the operator) pays once those are fixed, from about 540 MHz.
 - The macros are CACTI-fitted estimates (`tools/asic/fakeram.py`), not a compiler's; a real PDK's
   1R1W macros (IHP SG13G2, commercial) replace them through `rtl/tech/asic`'s leaves.
 - Power is vectorless; a VCD from the Verilator RTL (a decode token) would give real activities.
-- **The card's floorplan**: its global routing ends congested around the ACT RAM's macros (above).
+- **The card's floorplan**: its global routing ends congested next to the ACT RAM's macros; a lower
+  placement density clears global placement's estimate, not yet routed (above).
