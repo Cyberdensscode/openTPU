@@ -11,7 +11,9 @@ standard library only, so it runs from the card host's venv).
 3. A conversation's turns: each turn re-sends the history; its prompt tokens the server already
    held (usage.prompt_tokens_details.cached_tokens) and its TTFT against the same prompt with
    the cache flushed.
-4. Users (--users N, more than the slots): every user's first turn at once, then every user's
+4. Arrivals (--arrivals N): clients starting one every --arrival-interval s: their TTFTs and
+   the gaps between their tokens (how long a newcomer's prompt held the others).
+5. Users (--users N, more than the slots): every user's first turn at once, then every user's
    second turn at once: the tokens the server held for each (its context from a slot, host RAM
    or disk), the KV store's tiers; then a few second turns again with the cache flushed: the
    same replies (greedy), so the contexts came back bit for bit.
@@ -69,6 +71,7 @@ class Client:
         if r.status != 200:
             raise RuntimeError(f"HTTP {r.status}: {r.read()[:300]!r}")
         text, first, last, usage, n, fin = "", None, None, None, 0, None
+        times = []
         buf = b""
         while True:
             line = r.fp.readline()
@@ -89,13 +92,15 @@ class Client:
                     now = time.perf_counter()
                     first = first or now
                     last = now
+                    times.append(now)
                     text += d
                     n += 1
                 fin = ch.get("finish_reason") or fin
         del buf
         return {"text": text, "ttft": (first - t0) if first else None,
                 "wall": time.perf_counter() - t0, "decode_s": (last - first) if first else 0,
-                "deltas": n, "usage": usage, "finish": fin}
+                "deltas": n, "usage": usage, "finish": fin,
+                "gaps": [b - a for a, b in zip(times, times[1:])]}
 
 
 def _msgs(q):
@@ -170,6 +175,42 @@ def conversation(cl: Client, turns: int, max_tokens: int) -> list:
     return out
 
 
+def arrivals(cl: Client, n: int, interval: float, max_tokens: int) -> dict:
+    """n clients, the i-th starting i * interval s after the first, each a streamed greedy chat
+    of max_tokens (ignore_eos): their times to first token and the gaps between their tokens
+    (the longest: how long a newcomer's prompt held the others)."""
+    def run(i):
+        time.sleep(i * interval)
+        return cl.chat_stream(_msgs(QUESTIONS[i % len(QUESTIONS)] + f" (arrival {i})"),
+                              max_tokens=max_tokens, ignore_eos=True, temperature=0)
+    s0 = cl.get("/v1/stats")[1]
+    t0 = time.perf_counter()
+    res = _all(n, run)
+    wall = time.perf_counter() - t0
+    s1 = cl.get("/v1/stats")[1]
+    gaps = sorted(g for r in res for g in r["gaps"])
+    pick = (lambda q: round(1e3 * gaps[min(len(gaps) - 1, int(q * len(gaps)))], 1)) \
+        if gaps else (lambda q: None)
+    return {"clients": n, "interval_s": interval, "wall_s": round(wall, 2),
+            "generated": sum((r["usage"] or {}).get("completion_tokens", 0) for r in res),
+            "ttft_s": [round(r["ttft"], 3) for r in res],
+            "gap_ms": {"p50": pick(0.5), "p90": pick(0.9), "p99": pick(0.99),
+                       "max": round(1e3 * gaps[-1], 1) if gaps else None},
+            "max_gap_ms_per_client": [round(1e3 * max(r["gaps"]), 1) if r["gaps"] else None
+                                      for r in res],
+            "server": _server(s0, s1)}
+
+
+def _server(s0: dict, s1: dict) -> dict:
+    """The batching server's counts between two /v1/stats: decode steps, their runs (a step
+    runs a block of slots a run), mixed runs, inline compiles."""
+    d = {k: s1.get(k, 0) - s0.get(k, 0) for k in ("steps", "step_runs", "mixed_runs",
+                                                   "prefill_tokens")}
+    t0, t1 = s0.get("step_timing") or {}, s1.get("step_timing") or {}
+    d["compiled_inline"] = t1.get("compiled_inline", 0) - t0.get("compiled_inline", 0)
+    return d
+
+
 def _all(n, fn) -> list:
     """fn(i) for i < n, each in its own thread at once."""
     res = [None] * n
@@ -230,11 +271,14 @@ def main(argv=None):
                     help="levels run again with the model's sampling (seeded)")
     ap.add_argument("--turns", type=int, default=4)
     ap.add_argument("--users", type=int, default=16, help="users of the users part (0: none)")
+    ap.add_argument("--arrivals", type=int, default=6,
+                    help="clients of the arrivals part, one every --arrival-interval s (0: none)")
+    ap.add_argument("--arrival-interval", type=float, default=1.5)
     ap.add_argument("--user-tokens", type=int, default=64, help="max tokens of a user's reply")
     ap.add_argument("--wait", type=float, default=900, help="seconds to wait for /health")
     ap.add_argument("--out")
     ap.add_argument("--skip", default="",
-                    help="parts to skip: check,throughput,conversation,users")
+                    help="parts to skip: check,throughput,conversation,users,arrivals")
     a = ap.parse_args(argv)
     cl = Client(a.host, a.port, a.api_key)
     t0 = time.time()
@@ -264,6 +308,9 @@ def main(argv=None):
         rep["conversation"] = conversation(cl, a.turns, a.max_tokens)
         for i, x in enumerate(rep["conversation"]):
             print(f"turn {i + 1}:", x, flush=True)
+    if "arrivals" not in skip and a.arrivals:
+        rep["arrivals"] = arrivals(cl, a.arrivals, a.arrival_interval, a.max_tokens)
+        print("arrivals:", rep["arrivals"], flush=True)
     if "users" not in skip and a.users:
         rep["users"] = users(cl, a.users, a.user_tokens)
         print("users:", "PASS" if rep["users"]["pass"] else "FAIL", rep["users"], flush=True)
