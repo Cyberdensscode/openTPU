@@ -580,12 +580,12 @@ def load(a):
                          formats=formats, prog_cache=not a.no_prog_cache, snapshots=0)
     else:
         B = a.slots if batchable(spec) else 1
-        if B > 1 and cfg is None:           # the simulator: room for the slots and their area
-            from dataclasses import replace
+        if B > 1 and cfg is None:           # the simulator: room for the slots and their area, one
+            from dataclasses import replace  # slice as the card (sampled rows need it)
 
             from ..llm.qwen3 import PREFILL_ROWS, device_config
             c = device_config(spec, a.cap, batch=B, rows=PREFILL_ROWS, lookup=True,
-                              wformat=wformat, head_format=a.head_format)
+                              wformat=wformat, head_format=a.head_format, S=1)
             cfg = replace(c, DRAM_BYTES=2 * c.DRAM_BYTES)
         eng = Engine(spec, load_weights(path), cap=a.cap, cfg=cfg, backend=backend,
                      wformat=wformat, head_format=a.head_format, resident=True,
