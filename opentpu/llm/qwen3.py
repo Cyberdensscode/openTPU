@@ -2069,7 +2069,7 @@ class Engine:
                  restore: str = "lazy", embed_runs: bool = False, release_weights: bool = True,
                  pool_map: bool = True, prog_cache: bool | None = None,
                  prompt_runs: bool = False, layer_ahead=None, expert_major: bool = False,
-                 snapshots: int = 0):
+                 snapshots: int = 0, batch_area: bool = False):
         self.spec, self.cap, self.block = spec, cap, block
         self.prog_cache = PC.enabled() if prog_cache is None else bool(prog_cache)
         self.prompt_runs = prompt_runs
@@ -2081,7 +2081,9 @@ class Engine:
             wkw["embed_host"] = embed_host  # image's choice, a MoE's untied table there)
         # an int8 embedding is dequantized on the device (the image's tables), never the host
         int8_embed = getattr(spec, "embed", "f32") == "int8"
-        lookup = (bool(resident) or int8_embed) and batch == 1 and has_lookup(spec)
+        # (batch > 1: the tables serve every sequence; sequence 0 keeps the resident decode,
+        # the generate loop and the prompt runs, whose programs address its KV caches)
+        lookup = (bool(resident) or int8_embed) and has_lookup(spec)
         if lookup:
             wkw["lookup"] = True
         self.cfg = cfg or device_config(spec, cap, batch=batch, rows=self.rows, **wkw)
@@ -2122,6 +2124,19 @@ class Engine:
             if self._snaps.base is not None:
                 images = SN.grow(images, self._snaps.end())
         self.snap_stats: list = []          # the snapshots' and restores' copies (stats)
+        # batched decode steps over the sequences' KV slots (opentpu/llm/batch.py): their area
+        # past the image (and the snapshots)
+        self.bat = None
+        if batch_area:
+            if batch < 2 or not self.image.lookup:
+                raise ValueError("batch_area needs batch > 1 and the lookup tables "
+                                 "(resident=True)")
+            from . import batch as BA
+            self.bat = BA.alloc(self.image, self.cfg, batch, -(-len(images[0]) // 4096) * 4096)
+            if self.bat["end"] + 4 * self.cfg.IMEM_WORDS > self.cfg.DRAM_BYTES:
+                raise MemoryError("no room in the DRAM for the batch area")
+            images = SN.grow(images, self.bat["end"])
+            BA.build(images, self.bat, spec, self.cfg)
         self.backend = IsaBackend(self.cfg, images, adopt=True) if backend == "isa" else backend(
             self.cfg, images)
         self.resident = bool(resident) and lookup and bool(getattr(self.backend, "args", False))

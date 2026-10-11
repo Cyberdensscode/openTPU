@@ -148,6 +148,16 @@ class ContextIO:
             self._write([r for r, _ in batch], [d for _, d in batch])
         self.stats["written"] += sum(len(d) for _, _, d in pages)
 
+    def copy_from(self, other: "ContextIO", pages) -> None:
+        """[(i, m)]: pages of another sequence's caches (another KV slot of the same image)
+        into this one's, on the device (LD / ST programs: no bytes cross to the host)."""
+        pairs = []
+        for i, m in pages:
+            for (src, n), (dst, n2) in zip(other.layout.regions(i, m), self.layout.regions(i, m)):
+                assert n == n2
+                pairs.append((src, dst, n))
+        self._copy(pairs)
+
     # ---- state
     def read_state(self) -> np.ndarray:
         if not self.layout.stateful:
