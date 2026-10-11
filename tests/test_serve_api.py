@@ -1,6 +1,6 @@
 """otpu-serve's HTTP API (opentpu/serve/api.py) end to end: a tiny Qwen3 on the ISA simulator
 behind the server, clients over HTTP. Chat and text completions (plain and streamed, the
-streamed text the plain one's), greedy replies equal to a fresh engine's on the rendered
+streamed text the plain one's), SGLang's /generate, greedy replies equal to a fresh engine's on the rendered
 prompt, several clients' conversations at once (their second turns continuing the first's
 context: cached tokens), stop strings, n choices, usage, the models and stats routes, errors
 (a prompt over the context, a bad body, an API key), and the reasoning split."""
@@ -193,6 +193,33 @@ def test_completions_stop_and_n(server):
     a = _call(port, "POST", "/v1/completions", body)[1]["choices"][0]["text"]
     b = _call(port, "POST", "/v1/completions", body)[1]["choices"][0]["text"]
     assert a == b and len(a) == 6
+
+
+def test_sglang_generate(server):
+    """SGLang's /generate: input_ids or text (one, or a list), sampling_params, meta_info; streamed:
+    each event the whole text so far, then [DONE]."""
+    srv, port, models = server
+    ids = [5, 17, 300, 42, 8, 99, 123]
+    want_ids = _ref(models, ids, 8)
+    st, r = _call(port, "POST", "/generate", {"input_ids": ids, "sampling_params": {
+        "max_new_tokens": 8, "temperature": 0}})
+    assert st == 200, r
+    assert r["output_ids"] == want_ids and r["text"] == _Tok().decode(want_ids)
+    m = r["meta_info"]
+    assert m["prompt_tokens"] == len(ids) and m["completion_tokens"] == 8
+    assert m["finish_reason"] == {"type": "length", "length": 8} and m["e2e_latency"] > 0
+    st, rs = _call(port, "POST", "/generate", {"text": ["ab", "cd"], "sampling_params": {
+        "max_new_tokens": 3, "temperature": 0, "ignore_eos": True}})
+    assert st == 200 and isinstance(rs, list) and len(rs) == 2
+    for x, t in zip(rs, ["ab", "cd"]):
+        assert x["output_ids"] == _ref(models, _Tok()(t)["input_ids"], 3)
+    ev = _stream(port, "/generate", {"input_ids": ids, "sampling_params": {
+        "max_new_tokens": 8, "temperature": 0}})
+    assert ev[-1] == "DONE" and ev[-2]["text"] == r["text"]
+    assert ev[-2]["meta_info"]["finish_reason"]["type"] == "length"
+    texts = [e["text"] for e in ev[:-1]]
+    assert all(b.startswith(a) for a, b in zip(texts, texts[1:]))
+    assert _call(port, "POST", "/generate", {"sampling_params": {}})[0] == 400
 
 
 def test_errors(server):

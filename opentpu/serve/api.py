@@ -5,12 +5,13 @@
 
 Endpoints: POST /v1/chat/completions and /v1/completions (stream or not, n choices, stop
 strings and token ids, the model's sampling defaults, usage with the prompt tokens the KV
-cache already held), GET /v1/models, /health, /v1/stats (the queue, throughput, the KV store),
-POST /flush_cache (forget the saved contexts). Many clients at once: their requests run in
-turns on the card (opentpu/serve/scheduler.py), each context switched in and out of the
-device's KV cache through the KV store (opentpu/serve/store.py: host RAM, then disk), and a
-prompt that continues a saved context (a chat's next turn, a shared system prompt) feeds only
-the rest.
+cache already held), SGLang's POST /generate (text or input_ids, sampling_params, meta_info),
+GET /v1/models, /health, /v1/stats (the queue, throughput, the slots, the KV store), POST
+/flush_cache (forget the saved contexts). Many clients at once: a model whose image holds
+several sequences decodes their requests together in KV slots (opentpu/serve/batching.py),
+the others run them in turns (opentpu/serve/scheduler.py); contexts move in and out of the
+device through the KV store (opentpu/serve/store.py: host RAM, then disk), and a prompt that
+continues a saved context (a chat's next turn, a shared system prompt) feeds only the rest.
 
 The chat template renders the messages as otpu-chat does (thinking off unless --think or the
 request's chat_template_kwargs {"enable_thinking": true}); with --reasoning-parser qwen3 a
@@ -23,10 +24,8 @@ import argparse
 import json
 import os
 import sys
-import threading
 import time
 import uuid
-from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -281,6 +280,59 @@ class Server:
             raise APIError(400, "suffix is not supported", param="suffix")
         return self.submit(body, ids), len(ids), p if body.get("echo") else None
 
+    def generate(self, body: dict):
+        """SGLang's native /generate: `text` or `input_ids` (one prompt, or a list of them) and
+        `sampling_params` (max_new_tokens (default 128), temperature, top_p, top_k (-1: all),
+        repetition_penalty, stop, stop_token_ids, ignore_eos, skip_special_tokens, n). Returns
+        [(requests, prompt tokens)] per prompt, and whether the input was a list."""
+        sp = body.get("sampling_params") or {}
+        if not isinstance(sp, dict):
+            raise APIError(400, "sampling_params: an object", param="sampling_params")
+        text, ids = body.get("text"), body.get("input_ids")
+        if (text is None) == (ids is None):
+            raise APIError(400, "one of text and input_ids", param="text")
+        if text is not None:
+            batch = isinstance(text, list)
+            texts = text if batch else [text]
+            if not texts or not all(isinstance(t, str) for t in texts):
+                raise APIError(400, "text: a string or a list of strings", param="text")
+            prompts = [self.encode(t) for t in texts]
+        else:
+            batch = isinstance(ids, list) and bool(ids) and isinstance(ids[0], list)
+            prompts = ids if batch else [ids]
+            if not all(isinstance(p, list) and all(isinstance(x, int) for x in p)
+                       for p in prompts):
+                raise APIError(400, "input_ids: token ids or a list of them", param="input_ids")
+        top_k = sp.get("top_k")
+        ob = {"max_tokens": sp.get("max_new_tokens", 128), "temperature": sp.get("temperature"),
+              "top_p": sp.get("top_p"), "top_k": 0 if top_k == -1 else top_k,
+              "repetition_penalty": sp.get("repetition_penalty"), "stop": sp.get("stop"),
+              "stop_token_ids": sp.get("stop_token_ids"), "ignore_eos": sp.get("ignore_eos"),
+              "skip_special_tokens": sp.get("skip_special_tokens", True),
+              "n": sp.get("n", 1), "seed": sp.get("sampling_seed", body.get("seed"))}
+        out = []
+        try:
+            for p in prompts:
+                out.append((self.submit(ob, [int(x) for x in p]), len(p)))
+        except BaseException:
+            for reqs, _ in out:
+                for r in reqs:
+                    r.cancel()
+            raise
+        return out, batch
+
+    def gen_item(self, r: SC.Request, prompt: int, text: str, t0: float, done: bool) -> dict:
+        """One /generate result (or a streamed state of it: the text so far)."""
+        fin = None
+        if done:
+            fin = ({"type": "abort", "message": r.error} if r.finish == "error" else
+                   {"type": "length", "length": len(r.out)} if r.finish == "length" else
+                   {"type": "abort"} if r.finish == "abort" else {"type": "stop"})
+        return {"text": text, "output_ids": list(r.out),
+                "meta_info": {"id": r.rid, "finish_reason": fin, "prompt_tokens": prompt,
+                              "completion_tokens": len(r.out), "cached_tokens": r.cached,
+                              "e2e_latency": round(time.perf_counter() - t0, 4)}}
+
     # ---- responses
     def usage(self, reqs, prompt: int) -> dict:
         out = sum(len(r.out) for r in reqs)
@@ -370,7 +422,7 @@ def make_handler(srv: Server):
             try:
                 self._auth()
                 path = self.path.split("?")[0].rstrip("/")
-                if path in ("/health", "/v1/health"):
+                if path in ("/health", "/v1/health", "/health_generate"):
                     return self._json(200, {"status": "ok"})
                 if path == "/v1/models":
                     return self._json(200, srv.models())
@@ -401,6 +453,8 @@ def make_handler(srv: Server):
                     return self._chat(body)
                 if path == "/v1/completions":
                     return self._completion(body)
+                if path == "/generate":
+                    return self._generate(body)
                 raise APIError(404, f"no route {self.path}")
             except APIError as e:
                 self._error(e)
@@ -478,6 +532,33 @@ def make_handler(srv: Server):
             if d:
                 self._chunk(_sse({**base, "choices": [{"index": i, "delta": d, "logprobs": None,
                                                        "finish_reason": None}]}))
+
+        def _generate(self, body: dict) -> None:
+            t0 = time.perf_counter()
+            groups, batch = srv.generate(body)
+            items = [(r, plen) for reqs, plen in groups for r in reqs]
+            if body.get("stream"):              # SGLang's: each event the whole text so far
+                self._stream_start()
+                try:
+                    for r, plen in items:
+                        text = ""
+                        for delta in r.stream():
+                            text += delta
+                            self._chunk(_sse(srv.gen_item(r, plen, text, t0, False)))
+                        self._chunk(_sse(srv.gen_item(r, plen, text, t0, True)))
+                    self._stream_end()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    for r, _ in items:
+                        r.cancel()
+                return
+            try:
+                self._wait([r for r, _ in items])
+            except BaseException:
+                for r, _ in items:
+                    r.cancel()
+                raise
+            res = [srv.gen_item(r, plen, r.text, t0, True) for r, plen in items]
+            self._json(200, res if batch or len(res) > 1 else res[0])
 
         def _completion(self, body: dict) -> None:
             reqs, plen, echo = srv.completion(body)

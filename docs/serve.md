@@ -27,9 +27,10 @@ r = c.chat.completions.create(model="Qwen3-0.6B", messages=[{"role": "user", "co
 |---|---|
 | `POST /v1/chat/completions` | the chat template as otpu-chat renders it; `stream` (SSE), `n`, `max_tokens` / `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `repetition_penalty`, `seed`, `stop` (strings), `stop_token_ids`, `ignore_eos`, `stream_options.include_usage`, `chat_template_kwargs.enable_thinking`, `skip_special_tokens`; content as a string or text parts |
 | `POST /v1/completions` | a prompt string or token ids, `echo`, the same sampling and stops |
+| `POST /generate` | SGLang's native call: `text` or `input_ids` (one, or a list), `sampling_params` (`max_new_tokens` (default 128), `temperature`, `top_p`, `top_k` (-1: all), `repetition_penalty`, `stop`, `stop_token_ids`, `ignore_eos`, `n`), `stream` (each event the whole text so far); `output_ids` and `meta_info` (prompt, completion and cached tokens, `finish_reason`, `e2e_latency`) |
 | `GET /v1/models` | the model, its context length (`max_model_len`) |
 | `GET /v1/stats` | the queue, throughput, the slots, the KV store and prefix cache, the steps' timing |
-| `GET /health`, `GET /get_model_info` | |
+| `GET /health`, `/health_generate`, `/get_model_info`, `/get_server_info` | |
 | `POST /flush_cache` | forget every saved context and what idle slots hold |
 
 `usage.prompt_tokens_details.cached_tokens` counts the prompt tokens the server did not feed
