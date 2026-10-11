@@ -394,7 +394,7 @@ def make_handler(srv: Server):
                 self._auth()
                 path = self.path.split("?")[0].rstrip("/")
                 if path == "/flush_cache":
-                    srv.w.cache.clear()
+                    srv.w.flush()
                     return self._json(200, {"flushed": True})
                 body = self._body()
                 if path == "/v1/chat/completions":
@@ -579,15 +579,30 @@ def load(a):
                          experts=a.experts, wformat=wformat, head_format=a.head_format,
                          formats=formats, prog_cache=not a.no_prog_cache, snapshots=0)
     else:
+        B = a.slots if batchable(spec) else 1
+        if B > 1 and cfg is None:           # the simulator: room for the slots and their area
+            from dataclasses import replace
+
+            from ..llm.qwen3 import PREFILL_ROWS, device_config
+            c = device_config(spec, a.cap, batch=B, rows=PREFILL_ROWS, lookup=True,
+                              wformat=wformat, head_format=a.head_format)
+            cfg = replace(c, DRAM_BYTES=2 * c.DRAM_BYTES)
         eng = Engine(spec, load_weights(path), cap=a.cap, cfg=cfg, backend=backend,
                      wformat=wformat, head_format=a.head_format, resident=True,
-                     prog_cache=not a.no_prog_cache, prompt_runs=not a.no_prompt_runs)
+                     prog_cache=not a.no_prog_cache, prompt_runs=not a.no_prompt_runs,
+                     batch=B, batch_area=B > 1)
     weights = CH.weights_label(eng.image, wformat)
     print(f"weights: {weights}; loaded in {time.perf_counter() - t0:.1f} s", flush=True)
     tok = tokenizer()
     ns = argparse.Namespace(temperature=None, top_k=None, top_p=None, repetition_penalty=None)
     defaults = CH.sampling(spec, ns, path)
     return eng, tok, spec, path, defaults, weights
+
+
+def batchable(spec) -> bool:
+    """The model's image holds several sequences' KV caches (Qwen3 and the Llama-likes)."""
+    from ..llm import qwen3
+    return type(spec) is qwen3.Spec
 
 
 def main(argv=None):
@@ -607,8 +622,12 @@ def main(argv=None):
     ap.add_argument("--wformat", default=FM.AUTO,
                     choices=[FM.AUTO, "int8", "fp4", "int4", FM.MIX])
     ap.add_argument("--head-format", default=None, choices=["int8", "fp4", "int4"])
+    ap.add_argument("--slots", type=int, default=8,
+                    help="KV slots on the card: requests decoded together, batched (Qwen3 and "
+                         "the Llama-likes; other models run one sequence, requests in turns)")
     ap.add_argument("--max-running", type=int, default=8,
-                    help="requests that run in turns at once (the others queue)")
+                    help="without slots: requests that run in turns at once (the others "
+                         "queue)")
     ap.add_argument("--quantum", type=int, default=SC.QUANTUM,
                     help="tokens a request decodes per turn while others wait")
     ap.add_argument("--max-queue", type=int, default=256)
@@ -640,14 +659,18 @@ def _main(a):
                       eng.block, eng.cfg.S, eng.cfg.D, eng.cfg.MCOLS, eng.cfg.PAIR)
     store = ST.BlobStore(int(a.kv_ram_gb * 2**30), int(a.kv_disk_gb * 2**30),
                          a.kv_dir + f"/{mk}" if a.kv_disk_gb > 0 else None)
-    w = SC.Worker(eng, tok, store=store, model_key=mk, max_running=a.max_running,
-                  quantum=a.quantum).start()
+    from .batching import BatchWorker, batches
+    if batches(eng):
+        w = BatchWorker(eng, tok, store=store, model_key=mk, quantum=a.quantum).start()
+    else:
+        w = SC.Worker(eng, tok, store=store, model_key=mk, max_running=a.max_running,
+                      quantum=a.quantum).start()
     name = a.served_model_name or Path(path).name
     srv = Server(w, tok, spec, name, defaults, think=a.think, reasoning=a.reasoning_parser,
                  aliases=(a.model,), api_key=a.api_key, max_queue=a.max_queue,
                  info={"path": str(path), "backend": a.backend, "weights": weights,
                        "cap": a.cap, "kv_page_bytes": w.io.layout.page_bytes(),
-                       "staged": w.io.area is not None})
+                       "staged": w.io.area is not None, "slots": eng.batch})
     httpd = serve(srv, a.host, a.port)
     print(f"otpu-serve: {name} on http://{a.host}:{a.port}/v1 (context {a.cap}, KV store "
           f"{a.kv_ram_gb:g} GB RAM + {a.kv_disk_gb:g} GB disk, sampling {defaults})",

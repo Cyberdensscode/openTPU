@@ -1,0 +1,129 @@
+"""The batching worker (opentpu/serve/batching.py) on the ISA simulator: a tiny Qwen3 with 4
+KV slots. Requests submitted together run in their slots, their decode steps batched (one run
+for every decoding request, each next token picked on the device): every request's greedy
+tokens equal its own fresh run's; a seeded sampled request gives the same text alone and among
+others; a prompt sharing a prefix with another slot's context takes its pages by a device copy,
+one sharing a saved context from the store; more requests than slots wait for one; a lone
+request in slot 0 runs the card's decode loop; stop strings and cancels end requests."""
+import dataclasses
+import threading
+
+import numpy as np
+import pytest
+
+from opentpu.llm.qwen3 import PREFILL_ROWS, Engine, device_config
+from opentpu.serve import batching as BW
+from opentpu.serve import scheduler as SC
+
+from test_serve_kvio import _model
+from test_serve_scheduler import _Tok, _prompts, _ref
+
+torch = pytest.importorskip("torch")
+
+CAP = 512
+
+
+def _setup(B=4):
+    W, spec, cfg1 = _model("qwen3")
+    cfg = device_config(spec, CAP, batch=B, rows=PREFILL_ROWS, lookup=True, S=1)
+    cfg = dataclasses.replace(cfg, DRAM_BYTES=2 * cfg.DRAM_BYTES)
+    eng = Engine(spec, W, cap=CAP, cfg=cfg, batch=B, resident=True, prompt_runs=True,
+                 batch_area=True)
+    return eng, W, spec, cfg1
+
+
+def test_requests_batched_in_slots_are_their_own_runs():
+    eng, W, spec, cfg1 = _setup()
+    stop = frozenset()
+    w = BW.BatchWorker(eng, _Tok()).start()
+    try:
+        ps = _prompts(1, [21, 34, 9, 27, 15, 12])          # six requests, four slots
+        reqs = [w.submit(SC.Request(p, max_new=9, stop_ids=stop)) for p in ps]
+        for r in reqs:
+            r.wait(timeout=900)
+        for p, r in zip(ps, reqs):
+            assert r.finish == "length" and r.error is None, r.error
+            assert r.out == _ref(spec, W, cfg1, p, 9, stop), r.rid
+        st = w.usage()
+        assert st["steps"] > 0 and st["step_rows"] > st["steps"]      # rows batched
+        assert {r.slot for r in reqs} == {0, 1, 2, 3}
+        # a request continuing the first conversation feeds only what is new
+        nxt = ps[0] + reqs[0].out + _prompts(2, [6])[0]
+        r = w.submit(SC.Request(nxt, max_new=5, stop_ids=stop)).wait(900)
+        assert r.out == _ref(spec, W, cfg1, nxt, 5, stop)
+        assert r.cached >= len(ps[0]) + len(reqs[0].out) - 1
+    finally:
+        w.stop()
+
+
+def test_shared_prefix_from_another_slot_and_from_the_store():
+    eng, W, spec, cfg1 = _setup()
+    stop = frozenset()
+    w = BW.BatchWorker(eng, _Tok()).start()
+    try:
+        sysp = _prompts(5, [270])[0]
+        a, b = _prompts(6, [10, 13])
+        a, b = sysp + a, sysp + b
+        r0 = w.submit(SC.Request(a, max_new=3, stop_ids=stop)).wait(900)
+        with w.cv:                                  # bound in one iteration: a takes its slot
+            ra = w.submit(SC.Request(a, max_new=40, stop_ids=stop))       # back, b copies
+            rb = w.submit(SC.Request(b, max_new=6, stop_ids=stop))        # its pages from it
+        rb.wait(900)
+        ra.wait(900)
+        assert r0.slot == ra.slot and ra.cached == len(a) - 1
+        assert rb.cached == 270 and w.stats["slot_copies"] >= 1
+        # fill every slot with other contexts: a's slot is overwritten, its context saved
+        others = [w.submit(SC.Request(p, max_new=2, stop_ids=stop))
+                  for p in _prompts(7, [20, 21, 22, 23, 24])]
+        for r in others:
+            r.wait(900)
+        c = a + ra.out + _prompts(8, [7])[0]
+        rc = w.submit(SC.Request(c, max_new=5, stop_ids=stop)).wait(900)
+        assert rc.cached >= len(a) and w.stats["restores"] >= 1
+        for p, r, n in ((a, ra, 40), (b, rb, 6), (c, rc, 5)):
+            assert r.out == _ref(spec, W, cfg1, p, n, stop)
+    finally:
+        w.stop()
+
+
+def test_sampled_requests_alone_and_together():
+    """A seeded sampled request's tokens are the same alone (slot 0: the card's loop) and with
+    others batched beside it (each row its own uniforms, picked on the device)."""
+    eng, W, spec, cfg1 = _setup()
+    stop = frozenset()
+    samp = SC.Sampling(0.9, 16, 0.9, 1.2, seed=11)
+    p = _prompts(9, [18])[0]
+    w = BW.BatchWorker(eng, _Tok()).start()
+    try:
+        alone = w.submit(SC.Request(p, max_new=12, stop_ids=stop, sampling=samp)).wait(900)
+        assert w.stats["card_loops"] >= 1
+        w.flush()
+        others = [w.submit(SC.Request(q, max_new=14, stop_ids=stop,
+                                      sampling=SC.Sampling(1.0, 32, 0.95, 1.0, seed=i)))
+                  for i, q in enumerate(_prompts(10, [22, 25]))]
+        together = w.submit(SC.Request(p, max_new=12, stop_ids=stop, sampling=samp))
+        together.wait(900)
+        for r in others:
+            r.wait(900)
+        assert together.out == alone.out
+        assert w.stats["step_rows"] > w.stats["steps"]
+    finally:
+        w.stop()
+
+
+def test_stop_strings_and_cancel_in_slots():
+    eng, W, spec, cfg1 = _setup()
+    w = BW.BatchWorker(eng, _Tok()).start()
+    try:
+        p = _prompts(11, [15])[0]
+        want = _ref(spec, W, cfg1, p, 12, frozenset())
+        text = _Tok().decode(want)
+        long = w.submit(SC.Request(_prompts(12, [20])[0], max_new=200, stop_ids=frozenset()))
+        r = w.submit(SC.Request(p, max_new=12, stop_ids=frozenset(), stop_strs=(text[5:7],)))
+        assert "".join(r.stream(timeout=900)) == text[:5] and r.finish == "stop"
+        long.cancel()
+        long.wait(900)
+        assert long.finish == "abort" and len(long.out) < 200
+        assert all(x is None for x in w.slot_req)
+    finally:
+        w.stop()

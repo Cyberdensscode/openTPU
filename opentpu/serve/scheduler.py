@@ -54,7 +54,7 @@ class Sampling:
         return self.temperature <= 0 and self.repetition_penalty == 1.0
 
 
-@dataclass
+@dataclass(eq=False)                    # (identity: requests are equal only to themselves)
 class Request:
     """One generation. prompt: the token ids fed; at: where a model with state keeps a saved
     context in the prompt (a chat's reply start: the next turn's rendering parts there), or
@@ -86,6 +86,8 @@ class Request:
     fed: list = field(default_factory=list)      # tokens in its context (the device's or saved)
     next: int | None = None           # its next token: picked, not fed
     entry: object = None              # its saved context while it is off the device (pinned)
+    slot: int | None = None           # its KV slot (batching.BatchWorker)
+    _bset: bool = False               # its slot's sampling words written (BatchWorker)
     _shown: int = 0                   # chars of text sent
     _detok: object = None
     _pick: object = None
@@ -179,6 +181,15 @@ class Worker:
             self.stats["requests"] += 1
             self.cv.notify_all()
         return r
+
+    def flush(self) -> None:
+        """Forget the saved contexts and the device's (the next request starts from what the
+        store and the device do not hold)."""
+        self.cache.clear()
+        with self.cv:
+            idle = not self.running
+        if idle:
+            self.dev, self.dirty = [], False
 
     def busy(self) -> int:
         with self.cv:
