@@ -65,7 +65,7 @@ from .. import fp32 as F
 from .. import qcache as QC
 from .. import quant as Q
 from .. import language as ol
-from ..compiler import Affine, CompileError, KVDesc, QTensor, Tensor, current
+from ..compiler import Affine, CompileError, KVDesc, QTensor, Tensor, current, trace_fit
 from ..host.offload import LINE, ExpertServer, Layout
 from ..isasim import Config
 from ..kernels.layouts import head_parallel_attention_weights
@@ -182,7 +182,11 @@ class Spec:
         S, D = cfg.S, cfg.D
         need = [(self.head_dim % D == 0, f"head_dim {self.head_dim} % D"),
                 (self.rope_dim % 2 == 0 and self.rope_dim <= self.head_dim, "rope_dim"),
-                (self.lin_dk == D and self.lin_dv == D, "DeltaNet heads must be D wide"),
+                (self.lin_dk % D == 0 and self.lin_dv % D == 0,
+                 f"DeltaNet heads ({self.lin_dk} x {self.lin_dv}) a multiple of D {D} wide"),
+                (cfg.DSTEP or 2 * self.lin_dk * self.lin_dv < cfg.TMEM_WORDS,
+                 f"DeltaNet on the VPU: a head pair's states ({self.lin_dk} x {self.lin_dv} "
+                 f"words each) in TMEM ({cfg.TMEM_WORDS} words; DSTEP keeps them in DRAM)"),
                 (self.lin_heads % (2 * S) == 0, f"DeltaNet heads % 2S (pairs per slice)"),
                 (self.lin_heads % self.lin_nk == 0, "DeltaNet value heads % key heads"),
                 (self.hidden % (S * D) == 0, f"hidden {self.hidden} % S*D"),
@@ -771,10 +775,11 @@ class Image(EmbedHost):
             raise ValueError("embed_host needs the image's lookup tables (lookup=True)")
         self.lookup = _lookup_alloc(b, spec, cap, D=D, head=self.head if shared else None,
                                     M=cfg.MCOLS, embed_host=bool(embed_host),
-                                    rows=self.grows) if lookup else {}  # (layer 0's R rows)
+                                    rows=self.grows,                # (layer 0's R rows)
+                                    imem=cfg.IMEM_WORDS) if lookup else {}
         if lookup and spec.mtp:     # the MTP loop's chain area (opentpu/llm/mtp.py)
             from .mtp import gen_alloc
-            self.lookup["mtpgen"] = gen_alloc(b, cap, spec)
+            self.lookup["mtpgen"] = gen_alloc(b, cap, spec, imem_words=cfg.IMEM_WORDS)
         self.choices = {"embed_host": self.embed_host,          # (the compile worker's
                         "formats": self.formats}                # image)
         self.offload = None
@@ -1053,8 +1058,9 @@ class Image(EmbedHost):
 
     def compile_step(self, pos: int, block: int = ATTN_BLOCK, tok: int | None = None) -> list:
         """One program per slice: the decode token at position `pos` (qwen35_step)."""
-        return [qwen35_step.trace(self.cfg, s, {"m": step_descriptors(self, s), "pos": pos,
-                                                "block": block, **_tok_arg(self, tok)}).finish()
+        return [trace_fit(qwen35_step, self.cfg, s,
+                          lambda s=s: {"m": step_descriptors(self, s), "pos": pos,
+                                       "block": block, **_tok_arg(self, tok)}).finish()
                 for s in range(self.cfg.S)]
 
     def compile_rows(self, rows, logit_rows, block: int = ATTN_BLOCK, tokens=None,

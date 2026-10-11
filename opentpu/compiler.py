@@ -643,6 +643,7 @@ class Builder:
         self.stack: list = [self.root]
         self.loops: list[LoopBlock] = []
         self.tmem_next = 0
+        self.fit = "next"               # TMEM placement: next-fit, or "best" (trace_fit's retry)
         self.act_next = 0
         self.act_owner = [None] * cfg.ACT_BLOCKS
         self.act_live = [None] * cfg.ACT_BLOCKS      # weakref to the Stationary holding a block
@@ -1036,6 +1037,17 @@ class Builder:
         W = self.cfg.TMEM_WORDS - self.desc_area
         for attempt in range(2):
             self.tmem_regions = [r for r in self.tmem_regions if r[2]() is not None]
+            if self.fit == "best":          # the smallest gap that holds n words
+                best, a = None, 0
+                for b, e, _ in self.tmem_regions + [(W, W, None)]:
+                    if b - a >= n and (best is None or b - a < best[1]):
+                        best = (a, b - a)
+                    a = max(a, e)
+                if best is not None:
+                    self.tmem_next = best[0] + n
+                    return best[0]
+                gc.collect()
+                continue
             for start in (self.tmem_next, 0):
                 a = start
                 for b, e, _ in self.tmem_regions:
@@ -1048,7 +1060,9 @@ class Builder:
                     self.tmem_next = a + n
                     return a
             gc.collect()       # dead tiles in reference cycles still hold their regions
-        raise CompileError("TMEM exhausted")
+        live = sum(e - b for b, e, _ in self.tmem_regions)
+        raise CompileError(f"TMEM exhausted: a tile of {n} words, {live} of {W} in use "
+                           f"(TMEM_WORDS {self.cfg.TMEM_WORDS})")
 
     def act_alloc(self, KB: int) -> tuple[int, object]:
         """KB contiguous ACT RAM blocks not held by a live Stationary, searched round-robin
@@ -1724,9 +1738,10 @@ class Kernel:
         self.fn = fn
         self.__name__ = fn.__name__
 
-    def trace(self, cfg: Config, sid: int, bound: dict) -> Builder:
+    def trace(self, cfg: Config, sid: int, bound: dict, fit: str = "next") -> Builder:
         b = Builder(cfg, sid)
         b.S = cfg.S
+        b.fit = fit
         st = _stack()
         st.append(b)
         try:
@@ -1737,6 +1752,21 @@ class Kernel:
 
 
 _TRACE_CODE = Kernel.trace.__code__
+
+
+def trace_fit(kernel: Kernel, cfg: Config, sid: int, bound) -> Builder:
+    """kernel.trace(cfg, sid, bound()), and when its tiles do not fit TMEM placed next-fit (the
+    free words split into gaps too small: a small TMEM), the trace again with best-fit
+    placement. For the programs that have no smaller form to fall back to (a decode step):
+    the compiles that probe (a prefill run's rows, a prompt run's, a generate bucket's single
+    program) keep next-fit's answer, so a program that fits next-fit is placed as before.
+    `bound` makes the arguments (fresh descriptors for the second trace)."""
+    try:
+        return kernel.trace(cfg, sid, bound())
+    except CompileError as e:
+        if not str(e).startswith("TMEM exhausted"):
+            raise
+    return kernel.trace(cfg, sid, bound(), fit="best")
 
 
 def jit(fn) -> Kernel:

@@ -10,7 +10,8 @@ M k + j of every block, dequantized by the MXU's own arithmetic, t = (i2f(127 w)
 127) (the one-hot quantizes to 127 with scale f32(1/127)); D / M MMs give every element (for
 4-bit, twice as many, one for each block of a chunk: the one-hot blocks are interleaved with
 zero blocks, [Z, O_0, Z, O_1, ..., O_{D/M-1}, Z], and [O_k, Z] reads a chunk's first block,
-[Z, O_k] its second). The operand is the constant `onehot(D, M, fmt)` from DRAM, quantized once.
+[Z, O_k] its second). The operand is the constant `onehot(D, M, fmt)` from DRAM, quantized once
+(operand; where it does not fit ACT RAM or TMEM whole, each MM's blocks on their own).
 
   gather_row     a row of a row-major table (the LM head): the MMs write the elements
                  transposed, [D, blocks], and one VOP per block copies a column to the row
@@ -51,6 +52,37 @@ def onehot(D: int, M: int, fmt: str) -> np.ndarray:
 
 def onehot_blocks(D: int, M: int, fmt: str) -> int:
     return onehot(D, M, fmt).shape[1] // D
+
+
+class _Parts:
+    """The one-hot operand where it does not fit whole (D / M blocks, 2 D / M + 1 for 4-bit,
+    against ACT_BLOCKS; or its tile, M x the blocks, against TMEM: a small configuration):
+    each MM's blocks loaded and quantized on their own (blocks(k, kb): M rows of kb blocks
+    from DRAM, a QACT, the operand of one MM)."""
+
+    def __init__(self, desc):
+        self.desc, self.rows = desc, desc.shape[0]
+
+    @property
+    def src(self):                  # (oh.src.rows: M, as a quantized operand's)
+        return self
+
+    def blocks(self, k: int, kb: int = 1):
+        D = ol.block_size()
+        return ol.quantize(ol.load(self.desc[:, k * D:(k + kb) * D]))
+
+
+def operand(desc):
+    """The gathers' one-hot operand (oh) from its DRAM descriptor (the image's onehot(D, M,
+    fmt)): loaded and quantized into ACT RAM once where the configuration holds it whole (its
+    blocks in ACT RAM, its tile in at most 3/4 of TMEM, leaving the gather's own tiles room:
+    the card's largest, 4-bit at D = 128 and 4 columns, is 51%), else _Parts. The choice is
+    the configuration's, not the trace's: a whole operand that finds TMEM full fails the
+    compile as it always did (the generate loop's split form, a prefill run's fewer rows)."""
+    M, cols = desc.shape
+    if cols // ol.block_size() <= ol.act_blocks() and 4 * M * cols <= 3 * ol.tmem_words():
+        return ol.quantize(ol.load(desc))
+    return _Parts(desc)
 
 
 def _mms(oh, qv: QTensor, out, fmt: str, half: int = 0):

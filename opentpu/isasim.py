@@ -682,12 +682,22 @@ def _regs(args) -> list[int]:
     return R
 
 
+def _fit_imem(cfg: Config, programs) -> None:
+    """The board's loader takes at most IMEM's instructions (IMEM_WORDS / 8): a longer program
+    cannot run on a device of this configuration."""
+    for sid, p in enumerate(programs):
+        if len(p) > cfg.IMEM_WORDS // 8:
+            raise SimError(f"slice {sid}: a program of {len(p)} instructions, IMEM holds "
+                           f"{cfg.IMEM_WORDS // 8} (IMEM_WORDS {cfg.IMEM_WORDS})")
+
+
 class Machine:
     """args: the run's arguments (up to 8 words): R8..R15 start with them (0 without)."""
 
     def __init__(self, cfg: Config, programs: list[list[I.Instr]], drams: list[np.ndarray | None],
                  args=None):
         assert len(programs) == cfg.S and len(drams) == cfg.S
+        _fit_imem(cfg, programs)
         self.cfg = cfg
         self.slices = [Slice(cfg, s, programs[s], drams[s]) for s in range(cfg.S)]
         self.args = args
@@ -700,6 +710,7 @@ class Machine:
         """Start new programs on the same machine: DRAM, TMEM and ACT RAM are kept (as on the
         board, where the host writes a new program image between launches)."""
         assert len(programs) == self.cfg.S
+        _fit_imem(self.cfg, programs)
         self.args = args
         for s, p in zip(self.slices, programs):
             s.prog, s.R, s.pc, s.stack = p, _regs(args), 0, []

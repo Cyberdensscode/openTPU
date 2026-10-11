@@ -54,6 +54,11 @@ def tmem_words() -> int:
     return current().cfg.TMEM_WORDS
 
 
+def act_blocks() -> int:
+    """ACT RAM depth in D-blocks: the most K-blocks a stationary operand can have."""
+    return current().cfg.ACT_BLOCKS
+
+
 def mxu_columns() -> int:
     """MCOLS: the most rows a stationary operand of one MM can have."""
     return current().cfg.MCOLS

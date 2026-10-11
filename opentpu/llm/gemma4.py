@@ -80,7 +80,7 @@ from .. import isa as I
 from .. import qcache as QC
 from .. import quant as Q
 from .. import language as ol
-from ..compiler import Affine, DevVar, KVDesc, QTensor, Tensor, current
+from ..compiler import Affine, DevVar, KVDesc, QTensor, Tensor, current, trace_fit
 from ..isasim import Config
 from ..kernels import gather as GA
 from ..kernels import mailbox as MB
@@ -635,21 +635,32 @@ def softcap(spec: Spec, logits: np.ndarray) -> np.ndarray:
 
 # =============================================================================== DRAM image
 RING_BLOCKS = 1         # sliding K / V ring: the window plus this many attention blocks
-CARD_BYTES = 1 << 32    # the card's DRAM: the PLE table's place and the formats follow the fit
+CARD_BYTES = 1 << 32    # a slice's DRAM at most (32-bit addresses; the card's 4 GiB): the PLE
+                        # table's place and the formats follow the fit to the configuration's
+                        # DRAM, at most this (_fit_bytes)
 PLE_CHUNK = 8192        # PLE records quantized per pass (host memory)
 BIG = 2.0 ** 100        # (tpos + 0.5 - c) * BIG * BIG: +-inf, the run-time mask rows
-MLP_CHUNK = 768         # the MLP's F chunk at most: 4 prefill rows' gate / up in flight fit TMEM
+MLP_CHUNK = 768         # the MLP's F chunk at most: 4 prefill rows' gate / up in flight fit
+                        # TMEM (64K words; a smaller TMEM: proportionally less, _mlp_chunk)
 PREFILL_CHUNK = 512     # a MoE model's layer-major prefill: prompt rows a chunk (Image's xbuf)
 RUN_ROWS = 4            # and at most rows a run (its mask rows; moe_ffn_rows' request: R k ids)
 
 
-def _mlp_chunk(f: int, D: int, q: int) -> int:
-    """mlp's F chunk (about 8 per MLP), else the largest multiple of q up to MLP_CHUNK that
-    divides the MLP (E4B's 10240: 512 at fp4, where _chunk takes 1280)."""
+def _mlp_chunk(f: int, D: int, q: int, tmem: int = 1 << 16) -> int:
+    """mlp's F chunk (about 8 per MLP), else the largest multiple of q up to MLP_CHUNK (scaled
+    to a TMEM of `tmem` words) that divides the MLP (E4B's 10240: 512 at fp4, where _chunk
+    takes 1280)."""
+    lim = max(q, MLP_CHUNK * tmem // (1 << 16))
     c = _chunk(f, D, q)
-    if c <= MLP_CHUNK:
+    if c <= lim:
         return c
-    return next((k for k in range(MLP_CHUNK - MLP_CHUNK % q, 0, -q) if f % k == 0), c)
+    return next((k for k in range(lim - lim % q, 0, -q) if f % k == 0), c)
+
+
+def _fit_bytes(cfg: Config) -> int:
+    """The DRAM an image must fit for its formats and PLE place (Image): the configuration's,
+    at most CARD_BYTES (a probe's 1 << 40 is the card's 4 GiB)."""
+    return min(cfg.DRAM_BYTES, CARD_BYTES)
 
 
 def _ffn_pad(f: int, fd: str, D: int) -> int:
@@ -778,7 +789,7 @@ class Image:
             if not formats and wformat == "int8" and spec.fit_formats and \
                     Image(spec, replace(cfg, DRAM_BYTES=1 << 40), cap, 1, rows, wformat,
                           head_format, lookup, ple_format, block, ple_host,
-                          "", experts).nbytes > CARD_BYTES:
+                          "", experts).nbytes > _fit_bytes(cfg):
                 formats = spec.fit_formats  # int8 layers do not fit beside any PLE choice
         if ple_format is None:
             ple_format = os.environ.get("OTPU_PLE_FORMAT")
@@ -793,7 +804,7 @@ class Image:
             for ple_format, ple_host in opts:           # the first that fits (else the last)
                 if Image(spec, replace(cfg, DRAM_BYTES=1 << 40), cap, 1, rows, wformat,
                          head_format, lookup, ple_format, block, ple_host,
-                         formats, experts).nbytes <= CARD_BYTES:
+                         formats, experts).nbytes <= _fit_bytes(cfg):
                     break
         self.ple_host = bool(ple_host)
         D, H, P, L = cfg.D, spec.hidden, spec.ple_dim, spec.layers
@@ -847,7 +858,8 @@ class Image:
         self.wproj = (b.alloc(L * P * rb(H, self.pformat)), b.alloc(4 * L * P * (H // D))) \
             if P else None
         # layer blocks: one layout per key
-        self.dchunk = {(f, fd): _mlp_chunk(_ffn_pad(f, fd, D), D, D if fd == "int8" else 2 * D)
+        self.dchunk = {(f, fd): _mlp_chunk(_ffn_pad(f, fd, D), D, D if fd == "int8" else 2 * D,
+                                           cfg.TMEM_WORDS)
                        for f, (_, _, fd, _) in zip(spec.ffn, self.lf)}
         self.bofs, self.bsize = {}, {}
         for i in range(L):
@@ -918,7 +930,8 @@ class Image:
             self.lookup = {"rope_t": b.alloc(cap * self.ps), "iota": b.alloc(4 * block),
                            "onehot": {f: b.alloc(4 * cfg.MCOLS * D * GA.onehot_blocks(
                                D, cfg.MCOLS, "int8" if f == "int8" else "fp4")) for f in fmts},
-                           "gen": G.alloc(b, spec, cap, block)}       # the decode loop's area
+                           # the decode loop's area
+                           "gen": G.alloc(b, spec, cap, block, cfg.IMEM_WORDS)}
             if not spec.experts:    # the prompt runs' mask tiles, ends then starts (Additive)
                 self.lookup.update(amask=b.alloc(2 * amask_table(block, cfg.MCOLS).nbytes),
                                    amask_M=cfg.MCOLS)
@@ -1153,8 +1166,8 @@ class Image:
         if not (blocks - 1) * block <= lo < min(blocks * block, self.cap):
             raise ValueError(f"lo {lo} is not in bucket {blocks}")
         rp = RunPos(blocks, block, lo, 0, self.cap)
-        b = gemma4_step.trace(self.cfg, 0, {"m": step_descriptors(self, 0), "pos": rp,
-                                            "block": block})
+        b = trace_fit(gemma4_step, self.cfg, 0, lambda: {"m": step_descriptors(self, 0),
+                                                          "pos": rp, "block": block})
         return [b.finish()], list(b.run_args)
 
     def compile_layer_run(self, li: int, blocks: int, block: int = ATTN_BLOCK, R: int = 1,
@@ -1245,12 +1258,14 @@ class Image:
             if len(tokens) != len(rows):
                 raise ValueError(f"{len(tokens)} tokens for {len(rows)} rows")
             kw["tokens"] = [int(t) for t in tokens]
-        m = self.descriptors(0)
-        m.fill = bool(fill)
-        return [gemma4_step.trace(self.cfg, 0, {"m": m,
-                                                "pos": [p for _, p in rows],
-                                                "logit_rows": list(logit_rows),
-                                                "block": block, **kw}).finish()]
+        def bound():
+            m = self.descriptors(0)
+            m.fill = bool(fill)
+            return {"m": m, "pos": [p for _, p in rows], "logit_rows": list(logit_rows),
+                    "block": block, **kw}
+        if len(rows) == 1:          # a decode step: placed best-fit where next-fit fails
+            return [trace_fit(gemma4_step, self.cfg, 0, bound).finish()]
+        return [gemma4_step.trace(self.cfg, 0, bound()).finish()]
 
     def compile_prompt_run(self, blocks: int, R: int, kind: str, block: int = ATTN_BLOCK):
         """gemma4_prompt_run's (programs, run_args) (docs/prefill.md): R rows of a prompt at a
@@ -1702,7 +1717,7 @@ def _gathered(m, pos):
         f = "int8" if fmt == "int8" else "4bit"
         if f not in ops:
             ops.clear()                                     # one operand at a time (TMEM)
-            ops[f] = ol.quantize(ol.load(m.onehot[f]))
+            ops[f] = GA.operand(m.onehot[f])
         return ops[f]
 
     e = GA.gather_row(op(m.head_format), m.head, pos.tok, m.head_format)
@@ -1749,7 +1764,7 @@ def _gathered_rows(m, tokens):
     e = ol.empty([len(tokens), H])
     for fmt, tab in ((m.head_format, "head"), (m.ple_format, "ple"))[:2 if m.ple else 1]:
         f = "int8" if fmt == "int8" else "4bit"
-        oh = ol.quantize(ol.load(m.onehot[f]))
+        oh = GA.operand(m.onehot[f])
         for r, t in enumerate(tokens):
             if tab == "head":
                 e[r, :].set(GA.gather_row(oh, m.head, t, fmt))
@@ -1769,7 +1784,7 @@ def _gathered_out(m, pos):
     tk = ol.load(m.gen.out[pos.pos:pos.pos + pos.R])
     e = ol.empty([pos.R, H])
     for fmt, tab in ((m.head_format, m.head), (m.ple_format, m.ple))[:2 if m.ple else 1]:
-        oh = ol.quantize(ol.load(m.onehot["int8" if fmt == "int8" else "4bit"]))
+        oh = GA.operand(m.onehot["int8" if fmt == "int8" else "4bit"])
         for r in range(pos.R):
             if tab is m.ple and m.ple_host:
                 ol.store(m.pe[r, :], GA.gather_record(oh, tab, r, fmt, m.S))

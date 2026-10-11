@@ -50,7 +50,6 @@ OUT_MARK = 0xFFFFFFFF                             # out[] before the token lands
                                                   # stores ids, never this NaN)
 
 
-PROG_SLOT = 1 << 18        # bytes per bucket program in the chain area (8K instructions)
 MODES = 2                  # chain areas: 0 greedy, 1 sampled (Samp)
 BLK = 64                   # the sampler's block of logits (block maxima, gathers)
 K_MAX = 64                 # the largest top-k the sampler takes
@@ -65,17 +64,26 @@ def _vpad(spec) -> int:
     return -(-spec.vocab // BLK) * BLK
 
 
-def alloc(b, spec, cap: int, block: int) -> dict:
+def prog_bytes(imem_words: int) -> int:
+    """A bucket program's slot in the chain area (bytes): two programs of IMEM's instructions
+    (32 bytes each), a split program's two parts (256 KiB at the card's 32K-word IMEM)."""
+    return 8 * imem_words
+
+
+def alloc(b, spec, cap: int, block: int, imem_words: int = 1 << 15) -> dict:
     """DRAM of the generate loop: the state block, out[] (one fp32 id per position), the
     bucket programs a run chains through (one slot per bucket and mode) and their tables
     ([address, instructions] per bucket, raw words, one table per mode); the sampler's
     logits (this slice's rows, -inf after them to a whole block), repetition penalty factors
     (pa, pb: 1 / R and R for the ids in the context, 1 for the others), uniforms (one per
-    position, from the host) and constants (iota: 0 .. BLK - 1)."""
+    position, from the host) and constants (iota: 0 .. BLK - 1). A program slot holds two
+    programs that fit IMEM (`imem_words`: prog_bytes)."""
     nb = buckets(cap, block)
     V = _vpad(spec)
+    slot = prog_bytes(imem_words)
     return {"state": b.alloc(4 * STATE_WORDS), "out": b.alloc(4 * (cap + 1)),
-            "ptab": b.alloc(8 * (nb + 2) * MODES), "progs": b.alloc(PROG_SLOT * nb * MODES),
+            "ptab": b.alloc(8 * (nb + 2) * MODES), "progs": b.alloc(slot * nb * MODES),
+            "slot": slot,
             "lg": b.alloc(4 * V), "pa": b.alloc(4 * V), "pb": b.alloc(4 * V),
             "uni": b.alloc(4 * (cap + 1)), "iota": b.alloc(4 * BLK), "nb": nb,
             "ptab2": b.alloc(16 * (nb + 2) * MODES), "xs": b.alloc(4 * spec.hidden)}
@@ -84,7 +92,7 @@ def alloc(b, spec, cap: int, block: int) -> dict:
 def prog_slot(g: dict, blocks: int, mode: int = 0, part: int = 0) -> int:
     """The chain area's slot of bucket `blocks` (1, 2, ...) in chain area `mode`; a split
     program's second part in the slot's second half."""
-    return g["progs"] + PROG_SLOT * (mode * g["nb"] + blocks - 1) + part * PROG_SLOT // 2
+    return g["progs"] + g["slot"] * (mode * g["nb"] + blocks - 1) + part * g["slot"] // 2
 
 
 def ptab_addr(g: dict, mode: int = 0) -> int:

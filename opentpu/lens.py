@@ -50,10 +50,11 @@ from pathlib import Path
 
 from . import isa as I
 from . import rtlsim
+from . import target as T
 from .profile import UNITS, OPNAMES, Profile, _describe
 
 FORMAT, VERSION = "openTPU-profile", 1
-CLOCK_MHZ = 100          # board core clock
+CLOCK_MHZ = T.current().platform["core_mhz"]    # the core clock of the target (OTPU_TARGET)
 APP = Path(__file__).with_name("lens_app.html")
 ROOT = Path(__file__).resolve().parent.parent
 

@@ -36,7 +36,7 @@ from .. import qcache as QC
 from .. import quant as Q
 from .. import language as ol
 from ..compiler import (Affine, CompileError, DevVar, KVDesc, QTensor, RunVar, Tensor, arg_words,
-                        current)
+                        current, trace_fit)
 from . import formats as FM
 from . import generate as G
 from . import rope_parameters
@@ -47,6 +47,7 @@ from ..kernels.layouts import head_parallel_attention_weights
 from ..host.offload import BackendDram, RowLayout, RowServer
 from ..kernels import mailbox as MB
 from ..kernels.gather import dequant_row, gather_row, onehot, onehot_blocks
+from ..kernels.gather import operand as gather_operand
 from ..kernels.lib import rmsnorm, rope, rope_rows, sigmoid, softcap
 from ..kernels.mlp import _chunk, swiglu_down
 from ..runtime import ALIGN
@@ -361,7 +362,7 @@ def qk_gains(spec: Spec, W, p: str) -> tuple[np.ndarray, np.ndarray]:
 # =============================================================================== lookup tables
 def _lookup_alloc(b: "_Bump", spec, cap: int, block: int = None, D: int = 128,
                   head: tuple | None = None, M: int = 4, embed_host: bool = False,
-                  rows: int = 1) -> dict:
+                  rows: int = 1, imem: int = 1 << 15) -> dict:
     """DRAM for the device-side inputs of a run-time position (RunPos): every token's embedding
     row, the RoPE cos / sin rows of every position, and the attention mask table
     (attention.Bucket: cap entries +inf, then a block of -inf). The embedding rows are fp32
@@ -395,7 +396,7 @@ def _lookup_alloc(b: "_Bump", spec, cap: int, block: int = None, D: int = 128,
         emb.update(amask=b.alloc(amask_table(block, M).nbytes), amask_M=M)
     return {**emb, "cos_t": b.alloc(4 * cap * half), "sin_t": b.alloc(4 * cap * half),
             "zmask": b.alloc(4 * (cap + block)), "half": half, "block": block, "D": D,
-            "gen": G.alloc(b, spec, cap, block)}
+            "gen": G.alloc(b, spec, cap, block, imem)}
 
 
 def amask_table(block: int, M: int, start: bool = False) -> np.ndarray:
@@ -588,8 +589,8 @@ def compile_decode(image, kernel, blocks: int, lo: int, block: int | None = None
     if not (blocks - 1) * block <= lo < min(blocks * block, image.cap):
         raise ValueError(f"lo {lo} is not in bucket {blocks}")
     rp = RunPos(blocks, block, lo, image.lookup["zmask"], image.cap)
-    bs = [kernel.trace(image.cfg, s, {"m": step_descriptors(image, s), "pos": rp,
-                                      "block": block})
+    bs = [trace_fit(kernel, image.cfg, s, lambda s=s: {"m": step_descriptors(image, s),
+                                                       "pos": rp, "block": block})
           for s in range(image.cfg.S)]
     progs = [b.finish() for b in bs]
     if any(b.run_args != bs[0].run_args for b in bs):
@@ -910,7 +911,7 @@ class Image(EmbedHost):
             raise ValueError("embed_host needs the image's lookup tables (lookup=True)")
         self.lookup = _lookup_alloc(b, spec, cap, D=D, head=self.head if shared else None,
                                     M=cfg.MCOLS, embed_host=bool(embed_host),
-                                    rows=rows) if lookup else {}
+                                    rows=rows, imem=cfg.IMEM_WORDS) if lookup else {}
         self.choices = {"embed_host": self.embed_host,          # (the compile worker's
                         "formats": self.formats}                # image)
         self.nbytes = b.next
@@ -1007,8 +1008,9 @@ class Image(EmbedHost):
     def compile_step(self, pos: int, block: int = ATTN_BLOCK, tok: int | None = None) -> list:
         """One program per slice: the decode token at position `pos` (qwen3_step); with `tok`
         (an image with lookup tables) its inputs come from the tables, not the host."""
-        return [qwen3_step.trace(self.cfg, s, {"m": step_descriptors(self, s), "pos": pos,
-                                               "block": block, **_tok_arg(self, tok)}).finish()
+        return [trace_fit(qwen3_step, self.cfg, s,
+                          lambda s=s: {"m": step_descriptors(self, s), "pos": pos,
+                                       "block": block, **_tok_arg(self, tok)}).finish()
                 for s in range(self.cfg.S)]
 
     def compile_rows(self, rows, logit_rows, block: int = ATTN_BLOCK, tokens=None) -> list:
@@ -1550,7 +1552,7 @@ def _gather(m, eq, toks):
     """The int8 embedding rows of tokens `toks` (ints or run-time values), gathered on the
     device (kernels.gather.gather_row, one one-hot operand for all), one [1, H] tile at a
     time."""
-    oh = ol.quantize(ol.load(m.onehot))
+    oh = gather_operand(m.onehot)
     for t in toks:
         yield gather_row(oh, eq, t, "int8").reshape(1, eq.shape[1])
 

@@ -398,12 +398,14 @@ NK = len(KINDS)
 V0, E0, D2, D1 = 0, 2, 4, 5
 
 
-def gen_alloc(b, cap: int, spec, block: int = ATTN_BLOCK) -> dict:
+def gen_alloc(b, cap: int, spec, block: int = ATTN_BLOCK,
+              imem_words: int = 1 << 15) -> dict:
     """DRAM of the MTP loop: a program slot per bucket and kind, and the chain table
     ([address, instructions] per bucket and kind); the sampled verify's row 1 logits (the
     generate loop's lg holds row 0's: generate.Sampler)."""
-    nb = G.buckets(cap, block)
-    return {"progs": b.alloc(G.PROG_SLOT * NK * nb), "ptab": b.alloc(8 * NK * nb), "nb": nb,
+    nb, slot = G.buckets(cap, block), G.prog_bytes(imem_words)
+    return {"progs": b.alloc(slot * NK * nb), "ptab": b.alloc(8 * NK * nb), "nb": nb,
+            "slot": slot,
             "dtab": b.alloc(4 * (cap + 2)),     # tests: the draft of each position
             "lg": b.alloc(4 * G._vpad(spec))}
 
@@ -416,7 +418,7 @@ def gen_build(put, s: int, S: int, spec, a: dict) -> None:
 
 
 def prog_addr(a: dict, blocks: int, kind: int) -> int:
-    return a["progs"] + G.PROG_SLOT * (NK * (blocks - 1) + kind)
+    return a["progs"] + a["slot"] * (NK * (blocks - 1) + kind)
 
 
 def ptab_addr(a: dict, blocks: int, kind: int = 0) -> int:

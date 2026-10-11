@@ -194,8 +194,36 @@ Measured on the RTL at the board configuration (LANES = 8, AXI memory path, 80% 
 - **TMEM** uses liveness: each allocation is a buffer object, freed when the last tile viewing it
   is garbage-collected. New buffers are placed next-fit from a moving cursor, which spreads
   consecutive temporaries over different addresses so the scoreboard sees no false conflicts.
+  In a small TMEM next-fit can leave the free words in gaps too small for a later tile; a
+  decode step, which has no smaller form to fall back to, is then traced again with best-fit
+  placement (`compiler.trace_fit`). The compiles that probe (a prefill run's rows, a prompt
+  run, a generate bucket's single program) keep next-fit's answer and fall back to their
+  smaller forms, so a program that fits next-fit is placed as before.
 - **ACT RAM** blocks are freed when their `Stationary` dies and are reused round-robin, so a
   stationary operand that is still live is never overwritten.
+
+## Sizes come from the Config
+
+Nothing in the compiler, the kernels or the models assumes the card's sizes; they read
+`opentpu.isasim.Config` (a target's: docs/targets.md):
+
+- TMEM: the LM head's chunks, the prefill runs' rows (`qwen3.fit_chunk` shrinks a run that does
+  not fit), the snapshot copies' chunks, Gemma 4's MLP chunk (768 at the card's 64K words,
+  proportionally less below).
+- IMEM: the prefill runs and generate buckets that must fit it, the generate loop's program
+  slots (`generate.prog_bytes`: two programs of IMEM's instructions); the ISA simulator refuses
+  a program over IMEM, as the board's loader does.
+- ACT RAM and TMEM: the one-hot operand of the device's gathers (`kernels/gather.py`) is
+  quantized once where it fits, else each MM's blocks on their own.
+- DRAM: Gemma 4's formats and PLE place follow the fit to the configuration's DRAM (at most the
+  4 GiB a slice addresses).
+- D: attention heads and DeltaNet heads of any multiple of D (LFM2's heads at most D, or a
+  multiple), the emulations at the configuration's D.
+
+A model that does not map onto a configuration is refused by its `Spec.check` with the limit
+named (an inner dimension over ACT RAM, a head pair's DeltaNet state over TMEM without DSTEP,
+one slice for Gemma 4 and MoE). `tests/test_config_matrix.py` runs the kernels and the tiny
+models on every target's architecture, the design point and grown versions of the small one.
 
 ## Bank-aware strides
 
@@ -228,7 +256,8 @@ Lens (`python -m opentpu.lens`) records these into profile files and explores th
 
 - A `dot` whose K is not a multiple of D, or whose shapes or accumulator do not match.
 - A stationary operand that does not fit ACT RAM, or that was overwritten before a later use.
-- Running out of TMEM or address registers, or nesting loops deeper than 4.
+- Running out of TMEM (the tile's words and the words in use) or address registers, or nesting
+  loops deeper than 4.
 - Reading a tile that `.set()` has already moved into another tile.
 - Shape mismatches in stores, `set` and broadcasts, and unsupported strided views.
 - A KV head accessed from a slice that does not own it.

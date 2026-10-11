@@ -44,7 +44,7 @@ from .. import qcache as QC
 from .. import quant as Q
 from .. import language as ol
 from .. import isa as I
-from ..compiler import Affine, KVDesc, QTensor, Tensor, current
+from ..compiler import Affine, KVDesc, QTensor, Tensor, current, trace_fit
 from ..isasim import Config
 from ..kernels.layouts import head_parallel_attention_weights
 from ..kernels.lib import rmsnorm
@@ -149,7 +149,8 @@ class Spec:
 
     def check(self, cfg: Config) -> None:
         S, D = cfg.S, cfg.D
-        need = [(self.head_dim <= D and self.head_dim % 2 == 0, f"head_dim {self.head_dim} > D"),
+        need = [((self.head_dim <= D or self.head_dim % D == 0) and self.head_dim % 2 == 0,
+                 f"head_dim {self.head_dim}: at most D or a multiple of D {D}"),
                 (self.n_q * self.head_dim % D == 0, "n_q * head_dim % D"),
                 (self.hidden % (S * D) == 0, f"hidden {self.hidden} % S*D"),
                 (self.ffn % (S * D) == 0, f"ffn {self.ffn} % S*D"),
@@ -470,7 +471,7 @@ class Image(EmbedHost):
             raise ValueError("embed_host needs the image's lookup tables (lookup=True)")
         self.lookup = _lookup_alloc(b, spec, cap, D=D, head=self.head if shared else None,
                                     M=cfg.MCOLS, embed_host=bool(embed_host),
-                                    rows=rows) if lookup else {}
+                                    rows=rows, imem=cfg.IMEM_WORDS) if lookup else {}
         self.choices = {"embed_host": self.embed_host,          # (the compile worker's
                         "formats": self.formats}                # image)
         self.offload = None
@@ -662,8 +663,9 @@ class Image(EmbedHost):
 
     def compile_step(self, pos: int, block: int = ATTN_BLOCK, tok: int | None = None) -> list:
         """One program per slice: the decode token at position `pos` (lfm2_step)."""
-        return [lfm2_step.trace(self.cfg, s, {"m": step_descriptors(self, s), "pos": pos,
-                                              "block": block, **_tok_arg(self, tok)}).finish()
+        return [trace_fit(lfm2_step, self.cfg, s,
+                          lambda s=s: {"m": step_descriptors(self, s), "pos": pos,
+                                       "block": block, **_tok_arg(self, tok)}).finish()
                 for s in range(self.cfg.S)]
 
     def compile_rows(self, rows, logit_rows, block: int = ATTN_BLOCK, tokens=None) -> list:
