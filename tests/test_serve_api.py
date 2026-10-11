@@ -110,6 +110,22 @@ def test_models_health_and_stats(server):
     assert st == 200 and "kv_store" in s and "prefix_cache" in s
 
 
+def test_many_connections_at_once(server):
+    """64 clients connecting at the same moment are all served (the listen backlog)."""
+    srv, port, _ = server
+    go, res = threading.Barrier(64), []
+
+    def client():
+        go.wait()
+        res.append(_call(port, "GET", "/health")[0])
+    ts = [threading.Thread(target=client) for _ in range(64)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert res == [200] * 64
+
+
 def test_chat_is_the_engines_greedy_reply(server):
     srv, port, models = server
     msgs = [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hello!"}]

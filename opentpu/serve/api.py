@@ -611,6 +611,8 @@ def make_handler(srv: Server):
 class HTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 1024           # the listen backlog (socketserver's 5: 16 clients
+                                        # connecting at once were reset on the card host)
 
     def handle_error(self, request, client_address):
         if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
