@@ -122,6 +122,10 @@ def main(argv=None):
             res[-1]["programs"] = st.timing["programs"] - p0["programs"]
             res[-1]["compile_wait_ms"] = round(1e3 * (st.timing["compile_wait_s"] -
                                                       p0["compile_wait_s"]), 1)
+            nr = max(1, res[-1]["runs"])
+            res[-1]["phase_ms_run"] = {k[:-2]: round(1e3 * (st.timing[k] - p0[k]) / nr, 2)
+                                       for k in ("write_s", "start_s", "wait_s", "read_s")}
+            print(f"   (per run: {res[-1]['phase_ms_run']})", flush=True)
             print(f"   (groups per step: {groups}, programs {res[-1]['programs']}, compile "
                   f"wait {res[-1]['compile_wait_ms']} ms)", flush=True)
     print("timing:", st.timing, flush=True)

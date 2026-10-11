@@ -269,7 +269,8 @@ class Steps:
         # where a step's time goes: device cycles, the host's waits for programs (compiles
         # not ready), the whole runs; programs compiled, runs of a program already loaded
         self.timing = {"cycles": 0, "compile_wait_s": 0.0, "compiled_inline": 0, "run_s": 0.0,
-                       "programs": 0, "reused": 0}
+                       "programs": 0, "reused": 0, "write_s": 0.0, "start_s": 0.0,
+                       "wait_s": 0.0, "read_s": 0.0}
 
     def set_sampling(self, slot: int, samp, context=()) -> None:
         """Slot `slot` picks greedily (samp None) or with samp (generate.Sampling): its state
@@ -468,9 +469,10 @@ class Steps:
     def _go(self, grp, kinds, toks, uni, adv, ahead_key=None):
         """One run of grp (its live program or a new one) with tokens toks, uniforms uni (or
         None); while it runs, ahead_key's programs compile. Returns tout's words."""
-        eng, a = self.eng, self.a
+        eng, a, tm = self.eng, self.a, self.timing
         progs, t = self._take(grp, kinds, adv)
         Rm = a["R"]
+        c0 = time.perf_counter()
         io = np.zeros(2 * Rm + 1, np.float32)
         io[:len(grp)] = toks
         if uni is not None:
@@ -480,11 +482,15 @@ class Steps:
         for s in range(eng.cfg.S):
             eng.backend.write(s, a["io"], io)
         t0 = time.perf_counter()
+        tm["write_s"] += t0 - c0
         start = getattr(eng.backend, "start", None)
         if start is not None:
             start(progs)
+            t1 = time.perf_counter()
             self._prefetch(ahead_key)
             st = eng.backend.wait()
+            tm["start_s"] += t1 - t0
+            tm["wait_s"] += time.perf_counter() - t1
         else:
             st = eng.backend.run(progs)
             self._prefetch(ahead_key)
@@ -496,7 +502,10 @@ class Steps:
             eng.poss[s] += 1
         if kinds is not None and all(k == FEED for k in kinds):
             return None
-        return eng.backend.read(0, a["tout"], 4 * len(grp)).view(np.float32)
+        t2 = time.perf_counter()
+        out = eng.backend.read(0, a["tout"], 4 * len(grp)).view(np.float32)
+        tm["read_s"] += time.perf_counter() - t2
+        return out
 
     # ---- the step
     def run(self, rows, tokens, uniforms=None, ahead=True) -> list[int]:
