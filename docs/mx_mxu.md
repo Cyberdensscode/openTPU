@@ -1337,3 +1337,86 @@ ACT_ROWS 16, 7.5 ns): E 2 12,311 LUT / 22,472 FF / 562 DSP (WNS +0.164), E 3 14,
 1,930 LUT, 1,320 FF and 6 DSP a lane. The card builds E 4. Packing the drain across rows (G 3:
 1.5 cycles a row) or lanes without ACC / ASCALE would cost less area but fix less (G 4 needs four
 results a cycle), and splitting a head's rows across MMs keeps G x T / E.
+
+## 10. MCOLS 16 on the YPCB, out of context
+
+Sixteen rows a pass on eight pumped DSP48E1 columns: section 5's experiment (`rtl/exp/mx_mxu`
+`mx_top` on `otpu_mx_x7`, `run_ooc.sh k7-mx8e4 k7-mx8e8`: clk_s 133.33 MHz, the pumped columns at
+266.67 MHz, inputs and outputs registered) and the production tree's `otpu_actram`
+(`tools/synth/ooc_rows.py --mcols 16 --rows 16 --tops otpu_actram`), on 8b33206e with
+`rtl/exp/dsp_pump` (omarchy, 2026-10-12, 5 to 7 minutes a run). The 4-column run again
+reproduces section 5's row to the LUT.
+
+| design (xc7k480t-2) | rows | LUT | LUT RAM | SRL | FF | DSP | slices | WNS clk_s | clk_f | clk_s -> clk_f | clk_f -> clk_s | WHS |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| MX, 4 pumped columns, E 4 (section 5) | 8 | 17,922 | 1,728 | 5,053 | 35,794 | 576 | 8,854 | +0.329 | +0.135 | +0.359 | +0.103 | +0.050 |
+| **MX, 8 pumped columns, E 4** | 16 | **29,402** | 3,264 | 9,710 | **62,611** | **1,128** | **15,527** | +0.198 | +0.165 | +0.315 | +0.122 | +0.047 |
+| MX, 8 pumped columns, E 8 | 16 | 33,041 | 3,264 | 9,653 | 68,618 | 1,152 | 17,554 | +0.217 | +0.160 | +0.409 | +0.031 | +0.024 |
+
+- **Every run meets timing, hold included.** Eight columns do not tighten the pumped domain: its
+  worst path is still a fast-cycle INMODE replica (+0.165 / +0.160 ns against +0.135 at four
+  columns). The one-fast-period return from the chain ends into the column end has +0.122 at E 4
+  and +0.031 at E 8 (the denser placement). The slow clock's worst is the result FIFO's write (the
+  write enable at E 4, a write-address replica at E 8), which `otpu_mxu` already splits into one
+  enable and address a copy (section 9).
+- **From 8 to 16 rows** (E 4): +11.5K LUTs, +26.8K flip-flops (about 8.7K of them the eight more
+  rows' registered inputs), +552 DSPs (eight columns of 128 pumped PEs, the column ends' five DSPs
+  a row: 1,024 + 80 + 4 x 6) and +6.7K slices.
+- **A lane at 16 rows** (E 4 -> E 8, divided by four): 910 LUTs, 1,502 flip-flops, 6 DSPs and 507
+  slices (section 5's 8-row lane: ~920 LUTs, ~720 flip-flops). Its pick is a 16:1 multiplexer
+  of the head row's results.
+- **The ACT RAM at MCOLS 16** (ACT_ROWS 16, the 64-bit record, D 128, 128 blocks): 272 RAMB36,
+  9,702 LUTs, 2,207 flip-flops, WNS +0.203 ns at 7.5 ns, against 68 RAMB36 and 9,629 LUTs at
+  MCOLS 4 (section 9): the read width, four times the rows, takes four times the RAMs.
+- **The fit, estimated from 8b33206e** (734 DSPs, 615 block RAM tiles, 58,358 slices, 78%): with
+  this 16-row E 4 datapath in place of today's MXU, about 1,290 DSPs (67% of 1,920) and 615 - 68 +
+  272 = 819 block RAM tiles (86% of 955). The slices are for the full build to show, with fmax:
+  the 16-row datapath alone takes 15.5K here (8.9K at 8 rows), while today's MXU is a 4-row,
+  unpumped one with its issuer, FIFOs and TMEM ports, which these tops leave out.
+
+**The drain at 16 rows.** An output costs the array KB cycles (a 128-element chunk a block) and
+the drain ceil(M / E) (the head row's M live results, E a cycle; bank conflicts aside): drain /
+array, at ACT_ROWS = MCOLS = 16 (no replay up to 16 rows):
+
+| MM | rows M | KB | E 4 | E 8 |
+|---|---:|---:|---:|---:|
+| decode q.K^T, G 2 to 4 at d 128 (Qwen3-0.6B, Phi-4-mini, SmolLM3) | 2-4 | 1 | 1.00 | 1.00 |
+| decode q.K^T, G 4 at d 256 (Qwen3.5-0.8B, Gemma 4 E4B) | 4 | 2 | 0.50 | 0.50 |
+| decode q.K^T and P.V, G 8 at d 256 (Gemma 4 E2B, Qwen3.5-35B-A3B) | 8 | 2 | 1.00 | 0.50 |
+| decode P.V (256-token blocks), G <= 4 | <= 4 | 2 | 0.50 | 0.50 |
+| a 16-row q.K^T at d 128 (prefill) | 16 | 1 | **4.00** | 2.00 |
+| a 16-row q.K^T at d 256 or P.V (prefill) | 16 | 2 | **2.00** | 1.00 |
+| a 16-row projection, d_in >= 1024 | 16 | >= 8 | <= 0.50 | <= 0.25 |
+
+Decode is never drain-bound at E 4 on the card's models; full 16-row attention passes are (4x at
+d 128, 2x at d 256 and in P.V), and E 8 halves that. The projections are not, at any E.
+
+**A lane's parts** (production `otpu_mxu`, MCOLS 4: Vivado's E 2 -> E 4 difference per lane,
+1,930 LUTs, 1,320 flip-flops and 6 DSPs, split by Yosys `synth_xilinx` with the hierarchy kept
+(its LUT counts run above Vivado's) and, for the logic in `otpu_mxu`'s top, by counting bits):
+
+| part | LUT | FF | DSP | SRL |
+|---|---:|---:|---:|---:|
+| i2f48 (sign / magnitude, 48-bit leading zeros, normalize, round to nearest even) | 319 | 188 | 0 | 2 |
+| Sw / Sa' delays to the multiplies | 0 | 0 | 0 | 64 |
+| x Sw and x Sa' (two `otpu_fmul`) | 250 | 128 | 4 | 0 |
+| ACC / ASCALE's multiply-add (`otpu_fmadd`: fmul 124 / 64 / 2, fadd 484 / 180, the addend's delay 64 FF) | 608 | 308 | 2 | 1 |
+| the old value and the factor registers, ASCALE's factor select | ~32 | 64 | 0 | 0 |
+| the read-modify-write's address, value and column through its 6 stages | ~0 | ~75 | 0 | ~72 |
+| RMAX: the value's key against each column's (2 x MCOLS 32-bit compares), the candidate OR | ~250-280 | ~75 | 0 | 0 |
+| the pick (the head row's integer, Sa', column and TMEM address, MCOLS:1) and its registers | ~120 | ~121 | 0 | 0 |
+| the address and column alongside the lane (7 stages) | ~0 | 40 | 0 | 40 |
+| the lane's TMEM port multiplexer | ~64-100 | 0 | 0 | 0 |
+
+The pick and RMAX grow with MCOLS (at 16: a 16:1 pick, ~350-450 LUTs; RMAX ~1K LUTs a lane unless
+it leaves the lane); the result FIFO is shared (MCOLS x 80 + 32 bits a row: 32 rows in three LUT
+RAM copies, ~700 LUT RAM at MCOLS 4; 64 rows of 1,312 bits, ~5.2K, at 16). A lane without ACC /
+ASCALE saves the multiply-add, its registers and its bookkeeping: ~640 LUTs, ~450 flip-flops,
+2 DSPs.
+
+The pumped PEs' multicycle constraint: these runs source `boards/ypcb-00338/constraints/
+otpu_clk2x.tcl` (tmem-pump's 2x clock, 07297ddd) with an MX section for `otpu_pump_pe` (from the
+core clock through x0 / x1 / w: two fast cycles, -end); in the out-of-context netlist its
+core-clock lookup (the register driving a PE's x1[0]) found none, so `ooc.tcl` set the
+experiment's own multicycle on the DSPs' A / B / D pins (OTPU_C2X 0), the constraint of section
+5's rows.
