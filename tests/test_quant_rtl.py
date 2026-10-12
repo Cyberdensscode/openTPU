@@ -129,10 +129,12 @@ def test_mm_mx_rtl(have_verilator, wf, D, mcols, pair, rsc, k0, E):
         assert (sh[0] == 0).any() and (sh[1] == -1).any(), sh
 
 
-@pytest.mark.parametrize("mcols,rows,wf", [(4, 8, I.W8), (2, 6, I.W4F), (4, 12, I.WNV)])
-def test_mm_mx_replay_rtl(have_verilator, mcols, rows, wf):
-    """M > MCOLS: each streamed chunk and its scale entry serve every group of MCOLS rows."""
-    D = 32
+@pytest.mark.parametrize("mcols,rows,wf,D", [(4, 8, I.W8, 32), (2, 6, I.W4F, 32),
+                                             (4, 12, I.WNV, 32), (4, 16, I.W4F, 32),
+                                             (4, 16, I.WNV, 128)])
+def test_mm_mx_replay_rtl(have_verilator, mcols, rows, wf, D):
+    """M > MCOLS: each streamed chunk and its scale entry serve every group of MCOLS rows (up to
+    ACT_ROWS 16, the production build's, at the card's D = 128)."""
     cfg = Config(S=1, D=D, MCOLS=mcols, ACT_ROWS=rows, DRAM_BYTES=1 << 20)
     rng = np.random.default_rng(300 + rows)
     KB, N = 4, 9
