@@ -237,6 +237,107 @@ module otpu_seq
     return {any, dram};
   endfunction
 
+`ifndef SYNTHESIS
+  // ---- EXPERIMENTAL (docs/seq_vpu.md): emulations of cheaper hazard checks, simulation only.
+  // Plusargs (the defaults are today's check, and change nothing):
+  //   +hz_tg=G / +hz_dg=G  TMEM / DRAM ranges widened to 2^G-word / -byte granules (lo down, hi
+  //                        up): a check on the ranges' top bits only, or region busy bits
+  //   +hz_rh=1             an instruction's TMEM reads as one range (their hull): 3 TMEM range
+  //                        pairs to compare instead of 9;  +hz_dh=1: its DRAM ranges as one
+  //   +hz_win=N            N window slots used;  +hz_uq=a:b:c:d:e: at most that many slots per
+  //                        unit (DMA, MXU, QUANT, VPU, COLL; 0: no cap): per-unit queues
+  //   +hz_ino=1            every unit starts its instructions in program order (as the MXU and the
+  //                        collective unit do today)
+  //   +hz_rob=1            window slots are freed in program order (a reorder buffer)
+  //   +hz_wc=FILE          with +hz_ino: the dependencies from per-pc wait counts (FILE, written by
+  //                        +hz_kout) instead of the ranges: wait until at most k_u - 1 of the
+  //                        instruction's older unit-u instructions are outstanding
+  //   +hz_kout=FILE        write the wait counts: per pc and unit, the least rank (1 = the unit's
+  //                        last instruction) of an older instruction it conflicts with, over the
+  //                        pc's dynamic instances (the compiler's static view, no loop peeling)
+  //   +hz_log=FILE         hazard statistics at the end of the run (stall cycles by unit and by
+  //                        what they wait for, dependencies by class and kind, rank histograms)
+  int  hz_tg = 0, hz_dg = 0, hz_win = 0;
+  bit  hz_rh = 0, hz_dh = 0, hz_ino = 0, hz_rob = 0, hz_wc = 0, hz_cs = 0;
+  int  hz_uq [NUNITS];
+  initial begin
+    string s;
+    void'($value$plusargs("hz_tg=%d", hz_tg));
+    void'($value$plusargs("hz_dg=%d", hz_dg));
+    void'($value$plusargs("hz_win=%d", hz_win));
+    hz_rh = $test$plusargs("hz_rh=1");
+    hz_dh = $test$plusargs("hz_dh=1");
+    hz_ino = $test$plusargs("hz_ino=1");
+    hz_rob = $test$plusargs("hz_rob=1");
+    for (int u = 0; u < NUNITS; u++) hz_uq[u] = 0;
+    if ($value$plusargs("hz_uq=%s", s))
+      void'($sscanf(s, "%d:%d:%d:%d:%d", hz_uq[0], hz_uq[1], hz_uq[2], hz_uq[3], hz_uq[4]));
+    hz_cs = hz_tg > 0 || hz_dg > 0 || hz_rh || hz_dh;
+  end
+  fps_t           c_fpx;                    // C's footprint as fp_seg makes it (the oracle's)
+  logic [WIN-1:0] sdone;                    // +hz_rob: completed, the slot not yet freed
+  logic [WIN-1:0] wc_dep, wc_depd;          // +hz_wc: the dependencies the wait counts give
+
+  // a TMEM range out to 2^g-word granules (hi stays within TAW+1 bits: TMEM ends on a granule)
+  function automatic rt_t hz_gt(input rt_t r, input int g);
+    rt_t o;
+    logic [TAW+1:0] m, h;
+    o = r;
+    if (r.hi != '0 && g > 0) begin
+      m = (g >= TAW) ? {1'b0, {(TAW + 1){1'b1}}} : (TAW + 2)'((64'd1 << g) - 1);
+      h = ({1'b0, r.hi} + m) & ~m;
+      o.lo = r.lo & ~TAW'(m);
+      o.hi = h[TAW+1] ? {1'b1, {TAW{1'b0}}} : h[TAW:0];
+    end
+    return o;
+  endfunction
+
+  function automatic r32_t hz_gd(input r32_t r, input int g);
+    r32_t o;
+    logic [63:0] m, h;
+    o = r;
+    if (r.hi != '0 && g > 0) begin
+      m = (64'd1 << g) - 1;
+      h = ({32'd0, r.hi} + m) & ~m;
+      o.lo = r.lo & ~m[31:0];
+      o.hi = (h > 64'hFFFF_FFFF) ? 32'hFFFF_FFFF : h[31:0];
+    end
+    return o;
+  endfunction
+
+  function automatic r32_t hz_hull32(input r32_t a, input r32_t b);
+    r32_t o;
+    if (b.hi == '0) o = a;
+    else if (a.hi == '0) o = b;
+    else begin
+      o.lo = (b.lo < a.lo) ? b.lo : a.lo;
+      o.hi = (b.hi > a.hi) ? b.hi : a.hi;
+    end
+    return o;
+  endfunction
+`endif
+
+  // the footprint as the window keeps it: fp_seg's, or (simulation) a cheaper check's superset
+  function automatic fps_t hz_coarse(input fps_t s);
+    fps_t o;
+    o = s;
+`ifndef SYNTHESIS
+    if (hz_rh) begin
+      rt_t h;
+      h = hull(hull(s.t1, s.t2), hull(s.t3, s.t4));
+      if (!s.t0.w) begin h = hull(h, s.t0.r); o.t0.r = '0; end
+      o.t1 = h; o.t2 = '0; o.t3 = '0; o.t4 = '0;
+    end
+    if (hz_dh) begin o.d[0] = hz_hull32(s.d[0], s.d[1]); o.d[1] = '0; end
+    if (hz_tg > 0) begin
+      o.t0.r = hz_gt(o.t0.r, hz_tg); o.t1 = hz_gt(o.t1, hz_tg); o.t2 = hz_gt(o.t2, hz_tg);
+      o.t3 = hz_gt(o.t3, hz_tg); o.t4 = hz_gt(o.t4, hz_tg);
+    end
+    if (hz_dg > 0) begin o.d[0] = hz_gd(o.d[0], hz_dg); o.d[1] = hz_gd(o.d[1], hz_dg); end
+`endif
+    return o;
+  endfunction
+
   // window
   logic [WIN-1:0]  sv;                       // slot valid (dispatched, not completed)
   logic [WIN-1:0]  older [WIN];              // older[i][j]: slot j was dispatched before slot i
@@ -347,6 +448,22 @@ module otpu_seq
       ndep[i] = sv[i] && !fin[i] && cf[1];
       ndepd[i] = sv[i] && !fin[i] && cf[0];
     end
+`ifndef SYNTHESIS
+    // the emulations: window / per-unit caps, the reorder buffer's held slots, wait counts
+    begin
+      int n, nu;
+      n = 0; nu = 0;
+      for (int i = 0; i < WIN; i++) begin
+        n += int'(sv[i]);
+        nu += int'(sv[i] && c_unit < NUNITS && soh[i][c_unit]);
+      end
+      if ((hz_win > 0 && n >= hz_win) ||
+          (c_unit < NUNITS && hz_uq[c_unit] > 0 && nu >= hz_uq[c_unit]))
+        have_free = 1'b0;
+      if (hz_rob) begin ndep &= ~sdone; ndepd &= ~sdone; end
+      if (hz_wc) begin ndep = wc_dep; ndepd = wc_depd; end
+    end
+`endif
   end
 
   // ---- loop-end handling for the instruction at pc
@@ -457,6 +574,26 @@ module otpu_seq
       else    // cand already requires readiness
         can_start[u] = cand_any[u] && urdy[u] && !ustart[u];
     end
+`ifndef SYNTHESIS
+    // +hz_ino: the DMA, the quantizer and the VPU start their oldest instruction only, as the
+    // MXU and the collective unit do
+    if (hz_ino)
+      for (int u = 0; u < NUNITS; u++)
+        if (u != U_MXU && u != U_COLL) begin
+          logic [WIN-1:0] c2, r2;
+          start_slot[u] = '0;
+          for (int i = 0; i < WIN; i++) begin
+            c2[i] = sv[i] && !sstarted[i] && soh[i][u];
+            r2[i] = (sdep[i] & ~same_started[u]) == '0;
+          end
+          for (int i = 0; i < WIN; i++) begin
+            sel[u][i] = c2[i] && (older[i] & c2) == '0;
+            if (sel[u][i]) start_slot[u] |= SW'(i);
+          end
+          cand_any[u] = |c2;
+          can_start[u] = |(sel[u] & r2) && urdy[u] && !ustart[u];
+        end
+`endif
   end
 
 
@@ -532,6 +669,9 @@ module otpu_seq
       for (int i = 0; i < 8; i++) R[8 + i] <= rinit[i];
       for (int u = 0; u < NUNITS; u++) begin uq_h[u] <= '0; uq_t[u] <= '0; end
       for (int i = 0; i < WIN; i++) sdep[i] <= '0;
+`ifndef SYNTHESIS
+      sdone <= '0;
+`endif
     end else begin
       cyc <= cyc + 1;
       if (ld) pc <= fa;
@@ -548,7 +688,7 @@ module otpu_seq
         for (int i = 0; i < WIN; i++) begin
           logic [1:0] cs;
           cs = conf_s(c_fp, sfp[i]);
-          if (sv[i] && (c_fp.all == c_ref.all && sfp[i].all == sfp_ref[i].all ?
+          if (sv[i] && !hz_cs && (c_fp.all == c_ref.all && sfp[i].all == sfp_ref[i].all ?
                         cs != {conflict(c_ref, sfp_ref[i]), conflict_dram(c_ref, sfp_ref[i])} :
                         cs != 2'b11))
             $fatal(1, "otpu_seq: scoreboard differs from conflict() for pc %0d vs slot %0d",
@@ -590,6 +730,16 @@ module otpu_seq
           sv[i] <= 1'b0;
         end
       end
+`ifndef SYNTHESIS
+      // +hz_rob: a completed slot is freed once every older one is
+      if (hz_rob)
+        for (int i = 0; i < WIN; i++) begin
+          logic dn;
+          dn = sdone[i] || fin[i];
+          sdone[i] <= dn;
+          sv[i] <= sv[i] && !(dn && (older[i] & sv & ~(sdone | fin)) == '0);
+        end
+`endif
       for (int u = 0; u < NUNITS; u++) if (udone[u]) uq_h[u] <= uq_h[u] + 1;
       // readiness (for the profiler: when did the dependencies clear)
       for (int i = 0; i < WIN; i++)
@@ -625,6 +775,9 @@ module otpu_seq
         sdepd[free_slot] <= ndepd;
         sfp[free_slot] <= c_fp;
 `ifndef SYNTHESIS
+        sdone[free_slot] <= 1'b0;
+`endif
+`ifndef SYNTHESIS
         sfp_ref[free_slot] <= c_ref;
         sfp_raw[free_slot] <= c_raw;
 `endif
@@ -634,7 +787,10 @@ module otpu_seq
         c_v <= q_v;
         if (q_v) begin
           c_cmd <= q_cmd; c_unit <= q_unit; c_pc <= q_pc;
-          c_fp <= fp_seg(q_cmd.op, q_fp);
+          c_fp <= hz_coarse(fp_seg(q_cmd.op, q_fp));
+`ifndef SYNTHESIS
+          c_fpx <= fp_seg(q_cmd.op, q_fp);
+`endif
 `ifndef SYNTHESIS
           c_ref <= fp_hull(q_fp);
           c_raw <= q_fp;
@@ -716,6 +872,271 @@ module otpu_seq
       end
     end
   end
+
+`ifndef SYNTHESIS
+  // ---- EXPERIMENTAL (docs/seq_vpu.md): wait counts, their oracle, and hazard statistics
+  localparam int NPC = IMEM_WORDS / 8;     // instructions IMEM holds
+  localparam int NCLS = 12;                // instruction classes of the statistics (hz_cls)
+  localparam int KMAX = 16;                // ranks the oracle looks back, per unit
+  // per pc: k for units 0..4 (any conflict), then the DRAM-only k for the DMA and the quantizer
+  // (an MM may stream once those are clear); 0: no conflict within KMAX
+  int  wc_k [NPC][7];
+  int  hz_fd = 0, hz_kfd = 0;
+  bit  hz_seen [NPC];
+  int  hz_cnt [NPC];
+  int  kmin [NPC][7];
+  fps_t hist [NUNITS][KMAX];
+  int  hist_n [NUNITS];
+  int  scls [WIN];
+  // statistics
+  longint st_cyc, st_wfull, st_rlw, st_disp, st_nodep;
+  longint st_u [NUNITS][6];                // busy, empty, start, unit not ready, blocked, (spare)
+  longint st_by [NUNITS][NUNITS];          // blocked cycles of unit u by producer unit p
+  longint st_bcls [NCLS][NCLS];            // blocked cycles by (waiting class, producer class)
+  longint st_rel [NUNITS + 1];             // MXU started, release waits, by producer unit; total
+  longint st_dep [NCLS][NCLS];             // dependencies at dispatch by (class, producer class)
+  longint st_kind [6];                     // TMEM RAW, WAR, WAW, DRAM, ACT, all (BAR / WAITW)
+  longint st_kh [NUNITS][NUNITS][KMAX + 1];// oracle ranks: consumer unit, producer unit, k
+  longint st_nu [NUNITS + 1];              // instructions by the number of units they depend on
+  longint st_wcmiss;
+
+  function automatic int hz_cls(input logic [7:0] op, input logic [7:0] f);
+    case (op)
+      OP_LD: return 0;
+      OP_ST: return 1;
+      OP_DSTEP, OP_STREAM: return 2;
+      OP_WAITW: return 3;
+      OP_MM: return 4;
+      OP_QACT: return 5;
+      OP_QST: return 6;
+      OP_VOP: return is_reduce(f) ? 8 : (f_cc(f) != CC_NONE) ? 9 : 7;
+      OP_RLD: return 10;
+      default: return 11;
+    endcase
+  endfunction
+
+  // which kinds a dependency is: TMEM RAW, WAR, WAW, DRAM, ACT, all
+  function automatic logic [5:0] hz_kind(input fps_t n, input fps_t e);
+    logic [5:0] k;
+    rt_t nr [5];
+    rt_t er [5];
+    k = '0;
+    if (n.all || e.all) k[5] = 1'b1;
+    nr[0] = n.t0.w ? '0 : n.t0.r; nr[1] = n.t1; nr[2] = n.t2; nr[3] = n.t3; nr[4] = n.t4;
+    er[0] = e.t0.w ? '0 : e.t0.r; er[1] = e.t1; er[2] = e.t2; er[3] = e.t3; er[4] = e.t4;
+    for (int j = 0; j < 5; j++) begin
+      if (e.t0.w && ovr_t(nr[j], e.t0.r)) k[0] = 1'b1;
+      if (n.t0.w && ovr_t(n.t0.r, er[j])) k[1] = 1'b1;
+    end
+    if (n.t0.w && e.t0.w && ovr_t(n.t0.r, e.t0.r)) k[2] = 1'b1;
+    for (int i = 0; i < 2; i++)
+      for (int j = 0; j < 2; j++)
+        if ((n.dw || e.dw) && ovr(n.d[i], e.d[j])) k[3] = 1'b1;
+    if ((n.aw || e.aw) && {9'd0, n.alo} < e.ahi && {9'd0, e.alo} < n.ahi) k[4] = 1'b1;
+    return k;
+  endfunction
+
+  function automatic int hz_unit(input logic [NUNITS-1:0] oh);
+    for (int u = 0; u < NUNITS; u++) if (oh[u]) return u;
+    return 0;
+  endfunction
+
+  initial begin
+    string fn;
+    int fd, pc, r, n;
+    int k [7];
+    for (int i = 0; i < NPC; i++) begin
+      hz_seen[i] = 1'b0; hz_cnt[i] = 0;
+      for (int j = 0; j < 7; j++) begin wc_k[i][j] = 1; kmin[i][j] = 0; end
+    end
+    for (int u = 0; u < NUNITS; u++) hist_n[u] = 0;
+    if ($value$plusargs("hz_wc=%s", fn)) begin
+      fd = $fopen(fn, "r");
+      if (fd == 0) $fatal(1, "otpu_seq: +hz_wc=%s: cannot open", fn);
+      while (!$feof(fd)) begin
+        r = $fscanf(fd, "%d %d %d %d %d %d %d %d %d\n", pc, k[0], k[1], k[2], k[3], k[4], k[5],
+                    k[6], n);
+        if (r >= 8 && pc >= 0 && pc < NPC)
+          for (int j = 0; j < 7; j++) wc_k[pc][j] = k[j];
+      end
+      $fclose(fd);
+      hz_wc = 1'b1;
+      if (!hz_ino) $fatal(1, "otpu_seq: +hz_wc needs +hz_ino=1 (in-order units)");
+    end
+    if ($value$plusargs("hz_kout=%s", fn)) hz_kfd = $fopen(fn, "w");
+    if ($value$plusargs("hz_log=%s", fn)) hz_fd = $fopen(fn, "w");
+    st_cyc = 0; st_wfull = 0; st_rlw = 0; st_disp = 0; st_nodep = 0; st_wcmiss = 0;
+    for (int u = 0; u < NUNITS; u++) begin
+      for (int j = 0; j < 6; j++) st_u[u][j] = 0;
+      for (int p = 0; p < NUNITS; p++) begin
+        st_by[u][p] = 0;
+        for (int j = 0; j <= KMAX; j++) st_kh[u][p][j] = 0;
+      end
+    end
+    for (int u = 0; u <= NUNITS; u++) begin st_rel[u] = 0; st_nu[u] = 0; end
+    for (int a = 0; a < NCLS; a++)
+      for (int b = 0; b < NCLS; b++) begin st_bcls[a][b] = 0; st_dep[a][b] = 0; end
+    for (int j = 0; j < 6; j++) st_kind[j] = 0;
+  end
+
+  // +hz_wc: slot i is a dependency when it is one of the older unit-u instructions beyond the
+  // k_u - 1 most recent (in-order units complete in program order, so these are outstanding)
+  always_comb begin
+    wc_dep = '0; wc_depd = '0;
+    if (hz_wc && c_v)
+      for (int i = 0; i < WIN; i++)
+        if (sv[i] && !fin[i]) begin
+          int u, y, k, kd;
+          u = hz_unit(soh[i]);
+          y = 0;
+          for (int j = 0; j < WIN; j++) y += int'(sv[j] && soh[j][u] && older[j][i]);
+          k = wc_k[c_pc % NPC][u];
+          kd = (u == U_DMA) ? wc_k[c_pc % NPC][5] : (u == U_Q) ? wc_k[c_pc % NPC][6] : 0;
+          if (u == int'(c_unit) && u != U_VPU) begin k = 0; kd = 0; end   // started first
+          wc_dep[i] = k != 0 && y >= k - 1;
+          wc_depd[i] = (c_cmd.op == OP_MM) ? (kd != 0 && y >= kd - 1) : wc_dep[i];
+        end
+  end
+
+  always @(posedge clk) begin
+    if (rst) begin
+      for (int u = 0; u < NUNITS; u++) hist_n[u] <= 0;
+    end else begin
+      // ---- at dispatch: the oracle's ranks, the dependencies' classes and kinds
+      if (c_go && (hz_fd != 0 || hz_kfd != 0)) begin
+        int cu, cc, nu, pc;
+        int kk [NUNITS];
+        int kd [NUNITS];
+        logic [NUNITS-1:0] du;
+        cu = int'(c_unit);
+        cc = hz_cls(c_cmd.op, c_cmd.w6[23:16]);
+        scls[free_slot] <= cc;
+        st_disp++;
+        du = '0;
+        for (int i = 0; i < WIN; i++)
+          if (ndep[i]) begin
+            logic [5:0] kn;
+            kn = hz_kind(c_fpx, sfp[i]);
+            st_dep[cc][scls[i]]++;
+            for (int j = 0; j < 6; j++) if (kn[j]) st_kind[j]++;
+            du |= soh[i];
+          end
+        if (ndep == '0) st_nodep++;
+        nu = $countones(du);
+        st_nu[nu]++;
+        if (hz_wc)
+          for (int i = 0; i < WIN; i++) begin
+            logic [1:0] cf;
+            cf = conf_s(c_fpx, sfp[i]);
+            if (sv[i] && !fin[i] && cf[1] && !ndep[i] && !(soh[i][cu] && cu != U_VPU))
+              st_wcmiss++;
+          end
+        for (int u = 0; u < NUNITS; u++) begin
+          kk[u] = 0; kd[u] = 0;
+          for (int j = 0; j < KMAX; j++)
+            if (j < hist_n[u]) begin
+              logic [1:0] cf;
+              cf = conf_s(c_fpx, hist[u][j]);
+              if (cf[1] && kk[u] == 0) kk[u] = j + 1;
+              if (cf[0] && kd[u] == 0) kd[u] = j + 1;
+            end
+          st_kh[cu][u][kk[u]]++;
+        end
+        pc = int'(c_pc % NPC);
+        for (int u = 0; u < NUNITS; u++)
+          if (kk[u] != 0 && (kmin[pc][u] == 0 || kk[u] < kmin[pc][u])) kmin[pc][u] = kk[u];
+        if (kd[U_DMA] != 0 && (kmin[pc][5] == 0 || kd[U_DMA] < kmin[pc][5]))
+          kmin[pc][5] = kd[U_DMA];
+        if (kd[U_Q] != 0 && (kmin[pc][6] == 0 || kd[U_Q] < kmin[pc][6])) kmin[pc][6] = kd[U_Q];
+        hz_seen[pc] = 1'b1;
+        hz_cnt[pc]++;
+        for (int j = KMAX - 1; j > 0; j--) hist[cu][j] <= hist[cu][j - 1];
+        hist[cu][0] <= c_fpx;
+        hist_n[cu] <= (hist_n[cu] < KMAX) ? hist_n[cu] + 1 : KMAX;
+      end
+      // ---- every cycle of the run: what each unit does, and what a blocked one waits for
+      if (!halted && hz_fd != 0) begin
+        st_cyc++;
+        if (c_v && !have_free) st_wfull++;
+        if (rl_wait) st_rlw++;
+        for (int u = 0; u < NUNITS; u++) begin
+          logic [WIN-1:0] pend;
+          for (int i = 0; i < WIN; i++) pend[i] = sv[i] && !sstarted[i] && soh[i][u];
+          if (uq_h[u] != uq_t[u]) st_u[u][0]++;
+          else if (pend == '0) st_u[u][1]++;
+          else if (can_start[u]) st_u[u][2]++;
+          else if (!urdy[u]) st_u[u][3]++;
+          else begin
+            int o;
+            logic [WIN-1:0] b;
+            st_u[u][4]++;
+            o = 0;
+            for (int i = 0; i < WIN; i++) if (pend[i] && (older[i] & pend) == '0) o = i;
+            b = ((u == U_MXU) ? sdepd[o] : sdep[o]) & ~same_started[u];
+            for (int p = 0; p < NUNITS; p++) begin
+              logic hit;
+              hit = 1'b0;
+              for (int i = 0; i < WIN; i++) if (b[i] && soh[i][p]) hit = 1'b1;
+              if (hit) st_by[u][p]++;
+            end
+            for (int i = 0; i < WIN; i++) if (b[i]) st_bcls[scls[o]][scls[i]]++;
+          end
+        end
+        if (uq_r != uq_t[U_MXU] && !can_rel) begin
+          logic [WIN-1:0] b;
+          b = sdep[rel_slot] & ~same_started[U_MXU];
+          st_rel[NUNITS]++;
+          for (int p = 0; p < NUNITS; p++) begin
+            logic hit;
+            hit = 1'b0;
+            for (int i = 0; i < WIN; i++) if (b[i] && soh[i][p]) hit = 1'b1;
+            if (hit) st_rel[p]++;
+          end
+        end
+      end
+    end
+  end
+
+  final begin
+    if (hz_kfd != 0) begin
+      for (int pc = 0; pc < NPC; pc++)
+        if (hz_seen[pc])
+          $fdisplay(hz_kfd, "%0d %0d %0d %0d %0d %0d %0d %0d %0d", pc, kmin[pc][0], kmin[pc][1],
+                    kmin[pc][2], kmin[pc][3], kmin[pc][4], kmin[pc][5], kmin[pc][6], hz_cnt[pc]);
+      $fclose(hz_kfd);
+    end
+    if (hz_fd != 0) begin
+      $fdisplay(hz_fd, "HZ cycles %0d dispatched %0d nodep %0d wfull %0d rlwait %0d wcmiss %0d",
+                st_cyc, st_disp, st_nodep, st_wfull, st_rlw, st_wcmiss);
+      $fdisplay(hz_fd, "HZ knobs tg %0d dg %0d rh %0d dh %0d win %0d ino %0d rob %0d wc %0d uq %0d,%0d,%0d,%0d,%0d",
+                hz_tg, hz_dg, hz_rh, hz_dh, hz_win, hz_ino, hz_rob, hz_wc, hz_uq[0], hz_uq[1],
+                hz_uq[2], hz_uq[3], hz_uq[4]);
+      for (int u = 0; u < NUNITS; u++)
+        $fdisplay(hz_fd, "HZU %0d busy %0d empty %0d start %0d notrdy %0d blocked %0d by %0d %0d %0d %0d %0d",
+                  u, st_u[u][0], st_u[u][1], st_u[u][2], st_u[u][3], st_u[u][4], st_by[u][0],
+                  st_by[u][1], st_by[u][2], st_by[u][3], st_by[u][4]);
+      $fdisplay(hz_fd, "HZREL total %0d by %0d %0d %0d %0d %0d", st_rel[NUNITS], st_rel[0],
+                st_rel[1], st_rel[2], st_rel[3], st_rel[4]);
+      $fdisplay(hz_fd, "HZKIND tmem_raw %0d tmem_war %0d tmem_waw %0d dram %0d act %0d all %0d",
+                st_kind[0], st_kind[1], st_kind[2], st_kind[3], st_kind[4], st_kind[5]);
+      $fdisplay(hz_fd, "HZNU %0d %0d %0d %0d %0d %0d", st_nu[0], st_nu[1], st_nu[2], st_nu[3],
+                st_nu[4], st_nu[5]);
+      for (int a = 0; a < NCLS; a++)
+        for (int b = 0; b < NCLS; b++) begin
+          if (st_dep[a][b] != 0) $fdisplay(hz_fd, "HZDEP %0d %0d %0d", a, b, st_dep[a][b]);
+          if (st_bcls[a][b] != 0) $fdisplay(hz_fd, "HZBLK %0d %0d %0d", a, b, st_bcls[a][b]);
+        end
+      for (int u = 0; u < NUNITS; u++)
+        for (int p = 0; p < NUNITS; p++) begin
+          string l;
+          l = $sformatf("HZK %0d %0d", u, p);
+          for (int j = 0; j <= KMAX; j++) l = {l, $sformatf(" %0d", st_kh[u][p][j])};
+          $fdisplay(hz_fd, "%s", l);
+        end
+      $fclose(hz_fd);
+    end
+  end
+`endif
 
   // ---- trace and activity events (otpu_pkg seq_ev_t): this cycle's, registered. A start's
   // ready cycle is looked up a cycle late, from the start's registered slot (ucs): if the slot

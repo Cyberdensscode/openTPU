@@ -1,0 +1,25 @@
+# EXPERIMENTAL (docs/seq_vpu.md): the workloads of the seq_vpu study (rtl/exp/seq_vpu/
+# run_cosim.sh), the card's models: fp4 weights, an int8 LM head, position 544, --check (bit-exact
+# against the ISA simulator) where perf_qwen runs; the larger models on zero images (config.json
+# only, a layer prefix), the MoE models through moe_prefill_cosim (every expert resident)
+# decode: one token, whole model
+d_q3 --model qwen3 --wformat fp4 --head-format int8 --pos 544 --layers 0 --check
+d_q35 --model qwen35 --wformat fp4 --head-format int8 --pos 544 --layers 0 --check
+d_lf --model lfm2 --wformat fp4 --head-format int8 --pos 544 --layers 0 --check
+# prefill at MCOLS 4: a 4-row run (the card's R_max), no logits; the larger models at their rows
+p_q3 --model qwen3 --wformat fp4 --head-format int8 --pos 544 --layers 2 --rows 4 --logits none --check
+p_q35 --model qwen35 --wformat fp4 --head-format int8 --pos 544 --layers 4 --rows 4 --logits none --check
+p_lf --model lfm2 --wformat fp4 --head-format int8 --pos 544 --layers 0 --rows 4 --logits none --check
+z_q4_r2 zero: models/Qwen3.5-4B rows 2 544 --layers 4
+z_ph_r3 zero: models/Phi-4-mini-instruct rows 3 544 --layers 2
+# prefill at MCOLS 8
+p8_q3 --model qwen3 --wformat fp4 --head-format int8 --pos 544 --layers 2 --rows 8 --logits none --mcols 8 --check
+p8_q35 --model qwen35 --wformat fp4 --head-format int8 --pos 544 --layers 4 --rows 4 --logits none --mcols 8 --check
+# batched decode: B slots, the picks on the device (opentpu/llm/batch.py)
+b4_q3 --model qwen3 --wformat fp4 --head-format int8 --pos 544 --layers 2 --batch 4 --check
+b8_q3 --model qwen3 --wformat fp4 --head-format int8 --pos 544 --layers 2 --batch 8 --mcols 8 --check
+# MoE: the layer-major prefill's layer run (2 rows), a decode row through the MoE block
+l_q35m moe: layer models/Qwen3.5-35B-A3B --R 2 --prefix 1:4
+l_g26 moe: layer models/gemma-4-26B-A4B-it --R 2 --prefix 0,1:0,5
+m_q35m moe: rows models/Qwen3.5-35B-A3B --variant moe --R 1 --prefix 1:3:4
+m_g26 moe: rows models/gemma-4-26B-A4B-it --variant moe --R 1 --prefix 0:0,1:0,5

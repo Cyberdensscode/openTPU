@@ -1,0 +1,38 @@
+# EXPERIMENTAL (docs/seq_vpu.md): the candidates of run_cosim.sh, "NAME K=V ...". otpu_seq's
+# simulation knobs (+hz_*, comma-separated in OTPU_SIM_PLUSARGS): tg / dg TMEM / DRAM granule
+# bits, rh / dh the reads' / DRAM ranges' hull, win the slots used, uq per-unit slot caps (DMA,
+# MXU, QUANT, VPU, COLL), ino in-order units, rob in-order slot release, wc wait counts.
+#
+# the card's sequencer: statistics and the wait-count oracle (run it before any WC candidate)
+i0 HZLOG=1 KOUT=1
+# ---- (b) the ISA unchanged, a cheaper conservative check
+rh OTPU_SIM_PLUSARGS=+hz_rh=1
+dh OTPU_SIM_PLUSARGS=+hz_dh=1
+rhdh OTPU_SIM_PLUSARGS=+hz_rh=1,+hz_dh=1 HZLOG=1
+# granules on top of the hulls: TMEM 2^G words, DRAM 2^G bytes
+g4 OTPU_SIM_PLUSARGS=+hz_rh=1,+hz_dh=1,+hz_tg=4,+hz_dg=12
+g6 OTPU_SIM_PLUSARGS=+hz_rh=1,+hz_dh=1,+hz_tg=6,+hz_dg=16 HZLOG=1
+g8 OTPU_SIM_PLUSARGS=+hz_rh=1,+hz_dh=1,+hz_tg=8,+hz_dg=20
+g10 OTPU_SIM_PLUSARGS=+hz_rh=1,+hz_dh=1,+hz_tg=10,+hz_dg=24
+g12 OTPU_SIM_PLUSARGS=+hz_rh=1,+hz_dh=1,+hz_tg=12,+hz_dg=28
+# one side at a time: TMEM alone coarse, DRAM alone coarse
+t8 OTPU_SIM_PLUSARGS=+hz_tg=8
+t11 OTPU_SIM_PLUSARGS=+hz_tg=11
+d20 OTPU_SIM_PLUSARGS=+hz_dg=20
+d26 OTPU_SIM_PLUSARGS=+hz_dg=26
+# extremes: TMEM as one region (a write conflicts with everything in TMEM), DRAM as one region
+t16 OTPU_SIM_PLUSARGS=+hz_tg=16 HZLOG=1
+d32 OTPU_SIM_PLUSARGS=+hz_dg=32 HZLOG=1
+# a smaller window
+w8 OTPU_SIM_PLUSARGS=+hz_win=8
+w12 OTPU_SIM_PLUSARGS=+hz_win=12
+# ---- (a) explicit dependencies: in-order units (exact dependencies = per-instance wait counts),
+# then per-pc wait counts from the oracle (what a compiler without loop peeling would emit)
+ino OTPU_SIM_PLUSARGS=+hz_ino=1 HZLOG=1
+wc OTPU_SIM_PLUSARGS=+hz_ino=1 WC=1 HZLOG=1
+# per-unit queues instead of the shared window (caps per unit: DMA, MXU, QUANT, VPU, COLL)
+inoq4 OTPU_SIM_PLUSARGS=+hz_ino=1,+hz_uq=4:4:4:4:2
+wcq4 OTPU_SIM_PLUSARGS=+hz_ino=1,+hz_uq=4:4:4:4:2 WC=1
+inoq6 OTPU_SIM_PLUSARGS=+hz_ino=1,+hz_uq=6:4:6:6:2
+# a reorder buffer (slots freed in program order): what distance-based tags would need
+rob OTPU_SIM_PLUSARGS=+hz_rob=1

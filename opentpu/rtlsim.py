@@ -4,6 +4,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import os
+import re as _re
 import shutil
 import subprocess
 import tempfile
@@ -316,6 +317,8 @@ def _run(cfg, programs: list, images: list, dram_lat: int = 8, max_cycles: int =
             f"{r:x} {ad // 4:x} {v & 0xFFFFFFFF:x}\n" for r, ad, v in pk))
     args = [str(exe), f"+dir={tmp}", f"+max_cycles={max_cycles}"] + (["+trace"] if trace else [])
     args += list(plusargs or [])
+    # e.g. OTPU_SIM_PLUSARGS=+hz_rh=1,+hz_log=/path (docs/seq_vpu.md; commas or spaces)
+    args += [x for x in _re.split(r"[\s,]+", os.environ.get("OTPU_SIM_PLUSARGS", "")) if x]
     args += [f"+arg{k}={int(v) & 0xFFFFFFFF}" for k, v in enumerate(run_args or [])]
     if again:
         args += [f"+runs={1 + len(again)}"] + (["+reload"] if reload else [])
