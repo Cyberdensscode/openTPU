@@ -108,6 +108,15 @@ def model_image(kind, M, spec, prefix, variant, R, cfg, cap, **kw):
                       **kw)
 
 
+def vpu_hack(progs, modes):
+    """tools/vpu_hack.py's transforms (docs/vpu_pump.md), the routing's bookkeeping kept exact."""
+    if not modes:
+        return progs
+    sys.path.insert(0, str(ROOT / "tools"))
+    import vpu_hack as VH
+    return [VH.apply(p, modes, keep=VH.moe_keep)[0] for p in progs]
+
+
 def timing_hack(img, dram):
     """served past every request; every entry present at its layer's first slot."""
     Lo = img.offload
@@ -128,7 +137,7 @@ def cmd_rows(a):
             if a.variant == "moe" and R != 1:
                 continue
             rec = dict(model=Path(a.model).name, variant=a.variant, prefix=prefix, R=R,
-                       pos=a.pos)
+                       pos=a.pos, hack=a.hack)
             try:
                 s, img = model_image(kind, M, spec, prefix, a.variant, R, cfg, a.cap)
                 rows = [(0, a.pos + r) for r in range(R)]
@@ -139,6 +148,7 @@ def cmd_rows(a):
                 rec["error"] = f"{type(e).__name__}: {e}"[:300]
                 print(json.dumps(rec), flush=True)
                 continue
+            progs = vpu_hack(progs, a.hack)
             rec["instructions"] = max(len(p) for p in progs)
             rec["image_mib"] = round(img.nbytes / 2**20)
             if a.compile_only:
@@ -167,6 +177,7 @@ def cmd_layer(a):
         progs, ra = img.compile_layer_run(li, a.pos // block + 1, block, R=a.R,
                                           embedded=a.R > 1)
         args = arg_words(ra, dict(RunPos.values(791, a.pos, 1, block), row=3))
+        progs = vpu_hack(progs, a.hack)
         dram = np.zeros(img.nbytes, np.uint8)
         timing_hack(img, dram)
         t = time.time()
@@ -175,6 +186,7 @@ def cmd_layer(a):
                               stall=0, bw=100, lat=round(0.3 * MHZ), max_cycles=1 << 40,
                               ldc=1066, args=args, plusargs=["+axi_dram=1", "+axi_map=1"] + plus)
         print(json.dumps(dict(model=Path(a.model).name, prefix=prefix, layer=li, R=a.R, pos=a.pos,
+                              hack=a.hack,
                               instructions=len(progs[0]), args=len(ra), cycles=st["cycles"],
                               ms=round(st["cycles"] / (MHZ * 1e3), 3),
                               sim_s=round(time.time() - t))), flush=True)
@@ -227,6 +239,7 @@ def main():
     r.add_argument("--cap", type=int, default=1024)
     r.add_argument("--compile-only", action="store_true")
     r.add_argument("--profile", action="store_true", help="per place: cycles (stderr)")
+    r.add_argument("--hack", default="", help="tools/vpu_hack.py modes (timing only)")
     la = sub.add_parser("layer")
     la.add_argument("model")
     la.add_argument("--prefix", default="0,1:0,5")
@@ -234,6 +247,7 @@ def main():
     la.add_argument("--R", type=int, default=1, help="rows a run (all routed alike: the zero "
                     "image's router ties, so a run's union is k experts)")
     la.add_argument("--cap", type=int, default=1024)
+    la.add_argument("--hack", default="", help="tools/vpu_hack.py modes (timing only)")
     e = sub.add_parser("expert")
     e.add_argument("model")
     e.add_argument("--M", default="1,2,3,4,8")

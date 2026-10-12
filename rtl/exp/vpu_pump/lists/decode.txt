@@ -1,0 +1,14 @@
+# decode, whole model, position 544, fp4 + int8 head, LDC DDR3-1066, 133.33 MHz
+d_q3 --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 544
+d_q3_novop --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 544 --hack novop
+d_lf --model lfm2 --wformat fp4 --head-format int8 --layers 0 --pos 544
+d_lf_novop --model lfm2 --wformat fp4 --head-format int8 --layers 0 --pos 544 --hack novop
+d_q35 --model qwen35 --wformat fp4 --head-format int8 --layers 0 --pos 544
+d_q35_novop --model qwen35 --wformat fp4 --head-format int8 --layers 0 --pos 544 --hack novop
+d_q35_nose --model qwen35 --wformat fp4 --head-format int8 --layers 0 --pos 544 --hack nose
+d_q35_half_halfse --model qwen35 --wformat fp4 --head-format int8 --layers 0 --pos 544 --hack half,halfse
+# a long context: position 4000
+d4k_q3 --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 4000
+d4k_q3_novop --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 4000 --hack novop
+d4k_q3_half --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 4000 --hack half
+d4k_q3_comp1 --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 4000 --hack comp1
