@@ -9,7 +9,8 @@
 #     statistics to <outdir>/<tag>.<n>.hz; KOUT=1 writes the wait-count oracle to
 #     <outdir>/<wl>.<n>.k; WC=1 runs on the wait counts of <outdir>/<wl>.<n>.k (a KOUT
 #     candidate's, run first); KOUT=x / WC=x: <outdir>/<wl>.x.<n>.k; SYNC=1 / SYNC=x: the same
-#     file as otpu_seq WAITC's wait counts (OTPU_SEQ_WC=1). <n> counts a tool's simulations (the
+#     file as otpu_seq WAITC's wait counts (OTPU_SEQ_WC=1); SYNCFROM=w: workload w's file (the
+#     same program at other run-time arguments). <n> counts a tool's simulations (the
 #     MoE tool runs one per prefix).
 # Results: <outdir>/<workload>__<candidate>.log (ends with rc=N and the wall time). A run whose
 # log ends in rc=0 is skipped. Usage, from anywhere:
@@ -39,6 +40,7 @@ one() {   # workload candidate args...
       WC=1) pa="$pa,+hz_wc=$O/$wl.%n.k" ;;
       WC=*) pa="$pa,+hz_wc=$O/$wl.${kv#WC=}.%n.k" ;;
       SYNC=1) pa="$pa,+hz_sync=$O/$wl.%n.k" ;;
+      SYNCFROM=*) pa="$pa,+hz_sync=$O/${kv#SYNCFROM=}.%n.k" ;;
       SYNC=*) pa="$pa,+hz_sync=$O/$wl.${kv#SYNC=}.%n.k" ;;
       OTPU_SIM_PLUSARGS=*) pa="$pa,${kv#OTPU_SIM_PLUSARGS=}" ;;
       *) env+=("$kv") ;;
