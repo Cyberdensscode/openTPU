@@ -10,7 +10,7 @@
 // Block RAM: one memory per column j (rows j, j+MCOLS, ...) and piece p (bytes p*PB ..
 // p*PB+PB-1: four 64-bit block RAMs at PB = 32), GROUPS*BLOCKS words of PB bytes with byte
 // write enables, group-major. The read is registered (the MXU's first pipeline register) and
-// advances with `ren`; a read of a block written at the same edge returns the old bytes. Writes
+// advances with the column's `ren` bit (otpu_mxu: the columns of the MM's rows); a read of a block written at the same edge returns the old bytes. Writes
 // land three cycles after they are presented: the quantizer's write is registered as it arrives
 // and again (LANES bytes, their index and row, the scale), so it crosses from the quantizer in
 // that narrow form in two hops and the lane placement (LANES -> D bytes) starts at a flip-flop
@@ -37,7 +37,7 @@ module otpu_actram #(
   input  logic [7:0]             s_row,
   input  logic [15:0]            s_blk,
   input  logic [63:0]            s_data,
-  input  logic                   ren,
+  input  logic [MCOLS-1:0]       ren,         // per column
   input  logic                   r_use,       // this edge's read is consumed (simulation checks)
   input  logic [15:0]            r_blk,
   input  logic [15:0]            r_blk2,
@@ -164,7 +164,7 @@ module otpu_actram #(
       // the piece's bytes: a technology RAM with byte enables (rtl/tech)
       otpu_ram_1r1w_be #(.W(PB*8), .N(GROUPS*BLOCKS), .STYLE("auto")) u_act (
         .clk, .we(wsel), .wbe(wbe[p*PB +: PB]), .wa(wa[RAW-1:0]), .wd(wd[p*PB*8 +: PB*8]),
-        .re(ren), .ra(ra[RAW-1:0]), .rd);
+        .re(ren[j]), .ra(ra[RAW-1:0]), .rd);
       assign r_data[j*D*8 + p*PB*8 +: PB*8] = rd;
 `ifndef SYNTHESIS
       initial wsel = 1'b0;
@@ -172,7 +172,7 @@ module otpu_actram #(
     end
     // the column's block scale records
     otpu_ram_1r1w #(.W(64), .N(GROUPS*BLOCKS), .STYLE("auto")) u_asc (
-      .clk, .we(ssel[j]), .wa(sa[RAW-1:0]), .wd(sd), .re(ren), .ra(ra[RAW-1:0]), .rd(rs));
+      .clk, .we(ssel[j]), .wa(sa[RAW-1:0]), .wd(sd), .re(ren[j]), .ra(ra[RAW-1:0]), .rd(rs));
     assign r_scale[j*64 +: 64] = rs;
 `ifndef SYNTHESIS
     // a consumed read of a block (or its scale) with a write in any register: it would return
@@ -186,7 +186,7 @@ module otpu_actram #(
     wire [GW+BW-1:0] wa_n = (GROUPS > 1) ? {wg_n[j], w_idx_h[DW +: BW]} : (GW+BW)'(w_idx_h[DW +: BW]);
     wire [GW+BW-1:0] sa_n = (GROUPS > 1) ? {sg_n[j], s_blk_h} : (GW+BW)'(s_blk_h);
     always @(posedge clk)
-      if (ren && r_use && ((g_pc[0].wsel && wa == ra) || (wsel_n[j] && wa_n == ra) ||
+      if (ren[j] && r_use && ((g_pc[0].wsel && wa == ra) || (wsel_n[j] && wa_n == ra) ||
                            (wsel_1 && wa_1 == ra) || (ssel[j] && sa == ra) ||
                            (ssel_n[j] && sa_n == ra) || (ssel_1 && sa_1 == ra)))
         $fatal(1, "otpu_actram: column %0d block %0d read while its write is in flight at %0t",

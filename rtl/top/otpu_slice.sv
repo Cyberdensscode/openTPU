@@ -251,7 +251,7 @@ module otpu_slice
   logic [15:0]            asc_blk, act_rblk, act_rblk2;
   logic [MCOLS-1:0]       act_rhi;
   logic [7:0]             act_rgrp;
-  logic                   act_ren;
+  logic [MCOLS-1:0]       act_ren;       // per column (otpu_mxu: the MM's columns)
   logic                   mxu_pop;       // the MXU consumes a block this cycle (its ACT read)
   logic [MCOLS*D*8-1:0]   act_rdata;
   logic [MCOLS*64-1:0]    act_rscale;
@@ -702,6 +702,12 @@ module otpu_slice
   // those that fetched a row's Sw alone
   always @(posedge clk)
     if (dump) $display("MXSCALE s%0d areq=%0d sw=%0d", SID, u_mxu.xs_a, u_mxu.xs_sw);
+  // the ACT RAM's reads (otpu_mxu xa_*; rtlsim stats["act_reads"]): cycles, column reads, pops,
+  // the columns of output rows at the pops, and the columns that ever read (a mask)
+  always @(posedge clk)
+    if (dump) $display("MXACT s%0d cyc=%0d rd=%0d pop=%0d use=%0d cols=%0d any=%0d", SID,
+                       u_mxu.xa_cyc, u_mxu.xa_rd, u_mxu.xa_pop, u_mxu.xa_use, MCOLS,
+                       64'(u_mxu.xa_any));
   always_ff @(posedge clk)
     if (trace) begin
       if (pf.sq.g) $display("T%0d G c=%0d s=%0d", SID, pf.sq.cyc, pf.sq.g_slot);
