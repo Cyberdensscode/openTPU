@@ -345,6 +345,47 @@ def test_tiled_shallow_pipeline(tmp_path_factory, monkeypatch):
                                                     _dram_but_scratch(b, 1050)))
 
 
+def test_tiled_forms_placed_next_fit_first():
+    """The form search (_first_fit) tries every form with its tiles placed next-fit before any
+    with best-fit (which fits a fragmented TMEM but reuses words that running work still reads:
+    slower), then the first that fits best-fit; over IMEM, the next form."""
+    from types import SimpleNamespace
+
+    from opentpu.compiler import CompileError
+
+    class Built:
+        run_args = ()
+
+        def __init__(self, n):
+            self.n = n
+
+        def finish(self):
+            return [0] * self.n
+
+    def search(fits, imem=1 << 17):
+        tried = []
+
+        def trace(form, fit):
+            tried.append((form["i"], form.get("depth"), fit))
+            if fit not in fits[form["i"]]:
+                raise CompileError("TMEM exhausted: a tile of 4096 words")
+            return [Built(fits[form["i"]][fit])]
+        progs, _ = tiled._first_fit(trace, [{"i": i} for i in range(len(fits))],
+                                    SimpleNamespace(IMEM_WORDS=imem))
+        return len(progs[0]), tried
+
+    # form 0 fits best-fit only, form 1 next-fit: form 1
+    n, tried = search([{"best": 10}, {"next": 11, "best": 11}])
+    assert n == 11 and tried == [(0, None, "next"), (1, None, "next")]
+    # neither fits next-fit: the first that fits best-fit
+    n, tried = search([{"best": 10}, {"best": 11}])
+    assert n == 10 and tried == [(0, None, "next"), (1, None, "next"), (0, None, "best")]
+    # form 1 next-fit over IMEM at both depths: form 0 best-fit, within it
+    n, tried = search([{"best": 10}, {"next": 20}], imem=8 * 15)
+    assert n == 10 and tried[-1] == (0, None, "best")
+    assert (1, tiled.SHALLOW, "next") in tried
+
+
 @pytest.mark.parametrize("case, mcols, act, p0, T, form", [
     ("qwen3", 4, 4, 300, 4, None),      # the card's ACT RAM (4 rows): a whole block, then the
     ("lfm2", 4, 16, 200, 16, None),     # masked one; 16 rows: replayed MMs, the convolution's

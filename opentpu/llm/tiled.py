@@ -267,7 +267,8 @@ def _attention_tile(res: Res, lw, c, s_, pos, T: int, spec, block: int, parts: i
         del o
 
     _attend_heads(qhs, kvc, kvh, seqs, block, scale, depth=depth, emit=emit)
-    xs = None
+    xs = qn = kn = None                        # (the norm gains too: placed after x's tiles,
+    #                                            they split TMEM under the load back)
     if whole:                                  # (the scratch's rows back: the stores before)
         if o_all is None:
             o_all = ol.load(oscr[0:T, 0:nq * d])
@@ -715,7 +716,7 @@ def _gemma_attention_tile(res: Res, lw, m, pos: RunRows, ropes, T: int, block: i
         del o
 
     _attend_heads(qhs, kv, kvh, seqs, block, ol.LOG2E, depth=depth, emit=emit)
-    xs = None
+    xs = qn = kn = None                        # (the norm gains: _attention_tile's)
     if whole:                                  # (the scratch's rows back: the stores before)
         if o_all is None:
             o_all = ol.load(oscr[0:T, 0:spec.n_q * d])
@@ -743,8 +744,8 @@ def gemma4_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool
     spec = m.spec
     if not isinstance(pos, RunRows) or pos.amask is None or spec.experts:
         raise CompileError("a tiled Gemma 4 run is a dense model's prompt run with mask tiles")
-    x = _gathered_out(m, pos)
-    ropes = _pos_rows(m, pos, T, masks=False)
+    ropes = _pos_rows(m, pos, T, masks=False)   # (first: x's gather leaves the next-fit
+    x = _gathered_out(m, pos)                   # cursor past its temporaries, TMEM split)
     x.set(x * math.sqrt(spec.hidden))           # (in place: one [T, H] tile)
     if spec.ple_dim:
         _ple_inputs(m, x, None)
@@ -936,10 +937,11 @@ def compile_tile_run(img, blocks: int, T: int, kind: str, block: int = ATTN_BLOC
                      hidden: bool = False, slot: int = 0):
     """tile_run's (programs, run_args): T rows of a prompt at a run-time position of bucket
     `blocks` (from conv_k - 1), as the image's compile_prompt_run's P and L runs. The first
-    of the run's forms (variants) that fits TMEM and ACT RAM, at the attention's pipeline depth
-    (ATTN_DEPTH), or where that is over IMEM at SHALLOW (its program grows with the blocks a
-    head's entries leave unrolled, up to ~3 x depth a packed tile: past bucket ~3 the
-    bigger tiles); over IMEM at both, the first (the caller's IMEM check)."""
+    of the run's forms (variants) that fits TMEM and ACT RAM, its tiles placed next-fit, then
+    best-fit (_first_fit), at the attention's pipeline depth (ATTN_DEPTH), or where that is
+    over IMEM at SHALLOW (its program grows with the blocks a head's entries leave unrolled,
+    up to ~3 x depth a packed tile: past bucket ~3 the bigger tiles); over IMEM at both, the
+    first (the caller's IMEM check)."""
     fam = family(img)
     if fam is None:
         raise ValueError(f"no tiled prompt run for {type(img).__module__}")
@@ -964,27 +966,30 @@ def compile_tile_run(img, blocks: int, T: int, kind: str, block: int = ATTN_BLOC
         pos = RunRows(blocks, block, lo, img.lookup["zmask"], img.cap, T, 0, _amask(img.lookup))
     desc = (lambda s: img.descriptors(s, slot)) if fam == "qwen35" else img.descriptors
 
-    def trace(kw):
+    def trace(kw, fit):
         kw = dict(kw, hidden=True) if hidden else kw
-        return [trace_fit(tile_run, img.cfg, s, lambda s=s: {
+        return [tile_run.trace(img.cfg, s, {
             "m": desc(s), "kernel": KERNELS[fam], "pos": pos, "T": T, "kind": kind,
-            "block": block, "kw": kw}) for s in range(img.cfg.S)]
+            "block": block, "kw": kw}, fit=fit) for s in range(img.cfg.S)]
 
     return _first_fit(trace, variants(fam, T, img.cfg.MCOLS), img.cfg)
 
 
 def _first_fit(trace, forms, cfg):
-    """(programs, run_args) of trace(form) (its builders, one a slice) for the first of the
-    forms that fits TMEM, ACT RAM and IMEM: each form at the attention's pipeline depth, then
-    over IMEM at SHALLOW, then the next form; over IMEM at every one, the first (the caller's
+    """(programs, run_args) of trace(form, fit) (its builders, one a slice) for the first of
+    the forms that fits TMEM, ACT RAM and IMEM: each form at the attention's pipeline depth,
+    then over IMEM at SHALLOW, then the next form, its tiles placed next-fit; then the same with
+    best-fit placement (slower: best-fit reuses the words just freed, which work still running
+    reads; Qwen3-0.6B's 16 rows in co-simulation, MX, the card's configuration: 94.9K cycles
+    a row placed best-fit, 87.4K next-fit); over IMEM at every one, the first (the caller's
     IMEM check: prefill.programs); none fitting, the last TMEM / ACT RAM error (or, where no
     form applied, the range forms' QACT range error)."""
     err = over = skip = None
     imem = cfg.IMEM_WORDS // 8
-    for v in forms:
+    for fit, v in [(fit, v) for fit in ("next", "best") for v in forms]:
         for f in [v] + ([dict(v, depth=SHALLOW)] if "depth" not in v else []):
             try:
-                bs = trace(f)
+                bs = trace(f, fit)
             except CompileError as e:
                 if "QACT range" in str(e):     # (a range form's part at an odd block of
                     skip = e                   # 4-bit weights: the form does not apply)
@@ -1065,10 +1070,10 @@ def compile_layer_tile(img, li: int, blocks: int, T: int, block: int = ATTN_BLOC
     pos = RunRows(blocks, block, lo, lk.get("zmask", 0), img.cap, T, 0, amask)
     row = RunVar("row", img.prefill_rows)
 
-    def trace(kw):
-        return [trace_fit(LAYER_KERNELS[fam], cfg, 0, lambda: {
+    def trace(kw, fit):
+        return [LAYER_KERNELS[fam].trace(cfg, 0, {
             "m": img.descriptors(0), "li": li, "pos": pos, "row": row, "T": T, "block": block,
-            **kw})]
+            **kw}, fit=fit)]
 
     return _first_fit(trace, layer_variants(img, fam, T), cfg)
 
