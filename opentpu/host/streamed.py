@@ -33,9 +33,12 @@ from pathlib import Path
 LAYER_MAJOR = 2         # the prompt's rows a layer run (docs/offload.md 13.7: R = 2, pooled)
 DEFAULT = "default"     # engine's pool: the checkpoint's own (default_pool)
 IDLE_PARTS = ("v1", "ra", "halt", "v2")      # ExpertServer's idle parts (13.12)
-# each family's weight formats on the card (wformat, head_format, formats): 4-bit experts with
-# an int8 head (docs/offload.md 10); Gemma 4 26B-A4B int8 layers, fp4 experts and head (11.5)
-FORMATS = {"lfm2": ("fp4", "int8", None), "qwen35": ("fp4", "int8", None),
+# each family's weight formats on the card (wformat, head_format, formats), the MX formats'
+# per-kind choices (docs/mx_mxu.md 3.6, docs/offload.md 14.2): LFM2.5-8B-A1B nvfp4, experts
+# included, with an int8 head; Qwen3.5-35B-A3B nvfp4 layers (attention, DeltaNet, the shared
+# expert), fp4 experts and an int8 head; Gemma 4 26B-A4B int8 layers, fp4 experts and head (11.5)
+FORMATS = {"lfm2": ("nvfp4", "int8", None),
+           "qwen35": ("fp4", "int8", "attn=nvfp4,delta=nvfp4,mlp=nvfp4"),
            "gemma4": ("int8", "fp4", "experts=fp4")}
 
 

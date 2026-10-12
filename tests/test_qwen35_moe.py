@@ -149,12 +149,18 @@ def test_device_follows_hf_and_routes_on_the_card(tiny):
     assert eng.server.misses == 0
 
 
-@pytest.mark.parametrize("wformat", ["int8", "fp4"])
-def test_small_cache_is_bit_exact(tiny, wformat):
-    """k slots per layer: nearly every request misses and streams; the logits do not move."""
+@pytest.mark.parametrize("wformat,formats", [("int8", ""), ("fp4", ""), ("nvfp4", ""),
+                                             ("fp4", "attn=nvfp4,delta=nvfp4,mlp=nvfp4")])
+def test_small_cache_is_bit_exact(tiny, wformat, formats):
+    """k slots per layer: nearly every request misses and streams; the logits do not move. The
+    35B's formats on the card too (nvfp4 layers and shared expert, fp4 experts:
+    streamed.FORMATS)."""
     _, W, spec = tiny
+    spec = replace(spec, formats=formats)
     toks = [int(t) for t in np.random.default_rng(2).integers(0, 1000, 8)]
     full = _engine(spec, W, wformat=wformat)
+    assert full.image.fmt.wformat == wformat
+    assert full.image.lf[0] == ("nvfp4" if formats else wformat,) * 4
     ref = np.array([full.step(t) for t in toks])
     small = _engine(spec, W, experts=K, wformat=wformat)
     got = np.array([small.step(t) for t in toks])
@@ -716,11 +722,14 @@ def test_moe_card_streams_as_the_resident_run(tiny, tmp_path, monkeypatch):
     assert json.loads((tmp_path / "trace.json").read_text())       # (the decode's timeline)
 
 
-def test_pack_pool_tool_packs_the_images_experts(tiny, tmp_path, monkeypatch):
+@pytest.mark.parametrize("wformat", ["fp4", "nvfp4"])
+def test_pack_pool_tool_packs_the_images_experts(tiny, tmp_path, monkeypatch, wformat):
     """tools/offload/pack_pool.py: init then two workers pack every expert of a checkpoint as the
     image's split slot bytes, each marked packed; send | recv into a second pool, on the host of
-    the checkpoint without its experts (strip_experts.py), gives the same file."""
+    the checkpoint without its experts (strip_experts.py), gives the same file. In fp4 and in
+    nvfp4 (LFM2.5-8B-A1B's experts, streamed.FORMATS), whose key names the format."""
     import io
+    import json
     import runpy
     import sys
     from pathlib import Path
@@ -747,11 +756,14 @@ def test_pack_pool_tool_packs_the_images_experts(tiny, tmp_path, monkeypatch):
         monkeypatch.undo()
 
     a, b = tmp_path / "a.bin", tmp_path / "b.bin"
+    wf = ("--wformat", wformat)
     for p in (a, b):
-        run(m, p, "init")
-    run(m, a, "pack", 0, 2)
-    run(m, a, "pack", 1, 2)
-    img = runpy.run_path(tool)["image"](str(m), "fp4")
+        run(m, p, "init", *wf)
+    run(m, a, "pack", 0, 2, *wf)
+    run(m, a, "pack", 1, 2, *wf)
+    img = runpy.run_path(tool)["image"](str(m), wformat)
+    assert img.fmt.wformat == wformat
+    assert json.loads(Path(str(a) + ".key").read_text())["format"] == wformat
     L = img.offload
     n, slot = L.layers * L.E, L.slot_bytes
     assert np.fromfile(str(a) + ".packed", np.uint8).tolist() == [1] * n
@@ -762,7 +774,7 @@ def test_pack_pool_tool_packs_the_images_experts(tiny, tmp_path, monkeypatch):
     ids.write_text("\n".join(map(str, range(n - 1, -1, -1))))
     out = tmp_path / "stream"
     with open(out, "wb") as f:
-        run(m, "-", "send", ids, stdout=f)
+        run(m, "-", "send", ids, *wf, stdout=f)
     stripped = tmp_path / "stripped"
     monkeypatch.setattr(sys, "argv", ["strip_experts.py", str(m), str(stripped)])
     runpy.run_path(str(tools / "strip_experts.py"), run_name="__main__")
@@ -771,7 +783,7 @@ def test_pack_pool_tool_packs_the_images_experts(tiny, tmp_path, monkeypatch):
     with safe_open(str(stripped / "model.safetensors"), "np") as h:
         assert set(h.keys()) == {k for k in tiny[1] if ".experts." not in k}
     with open(out, "rb") as f:
-        run(stripped, b, "recv", stdin=f)
+        run(stripped, b, "recv", *wf, stdin=f)
     assert a.read_bytes() == b.read_bytes()
     assert Path(str(b) + ".packed").read_bytes() == bytes([1] * n)
 

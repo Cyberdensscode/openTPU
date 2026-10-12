@@ -11,7 +11,7 @@ other models.
 ```sh
 hf download HuggingFaceTB/SmolLM3-3B --local-dir models/SmolLM3-3B
 hf download microsoft/Phi-4-mini-instruct --local-dir models/Phi-4-mini-instruct
-otpu-chat --model smollm3 --backend board            # its mix, gateup@9-35=fp4 (docs/formats.md)
+otpu-chat --model smollm3 --backend board            # its mix, gateup@9-35=nvfp4 (docs/formats.md)
 otpu-chat --model smollm3 --backend board --wformat int8   # closest to Hugging Face (Accuracy)
 otpu-chat --model phi4-mini --backend board --wformat fp4 --head-format int8
 python3 tools/compare_hf.py --model phi4-mini --cfg board --tokens 16   # ISA simulator vs HF
@@ -180,9 +180,10 @@ take '212'. So the device's 4-bit path is quantization, not a kernel error.
 **For SmolLM3, int8 is the format that stays with Hugging Face** (`--wformat int8`, 5.0 tok/s).
 4-bit (8.7 tok/s) gives fluent text, but it leaves HF's greedy path after 1 to 11 tokens on
 the four prompts. No cheaper mix helps, because the error is in the MLP, which holds most of the
-weights. The recommended mixes (`wformat="mix"`, `docs/formats.md`) are SmolLM3's
-`gateup@9-35=fp4` (23% faster than int8, dKL 2.1%) and Phi-4-mini's `mlp@4-29=fp4` (31% over
-int8, dKL 2.8%; `mlp@4-27=fp4` before it ran 5.20 tok/s on the card).
+weights. The recommended mixes (`wformat="mix"`, `docs/formats.md`) are, in the MX formats,
+SmolLM3's `gateup@9-35=nvfp4` and Phi-4-mini's `gateup@4-29=nvfp4,down@4-29=fp4`; before MX
+they were `gateup@9-35=fp4` (23% faster than int8, dKL 2.1%) and `mlp@4-29=fp4` (31% over int8,
+dKL 2.8%; `mlp@4-27=fp4` before it ran 5.20 tok/s on the card).
 
 ## Tests
 

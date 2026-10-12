@@ -196,8 +196,8 @@ def _moe_engine(moe, **kw):
     return Engine(spec, W, cap=1024, cfg=_cfg(), rows=1, **kw)
 
 
-@pytest.mark.parametrize("wf", ["int8", "fp4"])
-def test_moe_device_follows_the_emulation(moe, wf):
+@pytest.mark.parametrize("wf,formats", [("int8", ""), ("fp4", ""), ("int8", "experts=nvfp4")])
+def test_moe_device_follows_the_emulation(moe, wf, formats):
     """The MoE block on the device (moe.moe_ffn: the router and every expert on the card, the
     dense MLP emitted beside the request, the two norms combined) follows the emulation of the
     same quantization given the card's choice of experts (the emulation's own differs where
@@ -206,11 +206,15 @@ def test_moe_device_follows_the_emulation(moe, wf):
     token to the VPU's EXP2 / RECIP (the routing weights' softmax, gelu_tanh: 1 - 1.2e-4
     here), the others to cosine > 0.99. The card's experts in the first layer, whose input no
     routing has touched, are the emulation's wherever its k-th logit is clear of the next;
-    int8 follows HF."""
+    int8 follows HF. The experts in nvfp4 over int8 layers too (the 26B's alternative to its
+    fp4 experts: OTPU_FORMATS=experts=nvfp4)."""
     m, W, spec = moe
+    spec = G.replace(spec, formats=formats)
     toks = [int(t) for t in np.random.default_rng(1).integers(0, 1000, 12)]
-    eng = _moe_engine(moe, wformat=wf)
-    assert (eng.image.fmt.F0, eng.image.fmt.F) == (96, 128 if wf == "int8" else 256)
+    eng = _moe_engine((m, W, spec), wformat=wf)
+    efmt = G.expert_format(spec, wf, formats)
+    assert eng.image.efmt == efmt == (formats[8:] if formats else wf)
+    assert (eng.image.fmt.F0, eng.image.fmt.F) == (96, 128 if efmt == "int8" else 256)
     eng.server.history = []
     dev = np.array([eng.step(t) for t in toks])
     eng.server.poll()                   # (the last layer's request, served at a next fence)
@@ -218,15 +222,15 @@ def test_moe_device_follows_the_emulation(moe, wf):
     assert len(card) == len(toks) * L and eng.server.misses == 0
     assert all(g // E == j % L for j, r in enumerate(card) for g in r)
     routes = []
-    G.emulated_logits(spec, W, toks, wformat=wf, routes=routes)
+    G.emulated_logits(spec, W, toks, wformat=wf, formats=formats, routes=routes)
     clear = [(t, ids) for t, layer, ids, margin in routes if layer == 0 and margin > 0.05]
     assert len(clear) >= len(toks) // 2
     assert all(sorted(card[t * L]) == sorted(ids) for t, ids in clear)
-    emu = G.emulated_logits(spec, W, toks, wformat=wf, routing={
+    emu = G.emulated_logits(spec, W, toks, wformat=wf, formats=formats, routing={
         (j // L, j % L): [g % E for g in r] for j, r in enumerate(card)})
     c = _cos(dev, emu)
     assert c[0] > 1 - 2e-4 and c.min() > 0.99, c
-    if wf == "int8":
+    if efmt == "int8":
         with torch.no_grad():
             hf = m(torch.tensor([toks])).logits[0].numpy()
         assert np.median(_cos(G.softcap(spec, dev), hf)) > 0.98
@@ -304,14 +308,19 @@ def test_moe_experts_gain_with_outliers(moe_g2):
     assert np.median(_cos(dev, hf)) > 0.985
 
 
-@pytest.mark.parametrize("wf", ["int8", "fp4"])
-def test_moe_small_cache_is_bit_exact(moe, wf):
+@pytest.mark.parametrize("wf,hf,formats", [("int8", None, ""), ("fp4", None, ""),
+                                           ("int8", "fp4", "experts=nvfp4")])
+def test_moe_small_cache_is_bit_exact(moe, wf, hf, formats):
     """k slots per layer: nearly every request misses and streams (while the dense MLP runs
-    beside it); the logits do not move."""
+    beside it); the logits do not move. The 26B's alternative on the card too (int8 layers,
+    nvfp4 experts, an fp4 head: OTPU_FORMATS=experts=nvfp4)."""
+    m, W, spec = moe
+    moe = (m, W, G.replace(spec, formats=formats))
     toks = [int(t) for t in np.random.default_rng(2).integers(0, 1000, 10)]
-    full = _moe_engine(moe, wformat=wf)
+    full = _moe_engine(moe, wformat=wf, head_format=hf)
+    assert full.image.efmt == (formats[8:] if formats else wf)
     ref = np.array([full.step(t) for t in toks])
-    small = _moe_engine(moe, wformat=wf, experts=K)
+    small = _moe_engine(moe, wformat=wf, head_format=hf, experts=K)
     got = np.array([small.step(t) for t in toks])
     assert small.server.misses > len(toks)
     assert np.array_equal(got.view(np.uint32), ref.view(np.uint32))

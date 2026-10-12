@@ -54,7 +54,7 @@ IMEM. Each layer block in DRAM has its kind's size (conv or attention, in its fo
 block had the larger kind's size, so layer i started at `layer0 + i * LS`; LFM2.5-230M's int8
 image at a 4096-token capacity went from 334 to 276 MiB, LFM2-2.6B's from 2639 to 2595.)
 Formats per layer range, the second layout's IMEM cost and the recommended mixes:
-`docs/formats.md` (LFM2-2.6B: `conv=fp4,mlp=fp4`, the attention layers int8).
+`docs/formats.md` (LFM2-2.6B: `conv=nvfp4,gateup=nvfp4,down=fp4`, the attention layers int8).
 
 Nothing new was needed in the ISA or the RTL. The shared kernel code gained two small
 generalizations: `KVDesc` takes a V width (`dv`), and `qwen3._attention` pads heads narrower
@@ -244,7 +244,7 @@ softmax chain adds ~0.7 K cycles after them.
 
 ```sh
 hf download LiquidAI/LFM2-2.6B --local-dir models/LFM2-2.6B
-otpu-chat --model lfm2-2.6b --backend board            # its mix: conv=fp4,mlp=fp4 (docs/formats.md)
+otpu-chat --model lfm2-2.6b --backend board            # its mix (docs/formats.md)
 otpu-chat --model lfm2-2.6b --backend board --wformat fp4 --head-format int8
 python3 tools/compare_hf.py --model lfm2-2.6b --cfg board --tokens 16
 ```

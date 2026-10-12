@@ -21,28 +21,40 @@ In short:
   1 and 16: Gemma 4; E2B's 4-row prompt run of bucket 2 does not fit, [gemma4.md](gemma4.md)),
   and the LM head in int8. The default is the fastest mix at least
   1 SE under its bar; a dKL gap under 2 SE is a tie, which goes to the mix with fewer runs.
-  Finals are at 2000 tokens.
-- **Choices.** Phi-4-mini: `mlp@4-29=fp4`, 31% faster than int8 for dKL 2.8% (fp4: 64% for
-  16%). Qwen3.5-4B: `delta=fp4,mlp=fp4` (the attention layers int8), 56% for 5.3% (fp4: 64% for
-  6.5%, on its bar). SmolLM3-3B: `gateup@9-35=fp4`, 23% for 2.1%. LFM2-2.6B:
-  `conv=fp4,mlp=fp4` (the attention layers int8), 77% for 7.4% (fp4: 82% for 11.8%). Gemma 4
-  E2B-it, the chat's checkpoint: none qualifies (the closest 3.1 SE over its bar), so int8; its
-  base checkpoint's was `attn@15-24=fp4,mlp@15-34=fp4` (the KV-shared layers' MLP, layers
-  15-24's attention), 30% for 2.6% against int8 with the int8 PLE table, which on E2B-it is
-  +6.8% (fp4 layers: 56% for about 21% on the base, 17% on E2B-it). Gemma 4 E4B (int8 does
-  not fit): the head and gate / up 0-11, three loops, +0.56% against int8 on E4B-it.
-  Qwen3.5-2B: none qualifies. Qwen3.5-35B-A3B's fp4 head: +1.55% for 13%, so it stays int8.
-  Gemma 4 26B-A4B: all dense layers in fp4 fail (+7.9% for 56%); its ranges are not run yet.
-  On the card the mixes run at the predicted speed (within 0.1%), and their images give the ISA
-  simulator's tokens (Phi's and SmolLM3's through a proxy).
+  Finals are at 2000 tokens. On the MX MXU the reference is MX int8 (int8x); a kind takes
+  NVFP4 rather than fp4x6 only where its gain beats 0.1 x its decode-time cost by at least
+  1 SE, and MX's own accuracy gain makes no new, faster mix ([The rule](#the-rule)).
+- **Choices** (the MX formats: the per-kind scan of [mx_mxu.md](mx_mxu.md) 3.6, int8 kinds in
+  int8x, fp4 fp4x6). Phi-4-mini: `gateup@4-29=nvfp4,down@4-29=fp4`. Qwen3.5-4B:
+  `delta=fp4,mlp=nvfp4` (the attention layers int8). SmolLM3-3B: `gateup@9-35=nvfp4`.
+  LFM2-2.6B: `conv=nvfp4,gateup=nvfp4,down=fp4` (the attention layers int8). Qwen3-0.6B,
+  LFM2.5-230M, Qwen3.5-0.8B and 2B, Gemma 4 E2B-it: none, so int8 (E2B's fp4 PLE table stays).
+  Gemma 4 E4B: the head and gate / up 0-11 in fp4 as below. The streamed MoE models
+  ([offload.md](offload.md) 14.2, `streamed.FORMATS`): LFM2.5-8B-A1B nvfp4, its experts
+  included, with an int8 head; Qwen3.5-35B-A3B nvfp4 attention, DeltaNet and shared expert,
+  fp4 experts and an int8 head; Gemma 4 26B-A4B-it int8 layers with fp4 experts and head.
+- **Before MX** (the scans on this page, the former fp4). Phi-4-mini: `mlp@4-29=fp4`, 31% faster
+  than int8 for dKL 2.8% (fp4: 64% for 16%). Qwen3.5-4B: `delta=fp4,mlp=fp4` (the attention layers
+  int8), 56% for 5.3% (fp4: 64% for 6.5%, on its bar). SmolLM3-3B: `gateup@9-35=fp4`, 23% for 2.1%.
+  LFM2-2.6B: `conv=fp4,mlp=fp4` (the attention layers int8), 77% for 7.4% (fp4: 82% for 11.8%).
+  Gemma 4 E2B-it, the chat's checkpoint: none qualifies (the closest 3.1 SE over its bar), so int8;
+  its base checkpoint's was `attn@15-24=fp4,mlp@15-34=fp4` (the KV-shared layers' MLP, layers
+  15-24's attention), 30% for 2.6% against int8 with the int8 PLE table, which on E2B-it is +6.8%
+  (fp4 layers: 56% for about 21% on the base, 17% on E2B-it). Gemma 4 E4B (int8 does not fit): the
+  head and gate / up 0-11, three loops, +0.56% against int8 on E4B-it. Qwen3.5-2B: none qualifies.
+  Qwen3.5-35B-A3B's fp4 head: +1.55% for 13%, so it stays int8. Gemma 4 26B-A4B: all dense layers in
+  fp4 fail (+7.9% for 56%); its ranges are not run yet. On the card the mixes run at the predicted
+  speed (within 0.1%), and their images give the ISA simulator's tokens (Phi's and SmolLM3's through
+  a proxy).
 
 ## Formats strings
 
 `"kind=fmt,kind@a-b=fmt,..."`, fmt one of int8, int4, fp4 and nvfp4, a..b checkpoint layers.
 The formats are the MX MXU's ([mx_mxu.md](mx_mxu.md), [quant.md](quant.md) "The MX formats"):
 int8 is int8x, int4 int4x, fp4 fp4x6 and nvfp4 NVIDIA's NVFP4; any kind may take any of them.
-The scans and mixes on this page were measured on the MXU before MX (fp4 with bf16 block scales,
-a8 per 128); the mixes stay until they are scanned again in the MX formats. A rule
+The scans on this page were measured on the MXU before MX (fp4 with bf16 block scales, a8 per
+128); the mixes (`formats.MIXES`) are the MX formats' per-kind choices ([mx_mxu.md](mx_mxu.md)
+3.6). A rule
 with a range wins over one without; among equals the first one wins. The kinds: attn, mlp
 (the default of gateup and down), gateup, down and head (no range); LFM2 also conv, Qwen3.5
 also delta (the DeltaNet mixer). The string comes from the caller, else `OTPU_FORMATS`, else
@@ -53,7 +65,7 @@ the model's own default.
 string. `formats.mix_for` finds a checkpoint's mix in `formats.MIXES` by its text config's
 (model_type, num_hidden_layers, hidden_size, vocab_size); a model without one refuses "mix".
 `otpu-chat`'s default, `--wformat auto` (`formats.auto`), is "mix" where the model has one and
-int8 elsewhere; it prints the formats it chose (`weights: mix: int8 + gateup@9-35=fp4, head
+int8 elsewhere; it prints the formats it chose (`weights: mix: int8 + gateup@9-35=nvfp4, head
 int8`), and `otpu-smi` shows them. `Engine`'s own default stays int8.
 
 ## Layouts, runs and IMEM
@@ -135,6 +147,15 @@ LM head stays int8 in every mix.
 A default needs at least 1 SE of margin under its bar, so that the noise of one text cannot
 flip it. A faster mix that qualifies inside 1 SE is not the default; it is listed below with
 its numbers, as an opt-in through `OTPU_FORMATS` (with `wformat="mix"` or int8).
+
+On the MX MXU (the user's decision, 2026-10-12) the rule takes the MX formats against MX int8
+(int8x): dKL and the gain are measured against it, not against the int8 before MX. A kind
+takes NVFP4 rather than fp4x6 only where NVFP4's dKL gain over fp4x6 beats 0.1 x its
+decode-time cost (its extra bytes, 4.5 against 4.25 bits a weight with the row words, through
+T(b)) by at least 1 SE, paired against MX int8. MX's own accuracy gain does not buy faster
+mixes: a mix puts no more weights in 4-bit than its choice before MX. The per-kind scan is
+[mx_mxu.md](mx_mxu.md) 3.6 (`tools/exp/mx_formats.py`); the choices are in "In short" above,
+the sections below are the scans before MX.
 
 ## Choices
 

@@ -482,11 +482,11 @@ a checkpoint without a chat template (`chat_template.jinja`, `chat_template.json
 tokenizer_config.json's) before it loads, naming the instruct checkpoint where it knows one;
 `--raw` feeds the turns' text as is, after the tokenizer's BOS.
 
-`--wformat auto`, the default, takes the model's recommended mix of int8 and fp4 layers where it
-has one (Phi-4-mini, SmolLM3-3B, LFM2-2.6B, Qwen3.5-4B: [formats.md](formats.md)) and int8
+`--wformat auto`, the default, takes the model's recommended mix of int8 and 4-bit layers where
+it has one (Phi-4-mini, SmolLM3-3B, LFM2-2.6B, Qwen3.5-4B: [formats.md](formats.md)) and int8
 elsewhere (Gemma 4 E2B-it: every mix fails on it); `int8`, `fp4` and `mix` choose explicitly,
 and `--head-format` sets the LM head's. The tool prints the formats it chose (`weights: mix:
-int8 + gateup@9-35=fp4, head int8`); the interface's header and `/stats` panel show them, and
+int8 + gateup@9-35=nvfp4, head int8`); the interface's header and `/stats` panel show them, and
 otpu-smi's process line.
 
 The sampling flags (`--temperature`, `--top-k`, `--top-p` from 0 to 1, where 0 keeps only the

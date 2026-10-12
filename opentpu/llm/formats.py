@@ -30,12 +30,13 @@ MIX = "mix"                 # the named choice: int8 with the model's mix (Spec.
 AUTO = "auto"               # "mix" where the model has one, else int8 (otpu-chat's default)
 
 # the recommended mixes over int8 (wformat "mix", docs/formats.md), by (model_type, layers,
-# hidden size, vocabulary) of the checkpoint's config
+# hidden size, vocabulary) of the checkpoint's config: the MX formats' per-kind choices
+# (docs/mx_mxu.md 3.6), int8 kinds int8x
 MIXES: dict = {
-    ("phi3", 32, 3072, 200064): "mlp@4-29=fp4",                 # Phi-4-mini
-    ("qwen3_5_text", 32, 2560, 248320): "delta=fp4,mlp=fp4",    # Qwen3.5-4B
-    ("smollm3", 36, 2048, 128256): "gateup@9-35=fp4",           # SmolLM3-3B
-    ("lfm2", 30, 2048, 65536): "conv=fp4,mlp=fp4",              # LFM2-2.6B
+    ("phi3", 32, 3072, 200064): "gateup@4-29=nvfp4,down@4-29=fp4",  # Phi-4-mini
+    ("qwen3_5_text", 32, 2560, 248320): "delta=fp4,mlp=nvfp4",       # Qwen3.5-4B
+    ("smollm3", 36, 2048, 128256): "gateup@9-35=nvfp4",              # SmolLM3-3B
+    ("lfm2", 30, 2048, 65536): "conv=nvfp4,gateup=nvfp4,down=fp4",   # LFM2-2.6B
     # Gemma 4 E2B: none. Its base checkpoint's mix (attn@15-24=fp4,mlp@15-34=fp4) fails on
     # gemma-4-E2B-it, the chat's, as every other mix (the same config: one entry for both)
 }

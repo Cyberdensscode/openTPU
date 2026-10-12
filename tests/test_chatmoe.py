@@ -25,7 +25,6 @@ ROOT = Path(__file__).resolve().parents[1]
 CFG = board_config(DRAM_BYTES=1 << 26)      # 64 MiB: the tiny images and 2 slots a layer
 K = 2                                       # slots a layer (the tiny models' top k)
 N = 6                                       # tokens a reply
-FORMATS = {"qwen35": ("fp4", "int8"), "lfm2": ("fp4", "int8"), "gemma4": ("int8", "fp4")}
 
 
 class Tok:
@@ -88,13 +87,15 @@ def ckpt(request, tmp_path_factory):
 
 @pytest.fixture
 def formats(ckpt, monkeypatch):
-    """The family's weight formats on the card (streamed.defaults), as moe_card takes them:
-    Gemma 4's experts in fp4 beside int8 layers through OTPU_FORMATS."""
+    """The family's weight formats on the card (streamed.FORMATS), as moe_card takes them: the
+    formats string through OTPU_FORMATS (Qwen3.5's nvfp4 layers beside fp4 experts, Gemma 4's
+    fp4 experts beside int8 layers); LFM2 nvfp4 throughout."""
     fam, _ = ckpt
     monkeypatch.delenv("OTPU_FORMATS", raising=False)
-    if fam == "gemma4":
-        monkeypatch.setenv("OTPU_FORMATS", "experts=fp4")
-    return FORMATS[fam]
+    wf, hf, f = ST.FORMATS[fam]
+    if f:
+        monkeypatch.setenv("OTPU_FORMATS", f)
+    return wf, hf
 
 
 def _moe_card():
@@ -116,14 +117,18 @@ def _until_eos(tokens, eos):
 
 
 def test_streamed_defaults_are_the_cards_runs():
-    """--wformat auto for a streamed MoE: the formats each family ran with on the card (docs/
-    offload.md 10, 11.5); the pool's default place is the checkpoint's directory."""
+    """--wformat auto for a streamed MoE: each family's formats on the card (docs/offload.md
+    14.2: the MX formats' per-kind choices); the pool's default place is the checkpoint's
+    directory, named by the experts' format."""
     from opentpu.llm import gemma4, lfm2, qwen35
-    assert ST.defaults(object.__new__(qwen35.Spec)) == ("fp4", "int8", None)
-    assert ST.defaults(object.__new__(lfm2.Spec)) == ("fp4", "int8", None)
+    assert ST.defaults(object.__new__(qwen35.Spec)) == \
+        ("fp4", "int8", "attn=nvfp4,delta=nvfp4,mlp=nvfp4")
+    assert ST.defaults(object.__new__(lfm2.Spec)) == ("nvfp4", "int8", None)
     assert ST.defaults(object.__new__(gemma4.Spec)) == ("int8", "fp4", "experts=fp4")
     assert ST.default_pool("models/Qwen3.5-35B-A3B", "fp4") == \
         Path("models/Qwen3.5-35B-A3B/pool-fp4.bin")
+    assert ST.default_pool("models/LFM2.5-8B-A1B", "nvfp4") == \
+        Path("models/LFM2.5-8B-A1B/pool-nvfp4.bin")
 
 
 def test_a_chat_turn_is_moe_cards_run(ckpt, formats, tmp_path):
@@ -376,7 +381,7 @@ def test_otpu_chat_runs_a_streamed_moe(tmp_path, monkeypatch, capfd):
     C.main(argv)
     out = capfd.readouterr().out
     assert f"experts: {6 * K} slots of 48 experts (25%)" in out and str(pool) in out
-    assert "weights: fp4, head int8" in out
+    assert "weights: fp4 + attn=nvfp4,delta=nvfp4,mlp=nvfp4, head int8" in out
     assert "% hits" in out and "MB/token" in out and "misses in the prompt" in out
     with pytest.raises(SystemExit, match="runs on the ISA simulator or the card"):
         C.main(argv + ["--backend", "board-sim"])
@@ -398,9 +403,9 @@ def test_otpu_chat_clamps_the_models_top_k(tmp_path, monkeypatch, capfd):
     monkeypatch.setattr(C.Chat, "ask_plain", lambda self, text: (
         on_card.append((self.on_card, self.pick.params["top_k"], self.eng._snaps is not None)),
         plain(self, text, sys.stdout)))
-    pool = d / "pool-fp4.bin"
-    _pack_pool(d, pool, "init", monkeypatch=monkeypatch)
-    _pack_pool(d, pool, "pack", 0, 1, monkeypatch=monkeypatch)
+    pool = d / "pool-nvfp4.bin"                 # (LFM2's experts are nvfp4: streamed.FORMATS)
+    _pack_pool(d, pool, "init", "--wformat", "nvfp4", monkeypatch=monkeypatch)
+    _pack_pool(d, pool, "pack", 0, 1, "--wformat", "nvfp4", monkeypatch=monkeypatch)
     argv = ["--model", str(d), "--prompt", "11 22 33", "--max-new", "3", "--experts", str(K)]
     capfd.readouterr()
     C.main(argv)

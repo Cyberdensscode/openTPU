@@ -119,20 +119,21 @@ def test_device_follows_hf_and_routes_on_the_card(tiny):
     assert eng.server.misses == 0
 
 
-def test_padded_expert_width(tiny):
+@pytest.mark.parametrize("wformat", ["fp4", "nvfp4"])
+def test_padded_expert_width(tiny, wformat):
     """An expert width that is not a whole number of its format's chunks (2D for 4-bit: 384
     here, Gemma 4's 704) is padded in the slot with zero rows of W_gate / W_up and zero columns
     of W_down (moe.ExpertFormat; exact, act(0) * 0 = 0): the logits follow the 4-bit
     emulation of the unpadded model (as the 256-wide model's do: median cosine 0.989; a token
     whose routing turns on a near-tie differs), and a small cache gives the full cache's bit for
-    bit."""
+    bit. LFM2.5-8B-A1B's experts are nvfp4 (streamed.FORMATS)."""
     _, W, spec = _tiny(F=384)
     toks = [int(t) for t in np.random.default_rng(1).integers(0, 1000, 10)]
-    full = _engine(spec, W, wformat="fp4")
+    full = _engine(spec, W, wformat=wformat)
     assert (full.image.fmt.F0, full.image.fmt.F) == (384, 512)
     ref = np.array([full.step(t) for t in toks])
-    assert np.median(_cos(ref, emulated_logits(spec, W, toks, wformat="fp4"))) > 0.99
-    small = _engine(spec, W, experts=K, wformat="fp4")
+    assert np.median(_cos(ref, emulated_logits(spec, W, toks, wformat=wformat))) > 0.99
+    small = _engine(spec, W, experts=K, wformat=wformat)
     got = np.array([small.step(t) for t in toks])
     assert small.server.misses > len(toks)
     assert np.array_equal(got.view(np.uint32), ref.view(np.uint32))
@@ -192,7 +193,7 @@ def test_moe_ffn_beside_and_no_residual(tiny, monkeypatch):
     assert n[0] > 0 and card.waits > 0
 
 
-@pytest.mark.parametrize("wformat", ["int8", "fp4"])
+@pytest.mark.parametrize("wformat", ["int8", "fp4", "nvfp4"])
 def test_small_cache_is_bit_exact(tiny, wformat):
     """k slots per layer: nearly every request misses and streams; the logits do not move."""
     _, W, spec = tiny

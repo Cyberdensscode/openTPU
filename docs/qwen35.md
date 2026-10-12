@@ -116,7 +116,8 @@ run by run, `Image.loc` / `Image._off`): the int8 image without lookup tables go
 MiB to 763 at a 256-token capacity and to 786 at 4096; the 35B-A3B's with 16 expert slots per
 layer from 4040 to 3957 MiB at 256 tokens. A second layer layout would need a second loop
 body (about 2,000 more instructions), so a Qwen3.5 mix has one layout: the 4B's recommended
-mix (`wformat="mix"`) is `delta=fp4,mlp=fp4`, the 2B has none (`docs/formats.md`).
+mix (`wformat="mix"`) is `delta=fp4,mlp=nvfp4` (before MX `delta=fp4,mlp=fp4`), the 2B has
+none (`docs/formats.md`).
 
 ## Fewer key heads than value heads
 

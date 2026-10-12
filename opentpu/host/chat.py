@@ -900,7 +900,7 @@ def _maps_on_design(spec) -> bool:
 
 def weights_label(image, wformat: str) -> str:
     """An image's weight formats in words, as otpu-chat and otpu-smi show them: "mix: int8 +
-    gateup@9-35=fp4, head int8" (wformat the choice before formats.named: "mix" names it)."""
+    gateup@9-35=nvfp4, head int8" (wformat the choice before formats.named: "mix" names it)."""
     rest = ",".join(i for i in (image.formats or "").replace(" ", "").split(",")
                     if i and not i.startswith("head="))
     return (f"{FM.MIX}: " if wformat == FM.MIX else "") + image.wformat + \
