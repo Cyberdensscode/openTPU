@@ -45,8 +45,9 @@ module otpu_slice
   parameter int ULANES     = LANES,   // TMEM lanes of the MXU and the quantizer (<= LANES)
   parameter int PQ_WIN     = 64,      // cycles per P/Q counter window (+bucket= in simulation)
   parameter bit HAS_DSTEP  = 1'b1,    // streams (DSTEP, STREAM): SE's tail in the VPU
-  parameter int TMEM_IMPL  = 0        // TMEM: 0 a copy per read port (FPGA block RAM), 1 banked
+  parameter int TMEM_IMPL  = 0,       // TMEM: 0 a copy per read port (FPGA block RAM), 1 banked
                                       //   (three copies of 1R1W RAMs: an ASIC; otpu_tmem)
+  parameter bit SEQ_WC     = 1'b0     // EXPERIMENTAL: otpu_seq's wait counts (WAITC, docs/seq_vpu.md)
 ) (
   input  logic          clk,
   input  logic          sys_rst,
@@ -145,10 +146,12 @@ module otpu_slice
   logic        dma_err;           // a WAITW timed out: the slice stops with an error (to_err)
   logic [31:0] sq_icount, sq_cha, sq_chn, rl_val;
   otpu_seq #(.IMEM_WORDS(IMEM_WORDS), .TMEM_WORDS(TMEM_WORDS), .SID(SID), .S(S), .D(D),
-             .WIN(WIN), .STREAMS(HAS_SS)) u_seq (
+             .WIN(WIN), .STREAMS(HAS_SS), .WAITC(SEQ_WC)) u_seq (
     .clk, .rst(srst), .ucmd, .ustart, .urel, .urdy, .udone, .halted(sq_halted), .error(sq_err),
     .icount(sq_icount), .ev(sq_ev), .rinit, .rl_v, .rl_val, .ch_req(sq_ch), .ch_addr(sq_cha),
-    .ch_n(sq_chn), .im_we, .im_row, .im_data(b_rdata));
+    .ch_n(sq_chn), .im_we, .im_row, .im_data(b_rdata),
+    // the wait counts' loader port: not wired yet (simulation loads them, +hz_sync)
+    .sc_we(1'b0), .sc_row('0), .sc_data('0));
 
   // ---- HALT CHAIN: reload IMEM from the chained program's address, the units held in reset.
   // A WAITW timeout (dma_err) stops the slice until rst: to_err holds the sequencer and the

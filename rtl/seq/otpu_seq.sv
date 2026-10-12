@@ -37,8 +37,14 @@ module otpu_seq
   parameter int S          = 1,
   parameter int D          = 32,
   parameter int WIN        = 16,
-  parameter bit STREAMS    = 1'b1     // the stream engine (otpu_slice HAS_SS); 0: DSTEP and STREAM
+  parameter bit STREAMS    = 1'b1,    // the stream engine (otpu_slice HAS_SS); 0: DSTEP and STREAM
                                       //   are illegal instructions (ERROR), not a wait for SE
+  // EXPERIMENTAL (docs/seq_vpu.md): WAITC 1 takes the dependencies from wait counts the compiler
+  // writes beside each instruction (a sidecar word per instruction: 4 bits per unit, k = 0 no
+  // wait, else wait until the unit's k-th last instruction before this one has completed; and
+  // the MM's stream start's k for the DMA and the quantizer) instead of comparing footprints:
+  // no footprints, no range compares, every unit in order. 0: today's scoreboard.
+  parameter bit WAITC      = 1'b0
 ) (
   input  logic                clk,
   input  logic                rst,
@@ -60,7 +66,11 @@ module otpu_seq
   // IMEM write port (the loader; used while the slice is held in reset)
   input  logic                im_we,
   input  logic [31:0]         im_row,
-  input  logic [D*8-1:0]      im_data
+  input  logic [D*8-1:0]      im_data,
+  // WAITC: the wait counts' write port (a row of D / 32 sidecar words)
+  input  logic                sc_we,
+  input  logic [31:0]         sc_row,
+  input  logic [D-1:0]        sc_data
 );
   localparam int SW = $clog2(WIN);
   localparam int IPR = D / 32;                   // instructions per IMEM row
@@ -375,6 +385,47 @@ module otpu_seq
       ir_v <= 1'b1;
     end
   end
+  // WAITC: the sidecar RAM of wait counts, read beside IMEM (the same rows, D / 32 words)
+  logic [31:0] ir_sync;           // the wait counts of the instruction at pc
+  if (WAITC) begin : g_sync
+    logic [D-1:0] srow;
+    otpu_ram_1r1w #(.W(D), .N(NROW), .STYLE("auto"), .ZERO(1'b0)) u_sync (
+      .clk, .we(sc_we), .wa(RW'(sc_row)), .wd(sc_data), .re(fe), .ra(RW'(fa_n / IPR)),
+      .rd(srow));
+    always_ff @(posedge clk) if (!rst && ld) ir_sync <= srow[32 * (fa % IPR) +: 32];
+`ifndef SYNTHESIS
+    // simulation: the wait counts from +hz_sync=FILE (lines "pc k0 .. k6 n", +hz_kout's form:
+    // the compiler's insertion emulated by the oracle), each clamped to +hz_kclamp; an
+    // instruction the file does not name waits for every unit's last instruction (k = 1)
+    initial begin
+      string fn;
+      int fd, pc, r, n, kc;
+      int k [7];
+      kc = 0;
+      void'($value$plusargs("hz_kclamp=%d", kc));
+      for (int rr = 0; rr < NROW; rr++)
+        for (int w = 0; w < IPR; w++) u_sync.g_auto.mem[rr][32 * w +: 32] = 32'h0111_1111;
+      if ($value$plusargs("hz_sync=%s", fn)) begin
+        fd = $fopen(fn, "r");
+        if (fd == 0) $fatal(1, "otpu_seq: +hz_sync=%s: cannot open", fn);
+        while (!$feof(fd)) begin
+          r = $fscanf(fd, "%d %d %d %d %d %d %d %d %d\n", pc, k[0], k[1], k[2], k[3], k[4],
+                      k[5], k[6], n);
+          if (r >= 8 && pc >= 0 && pc < IMEM_WORDS / 8) begin
+            logic [31:0] wd;
+            wd = '0;
+            for (int j = 0; j < 7; j++)
+              wd[4 * j +: 4] = 4'((kc > 0 && k[j] > kc) ? kc : (k[j] > 15) ? 15 : k[j]);
+            u_sync.g_auto.mem[pc / IPR][32 * (pc % IPR) +: 32] = wd;
+          end
+        end
+        $fclose(fd);
+      end
+    end
+`endif
+  end else begin : g_nosync
+    assign ir_sync = '0;
+  end
   logic [31:0] iw [8];
   always_comb for (int k = 0; k < 8; k++) iw[k] = ir[32 * k +: 32];
   wire [7:0] op    = iw[0][7:0];
@@ -426,7 +477,9 @@ module otpu_seq
   wire         c_go = c_v && have_free;
   wire         q_adv = !c_v || c_go;            // Q hands its instruction to C
   wire         s_adv = !q_v || q_adv;           // S hands its instruction to Q
-  wire         p_adv = !s_v || s_adv;           // P hands its instruction to S
+  // P hands its instruction to S (WAITC: to C, no footprint stages)
+  wire         p_adv = WAITC ? (!c_v || c_go) : (!s_v || s_adv);
+  logic [31:0] p_sync, c_sync;                  // WAITC: the instruction's wait counts
   wire         r_take = !p_v || p_adv;          // P can take the instruction at R
   wire         pipe_empty = !p_v && !s_v && !q_v && !c_v;
   // R retires a control instruction this cycle (NOP, HALT, LI, ADDI, a LOOP's second cycle)
@@ -470,7 +523,35 @@ module otpu_seq
       if (hz_wc) begin ndep = wc_dep; ndepd = wc_depd; end
     end
 `endif
+    if (WAITC) begin ndep = '0; ndepd = '0; end   // the wait counts instead (w_all, w_dram)
   end
+
+  // ---- WAITC: per unit, its instructions dispatched (wd_n) and completed (wc_n), and per slot
+  // the counts its waits need: wait j (j < NUNITS: unit j; 5, 6: the DMA's and the quantizer's
+  // for an MM's stream start) holds until wc_n of its unit reaches wt (its producer's index + 1;
+  // the counters wrap, so the test is on the sign of the difference: a slot's target stays
+  // within WIN of the count). The unit's own wait is ignored except the VPU's: every unit starts
+  // in order, and all but the VPU complete in order too.
+  localparam int CW = 8;
+  localparam int NWT = NUNITS + 2;
+  logic [CW-1:0]    wd_n [NUNITS], wc_n [NUNITS];
+  logic [CW-1:0]    wt [WIN][NWT];
+  logic [NWT-1:0]   wv [WIN];
+  logic [WIN-1:0]   w_all, w_dram;            // the slot's waits (all / the stream's) are met
+  function automatic int wunit(input int j);
+    return (j < NUNITS) ? j : (j == NUNITS) ? U_DMA : U_Q;
+  endfunction
+  always_comb
+    for (int i = 0; i < WIN; i++) begin
+      logic [NWT-1:0] ok;
+      for (int j = 0; j < NWT; j++) begin
+        logic [CW-1:0] df;
+        df = wc_n[wunit(j)] - wt[i][j];
+        ok[j] = !wv[i][j] || !df[CW-1];
+      end
+      w_all[i] = &ok[NUNITS-1:0];
+      w_dram[i] = ok[NUNITS] && ok[NUNITS+1];
+    end
 
   // ---- loop-end handling for the instruction at pc
   logic        at_end;
@@ -557,8 +638,8 @@ module otpu_seq
   // in parallel with the selection and AND-ORed with sel -- no slot id on the can_start path
   always_comb begin
     for (int i = 0; i < WIN; i++) begin
-      mrdy[i] = (sdepd[i] & ~same_started[U_MXU]) == '0;
-      crdy[i] = (sdep[i] & ~same_started[U_COLL]) == '0;
+      mrdy[i] = WAITC ? w_dram[i] : (sdepd[i] & ~same_started[U_MXU]) == '0;
+      crdy[i] = WAITC ? w_all[i] : (sdep[i] & ~same_started[U_COLL]) == '0;
     end
     for (int u = 0; u < NUNITS; u++) begin
       logic [WIN-1:0] cand;
@@ -580,6 +661,20 @@ module otpu_seq
       else    // cand already requires readiness
         can_start[u] = cand_any[u] && urdy[u] && !ustart[u];
     end
+    // WAITC: every unit considers its oldest instruction only (the wait counts suppose it)
+    if (WAITC)
+      for (int u = 0; u < NUNITS; u++)
+        if (u != U_MXU && u != U_COLL) begin
+          logic [WIN-1:0] c2;
+          start_slot[u] = '0;
+          for (int i = 0; i < WIN; i++) c2[i] = sv[i] && !sstarted[i] && soh[i][u];
+          for (int i = 0; i < WIN; i++) begin
+            sel[u][i] = c2[i] && (older[i] & c2) == '0;
+            if (sel[u][i]) start_slot[u] |= SW'(i);
+          end
+          cand_any[u] = |c2;
+          can_start[u] = |(sel[u] & w_all) && urdy[u] && !ustart[u];
+        end
 `ifndef SYNTHESIS
     // +hz_ino: the DMA, the quantizer and the VPU start their oldest instruction only, as the
     // MXU and the collective unit do
@@ -605,7 +700,8 @@ module otpu_seq
 
   // MXU release: the oldest started, unreleased MM once all its dependencies are clear
   wire [SW-1:0] rel_slot = uq[U_MXU][uq_r[SW-1:0]];
-  wire          can_rel  = (uq_r != uq_t[U_MXU]) && (sdep[rel_slot] & ~same_started[U_MXU]) == '0;
+  wire          can_rel  = (uq_r != uq_t[U_MXU]) &&
+                           (WAITC ? w_all[rel_slot] : (sdep[rel_slot] & ~same_started[U_MXU]) == '0);
 
   // Each unit's command is read from the window as the unit starts, at the slot it starts, into a
   // register (ucmd): a slot's command is written only at dispatch and stays until the slot
@@ -646,6 +742,8 @@ module otpu_seq
   // for coverage on the footprints as they are (raw)
   fp_t c_ref, c_raw;
   fp_t sfp_ref [WIN], sfp_raw [WIN];
+  logic [7:0]  sidx [WIN];                   // WAITC: the slot's index among its unit's
+  logic [31:0] spc [WIN];
 
   // fp_seg's hull in otpu_pkg form: two TMEM write ranges (only MM with RMAX) become one
   function automatic fp_t fp_hull(input fp_t f);
@@ -674,6 +772,7 @@ module otpu_seq
       for (int i = 0; i < 8; i++) R[i] <= '0;
       for (int i = 0; i < 8; i++) R[8 + i] <= rinit[i];
       for (int u = 0; u < NUNITS; u++) begin uq_h[u] <= '0; uq_t[u] <= '0; end
+      for (int u = 0; u < NUNITS; u++) begin wd_n[u] <= '0; wc_n[u] <= '0; end
       for (int i = 0; i < WIN; i++) sdep[i] <= '0;
 `ifndef SYNTHESIS
       sdone <= '0;
@@ -690,7 +789,7 @@ module otpu_seq
       // the segregated footprints give exactly otpu_pkg's conflict() and conflict_dram(); a
       // footprint whose TMEM ranges overflowed rt_t (all raised by fp_seg) conflicts with all.
       // The hull only adds dependencies: every conflict() of the raw footprints is kept
-      if (c_v)
+      if (c_v && !WAITC)
         for (int i = 0; i < WIN; i++) begin
           logic [1:0] cs;
           cs = conf_s(c_fp, sfp[i]);
@@ -723,6 +822,32 @@ module otpu_seq
           $fatal(1, "otpu_seq: pc %0d both reads and writes DRAM (one dw bit)", q_pc);
       end
 `endif
+`ifndef SYNTHESIS
+      // WAITC: the wait counts cover every dependency conflict() finds on the window (a slot
+      // of the same unit, but the VPU, needs none: it started first)
+      if (WAITC && c_go) begin
+        for (int i = 0; i < WIN; i++)
+          if (sv[i] && !fin[i]) begin
+            int ui;
+            ui = 0;
+            for (int u = 0; u < NUNITS; u++) if (soh[i][u]) ui = u;
+            for (int j = 0; j < NWT; j++)
+              if (wunit(j) == ui && !(ui == int'(c_unit) && ui != U_VPU) &&
+                  ((j < NUNITS) ? conflict(c_ref, sfp_ref[i]) :
+                   c_cmd.op == OP_MM && conflict_dram(c_ref, sfp_ref[i]))) begin
+                logic [3:0] k;
+                logic [CW-1:0] df;
+                k = c_sync[4 * j +: 4];
+                df = wd_n[ui] - CW'(k) - sidx[i];      // the producer's index - the slot's
+                if (k == 0 || df[CW-1])
+                  $fatal(1, "otpu_seq: WAITC: pc %0d's wait %0d (k %0d) misses slot %0d (pc %0d)",
+                         c_pc, j, k, i, spc[i]);
+              end
+          end
+        sidx[free_slot] <= wd_n[c_unit];
+        spc[free_slot] <= c_pc;
+      end
+`endif
       icount <= icount + 32'(r_ret) + 32'(c_go);
       // completions
       if (can_rel) begin
@@ -747,9 +872,10 @@ module otpu_seq
         end
 `endif
       for (int u = 0; u < NUNITS; u++) if (udone[u]) uq_h[u] <= uq_h[u] + 1;
+      for (int u = 0; u < NUNITS; u++) if (WAITC && udone[u]) wc_n[u] <= wc_n[u] + 1'b1;
       // readiness (for the profiler: when did the dependencies clear)
       for (int i = 0; i < WIN; i++)
-        if (sv[i] && !sready[i] && sdep[i] == '0) begin
+        if (sv[i] && !sready[i] && (WAITC ? w_all[i] : sdep[i] == '0)) begin
           sready[i] <= 1'b1;
           srdy_c[i] <= cyc;
         end
@@ -780,6 +906,15 @@ module otpu_seq
         sdep[free_slot] <= ndep;
         sdepd[free_slot] <= ndepd;
         sfp[free_slot] <= c_fp;
+        if (WAITC) begin
+          for (int j = 0; j < NWT; j++) begin
+            logic [3:0] k;
+            k = c_sync[4 * j +: 4];
+            wv[free_slot][j] <= k != 0 && !(wunit(j) == int'(c_unit) && c_unit != U_VPU);
+            wt[free_slot][j] <= wd_n[wunit(j)] - CW'(k) + 1'b1;
+          end
+          wd_n[c_unit] <= wd_n[c_unit] + 1'b1;
+        end
 `ifndef SYNTHESIS
         sdone[free_slot] <= 1'b0;
 `endif
@@ -789,7 +924,7 @@ module otpu_seq
 `endif
       end
       // ---- Q: footprint ranges
-      if (q_adv) begin
+      if (!WAITC && q_adv) begin
         c_v <= q_v;
         if (q_v) begin
           c_cmd <= q_cmd; c_unit <= q_unit; c_pc <= q_pc;
@@ -804,19 +939,31 @@ module otpu_seq
         end
       end
       // ---- S: products
-      if (s_adv) begin
+      if (!WAITC && s_adv) begin
         q_v <= s_v;
         if (s_v) begin
           q_cmd <= s_cmd; q_unit <= s_unit; q_pc <= s_pc;
           q_pr <= fp_sum(s_pp);
         end
       end
-      // ---- P: partial products
+      // ---- P: partial products (WAITC: the instruction goes to C)
       if (p_adv) begin
-        s_v <= p_v;
-        if (p_v) begin
-          s_cmd <= p_cmd; s_unit <= p_unit; s_pc <= p_pc;
-          s_pp <= fp_part(fp_ops(p_cmd, D, S));
+        if (WAITC) begin
+          c_v <= p_v;
+          if (p_v) begin
+            c_cmd <= p_cmd; c_unit <= p_unit; c_pc <= p_pc; c_sync <= p_sync;
+`ifndef SYNTHESIS
+            c_ref <= fp_hull(footprint(p_cmd, D, S));
+            c_raw <= footprint(p_cmd, D, S);
+            c_fpx <= fp_seg(p_cmd.op, footprint(p_cmd, D, S));
+`endif
+          end
+        end else begin
+          s_v <= p_v;
+          if (p_v) begin
+            s_cmd <= p_cmd; s_unit <= p_unit; s_pc <= p_pc;
+            s_pp <= fp_part(fp_ops(p_cmd, D, S));
+          end
         end
       end
       if (r_take) p_v <= 1'b0;
@@ -866,7 +1013,7 @@ module otpu_seq
               halted <= 1'b1;
             end else if (r_take) begin
               p_v <= 1'b1;
-              p_cmd <= dcmd; p_unit <= 3'(dunit); p_pc <= pc;
+              p_cmd <= dcmd; p_unit <= 3'(dunit); p_pc <= pc; p_sync <= ir_sync;
               advance();
               if (op == OP_RLD) begin
                 rl_wait <= 1'b1;

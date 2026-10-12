@@ -8,8 +8,9 @@
 #     simulator plusargs (otpu_seq's +hz_*, otpu_vpu's +vt_*); HZLOG=1 writes otpu_seq's hazard
 #     statistics to <outdir>/<tag>.<n>.hz; KOUT=1 writes the wait-count oracle to
 #     <outdir>/<wl>.<n>.k; WC=1 runs on the wait counts of <outdir>/<wl>.<n>.k (a KOUT
-#     candidate's, run first); KOUT=x / WC=x: <outdir>/<wl>.x.<n>.k. <n> counts a tool's
-#     simulations (the MoE tool runs one per prefix).
+#     candidate's, run first); KOUT=x / WC=x: <outdir>/<wl>.x.<n>.k; SYNC=1 / SYNC=x: the same
+#     file as otpu_seq WAITC's wait counts (OTPU_SEQ_WC=1). <n> counts a tool's simulations (the
+#     MoE tool runs one per prefix).
 # Results: <outdir>/<workload>__<candidate>.log (ends with rc=N and the wall time). A run whose
 # log ends in rc=0 is skipped. Usage, from anywhere:
 #   rtl/exp/seq_vpu/run_cosim.sh <outdir> <P> <workloads> <candidates> NAME...
@@ -37,6 +38,8 @@ one() {   # workload candidate args...
       KOUT=*) pa="$pa,+hz_kout=$O/$wl.${kv#KOUT=}.%n.k" ;;
       WC=1) pa="$pa,+hz_wc=$O/$wl.%n.k" ;;
       WC=*) pa="$pa,+hz_wc=$O/$wl.${kv#WC=}.%n.k" ;;
+      SYNC=1) pa="$pa,+hz_sync=$O/$wl.%n.k" ;;
+      SYNC=*) pa="$pa,+hz_sync=$O/$wl.${kv#SYNC=}.%n.k" ;;
       OTPU_SIM_PLUSARGS=*) pa="$pa,${kv#OTPU_SIM_PLUSARGS=}" ;;
       *) env+=("$kv") ;;
     esac

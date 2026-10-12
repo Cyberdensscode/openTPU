@@ -37,6 +37,11 @@ wc1 OTPU_SIM_PLUSARGS=+hz_ino=1,+hz_kclamp=1 WC=1 HZLOG=1
 # a compiler that knows the ranges to 256-word / 1 MB granules only (its oracle: i0g8, run first)
 i0g8 OTPU_SIM_PLUSARGS=+hz_rh=1,+hz_dh=1,+hz_tg=8,+hz_dg=20,+hz_kc=1 KOUT=g8
 wcg8 OTPU_SIM_PLUSARGS=+hz_ino=1 WC=g8
+# the WAITC finalist (otpu_seq WAITC 1: no footprints, the counts from a sidecar word per
+# instruction, here the oracle's), bit-exact against the ISA where perf_qwen runs (--check);
+# wcr1: one bit a unit
+wcr OTPU_SEQ_WC=1 SYNC=1 HZLOG=1
+wcr1 OTPU_SEQ_WC=1 OTPU_SIM_PLUSARGS=+hz_kclamp=1 SYNC=1
 # per-unit queues instead of the shared window (caps per unit: DMA, MXU, QUANT, VPU, COLL)
 inoq4 OTPU_SIM_PLUSARGS=+hz_ino=1,+hz_uq=4:4:4:4:2
 wcq4 OTPU_SIM_PLUSARGS=+hz_ino=1,+hz_uq=4:4:4:4:2 WC=1

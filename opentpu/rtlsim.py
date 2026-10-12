@@ -176,6 +176,10 @@ if UARCH["MXU_IMPL"] == 1:
 # VPU lanes with the composite functions (exp2, recip, rsqrt; timing only): OTPU_VPU_CL=4
 if os.environ.get("OTPU_VPU_CL"):
     UARCH["VPU_CL"] = int(os.environ["OTPU_VPU_CL"])
+# EXPERIMENTAL (docs/seq_vpu.md): otpu_seq's wait counts instead of its scoreboard (WAITC; the
+# counts from +hz_sync, OTPU_SIM_PLUSARGS): OTPU_SEQ_WC=1
+if os.environ.get("OTPU_SEQ_WC"):
+    UARCH["SEQ_WC"] = BOARD_UARCH["SEQ_WC"] = int(os.environ["OTPU_SEQ_WC"])
 # TMEM lanes of the MXU and the quantizer when fewer than LANES (timing only): OTPU_ULANES=8
 if os.environ.get("OTPU_ULANES"):
     UARCH["ULANES"] = int(os.environ["OTPU_ULANES"])
