@@ -1837,13 +1837,17 @@ def _worker_decode(blocks: int, lo: int):
 
 def layer_programs(image, key, block: int, hint: bool = False, em: bool = False):
     """Engine.prefill_layers' run of `key`: (layer (-1: the embed run), blocks, rows,
-    embedded), (layer, None, rows, True, compile-time position), ("x", layer) (an expert run)
-    or "head" -> (programs, run_args); hint: a layer's run ends with the next MoE layer's hint
+    embedded), (layer, None, rows, True, compile-time position), (layer, blocks, rows, True,
+    "tile") (an expert-major run tiled: Engine.layer_tile), ("x", layer) (an expert run) or
+    "head" -> (programs, run_args); hint: a layer's run ends with the next MoE layer's hint
     (Engine's layer_ahead "hint"); em: expert-major (Engine's expert_major)."""
     if key == "head":
         return image.compile_prefill_head(**({"em": True} if em else {}))
     if key[0] == "x":
         return image.compile_expert_run(key[1])
+    if key[-1] == "tile":
+        from . import tiled as TL
+        return TL.compile_layer_tile(image, key[0], key[1], key[2], block)
     kw = {"hint": True} if hint and key[0] >= 0 else {}
     if em:
         kw["em"] = True
@@ -2053,7 +2057,8 @@ class Engine:
     the pipeline, bucket 1's are loaded or compiled on a thread as the engine starts
     (prefill.warm). tile_runs (docs/tiled_prefill.md; None: OTPU_TILE=1 turns them on): the
     prompt runs tiled (opentpu/llm/tiled.py), up to ACT_ROWS rows a run, the image's I/O rows
-    at least ACT_ROWS.
+    at least ACT_ROWS; with expert_major a MoE model's layer runs of more than one row
+    (layer_tile: tiled.compile_layer_tile, on an image built with OTPU_TILE=1: its mask tiles).
 
     rollback(k) takes the context back to its first k tokens (a chat's next turn, whose
     template renders the last reply differently from what was fed: opentpu/llm/snapshot.py).
@@ -2199,6 +2204,15 @@ class Engine:
                                       and not self.layer_hint):
             raise ValueError("expert-major MoE needs layer-major prefill, the expert server "
                              "with pooled slots, and no layer hints (its runs post needs)")
+        # expert-major runs of more than one row tiled (tile_runs, None: OTPU_TILE; tiled.py's
+        # compile_layer_tile: the layer's weights once for the run's rows, up to ACT_ROWS of
+        # them; the image's mask tiles, which OTPU_TILE gives a MoE image as it is built)
+        from . import tiled as TL
+        self.layer_tile = bool(self.expert_major and PF.tile_flag(tile_runs)
+                               and TL.layer_family(self.image))
+        if self.layer_tile and self.layer_major > self.cfg.act_rows:
+            raise ValueError(f"tiled layer runs of {self.layer_major} rows: one MM over them "
+                             f"needs ACT_ROWS >= {self.layer_major} ({self.cfg.act_rows})")
         self._gens: dict = {}               # the generate loop: (blocks, mode) -> programs
                                             # (a list, or split: (first parts, second parts))
         self.gen_split = None               # split generate programs: None when a bucket's
@@ -2727,8 +2741,10 @@ class Engine:
                     else:
                         n = min(R, len(part) - i, B - p % B)
                         gather = li == 0 and (R == 1 or host)   # (the run gathers its rows:
-                        runs.append(((li, p // B + 1, n, R > 1 and not gather),  # the host's)
-                                     dict(RunPos.values(part[i], p, K, B), row=i),
+                        key = (li, p // B + 1, n, R > 1 and not gather)     # the host's)
+                        if self.layer_tile and n > 1 and not gather:
+                            key += ("tile",)                    # (tiled.compile_layer_tile)
+                        runs.append((key, dict(RunPos.values(part[i], p, K, B), row=i),
                                      part[i:i + n] if gather else None))
                     i += n
                 if em and li >= mo.first:               # the layer's expert run

@@ -33,7 +33,10 @@ today's: they already stream each weight once a run, pair of heads by pair) and 
 
 Prompt runs (opentpu/llm/prefill.py, docs/prefill.md) take this kernel when the engine's
 tile_runs (or OTPU_TILE=1) is on: compile_tile_run's programs at a run-time position of a
-bucket, their tokens from out[], as compile_prompt_run's.
+bucket, their tokens from out[], as compile_prompt_run's. A MoE model's expert-major layer runs
+(docs/offload.md 13.11) take it as well (Engine.layer_tile: gemma4_layer_tile, T rows of a
+chunk through one layer from their records; compile_layer_tile), the mixer's and the dense
+MLP's weights once for the T rows, the experts left to the layer's expert run as today.
 """
 from __future__ import annotations
 
@@ -41,7 +44,7 @@ import math
 
 from .. import isa as I
 from .. import language as ol
-from ..compiler import Affine, CompileError, current, trace_fit
+from ..compiler import Affine, CompileError, Tensor, current, trace_fit
 from ..kernels.attention import RowMasks, RowTiles, TileSeq, _attend_heads
 from ..kernels.lib import sigmoid, silu
 from ..kernels.mlp import _chunk
@@ -270,16 +273,18 @@ def down_chunk(wg, wd) -> int:
     return _chunk(wg.shape[0], D, D if wd.wf == 0 else 2 * D)
 
 
-def _mlp_tile(x, lw, spec, parts: int, sub: int, act=silu, g=None, out=None):
+def _mlp_tile(x, lw, spec, parts: int, sub: int, act=silu, g=None, out=None, xs=None):
     """x + W_down(act(W_gate xn) * (W_up xn)) for T rows (xn: x normed by g, default
     lw.g_post): every chunk's activation quantized once and kept in ACT RAM (the C columns of
     a W_down part, made `sub` columns at a time: each piece's QACT gives its blocks what one
     of the whole chunk would), then the down projection by `parts` parts of its output
     columns, each summing the chunks in swiglu_down's order (the same bits). out: the MLP's
-    output into that [T, H] tile instead (_add_parts)."""
-    xs = _norm_quantize(x, lw.g_post if g is None else g, spec.eps)
+    output into that [T, H] tile instead (_add_parts). xs: the operand, quantized already (x
+    then may be None, with out)."""
+    if xs is None:
+        xs = _norm_quantize(x, lw.g_post if g is None else g, spec.eps)
     wg, wu, wd = lw.wg, lw.wu, lw.wd
-    T = x.rows
+    T = (out if x is None else x).rows
     C = down_chunk(wg, wd)
     starts = list(range(0, wg.shape[0], C))
     pieces = [(c0, s0) for c0 in starts for s0 in range(0, C, sub)]
@@ -299,7 +304,8 @@ def _mlp_tile(x, lw, spec, parts: int, sub: int, act=silu, g=None, out=None):
         ol.quantize_into(acts[c0], act(g) * u, s0)
         del g, u
     xs = nxt = None                     # the operand's ACT blocks are free for the down MMs
-    _add_parts(x, [acts[c0] for c0 in starts], [wd[:, c0:c0 + C] for c0 in starts], parts, out)
+    _add_parts(out if x is None else x, [acts[c0] for c0 in starts],
+               [wd[:, c0:c0 + C] for c0 in starts], parts, out)
     return x
 
 
@@ -688,6 +694,58 @@ def gemma4_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool
         _lm_head_rows(res.x, m, spec, list(logit_rows))
 
 
+EM_GROUP = 2    # rows a group of an expert-major tiled run's per-row record work ([R, H] tiles)
+
+
+@ol.jit
+def gemma4_layer_tile(m, li: int, pos, row, T: int, block: int = ATTN_BLOCK,
+                      spill: bool = False, depth: int = ATTN_DEPTH):
+    """gemma4_layer_run's expert-major run tiled (a MoE model's layer-major prefill,
+    docs/offload.md 13.11): the T rows of the chunk from `row` (a run argument; their records'
+    X, moe.em_x) at the run-time positions pos .. pos + T - 1 (a RunRows with the image's mask
+    tiles, in one attention block) through layer li. The layer before ends first
+    (gemma4._em_end, EM_GROUP rows at a time); the attention tiled (_gemma_attention_tile;
+    spill: x in the records' X while the heads attend); x to X; the route and the need lines
+    (moe.moe_prologue_rows over groups of rows, LINE / 4 ids a line); then the dense MLP tiled
+    over the T rows (its weights streamed once), normed (norm_1), to the records' SH. Each
+    row's arithmetic is gemma4_layer_run's, so the chunk's records, KV cache and expert runs
+    are those of its runs of fewer rows, bit for bit where their 4-bit MMs pair alike."""
+    from ..kernels.lib import gelu_tanh, rmsnorm
+    from .gemma4 import _em_end, _pos_rows
+    from .moe import LINE, em_row, em_x, moe_prologue_rows
+    spec, dev = m.spec, m.moe_dev
+    if not isinstance(pos, RunRows) or pos.amask is None or not spec.experts or spec.ple_dim:
+        raise CompileError("a tiled Gemma 4 layer run is a MoE model's, at a run-time position "
+                           "with the image's mask tiles")
+    H, k = spec.hidden, spec.top_k
+    X = em_x(dev, row, T, H)
+    x = ol.load(X)
+    ropes = _pos_rows(m, pos, T, masks=False)
+    groups = [(r0, min(EM_GROUP, T - r0)) for r0 in range(0, T, EM_GROUP)]
+    if li > 0:                                  # (the layer before: its experts' outputs)
+        for r0, n in groups:
+            _em_end(x[r0:r0 + n, :], m.layer(li - 1), spec, m, row + r0)
+    lw = m.layer(li)
+    res = Res(x, X if spill else None)
+    del x
+    parts, sub = _widths(m, T)
+    _gemma_attention_tile(res, lw, m, pos, ropes, T, block, parts, depth)
+    x = res.x
+    ol.store(X, x)
+    g = max(1, (LINE // 4) // k)                # rows a need line
+    for r0 in range(0, T, g):
+        moe_prologue_rows(x[r0:r0 + min(g, T - r0), :], lw, spec.moe, dev, spec.eps, row + r0)
+    xs = _norm_quantize(x, lw.g_pre, spec.eps)  # the dense MLP: the rows normed (g_pre)
+    res.x = x = None
+    y = ol.empty([T, H])
+    _mlp_tile(None, lw, spec, parts, sub(lw), act=gelu_tanh, out=y, xs=xs)
+    xs = None
+    gf = ol.load(lw.g_f1)
+    for r0, n in groups:                        # SH: norm_1 of the dense MLP's output
+        ol.store(Tensor(em_row(dev, row, r0) + 4 * H * (k + 1), (n, H), (dev.em_rec // 4, 1)),
+                 rmsnorm(y[r0:r0 + n, :], gf, spec.eps))
+
+
 @ol.jit
 def tile_run(m, kernel, pos, T: int, kind: str, block: int = ATTN_BLOCK, kw=None):
     """A tiled prompt run (docs/prefill.md): `kernel`'s T rows at the run-time position in the
@@ -760,16 +818,27 @@ def compile_tile_run(img, blocks: int, T: int, kind: str, block: int = ATTN_BLOC
     else:
         pos = RunRows(blocks, block, lo, img.lookup["zmask"], img.cap, T, 0, _amask(img.lookup))
     desc = (lambda s: img.descriptors(s, slot)) if fam == "qwen35" else img.descriptors
+
+    def trace(kw):
+        kw = dict(kw, hidden=True) if hidden else kw
+        return [trace_fit(tile_run, img.cfg, s, lambda s=s: {
+            "m": desc(s), "kernel": KERNELS[fam], "pos": pos, "T": T, "kind": kind,
+            "block": block, "kw": kw}) for s in range(img.cfg.S)]
+
+    return _first_fit(trace, variants(fam, T, img.cfg.MCOLS), img.cfg)
+
+
+def _first_fit(trace, forms, cfg):
+    """(programs, run_args) of trace(form) (its builders, one a slice) for the first of the
+    forms that fits TMEM, ACT RAM and IMEM: each form at the attention's pipeline depth, then
+    over IMEM at SHALLOW, then the next form; over IMEM at every one, the first (the caller's
+    IMEM check: prefill.programs)."""
     err = over = None
-    imem = img.cfg.IMEM_WORDS // 8
-    for v in variants(fam, T, img.cfg.MCOLS):       # the first that fits TMEM, ACT RAM, IMEM
-        # (over IMEM: the same form with a shallower attention pipeline, then the next form)
+    imem = cfg.IMEM_WORDS // 8
+    for v in forms:
         for f in [v] + ([dict(v, depth=SHALLOW)] if "depth" not in v else []):
-            kw = dict(f, hidden=True) if hidden else f
             try:
-                bs = [trace_fit(tile_run, img.cfg, s, lambda s=s: {
-                    "m": desc(s), "kernel": KERNELS[fam], "pos": pos, "T": T, "kind": kind,
-                    "block": block, "kw": kw}) for s in range(img.cfg.S)]
+                bs = trace(f)
             except CompileError as e:
                 if not any(w in str(e) for w in ("TMEM", "ACT RAM")):
                     raise
@@ -780,7 +849,7 @@ def compile_tile_run(img, blocks: int, T: int, kind: str, block: int = ATTN_BLOC
                 return progs, list(bs[0].run_args)
             if over is None:
                 over = progs, list(bs[0].run_args)
-    if over is not None:                # (the caller's IMEM check: prefill.programs)
+    if over is not None:
         return over
     raise err
 
@@ -796,3 +865,44 @@ def variants(fam: str, T: int, mcols: int) -> list:
             d = d - mcols if d > mcols else d - 1
             out.append({"spill": True, "drows": d})
     return out
+
+
+LAYER_KERNELS = {"gemma4": gemma4_layer_tile}
+
+
+def layer_family(img) -> str | None:
+    """The image's family when a tiled expert-major layer run serves it (LAYER_KERNELS: a MoE
+    image with prefill rows, the expert server's words and the mask tiles, which a MoE model's
+    image holds when OTPU_TILE is on as it is built), else None."""
+    name = type(img).__module__.rsplit(".", 1)[-1]
+    ok = name in LAYER_KERNELS and getattr(img, "prefill_rows", 0) and \
+        getattr(img, "offload", None) is not None and "amask" in (img.lookup or {})
+    return name if ok else None
+
+
+def compile_layer_tile(img, li: int, blocks: int, T: int, block: int = ATTN_BLOCK):
+    """(programs, run_args): layer li's expert-major run tiled (LAYER_KERNELS), T rows at a
+    run-time position of bucket `blocks` (from conv_k - 1) and a run-time chunk row ("row"),
+    in place of the image's compile_layer_run(li, blocks, R=T, em=True) (Engine.prefill_layers'
+    runs of more than one row with tiling on: Engine.layer_tile); the first of its forms that
+    fits TMEM, ACT RAM and IMEM (_first_fit)."""
+    from ..compiler import RunVar
+    fam = layer_family(img)
+    if fam is None:
+        raise ValueError(f"no tiled layer run for this image ({type(img).__module__}: an "
+                         "expert-major MoE image with the mask tiles, OTPU_TILE=1)")
+    cfg, lk = img.cfg, img.lookup
+    if not 0 <= li < img.spec.layers or not 1 <= T <= cfg.act_rows or cfg.S != 1:
+        raise ValueError(f"layer {li}, {T} rows: a layer's run of at most ACT_ROWS "
+                         f"({cfg.act_rows}) rows, one slice")
+    lo = max((blocks - 1) * block, getattr(img.spec, "conv_k", 1) - 1)
+    amask = (lk["amask"], 4 * lk["amask_M"] * (block + 1))
+    pos = RunRows(blocks, block, lo, lk.get("zmask", 0), img.cap, T, 0, amask)
+    row = RunVar("row", img.prefill_rows)
+
+    def trace(kw):
+        return [trace_fit(LAYER_KERNELS[fam], cfg, 0, lambda: {
+            "m": img.descriptors(0), "li": li, "pos": pos, "row": row, "T": T, "block": block,
+            **kw})]
+
+    return _first_fit(trace, [{}, {"spill": True}], cfg)

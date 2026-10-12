@@ -424,6 +424,48 @@ def test_engine_tile_runs_rows(tmp_path_factory, monkeypatch, how):
     assert np.array_equal(lg.view(np.uint32), want.view(np.uint32))
 
 
+@pytest.fixture(scope="module")
+def gmoe(tmp_path_factory):
+    """test_gemma4_moe's tiny Gemma 4 MoE: 8 experts 96 wide, top 2, beside the 320-wide MLP;
+    sliding layers of 2 KV heads (G = 2), global ones of 1 (G = 4, K = V)."""
+    import test_gemma4_moe as TGM
+    return TGM._model(tmp_path_factory, "tmoe", enable_moe_block=True, num_experts=8,
+                      top_k_experts=2, moe_intermediate_size=96)
+
+
+@pytest.mark.parametrize("wf, T, R", [("int8", 8, 0), ("fp4", 8, 4), ("fp4", 6, 3)])
+def test_tiled_expert_major_layer_runs(gmoe, monkeypatch, wf, T, R):
+    """Gemma 4 MoE's expert-major layer runs tiled (Engine.layer_tile, OTPU_TILE=1 as the image
+    is built: its mask tiles; tiled.compile_layer_tile): runs of T rows (the layer before
+    ended a group of rows at a time, the attention in packed tiles, the route and need lines
+    a group of LINE / 4 ids at a time, the dense MLP's weights once a run) against expert-major
+    runs of R rows (4-bit: none of either pairs at MCOLS 4) or token by token (R = 0, int8):
+    the logits, the layers' blocks (KV caches) and the decode steps after, bit for bit; 40
+    tokens in chunks of 24 and 16 rows, 6 expert slots a layer."""
+    from opentpu.llm import gemma4 as G4
+    _, W, spec = gmoe
+    monkeypatch.setattr(G4, "PREFILL_CHUNK", 24)
+    monkeypatch.setenv("OTPU_TILE", "1")
+    cfg = board_config(DRAM_BYTES=1 << 26, ACT_ROWS=16)
+    kw = dict(cap=1024, cfg=cfg, rows=1, wformat=wf, experts=6)
+    toks = [int(t) for t in np.random.default_rng(13).integers(0, 1000, 40)]
+    a = Engine(spec, W, layer_major=T, expert_major=True, **kw)
+    b = Engine(spec, W, layer_major=R, expert_major=bool(R), tile_runs=False, **kw)
+    assert a.layer_tile and not b.layer_tile and "amask" in b.image.lookup
+    la, lb = a.prefill(toks), b.prefill(toks)
+    assert any(k[-1] == "tile" for k in a._layer_runs if isinstance(k, tuple))
+    assert a.pos == b.pos == len(toks)
+    assert np.array_equal(la.view(np.uint32), lb.view(np.uint32))
+    img = a.image
+    assert np.array_equal(a.backend.machine.slices[0].dram[img.layer0:img.head[0]],
+                          b.backend.machine.slices[0].dram[img.layer0:img.head[0]])
+    t = int(np.argmax(la))
+    for _ in range(2):
+        ga, gb = a.step(t), b.step(t)
+        assert np.array_equal(ga.view(np.uint32), gb.view(np.uint32))
+        t = int(np.argmax(ga))
+
+
 def test_reference_key_tells_tiled_runs():
     """tools/qual/refs.py: OTPU_TILE is in a reference's key (env_key: the hashed sources read
     it), so a tiled qual's references are its own."""

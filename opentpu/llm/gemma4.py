@@ -932,7 +932,10 @@ class Image:
                                D, cfg.MCOLS, "int8" if f == "int8" else "fp4")) for f in fmts},
                            # the decode loop's area
                            "gen": G.alloc(b, spec, cap, block, cfg.IMEM_WORDS)}
-            if not spec.experts:    # the prompt runs' mask tiles, ends then starts (Additive)
+            # the prompt runs' mask tiles, ends then starts (Additive); a MoE model's for its
+            # tiled layer runs (OTPU_TILE as the image is built: tiled.compile_layer_tile)
+            from .prefill import tile_flag
+            if not spec.experts or (self.prefill_rows and tile_flag(None)):
                 self.lookup.update(amask=b.alloc(2 * amask_table(block, cfg.MCOLS).nbytes),
                                    amask_M=cfg.MCOLS)
         self.offload = None
