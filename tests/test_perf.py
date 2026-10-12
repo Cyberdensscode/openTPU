@@ -43,10 +43,20 @@ def test_mlp_small_batch_near_roofline(have_verilator):
     assert _eff(p) > 0.914, p.summary()
 
 
-@pytest.mark.parametrize("Hq,Hkv,T", [(16, 4, 1024), (6, 1, 2048)])
-def test_attention_decode_at_roofline(have_verilator, Hq, Hkv, T):
+@pytest.mark.parametrize("Hq,Hkv,T,E", [
+    (16, 4, 1024, "full"), (6, 1, 2048, "full"),
+    pytest.param(6, 1, 2048, "half", marks=pytest.mark.xfail(strict=True, reason=(
+        "E = MCOLS / 2 lanes drain the 6 rows of a q.K^T K row at d 128 in 2 cycles against the "
+        "array's 1 and the KV cache's ~1.1: drain-bound (docs/mx_mxu.md 9, attention decode at "
+        "MCOLS 8)")))])
+def test_attention_decode_at_roofline(have_verilator, Hq, Hkv, T, E):
     a, _ = attn_args(np.random.default_rng(1), Hq=Hq, Hkv=Hkv, d=128, T=T, cap=T, block=128)
-    p = profile(attention_decode, design_config(), **a)
+    cfg = design_config()
+    # "full": the MXU's epilogue at full rate, E = MCOLS lanes, as the card builds it. q.K^T at d
+    # 128 (KB 1) gives G = Hq / Hkv outputs a K row and E lanes drain them in ceil(G / E) cycles,
+    # so "half", the RTL's default E = MCOLS / 2 (4 at the design point's 8 columns), makes the
+    # 6-row case drain-bound: kept as a strict xfail, the limit docs/mx_mxu.md 9 states
+    p = profile(attention_decode, cfg, uarch={"MXU_E": cfg.MCOLS} if E == "full" else None, **a)
     # exp2 runs on LANES/4 composite lanes (the split VPU trades these exp2-heavy shapes --
     # 4 and 6 query rows per KV head -- for 70K LUTs; Qwen3's 2 rows per head barely notice)
     assert _eff(p) > 0.60, p.summary()
