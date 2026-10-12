@@ -15,7 +15,10 @@ needs no copies at all, or at least two? Explore in simulation first.
 loses its RAM is replayed the next cycle while its unit holds, QUANT 3 and COLL are the DMA's
 guests, and the read ports sit on the RAM ports by measured conflict (QUANT and VPU A on port A).
 On the FPGA screen it makes 2.8-8.2% extra TMEM reads (the replays) and costs +0.70% cycles
-geomean (+1.66% at worst, p8_q3), for about 13.4K LUTs (today's TMEM 11.9K). The user chose the
+geomean (+1.66% at worst, p8_q3), for 13.3K LUTs routed at 133.33 / 266.67 MHz, +0.232 ns
+(today's TMEM 11.9K). With WAITC v2 on the full model list: +0.72% geomean against today's TMEM
+without WAITC (section 6.5). A board builds it with `TMEM_IMPL=3`, the 2x clock from the block
+design's MMCM (section 10). The user chose the
 single copy over P3 (2026-10-12), and copies are out for the ASIC this core is for. What is left is
 one RAM port's traffic: QUANT's data reads against the MXU's. Placement has done what it can;
 fewer consumers (QUANT fed from the drain, `dataflow`) would cut the remaining conflicts to a
@@ -465,7 +468,39 @@ copy at 1 RAM a bank (`wcmP1`, default sides):
 | d_q3 | +0.68 | +0.13 | +0.53 | +0.40 |
 | dr_q3 | -0.05 | -0.38 | +0.41 | +0.79 |
 | geomean | +1.05 | +0.13 | +1.41 | +1.28 |
-*Running: the pick under WAITC v2 (`wcmP2s`) against `wcm` on the full model list (all.txt).*
+
+The pick under WAITC v2 (`wcmP2s`: `r2pgRs` in the WAITC v2 tree, b5d6bcef + ffd1140c) on the full
+model list (`all.txt`, 17 workloads), against WAITC v2 with today's TMEM (`wcm`) and against today's
+TMEM without WAITC (`i0`):
+
+| workload | `i0` cycles | wcm vs i0 | wcmP2s vs i0 | **wcmP2s vs wcm** | extra TMEM reads |
+|---|---:|---:|---:|---:|---:|
+| p_q3 | 372,383 | -0.14 | +0.59 | +0.73 | 3.9% |
+| p_q35 | 1,137,275 | +0.23 | +0.56 | +0.33 | 1.9% |
+| p_lf | 1,630,055 | -0.02 | +0.64 | +0.66 | 4.9% |
+| p8_q3 | 502,925 | +0.79 | +2.52 | +1.71 | 5.6% |
+| p8_q35 | 942,492 | +0.69 | +0.95 | +0.25 | 1.6% |
+| b4_q3 | 1,671,279 | +0.09 | +0.38 | +0.28 | 4.1% |
+| b8_q3 | 1,827,502 | +0.15 | +0.58 | +0.43 | 3.8% |
+| d_q3 | 3,623,644 | +0.13 | +0.37 | +0.24 | 4.0% |
+| d_q35 | 4,760,853 | +0.05 | +0.36 | +0.31 | 4.7% |
+| d_lf | 1,339,842 | +0.18 | +0.54 | +0.36 | 3.2% |
+| z_q4_r2 | 2,225,099 | +0.12 | +0.34 | +0.22 | 1.6% |
+| z_ph_r3 | 1,677,624 | +0.08 | +0.29 | +0.21 | 6.7% |
+| z8_q2_r4 | (none) | | | +0.38 | 2.0% |
+| l_q35m | 679,296 | +1.79 | +2.01 | +0.22 | 2.6% |
+| l_g26 | 1,963,377 | +0.67 | +0.83 | +0.17 | 3.1% |
+| m_q35m | 15,297,819 | +0.08 | +0.10 | +0.02 | 3.1% |
+| m_g26 | 3,886,066 | +0.26 | +0.41 | +0.15 | 1.3% |
+| geomean | | +0.28 | +0.72 | **+0.39** | |
+
+On top of WAITC v2 the pick costs +0.39% geomean. `wcmP1` cost +1.28% on the seven workloads of
+the table above; the pick has two RAMs a bank and the screen's sides. The worst case is p8_q3 at
++1.71% (the 8-row prefill at MCOLS 8, 5.6% extra TMEM reads), then p_q3 +0.73% and p_lf +0.66%. The
+MoE layers and models (`l_`, `m_`) cost +0.02 to +0.22%. With WAITC v2 the total is +0.72% against
+today's TMEM without WAITC: l_q35m's +2.01% is WAITC's (+1.79%), not the TMEM's. The extra TMEM
+reads are 1.3-6.7% of the reads. Every run is bit-exact. z8_q2_r4 has no `i0` run (`i0` ran
+z8_q4_r4, whose 4 rows at MCOLS 8 do not fit 64K words).
 
 ### 6.6 Fewer consumers (no feedback)
 
@@ -493,7 +528,23 @@ TMEM read is SRAM energy and port time).
 
 ### 6.7 With the MX column
 
-*Running: the pick (`r2pgRs`) with the MX column (mx-column 4406fbed, E 4) against its own TMEM (`i0n`) on the MX list.*
+The pick in the MX column's tree: mx-column 4406fbed (the MX MXU, E 4) merged with this branch at
+b5d6bcef, its parameter-list conflicts resolved by keeping both sides (section "Merging"). It runs against
+that tree's own TMEM (`i0n`), no WAITC, on six workloads, three of them at MCOLS 8:
+
+| workload | `i0n` cycles | `r2pgRs` vs `i0n` | extra TMEM reads |
+|---|---:|---:|---:|
+| p_q3 (4 rows) | 373,923 | +0.91% | 5.7% |
+| p_q35 (4 rows) | 1,148,266 | +0.69% | 2.4% |
+| p8_q3 (8 rows, MCOLS 8) | 504,388 | +1.60% | 7.8% |
+| p8_q35 (4 rows, MCOLS 8) | 952,090 | +0.68% | 2.5% |
+| b8_q3 (batch 8, MCOLS 8) | 1,798,064 | +0.57% | 4.6% |
+| d_lf (decode) | 1,355,181 | +0.18% | 2.9% |
+| geomean | | +0.77% | |
+
+All runs are bit-exact. The MX column changes the MXU's lanes and its drain, not which units meet on
+port B, so the cost is the screen's: +0.77% against +0.70%, and the worst case is again the 8-row
+prefill at MCOLS 8 (p8_q3 +1.60% against +1.66%).
 
 ## 7. Interactions
 
