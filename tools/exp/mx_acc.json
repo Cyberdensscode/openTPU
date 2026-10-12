@@ -3,7 +3,7 @@
  "decisions": {
   "rule_reference": "MX int8 (int8x weights and head, a8x32): the user, 2026-10-12",
   "gemma_it_text": "the chat, docs/isa.md the cross-check: the lead, 2026-10-12",
-  "gemma4-26b": "provisional: every 4-bit kind fp4x6; experts=nvfp4r (about +6.6% decode, estimated) put to the user"
+  "gemma4-26b": "experts=nvfp4r: the user, 2026-10-12, for robustness to off-distribution text (about +6.6% decode, estimated), over the chat's rule (fp4x6); head fp4x6 as the rule picks"
  },
  "defaults": {
   "qwen3": {
@@ -121,11 +121,11 @@
   },
   "gemma4-26b": {
    "text": "chat",
-   "four_bit": "head=fp4x6,experts=fp4x6",
+   "four_bit": "head=fp4x6,experts=nvfp4r",
    "mx_vs_today": {
-    "mx": "mx:headF.expertsF",
-    "d": -2.8716,
-    "se": 2.2719
+    "mx": "mx:headF.expertsN",
+    "d": 0.175,
+    "se": 2.3861
    }
   }
  },
@@ -1264,6 +1264,19 @@
       15647694,
       2035384320000
      ]
+    },
+    "mx_int8": {
+     "variant": "int8x/int8x/a8x32/flush",
+     "dkl": -0.0864,
+     "se": 0.0075,
+     "ppl": 17.875,
+     "mib": 4046.59,
+     "gain_vs_int8": 2.02,
+     "drops": [
+      35502,
+      446136320000
+     ],
+     "run": "mx8-qwen35-4b"
     }
    },
    "kinds": {
@@ -1310,6 +1323,12 @@
       "se": 0.0963,
       "gain": 3.13,
       "margin_se": -5.24
+     },
+     "vs_mx_int8": {
+      "d": 5.1296,
+      "se": 0.1287,
+      "gain": 51.95,
+      "margin_se": 0.51
      }
     },
     "opp:attnN.allF": {
@@ -1325,8 +1344,20 @@
       "se": 0.1015,
       "gain": 7.04,
       "margin_se": -7.08
+     },
+     "vs_mx_int8": {
+      "d": 5.7338,
+      "se": 0.1418,
+      "gain": 57.7,
+      "margin_se": 0.26
      }
     }
+   },
+   "default_vs_mx_int8": {
+    "d": 4.3116,
+    "se": 0.1176,
+    "gain": 47.33,
+    "margin_se": 3.59
    }
   },
   "lfm2-2.6b": {
@@ -1636,6 +1667,19 @@
       445,
       351535104000
      ]
+    },
+    "mx_int8": {
+     "variant": "int8x/int8x/a8x32/flush",
+     "dkl": 0.094,
+     "se": 0.0198,
+     "ppl": 27.6723,
+     "mib": 2960.05,
+     "gain_vs_int8": 2.09,
+     "drops": [
+      408,
+      351535104000
+     ],
+     "run": "mx8-smollm3"
     }
    },
    "kinds": {
@@ -1668,6 +1712,12 @@
       "se": 0.0819,
       "gain": 15.43,
       "margin_se": -3.52
+     },
+     "vs_mx_int8": {
+      "d": 3.5982,
+      "se": 0.114,
+      "gain": 38.43,
+      "margin_se": 2.15
      }
     },
     "opp:gateupF.down9-26F": {
@@ -1683,6 +1733,12 @@
       "se": 0.0994,
       "gain": 19.01,
       "margin_se": -5.31
+     },
+     "vs_mx_int8": {
+      "d": 4.1964,
+      "se": 0.1196,
+      "gain": 42.73,
+      "margin_se": 0.64
      }
     },
     "opp:gateupN": {
@@ -1698,8 +1754,20 @@
       "se": 0.0665,
       "gain": 7.12,
       "margin_se": -6.14
+     },
+     "vs_mx_int8": {
+      "d": 2.8875,
+      "se": 0.0941,
+      "gain": 28.47,
+      "margin_se": -0.43
      }
     }
+   },
+   "default_vs_mx_int8": {
+    "d": 1.7676,
+    "se": 0.0628,
+    "gain": 19.93,
+    "margin_se": 3.6
    }
   },
   "phi4-mini": {
@@ -2682,7 +2750,9 @@
       "margin_se": -12.09
      }
     }
-   }
+   },
+   "default_rule": "mx:headF.expertsN",
+   "default_by": "the user, 2026-10-12: experts NVFP4 for robustness to off-distribution text"
   }
  },
  "chat": {
@@ -3092,12 +3162,12 @@
      "choice": "F"
     }
    },
-   "default": "mx:headF.expertsF",
+   "default": "mx:headF.expertsN",
    "least_u": "mx:headF.expertsF",
    "mx_vs_today": {
-    "mx": "mx:headF.expertsF",
-    "d": -2.8716,
-    "se": 2.2719
+    "mx": "mx:headF.expertsN",
+    "d": 0.175,
+    "se": 2.3861
    },
    "opportunities": {
     "opp:attnN": {
@@ -3130,7 +3200,9 @@
       "margin_se": -7.72
      }
     }
-   }
+   },
+   "default_rule": "mx:headF.expertsF",
+   "default_by": "the user, 2026-10-12: experts NVFP4 for robustness to off-distribution text"
   }
  }
 }
