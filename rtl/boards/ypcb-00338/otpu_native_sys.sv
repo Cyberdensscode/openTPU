@@ -17,6 +17,7 @@ module otpu_native_sys #(
   parameter int ACT_ROWS = MCOLS,
   parameter int VPU_CL = 2,
   parameter int MXU_IMPL = 0,            // MXU dot product: 0 adder tree, 2 systolic
+  parameter int TMEM_IMPL = 0,           // TMEM: 0 a copy per read port, 1 banked (otpu_board)
   parameter int LANES = 8,
   parameter int ULANES = 8,
   parameter int CORE_KHZ = 100000,
@@ -174,7 +175,7 @@ module otpu_native_sys #(
     .c_rdata_valid(c_rdata_valid[1]), .c_rdata_data(c_rdata_data[1]));
 
   otpu_board #(.MCOLS(MCOLS), .ACT_ROWS(ACT_ROWS), .VPU_CL(VPU_CL), .MXU_IMPL(MXU_IMPL),
-               .LANES(LANES), .ULANES(ULANES),
+               .TMEM_IMPL(TMEM_IMPL), .LANES(LANES), .ULANES(ULANES),
                .CORE_KHZ(CORE_KHZ), .BUILD_ID(BUILD_ID), .DDR_MTS(DDR_MTS), .DSTEP(DSTEP),
                .HOSTCAL(HOSTCAL), .PLATFORM(PLATFORM), .ARCH_HASH(ARCH_HASH)) u_board (
     .clk, .rst, .ctl_mrst, .calib, .ded, .temp, .led, .i2c_lo, .i2c_pin,

@@ -18,6 +18,8 @@ DDR ?= 1066
 # LANES: VPU lanes / TMEM banks, 8 or 16 (timing only; the host reads it from VERSION)
 # ACT_ROWS: ACT RAM rows, the most rows of one MM (default MCOLS; 8: prefill's 8-row MMs stream
 #   each weight once, the MXU replaying it per MCOLS rows)
+# TMEM_IMPL: the TMEM, 0 a copy per read port (default) or 1 banked (three copies; timing only,
+#   docs/tmem_pump.md)
 # BUILD_ID: the BUILD_ID register (8 hex digits; default: the git commit)
 # PCIE_GEN: 2 (Gen2 x8, xdma_aclk 250 MHz, the default) or 1 (Gen1 x8), from the environment
 ifeq ($(FAST),1)
@@ -53,7 +55,7 @@ lint:
 lint-ld: lint
 
 bit:
-	MCOLS=$(MCOLS) ACT_ROWS=$(ACT_ROWS) VPU_CL=$(VPU_CL) LANES=$(LANES) CORE_MHZ=$(CORE_MHZ) $(if $(BUILD_ID),BUILD_ID=$(BUILD_ID)) ./run_vivado.sh $(DDR)
+	MCOLS=$(MCOLS) ACT_ROWS=$(ACT_ROWS) VPU_CL=$(VPU_CL) LANES=$(LANES) CORE_MHZ=$(CORE_MHZ) $(if $(TMEM_IMPL),TMEM_IMPL=$(TMEM_IMPL)) $(if $(BUILD_ID),BUILD_ID=$(BUILD_ID)) ./run_vivado.sh $(DDR)
 
 impl:
 	STEP=impl ./run_vivado.sh $(DDR)
