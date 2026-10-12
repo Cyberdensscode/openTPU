@@ -32,6 +32,7 @@ module otpu_seq
   import otpu_pkg::*;
 #(
   parameter int IMEM_WORDS = 1 << 16,
+  parameter int TMEM_WORDS = 1 << 16,
   parameter int SID        = 0,
   parameter int S          = 1,
   parameter int D          = 32,
@@ -108,10 +109,11 @@ module otpu_seq
   // in the range); it adds only the output tile's padding words between them (ors - N).
   // An instruction's DRAM ranges are all reads or all writes, hence one dw bit. ACT ranges
   // start below 2^8 (an 8-bit field) and are at most 2^16 - 1 long, so [alo, ahi) is exact.
-  // TMEM ranges keep TAW/TAW+1 bits: TMEM holds 2^16 words, so every access the ISA allows has
-  // lo < 2^16, hi <= 2^16. A valid TMEM range that does not fit raises all instead (the
-  // instruction then conflicts with everything, like BAR) -- conservative, never wrong.
-  localparam int TAW = 16;
+  // TMEM ranges keep TAW/TAW+1 bits: TMEM holds 2^16 words (more in a configuration with a
+  // larger TMEM: TAW follows it), so every access the ISA allows has lo < 2^TAW, hi <= 2^TAW.
+  // A valid TMEM range that does not fit raises all instead (the instruction then conflicts
+  // with everything, like BAR) -- conservative, never wrong.
+  localparam int TAW = (TMEM_WORDS > (1 << 16)) ? $clog2(TMEM_WORDS) : 16;
   typedef struct packed { logic [31:0] lo, hi; } r32_t;
   typedef struct packed { logic [TAW-1:0] lo; logic [TAW:0] hi; } rt_t;
   typedef struct packed { logic w; rt_t r; } rtw_t;     // TMEM, may be written
