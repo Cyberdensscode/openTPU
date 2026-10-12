@@ -1254,18 +1254,18 @@ i2f48 +3.61, result FIFO write +2.35, drain pick +1.61, scale line +4.69, scale 
 
 **Board builds** (YPCB-00338, DDR3-1066, ACT_ROWS 16, CFG_HASH 89417856, post-route):
 
-| | dev dd372036 (FAST, 100 MHz) | 999b0bc0 (133.33 MHz) | production 91a9c2d3 |
-|---|---|---|---|
-| WNS / WHS (ns) | +0.025 / +0.012 | +0.059 / +0.023 | +0.013 / +0.012 |
-| core_clk WNS (ns) | +0.074 | +0.070 | |
-| LUT | 161,221 | 172,276 | 177,292 |
-| FF | 128,929 | 134,996 | 134,913 |
-| BRAM tiles (RAMB36 + RAMB18 / 2) | 607.5 | 607.5 | 602.5 |
-| DSP | 722 | 722 | 716 |
-| `u_mxu` LUT / FF / DSP | 17,553 / 18,444 / 562 | 19,889 / 19,965 / 562 | 25,082 / 21,823 / 554 |
-| `u_quant` LUT / FF / RAMB18 | 7,184 / - / 4 | 7,635 / 8,511 / 4 | 7,924 / 6,969 / 0 |
-| `u_act` LUT / RAMB36 | 722 / 68 | 1,321 / 68 | 958 / 64 (+4 RAMB18) |
-| `u_mem` LUT / FF | 12,715 / 3,935 | 14,101 / 3,954 | 14,328 / 3,767 |
+| | dev dd372036 (FAST, 100 MHz) | 999b0bc0 (133.33 MHz) | MX production 8b33206e (133.33 MHz) | production 91a9c2d3 |
+|---|---|---|---|---|
+| WNS / WHS (ns) | +0.025 / +0.012 | +0.059 / +0.023 | +0.007 / +0.013 | +0.013 / +0.012 |
+| core_clk WNS (ns) | +0.074 | +0.070 | +0.007 | |
+| LUT | 161,221 | 172,276 | 178,529 | 177,292 |
+| FF | 128,929 | 134,996 | 138,466 | 134,913 |
+| BRAM tiles (RAMB36 + RAMB18 / 2) | 607.5 | 607.5 | 615 | 602.5 |
+| DSP | 722 | 722 | 734 | 716 |
+| `u_mxu` LUT / FF / DSP | 17,553 / 18,444 / 562 | 19,889 / 19,965 / 562 | 23,766 / 22,838 / 574 | 25,082 / 21,823 / 554 |
+| `u_quant` LUT / FF / RAMB18 | 7,184 / - / 4 | 7,635 / 8,511 / 4 | 8,621 / 8,765 / 5 (+ 7 RAMB36) | 7,924 / 6,969 / 0 |
+| `u_act` LUT / RAMB36 | 722 / 68 | 1,321 / 68 | 1,338 / 68 | 958 / 64 (+4 RAMB18) |
+| `u_mem` LUT / FF | 12,715 / 3,935 | 14,101 / 3,954 | 13,625 / 3,953 | 14,328 / 3,767 |
 
 The 133.33 MHz build's core paths at the limit are the sequencer's (`u_seq` q_cmd -> c_fp,
 +0.070, unchanged code), port A's line (`u_mem` aoh -> a_rdata, +0.077, 96% route) and the ACT
@@ -1273,6 +1273,24 @@ RAM's write data (+0.081, route). Port A's 256-bit line costs about +170 FF in `
 build has the row buffer (two passes); it adds 15 RAMB18 (7.5 BRAM36: Yosys synth_xilinx of
 `otpu_quant` at D 128, LANES 8, XD 1024 against XD 0, the four group RAMs unchanged at one
 RAMB18 each), +561 FF and +371 LUT.
+
+**The production build, 8b33206e** (2026-10-12: E 4, the row buffer at XD 1024, 133.33 MHz,
+DDR3-1066, Gen2 x8, full effort; BUILD_ID 0x8B33206E, CFG_HASH 89417856; 58,358 slices, 78.2%).
+Against production 91a9c2d3: LUT +0.7%, FF +2.6%, BRAM +12.5 tiles (the row buffer's 9.5 in
+`u_quant`, the ACT RAM's 16 rows), DSP +18 (the column ends' ninth DSP and E 4's lanes against the
+previous MXU's 554). The first route missed by 4 ps (WNS -0.004 on one endpoint: `u_seq` q_cmd
+w4 -> c_fp, 20 levels with 10 CARRY4, 74% route), the sequencer's footprint of an MM, which MX
+lengthened: KB in w4[23:16] with k0 beside it, and the scale rows' bytes by format. It closed
+without a netlist change (same BUILD_ID): the routed checkpoint reopened, the userclk1 reroute
+first, then post-route phys_opt (AggressiveExplore) replicating the path's high-fanout nets: WNS
++0.007, WHS +0.013 (userclk1 +0.030, userclk2 +0.081, LiteDRAM sys +0.111). phys_opt before the
+reroute did not close it (core WNS stayed at -0.048 on IMEM's address into its BRAM, a route the
+userclk1 reroute fixes). The fallback, not built, is branch `mx-fpcut` (15da5b56): each footprint
+product carries its addend into the sequencer's sum stage, so the queue stage does one base +
+length add; same cycles, and `footprint()` equal to 8b33206e's by a Yosys SAT miter at (D, S) =
+(128, 1), (32, 1), (128, 2). Sign-off on the frozen tree in Verilator: the token_on_rtl tests (11)
+and the six new family tests, `test_models_on_board_rtl` 10/10, and `test_rtl` / `test_board` /
+`test_quant_rtl` at `OTPU_MXU_E=4` (283 passed, the MM fuzzers included).
 
 **QACT's cost** (co-simulation, `tools/perf_qwen.py`, Qwen3-0.6B, 2 layers and the LM head,
 against b370889d's per-block streaming QACT, the MM unchanged):
