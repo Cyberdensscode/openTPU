@@ -4,6 +4,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import os
+import re as _re
 import shutil
 import subprocess
 import tempfile
@@ -181,6 +182,14 @@ if os.environ.get("OTPU_QUANT_XD"):
 # VPU lanes with the composite functions (exp2, recip, rsqrt; timing only): OTPU_VPU_CL=4
 if os.environ.get("OTPU_VPU_CL"):
     UARCH["VPU_CL"] = int(os.environ["OTPU_VPU_CL"])
+# EXPERIMENTAL (docs/seq_vpu.md): otpu_seq's wait entries instead of its scoreboard (WAITC):
+# OTPU_SEQ_WC=1. The entries are the compiler's (opentpu.waits; the run's arguments bounded by
+# their variables, OTPU_WAITS=args: known), or a +hz_sync file's (OTPU_SIM_PLUSARGS; or
+# OTPU_WAITS=0). WAITC needs a window of 16 (the card's), and the simulator's default is 32
+if os.environ.get("OTPU_SEQ_WC"):
+    UARCH["SEQ_WC"] = BOARD_UARCH["SEQ_WC"] = int(os.environ["OTPU_SEQ_WC"])
+    if UARCH["SEQ_WC"]:
+        UARCH["WIN"] = min(UARCH.get("WIN", 32), 16)
 # TMEM lanes of the MXU and the quantizer when fewer than LANES (timing only): OTPU_ULANES=8
 if os.environ.get("OTPU_ULANES"):
     UARCH["ULANES"] = int(os.environ["OTPU_ULANES"])
@@ -209,6 +218,7 @@ MEMORY = {"AXI": os.environ.get("OTPU_AXI", "0") == "1",
 # clock (the rate / 8) with the core at LDC_MHZ (OTPU_LDC_MHZ; 0: the controller's clock). The
 # stall, bandwidth and latency settings do not apply.
 LDC_MODELS = {1066: "otpu_ldc_ch.v"}
+_SIM_RUNS = 0                   # simulations run by this process (OTPU_SIM_PLUSARGS's %n)
 
 
 def ldc_plusargs(mts: int, mhz: float = 0) -> list[str]:
@@ -290,6 +300,33 @@ def _run(cfg, programs: list, images: list, dram_lat: int = 8, max_cycles: int =
         img = np.asarray(images[s], np.uint8)
         imgs.append(np.concatenate([img, np.zeros(-len(img) % 4, np.uint8)]))
         progs.append(np.asarray(words, "<u4"))
+    # EXPERIMENTAL (docs/seq_vpu.md): the compiler's wait entries (opentpu.waits) for otpu_seq
+    # WAITC: in DRAM after the program's last chunk, 64 bits each (boot: the loader reads them
+    # into the sidecar, docs/isa.md "Wait counts"), else from +hz_sync_s<k>. A WAITC run takes
+    # them unless OTPU_WAITS=0 or the simulation names its own (+hz_sync)
+    nins = [len(p) // 8 for p in progs]
+    sync_arg: list = []
+    ua = {**UARCH, **(uarch or {})}
+    if ua.get("SEQ_WC") and ua.get("WIN", 16) > 16:
+        raise ValueError("SEQ_WC (otpu_seq WAITC) needs WIN <= 16: 4-bit counts, a 15-bit VPU mask")
+    wmode = os.environ.get("OTPU_WAITS")
+    if wmode is None and "hz_sync" not in os.environ.get("OTPU_SIM_PLUSARGS", ""):
+        wmode = "1"
+    if wmode and wmode != "0" and ua.get("SEQ_WC"):
+        from . import waits as W
+        for s in range(cfg.S):
+            wst: dict = {}
+            ww = W.wait_counts(programs[s], cfg.D, cfg.S, stats=wst,
+                               args=run_args if wmode == "args" else None)
+            print(f"waits: slice {s}: {len(ww)} instructions, {wst['visits']} visits, "
+                  f"{len(wst['widened'])} loops widened, {wst['unreached']} unreached",
+                  flush=True)
+            if boot:
+                pad = np.zeros(-len(progs[s]) % (cfg.D // 4), "<u4")
+                progs[s] = np.concatenate([progs[s], pad, ww.astype("<u8").view("<u4")])
+            else:
+                W.sync_file(ww, tmp / f"sync_{s}.txt")
+                sync_arg.append(f"+hz_sync_s{s}={tmp / f'sync_{s}.txt'}")
     # boot: every slice's program right after the largest image (one loader address), or, if
     # there is no room, above the machine's DRAM (the simulated DRAM is then doubled)
     at = -(-max(len(i) for i in imgs) // cfg.D) * cfg.D
@@ -322,6 +359,13 @@ def _run(cfg, programs: list, images: list, dram_lat: int = 8, max_cycles: int =
             f"{r:x} {ad // 4:x} {v & 0xFFFFFFFF:x}\n" for r, ad, v in pk))
     args = [str(exe), f"+dir={tmp}", f"+max_cycles={max_cycles}"] + (["+trace"] if trace else [])
     args += list(plusargs or [])
+    # e.g. OTPU_SIM_PLUSARGS=+hz_rh=1,+hz_log=/path (docs/seq_vpu.md; commas or spaces); %n is
+    # this process's simulation count (0, 1, ...), so each run of a tool gets its own files
+    global _SIM_RUNS
+    args += [x.replace("%n", str(_SIM_RUNS))
+             for x in _re.split(r"[\s,]+", os.environ.get("OTPU_SIM_PLUSARGS", "")) if x]
+    _SIM_RUNS += 1
+    args += sync_arg
     args += [f"+arg{k}={int(v) & 0xFFFFFFFF}" for k, v in enumerate(run_args or [])]
     if again:
         args += [f"+runs={1 + len(again)}"] + (["+reload"] if reload else [])
@@ -334,7 +378,7 @@ def _run(cfg, programs: list, images: list, dram_lat: int = 8, max_cycles: int =
     if ldc:                            # the first of a plusarg wins: the caller's
         args += ldc_plusargs(ldc, MEMORY["LDC_MHZ"])
     if boot:
-        args += ["+boot", f"+boot_addr={at}", f"+boot_n={max(len(p) for p in progs) // 8}"]
+        args += ["+boot", f"+boot_addr={at}", f"+boot_n={max(nins)}"]
     r = run_sim(args, timeout=3600)
     out = r.stdout + r.stderr
     import re

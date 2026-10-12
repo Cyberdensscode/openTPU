@@ -1,0 +1,6 @@
+# EXPERIMENTAL (docs/seq_vpu.md): the card's resident decode (compile_decode: one program a bucket,
+# the token and the position as run arguments), Qwen3-0.6B, positions 544 and 700 (bucket 3): the
+# wait counts of 544 run at 700 too (candidate wcx: SYNCFROM=dr_q3) -- a compiler's counts must
+# hold for every argument
+dr_q3 --model qwen3 --wformat fp4 --head-format int8 --pos 544 --layers 0 --resident --check
+dr7_q3 --model qwen3 --wformat fp4 --head-format int8 --pos 700 --layers 0 --resident --check

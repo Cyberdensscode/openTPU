@@ -32,7 +32,7 @@ def _words(progs):
     ([_prog(5, 1), _prog(7, 2)], None),                     # two slices
     (([_prog(4, 3)], [_prog(6, 4)]), None),                 # a split program's two parts
     (np.asarray(I.assemble(_prog(9, 5)), np.uint32),        # a compile worker's words and the
-     [(RunVar("tok"), 4096), (RunVar("tpos"), -4)])],       # run arguments
+     [(RunVar("tok"), 4096), (RunVar("tpos", 512), -4)])],  # run arguments (one bounded)
     ids=["slice", "slices", "split", "words"])
 def test_disk_round_trip(tmp_path, value):
     f = tmp_path / "ab" / "ab.npz"
@@ -42,7 +42,12 @@ def test_disk_round_trip(tmp_path, value):
     assert _words(progs) == _words(value[0])
     assert (ra is None) == (value[1] is None)
     if ra is not None:
-        assert [(v.name, c) for v, c in ra] == [(v.name, c) for v, c in value[1]]
+        assert [(v.name, v.bound, c) for v, c in ra] == [(v.name, v.bound, c) for v, c in value[1]]
+    # each slice's program carries the arguments (opentpu.waits bounds them by their variables)
+    for part in (progs if isinstance(progs, tuple) else (progs,)):
+        for p in part:
+            assert [(v.name, v.bound, c) for v, c in p.run_args] == \
+                [(v.name, v.bound, c) for v, c in (ra or ())]
 
 
 def test_the_key_sees_the_layout_the_environment_and_what(monkeypatch):
