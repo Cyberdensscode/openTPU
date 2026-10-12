@@ -43,11 +43,13 @@ wcq4 OTPU_SIM_PLUSARGS=+hz_ino=1,+hz_uq=4:4:4:4:2 WC=1
 inoq6 OTPU_SIM_PLUSARGS=+hz_ino=1,+hz_uq=6:4:6:6:2
 # a reorder buffer (slots freed in program order): what distance-based tags would need
 rob OTPU_SIM_PLUSARGS=+hz_rob=1
-# ---- the VPU at a narrower rate, today's latency (otpu_vpu +vt_*): elementwise / composite chunks
-# issue on one cycle in N; reductions advance on one cycle in N; DSTEP / STREAM unchanged
+# ---- the VPU at a narrower rate, today's latency (otpu_vpu +vt_*): composite chunks W columns
+# wide (+vt_cw: the composite path W lanes wide), elementwise chunks issued on one cycle in N,
+# reductions advancing on one cycle in N; DSTEP / STREAM unchanged
+v_cw4 OTPU_SIM_PLUSARGS=+vt_cw=4
+v_cw2 OTPU_SIM_PLUSARGS=+vt_cw=2
+v_cw1 OTPU_SIM_PLUSARGS=+vt_cw=1
 v_ew2 OTPU_SIM_PLUSARGS=+vt_ew=2
-v_comp2 OTPU_SIM_PLUSARGS=+vt_comp=2
-v_comp4 OTPU_SIM_PLUSARGS=+vt_comp=4
 v_red2 OTPU_SIM_PLUSARGS=+vt_red=2
-v_half OTPU_SIM_PLUSARGS=+vt_ew=2,+vt_comp=2,+vt_red=2
-v_quarter OTPU_SIM_PLUSARGS=+vt_ew=4,+vt_comp=4,+vt_red=4
+v_half OTPU_SIM_PLUSARGS=+vt_ew=2,+vt_cw=4,+vt_red=2
+v_quarter OTPU_SIM_PLUSARGS=+vt_ew=4,+vt_cw=2,+vt_red=4
