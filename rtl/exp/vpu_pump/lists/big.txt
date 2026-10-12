@@ -1,0 +1,62 @@
+# the card's larger models on zero images (tools/vpu_hack.py cosim: config.json only; a layer prefix,
+# no LM head except the batched step's: its 2- and 4-layer runs' difference), fp4 + int8 head, position 544
+# unless named. rows 1: a one-row run without logits, decode's layers' proxy
+z_q2_r4 zero: models/Qwen3.5-2B rows 4 544 --layers 4
+z_q2_r4_novop zero: models/Qwen3.5-2B rows 4 544 --layers 4 --hack novop
+z_q2_r4_half zero: models/Qwen3.5-2B rows 4 544 --layers 4 --hack half
+z_q2_r4_comp1 zero: models/Qwen3.5-2B rows 4 544 --layers 4 --hack comp1
+z_q2_r4_nose zero: models/Qwen3.5-2B rows 4 544 --layers 4 --hack nose
+z_q2_r4_halfse zero: models/Qwen3.5-2B rows 4 544 --layers 4 --hack halfse
+z_q2_r4_half_halfse zero: models/Qwen3.5-2B rows 4 544 --layers 4 --hack half,halfse
+z_q2_r4m8 zero: models/Qwen3.5-2B rows 4 544 --layers 4 --mcols 8
+z_q2_r4m8_novop zero: models/Qwen3.5-2B rows 4 544 --layers 4 --mcols 8 --hack novop
+z_q2_r4m8_half zero: models/Qwen3.5-2B rows 4 544 --layers 4 --mcols 8 --hack half
+z_q2_r4m8_nose zero: models/Qwen3.5-2B rows 4 544 --layers 4 --mcols 8 --hack nose
+z_q2_r4m8_half_halfse zero: models/Qwen3.5-2B rows 4 544 --layers 4 --mcols 8 --hack half,halfse
+z_q2_r1 zero: models/Qwen3.5-2B rows 1 544 --layers 4
+z_q2_r1_novop zero: models/Qwen3.5-2B rows 1 544 --layers 4 --hack novop
+z_q2_r1_nose zero: models/Qwen3.5-2B rows 1 544 --layers 4 --hack nose
+z_q2_r1_half_halfse zero: models/Qwen3.5-2B rows 1 544 --layers 4 --hack half,halfse
+z_q4_r2 zero: models/Qwen3.5-4B rows 2 544 --layers 4
+z_q4_r2_novop zero: models/Qwen3.5-4B rows 2 544 --layers 4 --hack novop
+z_q4_r2_half zero: models/Qwen3.5-4B rows 2 544 --layers 4 --hack half
+z_q4_r2_nose zero: models/Qwen3.5-4B rows 2 544 --layers 4 --hack nose
+z_q4_r2_halfse zero: models/Qwen3.5-4B rows 2 544 --layers 4 --hack halfse
+z_q4_r2_half_halfse zero: models/Qwen3.5-4B rows 2 544 --layers 4 --hack half,halfse
+z_q4_r1 zero: models/Qwen3.5-4B rows 1 544 --layers 4
+z_q4_r1_novop zero: models/Qwen3.5-4B rows 1 544 --layers 4 --hack novop
+z_q4_r1_nose zero: models/Qwen3.5-4B rows 1 544 --layers 4 --hack nose
+z_sm_r3 zero: models/SmolLM3-3B rows 3 544 --layers 2
+z_sm_r3_novop zero: models/SmolLM3-3B rows 3 544 --layers 2 --hack novop
+z_sm_r3_half zero: models/SmolLM3-3B rows 3 544 --layers 2 --hack half
+z_sm_r3_comp1 zero: models/SmolLM3-3B rows 3 544 --layers 2 --hack comp1
+z_sm_r4m8 zero: models/SmolLM3-3B rows 4 544 --layers 2 --mcols 8
+z_sm_r4m8_novop zero: models/SmolLM3-3B rows 4 544 --layers 2 --mcols 8 --hack novop
+z_sm_r4m8_half zero: models/SmolLM3-3B rows 4 544 --layers 2 --mcols 8 --hack half
+z_sm_b4l2 zero: models/SmolLM3-3B batch 4 544 --layers 2
+z_sm_b4l2_novop zero: models/SmolLM3-3B batch 4 544 --layers 2 --hack novop
+z_sm_b4l2_half zero: models/SmolLM3-3B batch 4 544 --layers 2 --hack half
+z_sm_b4l4 zero: models/SmolLM3-3B batch 4 544 --layers 4
+z_sm_b4l4_novop zero: models/SmolLM3-3B batch 4 544 --layers 4 --hack novop
+z_sm_b4l4_half zero: models/SmolLM3-3B batch 4 544 --layers 4 --hack half
+z_sm_r1k4 zero: models/SmolLM3-3B rows 1 4000 --layers 2
+z_sm_r1k4_novop zero: models/SmolLM3-3B rows 1 4000 --layers 2 --hack novop
+z_sm_r1k4_half zero: models/SmolLM3-3B rows 1 4000 --layers 2 --hack half
+z_sm_r1k4_comp1 zero: models/SmolLM3-3B rows 1 4000 --layers 2 --hack comp1
+z_ge_r4 zero: models/gemma-4-E2B-it rows 4 544 --layers 0,1,2,3,4
+z_ge_r4_novop zero: models/gemma-4-E2B-it rows 4 544 --layers 0,1,2,3,4 --hack novop
+z_ge_r4_half zero: models/gemma-4-E2B-it rows 4 544 --layers 0,1,2,3,4 --hack half
+z_ge_r4_comp1 zero: models/gemma-4-E2B-it rows 4 544 --layers 0,1,2,3,4 --hack comp1
+z_ge_r4m8 zero: models/gemma-4-E2B-it rows 4 544 --layers 0,1,2,3,4 --mcols 8
+z_ge_r4m8_novop zero: models/gemma-4-E2B-it rows 4 544 --layers 0,1,2,3,4 --mcols 8 --hack novop
+z_ge_r4m8_half zero: models/gemma-4-E2B-it rows 4 544 --layers 0,1,2,3,4 --mcols 8 --hack half
+z_ph_r3 zero: models/Phi-4-mini-instruct rows 3 544 --layers 2
+z_ph_r3_novop zero: models/Phi-4-mini-instruct rows 3 544 --layers 2 --hack novop
+z_ph_r3_half zero: models/Phi-4-mini-instruct rows 3 544 --layers 2 --hack half
+z_ph_r1k4 zero: models/Phi-4-mini-instruct rows 1 4000 --layers 2
+z_ph_r1k4_novop zero: models/Phi-4-mini-instruct rows 1 4000 --layers 2 --hack novop
+z_ph_r1k4_half zero: models/Phi-4-mini-instruct rows 1 4000 --layers 2 --hack half
+z_lf_r3 zero: models/LFM2-2.6B rows 3 544 --layers 6
+z_lf_r3_novop zero: models/LFM2-2.6B rows 3 544 --layers 6 --hack novop
+z_lf_r3_half zero: models/LFM2-2.6B rows 3 544 --layers 6 --hack half
+z_lf_r3_comp1 zero: models/LFM2-2.6B rows 3 544 --layers 6 --hack comp1

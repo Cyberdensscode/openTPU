@@ -123,6 +123,57 @@ def _gap_table(p, progs, pbytes, bpc):
         print(f"    {src:50s} starved {ms:7d}  blocked {mb:7d}  MAC {mx:8d}")
 
 
+def _union(iv) -> int:
+    tot, cs, ce = 0, None, None
+    for x, y in sorted(iv):
+        if ce is None or x > ce:
+            tot += 0 if ce is None else ce - cs
+            cs, ce = x, y
+        else:
+            ce = max(ce, y)
+    return tot + (0 if ce is None else ce - cs)
+
+
+def _json_line(a, p, progs, cfg, R, hacked, pbytes, D):
+    """One JSON line of the run (--json): cycles, units' busy, the stream engine's busy (its
+    DSTEP / STREAM intervals: the profile counts them on the DMA), per VOP function the
+    instructions and busy cycles, per phase cycles / VPU / MXU / SE, and the MXU gaps' blame
+    by the class of the instruction they waited on."""
+    import json
+    recs = p.slice_recs(0)
+    from opentpu import isa as II
+    se = _union([(r.start, r.end) for r in recs if r.op in (II.DSTEP, II.STREAM) and r.start >= 0])
+    sys.path.insert(0, str(ROOT / "tools"))
+    import vpu_hack
+    vf = defaultdict(lambda: [0, 0, 0])     # per function: count, busy, issue cycles (model)
+    for r in recs:
+        ins = progs[0][r.pc]
+        if r.op in (II.VOP, II.DSTEP, II.STREAM) and r.start >= 0:
+            f = II.VFUNCS.get((ins.w[5] >> 16) & 0xFF, "?") if r.op == II.VOP else r.name
+            vf[f][0] += 1
+            vf[f][1] += r.end - r.start
+            vf[f][2] += vpu_hack.issue_cycles(ins, cfg.LANES)
+    ph = p.phases(lambda r: _phase(progs[0][r.pc]))
+    for k, v in ph.items():
+        v["SE"] = _union([(r.start, r.end) for r in recs if r.op in (II.DSTEP, II.STREAM)
+                          and r.start >= 0 and _phase(progs[0][r.pc]) == k])
+        v["bytes"] = pbytes.get(k, 0)
+    g = p.mxu_gaps(0)
+    blame = defaultdict(int)
+    for (name, _), v in g["blame"].items():
+        blame[name] += v
+    out = {"model": Path(str(a.model)).name, "wformat": a.wformat, "head": a.head_format,
+           "rows": a.rows, "batch": a.batch, "pos": a.pos, "layers": a.layers,
+           "mcols": cfg.MCOLS, "hack": a.hack, "hacked": hacked, "cycles": p.cycles,
+           "instructions": len(progs[0]), "busy": p.unit_busy(0), "se_busy": se,
+           "vop": {k: v for k, v in sorted(vf.items())}, "phases": ph,
+           "mxu_gaps": {"prologue": g["prologue"], "epilogue": g["epilogue"],
+                        "gaps": sum(y - x for x, y, _ in g["gaps"]), "blame": dict(blame)},
+           "roofline": p.roofline()["bound"]}
+    with open(a.json, "a") as f:
+        f.write(json.dumps(out) + "\n")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="qwen3",
@@ -179,6 +230,14 @@ def main():
                     help="weight format of the layers (opentpu/quant.py)")
     ap.add_argument("--head-format", default=None, choices=["int8", "int4", "fp4"],
                     help="weight format of the LM head (default: --wformat)")
+    ap.add_argument("--batch", type=int, default=0, metavar="B",
+                    help="a batched decode step: B sequences (KV slots) at --pos each, one row a "
+                         "slot, every row's logits (Qwen3 family: opentpu/llm/batch.py's step, "
+                         "the pick on the device; other models: compile_rows over the slots)")
+    ap.add_argument("--hack", default="",
+                    help="timing-only program transforms, comma list (tools/vpu_hack.py: novop, "
+                         "nocomp, comp1, half, halfcomp, halfew, nose, halfse); results wrong")
+    ap.add_argument("--json", help="append the run's numbers as one JSON line to this file")
     ap.add_argument("--gaps", action="store_true",
                     help="per phase: the cycles above its roofline, split by what the MXU and "
                          "port B did (64-cycle windows)")
@@ -209,26 +268,34 @@ def main():
     if a.mtp:
         spec = dataclasses.replace(spec, mtp=True)
         a.rows, a.logits = 2, "all"
-    R = max(1, a.rows)
+    R = max(1, a.rows, a.batch)
+    if a.batch and (a.rows or a.mtp or a.resident):
+        ap.error("--batch is a decode step of its own (no --rows, --mtp, --resident)")
     if a.cap is None:
         a.cap = 256 * ((a.pos + R - 1) // 256 + 1)
-    if a.pos + R - 1 >= a.cap:
+    if a.pos + (1 if a.batch else R) - 1 >= a.cap:
         ap.error(f"--pos {a.pos} needs --cap above it (the KV write would land past the cache)")
     W = load_weights(path, mtp=bool(a.mtp))
     wkw = dict(wformat=a.wformat, head_format=a.head_format, rows=R,
                **({"lookup": True} if a.resident else {}))
+    qwen3_batch = bool(a.batch) and type(spec).__module__.endswith(".qwen3")
+    if a.batch:
+        wkw.update(batch=a.batch, **({"lookup": True} if qwen3_batch else {}))
     mk = {"MCOLS": a.mcols} if a.mcols else {}
     need = spec.image(board_config(DRAM_BYTES=1 << 40, **mk), a.cap, **wkw).nbytes
+    need += (64 << 20) if qwen3_batch else 0           # the batch area (batch.alloc)
     cfg = board_config(DRAM_BYTES=1 << max(20, (need - 1).bit_length()), **mk)
     img = spec.image(cfg, a.cap, **wkw)
     dram = img.build(W)[0]
+    # the rows' (slot, position): a batched step's slots at pos, or one sequence's positions
+    rows = [(s, a.pos) for s in range(a.batch)] if a.batch else [(0, a.pos + r) for r in range(R)]
     # the rows' inputs (the KV cache before pos stays zero: timing does not depend on it)
     if hasattr(img, "host_inputs"):         # Gemma 4: the gathered rows, the RoPE rows
-        parts = img.host_inputs([791 + r for r in range(R)], [a.pos + r for r in range(R)])
+        parts = img.host_inputs([791 + r for r in range(R)], [p for _, p in rows])
     else:
         emb = np.stack([np.asarray(W["model.embed_tokens.weight"][791 + r], np.float32)
                         for r in range(R)])
-        tabs = [rope_tables(spec, a.pos + r) for r in range(R)]
+        tabs = [rope_tables(spec, p) for _, p in rows]
         c, s = np.stack([t[0] for t in tabs]), np.stack([t[1] for t in tabs])
         parts = [(img.io[k], v) for k, v in (("x", emb), ("cos", c), ("sin", s))]
     for addr, v in parts:
@@ -242,7 +309,20 @@ def main():
         import opentpu.llm.qwen3 as Q
         Q.ATTN_DEPTH = a.depth
     args = None
-    if a.mtp == "draft":
+    if qwen3_batch:
+        from opentpu.llm import batch as BA
+        from opentpu.llm.qwen3 import ATTN_BLOCK
+        area = BA.alloc(img, cfg, a.batch, -(-img.nbytes // 4096) * 4096)
+        if area["end"] > cfg.DRAM_BYTES:
+            ap.error("--batch: no room for the batch area")
+        dram = np.concatenate([dram, np.zeros(max(0, area["end"] - len(dram)), np.uint8)])
+        BA.build([dram], area, spec, cfg)
+        tin = np.asarray([791 + s for s in range(a.batch)], np.float32).view(np.uint8)
+        dram[area["tin"]:area["tin"] + tin.size] = tin
+        progs = BA.compile_step(img, area, rows, [None] * a.batch, a.block or ATTN_BLOCK)
+    elif a.batch:
+        progs = img.compile_rows(rows, list(range(R)), *([a.block] if a.block else []))
+    elif a.mtp == "draft":
         progs = img.compile_mtp(a.pos, R, None, *([a.block] if a.block else []))
     elif a.mtp == "verify":
         progs = img.compile_rows([(0, a.pos + r) for r in range(R)], list(range(R)),
@@ -288,6 +368,16 @@ def main():
         args = arg_words(ra, RunPos.values(791, a.pos, K, blk))
     else:
         progs = img.compile_step(a.pos, *([a.block] if a.block else []))
+    hacked = {}
+    if a.hack:
+        sys.path.insert(0, str(ROOT / "tools"))
+        import vpu_hack
+        res = [vpu_hack.apply(p, a.hack) for p in progs]
+        progs, hacked = [p for p, _ in res], res[0][1]
+        print(f"hack {a.hack}: {hacked}")
+    if 8 * len(progs[0]) > cfg.IMEM_WORDS:      # a proxy of a longer program: time it
+        cfg = dataclasses.replace(cfg, IMEM_WORDS=1 << (8 * len(progs[0]) - 1).bit_length())
+        print(f"(IMEM grown to {cfg.IMEM_WORDS} words for {len(progs[0])} instructions)")
     t = time.time()
     drams, _, st = rtlsim.run(cfg, progs, [dram], trace=True,
                               uarch=rtlsim.BOARD_UARCH,
@@ -414,6 +504,8 @@ def main():
         if run and run[2] > 300:
             print(f"  idle {run[2]:6d} in [{run[0]}, {run[1]}]")
         print(f"  port-B idle cycles total {tot}")
+    if a.json:
+        _json_line(a, p, progs, cfg, R, hacked, pb, D)
     if a.dump:
         import json
         from opentpu import lens as L
