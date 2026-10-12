@@ -687,8 +687,13 @@ class Builder:
         self.tmem_peak = 0
         self.stores: list = []        # (host, element offsets, dram byte address)
         self.loop_uses: list = []     # stationaries used inside loops: (loop depth, stat)
-        # STREAM descriptors live at the top of TMEM, filled once at the program's start
+        # STREAM descriptors live at the top of TMEM, filled once at the program's start; in a
+        # TMEM above 64K words, at the top of its first 64K (STREAM's descriptor field is 16
+        # bits), a region no tile takes
         self.desc_area = I.STREAM_DESC_AREA if cfg.STREAM else 0
+        self.desc_at = min(cfg.TMEM_WORDS, 1 << 16) - self.desc_area
+        if self.desc_area and cfg.TMEM_WORDS > 1 << 16:
+            self.tmem_regions.append((self.desc_at, 1 << 16, lambda: True))
         self.descs: dict = {}         # descriptor words -> TMEM address
         self.desc_fills = 0
 
@@ -1034,7 +1039,7 @@ class Builder:
         """Next-fit: the first gap of n words at or after the cursor (wrapping once). Regions
         are free once no tile references them; reusing one is always correct (the scoreboard
         orders the accesses), and next-fit keeps reuse far from recent, still-running work."""
-        W = self.cfg.TMEM_WORDS - self.desc_area
+        W = self.cfg.TMEM_WORDS - (self.desc_area if self.cfg.TMEM_WORDS <= 1 << 16 else 0)
         for attempt in range(2):
             self.tmem_regions = [r for r in self.tmem_regions if r[2]() is not None]
             if self.fit == "best":          # the smallest gap that holds n words
@@ -1466,9 +1471,8 @@ class Builder:
         written by FILLs at the program's start (docs/stream.md, 3.2)."""
         words = tuple(d.words())
         if words not in self.descs:
-            at = self.cfg.TMEM_WORDS - self.desc_area + sum(-(-len(w) // 8) * 8
-                                                            for w in self.descs)
-            if at + len(words) > self.cfg.TMEM_WORDS:
+            at = self.desc_at + sum(-(-len(w) // 8) * 8 for w in self.descs)
+            if at + len(words) > self.desc_at + self.desc_area:
                 raise CompileError("the STREAM descriptor area is full")
             fills = [I.vop(I.V_FILL, at + i, 0, 0, 1, 1, 0, 0, 0, I.B_SCALAR,
                            imm=np.uint32(x).view(np.float32), comment=f"stream desc {i}")

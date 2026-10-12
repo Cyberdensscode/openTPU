@@ -99,7 +99,7 @@ package otpu_pkg;
   // overlapped nothing: a 4 GiB DRAM's top words, a STREAM's 256 KiB near the top). The lost byte
   // never decides an overlap: every DRAM range starts at a word (DMA, MXU, WAITW) or covers its
   // beats' words (QST, beats()), so a range holding the last byte also holds the word 0xFFFFFFFC.
-  // TMEM ranges that reach 2^32 do not fit the scoreboard's 16 bits anyway (otpu_seq: all).
+  // TMEM ranges that reach 2^32 do not fit the scoreboard's TAW bits anyway (otpu_seq: all).
   function automatic rng_t mk(input logic [1:0] sp, input logic [31:0] lo, input logic [31:0] len);
     rng_t r;
     logic [32:0] hi;

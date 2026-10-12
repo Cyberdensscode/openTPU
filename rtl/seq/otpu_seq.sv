@@ -36,8 +36,9 @@ module otpu_seq
   parameter int S          = 1,
   parameter int D          = 32,
   parameter int WIN        = 16,
-  parameter bit STREAMS    = 1'b1     // the stream engine (otpu_slice HAS_SS); 0: DSTEP and STREAM
+  parameter bit STREAMS    = 1'b1,    // the stream engine (otpu_slice HAS_SS); 0: DSTEP and STREAM
                                       //   are illegal instructions (ERROR), not a wait for SE
+  parameter int TMEM_WORDS = 1 << 16  // the scoreboard's TMEM ranges: TAW below
 ) (
   input  logic                clk,
   input  logic                rst,
@@ -108,10 +109,11 @@ module otpu_seq
   // in the range); it adds only the output tile's padding words between them (ors - N).
   // An instruction's DRAM ranges are all reads or all writes, hence one dw bit. ACT ranges
   // start below 2^8 (an 8-bit field) and are at most 2^16 - 1 long, so [alo, ahi) is exact.
-  // TMEM ranges keep TAW/TAW+1 bits: TMEM holds 2^16 words, so every access the ISA allows has
-  // lo < 2^16, hi <= 2^16. A valid TMEM range that does not fit raises all instead (the
-  // instruction then conflicts with everything, like BAR) -- conservative, never wrong.
-  localparam int TAW = 16;
+  // TMEM ranges keep TAW/TAW+1 bits: TMEM holds 2^TAW words (at least 2^16), so every access
+  // the ISA allows has lo < 2^TAW, hi <= 2^TAW. A valid TMEM range that does not fit raises all
+  // instead (the instruction then conflicts with everything, like BAR) -- conservative, never
+  // wrong.
+  localparam int TAW = (TMEM_WORDS > (1 << 16)) ? $clog2(TMEM_WORDS) : 16;
   typedef struct packed { logic [31:0] lo, hi; } r32_t;
   typedef struct packed { logic [TAW-1:0] lo; logic [TAW:0] hi; } rt_t;
   typedef struct packed { logic w; rt_t r; } rtw_t;     // TMEM, may be written

@@ -256,6 +256,23 @@ def test_state_step_descriptors_are_filled_at_the_start():
     assert [i.w[6] for i in fills] == d.words()
 
 
+def test_descriptors_stay_in_the_first_64k_of_a_larger_tmem():
+    """STREAM's descriptor field is 16 bits: with a TMEM above 64K words the descriptors sit at
+    the top of its first 64K (no tile there), and the step is the 64K TMEM's, bit for bit."""
+    rows, cols = 16, 64
+    S, vec, x, kk = _family_case(np.random.default_rng(3), rows, cols, "retnet")
+    args = dict(state=Input(S), vec=Input(vec), x=Input(x), kk=Input(kk),
+                state_out=Output((rows, cols)), out=Output((rows,)), mode="scale")
+    big = dataclasses.replace(CFG, STREAM=True, TMEM_WORDS=1 << 17)
+    comp, _ = compile_kernel(_family, big, **args)
+    st = next(i for i in comp.programs[0] if i.op == I.STREAM)
+    assert st.w[0] & 0xFFFF == (1 << 16) - I.STREAM_DESC_AREA
+    a = launch(_family, big, **args).outputs
+    b = launch(_family, dataclasses.replace(CFG, STREAM=True), **args).outputs
+    for k in ("state_out", "out"):
+        assert np.array_equal(a[k].view(np.uint32), b[k].view(np.uint32))
+
+
 # ------------------------------------------------------------------------ TMEM streams
 @ol.jit
 def _rmsnorm_k(x, gamma, y, eps=1e-6):
