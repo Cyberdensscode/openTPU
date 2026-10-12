@@ -1389,7 +1389,11 @@ bytes twice in act_wr; docs/tiled_prefill.md 11.2). So:
   groups, full depth), and replay streams each weight row from DRAM once for all the MM's rows
   (group 0 pops a row's chunks, the later groups read the same FIFO entries): a quarter of the
   weight bytes a prompt row against ACT_ROWS 16, with no more block RAM (the array's cycles and
-  the replay rule KB <= DEPTH unchanged).
+  the replay rule KB <= DEPTH unchanged; dataflow's ledger, fp4x6 layers: Qwen3-0.6B 14.9 ->
+  3.7 MB a row, SmolLM3-3B ~94 -> ~23, Qwen3.5-4B ~120 -> ~30). It pays only with a 64-row tile,
+  and today's TMEM (64K words) stops the tile kernel at 8 to 16 rows at MCOLS 16 (compile checks:
+  Qwen3-0.6B 16 rows at position 544, 12 at 4000; SmolLM3 8): it needs about 4x the TMEM a row,
+  or S > 1 slices splitting the outputs (docs/dataflow.md 4.12).
 - **Fewer RAMs take a faster port, not fewer copies.** Reading at the pumped clock (266.67 MHz,
   two half-rows a slow cycle into a register stage a bank; not built) gives 16 bytes a RAMB36 a
   slow cycle: 128 data and 8 record RAMB36 at MCOLS 16, 136 freed (half depth at ACT_ROWS 16,
