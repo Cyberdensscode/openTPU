@@ -55,8 +55,11 @@ module otpu_slice
   parameter int TMEM_NCP   = 3,       // TMEM_IMPL 1: copies (3; 2, 4, 5, 7: the read slots of
                                       //   pumped copies, docs/tmem_pump.md)
   parameter int TMEM_NSB   = 8,       // TMEM_IMPL 3 (EXPERIMENTAL): one copy, each bank TMEM_NSB
-  parameter int TMEM_SBP   = 3        //   RAMs, the sub-bank at word-address bit TMEM_SBP
+  parameter int TMEM_SBP   = 3,       //   RAMs, the sub-bank at word-address bit TMEM_SBP
                                       //   (docs/tmem_nocopy.md)
+  parameter int TMEM_SBH   = 0,       // TMEM_IMPL 3: the sub-bank hashed (otpu_tmem SBH)
+  parameter bit TMEM_RPL   = 1'b0     // TMEM_IMPL 3: lost reads replayed (otpu_tmem RPL), the
+                                      //   board's arbiter (ARB_MASK) with the replays' holds
 ) (
   input  logic          clk,
   input  logic          sys_rst,
@@ -125,7 +128,8 @@ module otpu_slice
   // the board build (TMEM replicated per read port, RPB >= NRP * LANES: reads never conflict;
   // WPB = 1): the arbiter only masks write banks (see the arbiter), and the VPU's grant only
   // takes its buffered writes (otpu_vpu WBUF)
-  localparam bit ARB_MASK = (TMEM_IMPL == 0) && (RPB >= NRP * LANES) && (WPB == 1);
+  localparam bit ARB_MASK = (TMEM_IMPL == 0 || (TMEM_IMPL == 3 && TMEM_RPL)) &&
+                            (RPB >= NRP * LANES) && (WPB == 1);
   // TMEM_IMPL 1 (banked TMEM): three copies, each bank one read per cycle; the ports of one
   // group on different copies (the quantizer's three, the VPU's two), so a group alone always
   // fits: copy 0 MXU, QUANT, VPU A; copy 1 VPU B, QUANT 2; copy 2 DMA, QUANT 3, COLL. The arbiter
@@ -172,8 +176,9 @@ module otpu_slice
   //                                        COLL  Q2    Q3    VB    VA    Q     DMA   MXU
   localparam logic [NRP-1:0][2:0] RGRP = {3'(G_COLL), 3'(G_Q), 3'(G_Q), 3'(G_VPU), 3'(G_VPU),
                                           3'(G_Q), 3'(G_DMA), 3'(G_MXU)};
-  initial if (TMEM_IMPL == 3 && (WPB != 1 || ARB_MASK))
-    $fatal(1, "otpu_slice: TMEM_IMPL 3 needs WPB = 1 (WPB %0d)", WPB);
+  initial if (TMEM_IMPL == 3 && (WPB != 1 || ARB_MASK != TMEM_RPL))
+    $fatal(1, "otpu_slice: TMEM_IMPL 3 needs WPB = 1 (WPB %0d), and RPB >= %0d with TMEM_RPL",
+           WPB, NRP * LANES);
 
   // ---- sequencer
   cmd_t ucmd [NUNITS];
@@ -321,6 +326,7 @@ module otpu_slice
   // ---- TMEM
   logic [NRP-1:0][LANES-1:0]       rq_en, r_en;
   logic [NRP-1:0]                  tm_bx, tm_bs, tm_sv, tm_pre;   // TMEM_IMPL 3 (below)
+  logic [NRP-1:0]                  tm_lost, tm_frz;               // TMEM_IMPL 3, TMEM_RPL
   logic [NRP-1:0][LANES-1:0]       rq_t;
   logic [NRP-1:0][LANES-1:0][31:0] r_addr, r_data;
   logic [NWP-1:0][LANES-1:0]       wq_en, w_en;
@@ -337,9 +343,10 @@ module otpu_slice
               .SH_MASK((TMEM_IMPL == 2) ? '0 : (NRP'(1) << P_Q3) | (NRP'(1) << P_COLL)),
               .SID(SID), .IMPL((TMEM_IMPL == 2) ? 0 : TMEM_IMPL), .NCP(NCP), .CPY(CPY), .RQ(TMEM_RQ),
               .PRANK((TMEM_IMPL == 3) ? PRANK3 : PRANK), .NSB(TMEM_NSB), .SBP(TMEM_SBP),
-              .GRP(RGRP)) u_tmem (
+              .GRP(RGRP), .SBH(TMEM_SBH), .RPL(TMEM_RPL), .RPLM(~(NRP'(1) << P_COLL)),
+              .TOPP(P_DMA)) u_tmem (
     .clk, .r_en, .r_req(rq_t), .r_addr, .r_data, .w_en, .w_req(wq_en), .w_gnt, .w_addr,
-    .w_data, .blk_x(tm_bx), .blk_s(tm_bs), .dump);
+    .w_data, .blk_x(tm_bx), .blk_s(tm_bs), .lost(tm_lost), .frz(tm_frz), .dump);
   assign coll_rdata = r_data[P_COLL];
   // the units' TMEM requests
   logic [LANES-1:0]        dma_ren, dma_wen, va_ren, vb_ren, v_wen;
@@ -451,7 +458,7 @@ module otpu_slice
 
   otpu_vpu #(.LANES(LANES), .CL(VPU_CL), .SID(SID), .WBUF(ARB_MASK), .HAS_SE(HAS_SS)) u_vpu (
     .clk, .rst(rst_vpu), .start(ustart[U_VPU]), .cmd(ucmd[U_VPU]), .rdy(r_vpu), .done(d_vpu),
-    .gnt(gnt[G_VPU]), .ren(v_ren),
+    .gnt(gnt[G_VPU]), .ren(v_ren), .rhold(tm_lost[P_VA] || tm_lost[P_VB]),
     .ta_en(va_ren), .ta_addr(va_raddr), .ta_data(r_data[P_VA]),
     .tb_en(vb_ren), .tb_addr(vb_raddr), .tb_data(r_data[P_VB]),
     .tw_en(v_wen), .tw_addr(v_waddr), .tw_data(v_wdata), .pf_u(v_u), .pf_frz(v_frz),
@@ -574,9 +581,17 @@ module otpu_slice
   // (TMEM_IMPL 1: no guests, the banked arbiter counts every copy's banks)
   wire q3_blk = (TMEM_IMPL == 0) && (|rq_en[P_Q3]) && (|rq_en[P_DMA]);
   wire coll_blk = (TMEM_IMPL == 0) && (|rq_en[P_COLL]) && ((|rq_en[P_DMA]) || (|rq_en[P_Q3]));
+  // TMEM_RPL: a group whose port replays a lost read is held (tm_frz, a register); the
+  // collective, which is not replayed, reads only where its request does not lose (tm_bx)
+  logic [NG-1:0] rpl_hold, rpl_frz;
+  always_comb
+    for (int g = 0; g < NG; g++) begin
+      rpl_frz[g] = TMEM_RPL && g != G_VPU && g != G_COLL && (tm_frz & grp_rports(g)) != '0;
+      rpl_hold[g] = rpl_frz[g] || (TMEM_RPL && g == G_COLL && tm_bx[P_COLL] && |rq_en[P_COLL]);
+    end
   always_comb begin
     for (int g = 0; g < NG; g++) begin
-      aok[g] = 1'b1;
+      aok[g] = !rpl_hold[g];
       for (int h = 0; h < g; h++) if (aok[h] && acf[g][h]) aok[g] = 1'b0;
       if (g == G_Q && q_awant && !sw_rdy) aok[g] = 1'b0;   // QST write the DRAM cannot take
       if ((g == G_Q && q3_blk) || (g == G_COLL && coll_blk)) aok[g] = 1'b0;
@@ -604,7 +619,7 @@ module otpu_slice
     if (!v_ren)       begin r_en[P_VA] = '0; r_en[P_VB] = '0; end
     if (!gnt[G_VPU])  w_en[W_VPU] = '0;
     if (!gnt[G_COLL]) begin r_en[P_COLL] = '0; w_en[W_COLL] = '0; end
-    if (TMEM_IMPL == 3)               // a split group's ports: read once, ahead of the grant
+    if (TMEM_IMPL == 3 && !TMEM_RPL)  // a split group's ports: read once, ahead of the grant
       for (int p = 0; p < NRP; p++) begin
         if (tm_sv[p]) r_en[p] = '0;
         if (tm_pre[p]) r_en[p] = rq_en[p];
@@ -617,8 +632,17 @@ module otpu_slice
   // as gnt_q) and its own ports do not collide (tm_bs). When they do, its ports read over
   // successive cycles: those not blocked read ahead of the grant (tm_pre: their lanes hold the
   // words), drop out of the requests (tm_sv), and the unit is granted when the rest can read.
-  always_comb
-    for (int p = 0; p < NRP; p++) rq_t[p] = (TMEM_IMPL == 3 && tm_sv[p]) ? '0 : rq_en[p];
+  // (TMEM_RPL: the requests of a group held for a replay, and the VPU's while its registered
+  // enable is low, ask no RAM)
+  always_comb begin
+    logic [NRP-1:0] off;
+    off = '0;
+    if (TMEM_IMPL == 3 && TMEM_RPL)
+      for (int g = 0; g < NG; g++)
+        if ((g == G_VPU) ? !v_ren : rpl_frz[g]) off = off | grp_rports(g);
+    for (int p = 0; p < NRP; p++)
+      rq_t[p] = ((TMEM_IMPL == 3 && !TMEM_RPL && tm_sv[p]) || off[p]) ? '0 : rq_en[p];
+  end
   logic [NG-1:0] gs3;
   always_comb begin
     gnt_s = gs3;
@@ -643,7 +667,7 @@ module otpu_slice
     cgl_s = gs[G_COLL];
   end
   always_ff @(posedge clk)
-    if (srst || TMEM_IMPL != 3) tm_sv <= '0;
+    if (srst || TMEM_IMPL != 3 || TMEM_RPL) tm_sv <= '0;
     else
       for (int g = 0; g < NG; g++) begin
         logic [NRP-1:0] rp;

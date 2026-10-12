@@ -189,8 +189,9 @@ if os.environ.get("OTPU_TMEM_NCP"):
 if os.environ.get("OTPU_TMEM_IMPL"):
     UARCH["TMEM_IMPL"] = BOARD_UARCH["TMEM_IMPL"] = int(os.environ["OTPU_TMEM_IMPL"])
 # ... OTPU_TMEM_IMPL=3: one copy of sub-banked RAMs (otpu_tmem IMPL 3), OTPU_TMEM_NSB RAMs a bank
-# with the sub-bank at word-address bit OTPU_TMEM_SBP
-for _k in ("NSB", "SBP"):
+# with the sub-bank at word-address bit OTPU_TMEM_SBP, hashed by OTPU_TMEM_SBH (1, 2); with
+# OTPU_TMEM_RPL=1 lost reads are replayed under the board's arbiter (otpu_slice TMEM_RPL)
+for _k in ("NSB", "SBP", "SBH", "RPL"):
     if os.environ.get("OTPU_TMEM_" + _k):
         UARCH["TMEM_" + _k] = int(os.environ["OTPU_TMEM_" + _k])
 # TMEM lanes of the MXU and the quantizer when fewer than LANES (timing only): OTPU_ULANES=8

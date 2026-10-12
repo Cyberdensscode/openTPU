@@ -64,3 +64,25 @@ s8t OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_rps=2,+tm_tdp=1
 s16t OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3,+tm_rps=2,+tm_tdp=1
 s8tq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_rps=2,+tm_tdp=1,+tm_rq=1
 c1t OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=1,+tm_rps=2,+tm_tdp=1
+# ... true dual-port, hashed; with request-priority addresses
+s8h2t OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_sbh=2,+tm_rps=2,+tm_tdp=1
+s8h2tq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_sbh=2,+tm_rps=2,+tm_tdp=1,+tm_rq=1
+s16h2tq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3,+tm_sbh=2,+tm_rps=2,+tm_tdp=1,+tm_rq=1
+s16h2q OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3,+tm_sbh=2,+tm_rq=1
+# ... a scalar operand read once: a line of the last word kept at QUANT 3, VPU B and COLL (their
+# reads repeat one address; bufm 0xb0), with a write to it dropping it
+s8iqB OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_rq=1,+tm_nbuf=1,+tm_bufm=b0
+s16h2qB OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3,+tm_sbh=2,+tm_rq=1,+tm_nbuf=1,+tm_bufm=b0
+s8tqB OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_rps=2,+tm_tdp=1,+tm_rq=1,+tm_nbuf=1,+tm_bufm=b0
+s8h2tqB OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_sbh=2,+tm_rps=2,+tm_tdp=1,+tm_rq=1,+tm_nbuf=1,+tm_bufm=b0
+s16h2tqB OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3,+tm_sbh=2,+tm_rps=2,+tm_tdp=1,+tm_rq=1,+tm_nbuf=1,+tm_bufm=b0
+# two copies, a unit's ports split over them (copy 0: MXU, QUANT, VPU A; copy 1: DMA, VPU B,
+# QUANT 3, QUANT 2, COLL): only other units' reads can collide
+d8iq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_rq=1,+tm_cpy=01001111
+d1q OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=1,+tm_rq=1,+tm_cpy=01001111
+# the RTL with replays (otpu_tmem IMPL 3 RPL, otpu_slice TMEM_RPL): the board's arbiter (no RAM in
+# the grant), a lost read read again the next cycle while its unit holds
+r8iR OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=8 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1
+r8hR OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=8 OTPU_TMEM_SBP=3 OTPU_TMEM_SBH=2 OTPU_TMEM_RPL=1
+r16hR OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=16 OTPU_TMEM_SBP=3 OTPU_TMEM_SBH=2 OTPU_TMEM_RPL=1
+r16h OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=16 OTPU_TMEM_SBP=3 OTPU_TMEM_SBH=2

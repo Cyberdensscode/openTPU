@@ -64,7 +64,13 @@ module otpu_tmem #(
   parameter int   NSB   = 8,              // IMPL 3: RAMs (sub-banks) per bank
   parameter int   SBP   = 3,              // IMPL 3: the sub-bank field's lowest word-address bit
   parameter bit   SHARE = 1'b1,           // IMPL 3: ports reading one word share its RAM read
-  parameter logic [NRP-1:0][2:0] GRP = '0 // IMPL 3: each read port's group (the slice's unit)
+  parameter logic [NRP-1:0][2:0] GRP = '0, // IMPL 3: each read port's group (the slice's unit)
+  parameter int   SBH   = 0,              // IMPL 3: the sub-bank hashed with the row bits above
+                                          //   it (1: the next field, 2: every field, XORed)
+  parameter bit   RPL   = 1'b0,           // IMPL 3: a lost read is replayed the next cycle (see
+                                          //   IMPL 3 below)
+  parameter logic [NRP-1:0] RPLM = '1,    // RPL: the ports whose reads may be replayed
+  parameter int   TOPP  = 0               // RPL: the port whose request comes before the replays
 ) (
   input  logic                                clk,
   input  logic [NRP-1:0][LANES-1:0]           r_en,     // granted reads
@@ -78,6 +84,9 @@ module otpu_tmem #(
   input  logic [NWP-1:0][LANES-1:0][31:0]     w_data,
   output logic [NRP-1:0]                      blk_x,    // IMPL 3: a port of another group
   output logic [NRP-1:0]                      blk_s,    //   / of its own took a RAM it reads
+  output logic [NRP-1:0]                      lost,     // IMPL 3 RPL: the port's read this cycle
+                                                        //   lost a RAM (replayed next cycle)
+  output logic [NRP-1:0]                      frz,      // IMPL 3 RPL: the port replays now
   input  logic                                dump
 );
   localparam int BW = $clog2(LANES);
@@ -196,6 +205,7 @@ module otpu_tmem #(
   logic [NRP-1:0][LANES-1:0]         pb_en;
   logic [NRP-1:0][LANES-1:0][IW-1:0] pb_a;
   logic [NRP-1:0][LANES-1:0][31:0]   pq;      // the bank data each port's copy returns
+  logic [NRP-1:0][LANES-1:0]         rpf;     // IMPL 3 RPL: the lanes a replay reads now
   for (genvar p = 0; p < NRP; p++) begin : g_preq
     // per bank: the address of the lane that reads it (lanes of one port hit distinct banks or
     // read the same word, so an AND-OR merge is exact). A port belongs to one unit and the
@@ -270,18 +280,50 @@ module otpu_tmem #(
   // one per CPY value, held by its first port; each bank serves the port granted in it.
   // ---- IMPL 3 (EXPERIMENTAL, docs/tmem_nocopy.md): one copy. Each bank is NSB RAMs with their
   // own addresses: a word's sub-bank is its bank row's bits [SBP-BW +: log2 NSB] (SBP = BW: the
-  // 8-word groups interleave over the RAMs; higher: regions). A RAM's address is that of the
-  // asking port first in PRANK order, from the requests (no grant on a RAM's address path, as
-  // RQ). A port that asks a RAM another port took for another word (SHARE: one word read by
-  // two ports is one read) is blocked: by a port of another group (blk_x: the slice does not
-  // grant the unit) or of its own (blk_s: the slice reads the group's ports over successive
-  // cycles, otpu_slice TMEM_IMPL 3). Writes: one per bank and cycle, as IMPL 0 and 1, to the
-  // RAM of its sub-bank; the registered write stage and its bypass are IMPL 0's.
+  // 8-word groups interleave over the RAMs; higher: regions), XORed with the row's fields above
+  // them (SBH 1: the next one, 2: all of them: a hash). A RAM's address is that of the asker
+  // first in rank, from the requests (no grant on a RAM's address path, as RQ). An asker that
+  // asks a RAM an asker before it took for another word (SHARE: one word read by two is one read)
+  // loses it.
+  // Without RPL the ranks are PRANK's and a port that would lose is blocked: by a port of
+  // another group (blk_x: the slice does not grant the unit) or of its own (blk_s: the slice reads
+  // the group's ports over successive cycles, otpu_slice TMEM_IMPL 3).
+  // RPL (replay): the units read as if no RAM were shared (the slice's grant ignores the RAMs) and
+  // a read that lost is read again the next cycle: the port's banks and rows are registered with
+  // the read, and the next cycle they ask again (frz) ranked before every request but TOPP's (the
+  // DMA's, which has no hold); their words reach the port's lanes the cycle after (the lanes
+  // fresh again, without the bypass: the replay returns what the first read would have, the
+  // writes landed since are the ones that were before it). `lost` tells the slice to hold the
+  // port's unit for the cycle the replay takes (its lanes' words of the lost read are not the
+  // ones asked). blk_x is then a port's request losing (for units that cannot hold, which the
+  // slice keeps from reading instead), blk_s 0.
+  // Writes: one per bank and cycle, as IMPL 0 and 1, to the RAM of its sub-bank; the registered
+  // write stage and its bypass are IMPL 0's.
+  // an asker's rank (0 first): without RPL PRANK's; with it TOPP's request, the replays in
+  // PRANK order, then the other requests in PRANK order. live: the asker exists
+  function automatic int rank(input int i);   // (IMPL 3: askers 0..NRP-1 requests, NRP.. replays)
+    if (i >= NRP) return 1 + int'(PRANK[i - NRP]);
+    if (!RPL) return int'(PRANK[i]);
+    if (i == TOPP) return 0;
+    return 1 + NRP + int'(PRANK[i]);
+  endfunction
+  function automatic bit live(input int i);
+    if (i >= NRP) return RPL && RPLM[i - NRP] && (i - NRP) != TOPP;
+    return 1'b1;
+  endfunction
   if (IMPL == 3) begin : g_one
     localparam int LSB = $clog2(NSB);
     localparam int SO  = SBP - BW;             // the sub-bank field's offset in a bank row
     localparam int RW  = IW - LSB;             // a RAM's address bits
     localparam int RD  = BD / NSB;             // a RAM's words
+    localparam int NA  = 2 * NRP;              // askers: the ports' requests, then their replays
+    function automatic logic [LSB-1:0] hash(input logic [IW-1:0] hi);
+      logic [LSB-1:0] x;
+      x = '0;
+      if (SBH == 1) x = LSB'(hi);
+      if (SBH == 2) for (int f = 0; f < IW; f += LSB) x = x ^ LSB'(hi >> f);
+      return x;
+    endfunction
     function automatic logic [RW-1:0] ram_row(input logic [IW-1:0] row);
       logic [IW-1:0] hi, lo;
       hi = row >> (SO + LSB);
@@ -289,65 +331,112 @@ module otpu_tmem #(
       return RW'((hi << SO) | lo);
     endfunction
     function automatic logic [LSB-1:0] sub_of(input logic [IW-1:0] row);
-      return row[SO +: LSB];
+      return row[SO +: LSB] ^ hash(row >> (SO + LSB));
     endfunction
-    // each port's sub-bank and RAM row per bank
-    logic [NRP-1:0][LANES-1:0][LSB-1:0] psb;
-    logic [NRP-1:0][LANES-1:0][RW-1:0]  prw;
-    for (genvar q = 0; q < NRP; q++) begin : g_ps
+`ifndef SYNTHESIS
+    // the bank row held in RAM k's row r (the dump)
+    function automatic int row_of(input int k, input int r);
+      logic [IW-1:0] hi, lo, f;
+      hi = IW'(r >> SO);
+      lo = IW'(r & ((1 << SO) - 1));
+      f = IW'(LSB'(k) ^ hash(hi));
+      return int'((hi << (SO + LSB)) | (f << SO) | lo);
+    endfunction
+`endif
+    // the replays: a lost read's banks, rows and lanes, registered with it
+    logic [NRP-1:0]                    rpv;
+    logic [NRP-1:0][LANES-1:0]         rpe;
+    logic [NRP-1:0][LANES-1:0][IW-1:0] rpa;
+    logic [NRP-1:0][LANES-1:0]         rpl;
+    // each asker's banks, bank rows, sub-banks and RAM rows (a replaying port's request does not
+    // ask: the slice holds its unit)
+    logic [NA-1:0][LANES-1:0]          ae;
+    logic [NA-1:0][LANES-1:0][IW-1:0]  aa;
+    logic [NA-1:0][LANES-1:0][LSB-1:0] asb;
+    logic [NA-1:0][LANES-1:0][RW-1:0]  arw;
+    for (genvar i = 0; i < NA; i++) begin : g_as
       for (genvar b = 0; b < LANES; b++) begin : g_b
-        assign psb[q][b] = sub_of(pb_a[q][b]);
-        assign prw[q][b] = ram_row(pb_a[q][b]);
+        if (i < NRP) begin : g_n
+          assign ae[i][b] = pb_en[i][b] && !(RPL && rpv[i]);
+          assign aa[i][b] = pb_a[i][b];
+        end else begin : g_r
+          assign ae[i][b] = live(i) && rpv[i - NRP] && rpe[i - NRP][b];
+          assign aa[i][b] = rpa[i - NRP][b];
+        end
+        assign asb[i][b] = sub_of(aa[i][b]);
+        assign arw[i][b] = ram_row(aa[i][b]);
       end
     end
-    // the RAMs' addresses: per RAM, the asking port first in PRANK order (a static priority: the
-    // ranks are parameters), as an AND-OR multiplexer of the ports' rows
+    // the RAMs' addresses: per RAM, the asker first in rank (a static priority: the ranks are
+    // parameters), as an AND-OR multiplexer of the askers' rows
     logic [LANES-1:0][NSB-1:0]         s_en;
     logic [LANES-1:0][NSB-1:0][RW-1:0] s_a;
     for (genvar b = 0; b < LANES; b++) begin : g_ra
       for (genvar k = 0; k < NSB; k++) begin : g_k
-        logic [NRP-1:0] rq, win;
-        for (genvar q = 0; q < NRP; q++) begin : g_q
-          assign rq[q] = pb_en[q][b] && psb[q][b] == LSB'(k);
-          logic ahead;
-          always_comb begin
-            ahead = 1'b0;
-            for (int o = 0; o < NRP; o++)
-              if (int'(PRANK[o]) < int'(PRANK[q]) && rq[o]) ahead = 1'b1;
+        logic [NA-1:0] rq, win;
+        for (genvar i = 0; i < NA; i++) begin : g_i
+          if (live(i)) begin : g_l
+            assign rq[i] = ae[i][b] && asb[i][b] == LSB'(k);
+            logic ahead;
+            always_comb begin
+              ahead = 1'b0;
+              for (int o = 0; o < NA; o++)
+                if (rank(o) < rank(i) && rq[o]) ahead = 1'b1;
+            end
+            assign win[i] = rq[i] && !ahead;
+          end else begin : g_d
+            assign rq[i] = 1'b0;
+            assign win[i] = 1'b0;
           end
-          assign win[q] = rq[q] && !ahead;
         end
         always_comb begin
           s_a[b][k] = '0;
-          for (int q = 0; q < NRP; q++) if (win[q]) s_a[b][k] = s_a[b][k] | prw[q][b];
+          for (int i = 0; i < NA; i++) if (win[i]) s_a[b][k] = s_a[b][k] | arw[i][b];
         end
         assign s_en[b][k] = |rq;
       end
     end
-    // a port is blocked where a port before it asks the same RAM for another word
-    for (genvar p = 0; p < NRP; p++) begin : g_blk
-      logic [NRP-1:0] hit;
-      for (genvar q = 0; q < NRP; q++) begin : g_q
-        if (int'(PRANK[q]) < int'(PRANK[p])) begin : g_before
+    // hm[i][o]: asker o, ranked before i, asks one of i's RAMs for another word
+    logic [NA-1:0][NA-1:0] hm;
+    for (genvar i = 0; i < NA; i++) begin : g_cf
+      for (genvar o = 0; o < NA; o++) begin : g_o
+        if (live(i) && live(o) && rank(o) < rank(i)) begin : g_before
           logic [LANES-1:0] hb;
           for (genvar b = 0; b < LANES; b++) begin : g_b
-            assign hb[b] = pb_en[p][b] && pb_en[q][b] && psb[q][b] == psb[p][b] &&
-                           (!SHARE || pb_a[q][b] != pb_a[p][b]);
+            assign hb[b] = ae[i][b] && ae[o][b] && asb[o][b] == asb[i][b] &&
+                           (!SHARE || aa[o][b] != aa[i][b]);
           end
-          assign hit[q] = |hb;
+          assign hm[i][o] = |hb;
         end else begin : g_after
-          assign hit[q] = 1'b0;
+          assign hm[i][o] = 1'b0;
         end
       end
-      always_comb begin
+    end
+    always_comb
+      for (int p = 0; p < NRP; p++) begin
         blk_x[p] = 1'b0; blk_s[p] = 1'b0;
-        for (int q = 0; q < NRP; q++)
-          if (hit[q]) begin
-            if (GRP[q] == GRP[p]) blk_s[p] = 1'b1;
+        for (int o = 0; o < NA; o++)
+          if (hm[p][o]) begin
+            if (!RPL && GRP[o % NRP] == GRP[p]) blk_s[p] = 1'b1;
             else blk_x[p] = 1'b1;
           end
       end
-    end
+    // a read lost: the port read (its unit was granted, r_en) or replayed, and lost a RAM
+    always_comb
+      for (int p = 0; p < NRP; p++)
+        lost[p] = RPL && live(NRP + p) &&
+                  (rpv[p] ? (|hm[NRP + p]) : ((|r_en[p]) && (|hm[p])));
+    always_ff @(posedge clk)
+      for (int p = 0; p < NRP; p++) begin
+        rpv[p] <= lost[p];
+        if (!rpv[p]) begin rpe[p] <= pb_en[p]; rpa[p] <= pb_a[p]; rpl[p] <= r_en[p]; end
+      end
+`ifndef SYNTHESIS
+    initial rpv = '0;
+`endif
+    assign frz = RPL ? rpv : '0;
+    always_comb
+      for (int p = 0; p < NRP; p++) rpf[p] = (RPL && rpv[p]) ? rpl[p] : '0;
     logic [LANES-1:0][NSB-1:0][31:0] s_q;
     for (genvar b = 0; b < LANES; b++) begin : g_bank
       for (genvar k = 0; k < NSB; k++) begin : g_sub
@@ -368,19 +457,21 @@ module otpu_tmem #(
         initial for (int r = 0; r < RD; r++) mem[r] = '0;
         always @(posedge clk)
           if (dump)
-            for (int r = 0; r < RD; r++)
-              img[(((r >> SO) << (SO + LSB)) | (k << SO) | (r & ((1 << SO) - 1))) * LANES + b] = mem[r];
+            for (int r = 0; r < RD; r++) img[row_of(k, r) * LANES + b] = mem[r];
 `endif
       end
     end
     // each port's data: per bank, the RAM it asked (registered with the read), or the write
-    // still in the registered stage that its word hit
+    // still in the registered stage that its word hit (a replay: the RAM's word, see above)
     for (genvar p = 0; p < NRP; p++) begin : g_pq
       logic [LANES-1:0][LSB-1:0] ss;
       logic [LANES-1:0]          bh;
       always_ff @(posedge clk)
         for (int b = 0; b < LANES; b++)
-          if (pb_en[p][b]) begin
+          if (RPL && rpv[p] && rpe[p][b]) begin
+            ss[b] <= sub_of(rpa[p][b]);
+            bh[b] <= 1'b0;
+          end else if (pb_en[p][b]) begin
             ss[b] <= sub_of(pb_a[p][b]);
             bh[b] <= pw_v[b][0] && pw_a[b][0] == pb_a[p][b];
           end
@@ -393,6 +484,9 @@ module otpu_tmem #(
   end else begin : g_nosb
     assign blk_x = '0;
     assign blk_s = '0;
+    assign lost = '0;
+    assign frz = '0;
+    assign rpf = '0;
   end
   for (genvar p = 0; p < NRP; p++) begin : g_port
    if (IMPL != 3 && host_of(p) == p) begin : g_copy
@@ -531,7 +625,7 @@ module otpu_tmem #(
     end
     always_ff @(posedge clk)
       for (int l = 0; l < LANES; l++) begin
-        fresh[l] <= r_en[p][l];
+        fresh[l] <= r_en[p][l] | rpf[p][l];   // (rpf: IMPL 3 RPL's replays)
         if (GEN_R[p] && r_en[p][l]) sel[l] <= r_addr[p][l][BW-1:0];
         if (fresh[l]) held[l] <= lq[l];
       end

@@ -38,7 +38,7 @@ module tb_se_vpu #(parameter bit WBUF = 1'b1, parameter int GNT_PCT = 80);
   logic [4:0] ss_fi = '0;
 
   otpu_vpu #(.LANES(L), .WBUF(WBUF), .HAS_SE(1'b1)) dut (
-    .clk, .rst, .start, .cmd, .rdy, .done, .gnt, .ren, .ta_en, .ta_addr, .ta_data, .tb_en,
+    .clk, .rst, .start, .cmd, .rdy, .done, .gnt, .ren, .rhold(1'b0), .ta_en, .ta_addr, .ta_data, .tb_en,
     .tb_addr, .tb_data, .tw_en, .tw_addr, .tw_data, .pf_u, .pf_frz,
     .ss_req, .ss_gnt, .ss_cfg, .ss_pe, .ss_in_v, .ss_in_d, .ss_fk, .ss_fi, .ss_fd, .ss_y_v,
     .ss_y_d, .ss_o_v, .ss_o_d);
