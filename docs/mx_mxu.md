@@ -1498,3 +1498,15 @@ core clock through x0 / x1 / w: two fast cycles, -end); in the out-of-context ne
 core-clock lookup (the register driving a PE's x1[0]) found none, so `ooc.tcl` set the
 experiment's own multicycle on the DSPs' A / B / D pins (OTPU_C2X 0), the constraint of section
 5's rows.
+
+**Next release (a pumped MXU), not r2:** r2 builds an unpumped MXU (MCOLS 8, E 8), so the 2x
+clock's MX section is left for the release that pumps the columns. It is not on any branch:
+`otpu_clk2x.tcl` exists only on tmem-pump's line (07297ddd to 930b3db7, not on main), with the MX
+section still a placeholder. What it needs: find `otpu_pump_pe`'s cells by module and their
+`clk_f` clock as above, but take the core clock as the start clock of a timing path through the
+first PE's x1 pins (`get_timing_paths -through`, falling back to the clocks of their fan-in's
+start points, `all_fanin -startpoints_only`) instead of following x1[0]'s net to its driver;
+then the multicycle from that clock through x0 / x1 / w to `clk_f` (2 -setup -end, 1 -hold
+-end). The proof is section 5's 4-column run with the section sourced instead of `ooc.tcl`'s
+own multicycle: OTPU_C2X 1, and clk_f +0.135, clk_s -> clk_f +0.359, clk_f -> clk_s +0.103.
+`rtl/exp/dsp_pump` (the pumped column the experiment reads) is not on main either.
