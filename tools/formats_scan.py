@@ -38,13 +38,15 @@ ckpt).
         text's token ids (tools/chat_text.py: a chat of an instruct model's own replies)
     python tools/formats_scan.py check
         tiny random models of each family (Qwen3 with K outliers, SmolLM3, Phi-3, Qwen3.5
-        with 4 key heads, LFM2):
+        with 4 key heads, LFM2, LFM2-MoE, Qwen3.5-MoE):
         emulate() against emulated_logits (formats including ranged ones) and the NLL of the
         chunked head against the full logits (Gemma 4's: tests/test_gemma4.py)
 
-MODEL: a short name of opentpu.llm.MODELS or a checkpoint directory. A dense model, or Gemma 4's
-MoE with --base (the other MoE models' experts are not emulated here). --cache DIR (Gemma 4; scan: OUT.json's name + .xl):
-each variant's rows into the head, by its tokens, formats and the emulation's sources.
+MODEL: a short name of opentpu.llm.MODELS or a checkpoint directory. A dense model, an LFM2-MoE
+or Qwen3.5-MoE (_moe_ffn: every expert the tokens route to, each variant through its own
+router; the experts in the wformat, e.g. ppl qwen35-35b attn=nvfp4,delta=nvfp4,mlp=nvfp4,head=int8
+--wformat fp4), or Gemma 4's MoE with --base. --cache DIR (Gemma 4; scan: OUT.json's name +
+.xl): each variant's rows into the head, by its tokens, formats and the emulation's sources.
 """
 import argparse
 import functools
@@ -81,6 +83,50 @@ def family(spec):
 
 def _ident(v, d=None, n=None):
     return v
+
+
+DROPS: dict = {}        # {label: {MM kind: what MM's window dropped}} (ppl: _counted_mm)
+_AT = {"lab": None, "rows": None, "T": 0, "kind": None}  # the variant running; its rows' tokens
+_MX_MATMUL = Q.mx_matmul
+
+
+def _counted_mm(h, w, dw=None, W=16, D=128):
+    """quant.mx_matmul, counting for the variant running (_AT) what the window drops, per MM
+    kind ("w": a layer's weights, a MoE's router and experts; "qk": q.K^T; "pv": P.V^T; "head"):
+    the MMs (and those with a drop), the (row, D/8 group) inputs and the (row, output, group)
+    terms (and those dropped), and the dropped terms per token (each row a token;
+    _AT["rows"]: the rows' tokens, a MoE expert's)."""
+    y = _MX_MATMUL(h, w, dw, W, D)
+    lab, da = _AT["lab"], getattr(h, "da", None)
+    if lab is None or da is None:
+        return y
+    fn = sys._getframe(1).f_code.co_name        # (MXW's matmul, qwen3._qk, or an attention's P.V)
+    kind = _AT["kind"] or {"__array_ufunc__": "w", "_qk": "qk"}.get(fn, "pv")
+    N, K, G = w.shape[0], w.shape[1], D // Q.NVG
+    dwa = np.zeros((1, K // G), np.int64) if dw is None else np.asarray(dw, np.int64)
+    dg = np.asarray(da).reshape(-1, dwa.shape[1])
+    R, T = len(dg), _AT["T"]
+    c = DROPS.setdefault(lab, {}).setdefault(kind, {
+        "mm": 0, "mm_drop": 0, "groups": 0, "groups_drop": 0, "terms": 0, "terms_drop": 0,
+        "tok": np.zeros(T, np.int64)})
+    c["mm"] += 1
+    c["groups"] += R * dwa.shape[1]
+    c["terms"] += R * N * dwa.shape[1]
+    per = np.zeros(R, np.int64)
+    dwmax = dwa.max(0)
+    for gi in np.nonzero(dg.max(0) + dwmax > W)[0]:
+        rows = np.nonzero(dg[:, gi] + dwmax[gi] > W)[0]
+        n = ((dg[rows, gi][:, None] + dwa[None, :, gi]) > W).sum(1) * (N // len(dwa))
+        per[rows] += n
+        c["groups_drop"] += int((n > 0).sum())
+    if per.any():
+        c["mm_drop"] += 1
+        c["terms_drop"] += int(per.sum())
+        if _AT["rows"] is not None:
+            np.add.at(c["tok"], _AT["rows"], per)
+        elif T and R % T == 0:
+            c["tok"] += per.reshape(T, -1).sum(1)
+    return y
 
 
 def dequant(a, fmt, D):
@@ -198,9 +244,9 @@ def _lfm2(spec, W, i, x, w, fq, c, s, D, wf):
         pad = ((0, 0), (0, 0), (0, dk - d))
         o = _attend(np.pad(q, pad), np.pad(k, pad), v, fq, D, math.sqrt(d))
         x = x + fq(o.reshape(T, -1), D) @ w(a + "out_proj.weight").T
-    if spec.is_moe(i):
-        raise ValueError("formats_scan: dense models only")
     h = fq(norm(x, W[p + "ffn_norm.weight"]), D)
+    if spec.is_moe(i):                          # the routed experts: _moe_ffn, every variant
+        return MoEIn(x, h, None)
     g = h @ w(p + "feed_forward.w1.weight").T
     u = h @ w(p + "feed_forward.w3.weight").T
     dn = p + "feed_forward.w2.weight"
@@ -254,13 +300,110 @@ def _qwen35(spec, W, i, x, w, fq, c, s, D, wf):
         k = Q35._rot(Q35._norm(k, g1(a + "k_norm.weight"), eps), c, s, spec.rope_dim)
         o = _attend(q, k, v, fq, D, math.sqrt(d)) / (1 + np.exp(-gate))
         x = x + fq(o.reshape(T, -1), D) @ w(a + "o_proj.weight").T
-    if spec.moe is not None:
-        raise ValueError("formats_scan: dense models only")
     h = fq(Q35._norm(x, g1(p + "post_attention_layernorm.weight"), eps), D)
     mp = spec.mlp_prefix(p)
     gg, u = h @ w(mp + "gate_proj.weight").T, h @ w(mp + "up_proj.weight").T
     dn = mp + "down_proj.weight"
-    return x + fq(Q35._silu(gg) * u, D, _down(spec, wf, dn, D)) @ w(dn).T
+    y = fq(Q35._silu(gg) * u, D, _down(spec, wf, dn, D)) @ w(dn).T
+    if spec.moe is not None:                    # y: the shared expert's (_moe_ffn gates it)
+        return MoEIn(x, h, y)
+    return x + y
+
+
+class MoEIn(tuple):
+    """A MoE layer's state before its routed experts: the rows x [T, H] after the mixer, the
+    FFN's input h (quantized), the shared expert's output y (Qwen3.5) or None."""
+
+    def __new__(cls, x, h, y):
+        return tuple.__new__(cls, (x, h, y))
+
+
+def _raw(W, n, e=None) -> np.ndarray:
+    """Tensor n (expert e of a fused one) as fp32, not kept by W (qwen3.Weights keeps every
+    tensor under 16 MB: a MoE's experts would fill the host)."""
+    if hasattr(W, "_where"):                                    # qwen3.Weights
+        import torch
+        h, k, rows = W._where[n]
+        t = (h.get_slice(k)[int(e)] if e is not None else h.get_tensor(k) if rows is None
+             else h.get_slice(k)[rows[0]:rows[1]])
+        return t.to(torch.float32).numpy()
+    if e is not None and hasattr(W, "part"):                    # LazyWeights
+        return np.asarray(W.part(n, e), np.float32)
+    a = W[n]
+    return np.asarray(a if e is None else a[e], np.float32)
+
+
+def _expert(M, W, p: str, e: int) -> list:
+    """Routed expert e of layer prefix p: W_gate, W_up [F, H], W_down [H, F] (fp32)."""
+    if M is L2:
+        f = f"{p}feed_forward.experts.{e}."
+        return [_raw(W, f + n) for n in ("w1.weight", "w3.weight", "w2.weight")]
+    gu = _raw(W, p + "mlp.experts.gate_up_proj", e)
+    F = gu.shape[0] // 2
+    return [gu[:F], gu[F:], _raw(W, p + "mlp.experts.down_proj", e)]
+
+
+def _moe_ffn(spec, W, i, st: dict, variants: dict, D: int, log=None) -> dict:
+    """Layer i's MoE FFN for every variant (st {label: MoEIn}) as lfm2 / qwen35.emulated_logits
+    run it: the router int8 in every quantized format (Qwen3.5: the shared expert's gate its
+    last row, gating y), moe.route per row, and each routed expert read once and quantized
+    once per format (a variant's "experts" format), its down projection's input in the slot's
+    QACT ranges (moe.ExpertFormat.ranges). {label: the layer's output rows}."""
+    from opentpu.llm import moe as MO
+    M, mo, p = family(spec), spec.moe, f"model.layers.{i}."
+    held: dict = {}
+
+    def router(f):
+        if f not in held:
+            if M is L2:
+                a = _raw(W, p + "feed_forward.gate.weight")
+            else:
+                a = np.concatenate([_raw(W, p + "mlp.gate.weight"),
+                                    _raw(W, p + "mlp.shared_expert_gate.weight")])
+            held[f] = dequant(a, f, D)
+        return held[f]
+
+    plan, out = {}, {}
+    for lab, (x, h, y) in st.items():
+        f = variants[lab]
+        _AT["lab"] = lab
+        lg = np.asarray(h @ router(None if f is None else "int8").T).view(np.ndarray)
+        _AT["lab"] = None
+        x = np.array(x, np.float64)
+        if M is L2:
+            bias = np.asarray(W[p + "feed_forward.expert_bias"], np.float64)
+        else:
+            x = x + np.asarray(y) / (1 + np.exp(-lg[:, mo.E:mo.E + 1]))
+            bias, lg = None, lg[:, :mo.E]
+        r = [MO.route(row, bias, mo) for row in lg]
+        plan[lab] = (h, np.array([a for a, _ in r]), np.array([b for _, b in r]),
+                     None if f is None else f("experts", i))
+        out[lab] = x
+    need: dict = {}
+    for h, ids, wts, fmt in plan.values():
+        for e in np.unique(ids):
+            need.setdefault(int(e), set()).add(fmt)
+    t0 = time.time()
+    for n, e in enumerate(sorted(need)):
+        mats = _expert(M, W, p, e)
+        for fmt in need[e]:
+            wg, wu, wd = (dequant(a, fmt, D) for a in mats)
+            ce = None if fmt is None else MO.ExpertFormat(spec.hidden, mo.ffn, D, fmt).ranges()
+            for lab, (h, ids, wts, f) in plan.items():
+                t, j = np.nonzero(ids == e)
+                if f != fmt or not len(t):
+                    continue
+                hs = h.rows(t) if isinstance(h, Q.MXAct) else h[t]
+                _AT.update(lab=lab, rows=t)
+                g, u = hs @ wg.T, hs @ wu.T
+                a = (g / (1 + np.exp(-g))) * u
+                if fmt is not None:
+                    a = _fake_q(a, D, ce)
+                out[lab][t] += wts[t, j][:, None] * np.asarray(a @ wd.T)
+                _AT.update(lab=None, rows=None)
+        if log and (n + 1) % 64 == 0:
+            log(f"  experts {n + 1}/{len(need)} ({time.time() - t0:.0f} s)")
+    return out
 
 
 LAYER = {Q3: _qwen3, L2: _lfm2, Q35: _qwen35}
@@ -308,8 +451,13 @@ def emulate(spec, W, tokens, variants: dict, D: int = 128, logits: bool = False,
             fq = _fake_q if f is not None else _ident
             wf = (lambda n, f=f: None if f is None else f(*M.weight_kind(n)))
             wl = (lambda n, wf=wf: w(n, wf(n)))
+            _AT.update(lab=lab, T=T)
             xs[lab] = LAYER[M](spec, W, i, xs[lab], wl, fq, c, s, D, wf)
+        _AT["lab"] = None
         held.clear()
+        st = {lab: v for lab, v in xs.items() if isinstance(v, MoEIn)}
+        if st:
+            xs.update(_moe_ffn(spec, W, i, st, variants, D, log))
         if log:
             log(f"layer {i + 1}/{spec.layers} ({time.time() - t0:.0f} s)")
     hs = {lab: (_fake_q if f is not None else _ident)(_final(spec, W, xs[lab]), D)
@@ -345,7 +493,9 @@ def _head(hs: dict, fmts: dict, chunks, tokens, D: int = 128, logits: bool = Fal
                  np.zeros(T, np.int64), []] for lab in hs}
     for r0, a in chunks():
         for lab in hs:
+            _AT.update(lab=lab, T=T, kind="head")       # (the head's drops: this pass only)
             lg = lg_of(lab, a)
+            _AT.update(lab=None, kind=None)
             m, se, tl, best, arg, full = acc[lab]
             if logits:
                 full.append(lg)
@@ -433,6 +583,10 @@ def _rows(specs: dict, res: dict) -> dict:
                     "nll_tok": np.round(nll, 5).tolist(), "kl_float": float(kl["float"].mean()),
                     "kl_int8": float(kl["int8"].mean()),
                     "kl_tok": np.round(kl["float"], 7).tolist()}
+        if lab in DROPS:                # (ppl: what the window dropped, _counted_mm)
+            out[lab]["drops"] = {kind: {k: (v.tolist() if k == "tok" else v)
+                                        for k, v in c.items()}
+                                 for kind, c in DROPS[lab].items()}
     return out
 
 
@@ -577,8 +731,10 @@ def _g4_run(spec, W, ids, specs: dict, D, log, cache=None, head_rows: int = HEAD
         if f is not None:
             f.parent.mkdir(parents=True, exist_ok=True)
         ck = f"{f}.ckpt.npz" if f is not None else None   # (no KV-shared layers: resumes)
+        _AT.update(lab=lab, T=len(ids))
         hs[lab] = E.emulate(spec, W, ids, D, wformat=wf, hf=hf, ple_format=pf, wmap=wmap,
                             hidden=True, ckpt=ck)
+        _AT["lab"] = None
         if f is not None:
             da = getattr(hs[lab], "da", None)
             np.savez(f"{f}.tmp.npz", v=np.asarray(hs[lab]).view(np.ndarray),
@@ -712,8 +868,13 @@ def ppl(name, formats: list, wformat: str, n_tok: int, D: int = 128, out=None,
     specs = {"float": None, "int8": (base, "int8", None)}
     specs.update({f or "(none)": (",".join(x for x in (base, f) if x), wformat, None)
                   for f in formats})
-    rows = run(specs, ids, (lambda m: print(m, flush=True)) if isinstance(spec, G.Spec)
-               else None)
+    DROPS.clear()
+    Q.mx_matmul = _counted_mm           # (each variant's drops in its row: "drops")
+    try:
+        rows = run(specs, ids, (lambda m: print(m, flush=True)) if isinstance(spec, G.Spec)
+                   else None)
+    finally:
+        Q.mx_matmul = _MX_MATMUL
     _finish(rows, nbytes)
     if out:
         Path(out).write_text(json.dumps({"model": str(name), "tokens": len(ids), "variants": rows},
@@ -811,6 +972,24 @@ def check() -> None:
             r = M.reference_logits(spec, W, toks[:40])
             print(f"{name:8s} float vs reference_logits rel "
                   f"{np.abs(fl - r).max() / np.abs(r).max():.2e}")
+    import importlib.util                   # the MoE models: tools/exp/mx_formats.py's tiny ones
+    sp = importlib.util.spec_from_file_location("mx_formats", ROOT / "tools/exp/mx_formats.py")
+    X = importlib.util.module_from_spec(sp)
+    sp.loader.exec_module(X)
+    for name, (W, spec) in (("lfm2-moe", X._tiny_lfm2_moe()), ("qwen35-moe", X._tiny_qwen35_moe())):
+        M = family(spec)
+        toks = [int(t) for t in rng.integers(3, 1000, 140)]
+        for fs, wf in (("", "int8"), ("attn=nvfp4,head=fp4", "fp4"), ("head=int8", "nvfp4")):
+            ref = M.emulated_logits(spec, W, toks, wformat=wf, formats=fs)
+            e = emulate(spec, W, toks, {"v": _resolver(M, fs, wf)}, logits=True)["v"]
+            err = np.abs(e - ref).max() / np.abs(ref).max()
+            nll, top1, kl = emulate(spec, W, toks, {"v": _resolver(M, fs, wf), "f": None},
+                                    head_rows=256, kl_to=("f",))["v"]
+            lse = np.log(np.exp(ref - ref.max(1, keepdims=True)).sum(1)) + ref.max(1)
+            errn = np.abs(nll - (lse[:-1] - ref[np.arange(len(toks) - 1), toks[1:]])).max()
+            worst = max(worst, err)
+            print(f"{name:10s} {wf:5s} {fs or '-':22s} logits rel {err:.2e}  nll {errn:.2e}")
+            assert err < 1e-6 and errn < 1e-6, (name, wf, fs)
     print(f"OK (worst logits rel {worst:.2e})")
 
 
