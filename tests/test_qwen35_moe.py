@@ -259,6 +259,32 @@ def test_the_card_generates_with_streamed_experts(tiny):
     assert a.server.misses > misses
 
 
+def test_moe_on_board_model(tiny, have_verilator):
+    """The MoE block on the RTL (WAITW) through the host driver, as test_lfm2_moe.py's: every
+    expert resident and `served` past any request, so each layer's fence and directory waits
+    hold at their first read. Per-position programs, then the resident decode, then the card's
+    generate loop (the DeltaNet layers, the routed experts and the gated shared expert): the ISA
+    simulator's logits and tokens bit for bit."""
+    from opentpu.host.board import Board, BoardBackend, SimTransport
+    from opentpu.isasim import board_config
+    _, W, spec = tiny
+    cfg = board_config(DRAM_BYTES=1 << 26)
+    tr = SimTransport(ch_bytes=cfg.DRAM_BYTES // 2, stall=20, seed=5)
+    assert Board(tr).info()["caps"].get("waitw"), "the board model has no WAITW (CAPS bit31)"
+    isa = Engine(spec, W, cap=256, cfg=cfg, rows=1, resident=True)
+    brd = Engine(spec, W, cap=256, cfg=cfg, rows=1, resident=True,
+                 backend=lambda c, imgs: BoardBackend(c, imgs, transport=tr))
+    assert brd.resident and brd.can_generate and brd.server.misses == 0
+    L = brd.image.offload
+    brd.backend.write(0, L.served, np.array([3e38], np.float32))
+    for tok in (11, 222, 333, 444):
+        a, b = isa.step(tok), brd.step(tok)
+        assert np.array_equal(a.view(np.uint32), b.view(np.uint32)), brd.pos
+    t0 = int(np.argmax(a))
+    assert brd.generate_card(t0, 4, stop_ids=[]) == isa.generate_card(t0, 4, stop_ids=[])
+    assert isa.server.misses == 0 and brd.stats[-1]["cycles"] > 0
+
+
 @pytest.mark.parametrize("wformat,R,b,real,embed_runs", [
     ("int8", 1, False, False, False), ("fp4", 2, True, False, False),
     ("fp4", 1, True, True, False), ("fp4", 2, True, True, False), ("fp4", 1, True, True, True)])

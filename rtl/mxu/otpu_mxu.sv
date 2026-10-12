@@ -395,7 +395,10 @@ module otpu_mxu
   assign a_req  = go_iss && need_a;
   assign a_addr = !a_req ? '0 : (i_sws || i_rsc) ? (srow_addr >> 2) : (scale_addr >> 2);
   assign act_blk = 16'(c_ab) + (c_pair ? {ck[14:0], 1'b0} : ck);
-  assign act_blk2 = 16'(c_ab) + {ck[14:0], 1'b1};
+  // past an odd KB the high block is not the MM's (block ab + KB, outside its ACT range: a later
+  // QACT may be writing it, and the scoreboard does not hold that one back): the high rows read
+  // the even block again, which their zero multipliers (m0.o low) ignore
+  assign act_blk2 = 16'(c_ab) + {ck[14:0], !(last_k && c_KB[0])};
   assign act_hi = c_hi;
   assign act_grp = cg;
 `ifndef SYNTHESIS
