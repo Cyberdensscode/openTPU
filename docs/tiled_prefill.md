@@ -14,7 +14,8 @@ run; estimated means arithmetic on measured parts, named as such.
 ## 0. Short answer
 
 (Section 10 has the tile in the engine for every card model family, dense and MoE, and its
-measurements; this section is the prototype's.)
+measurements, section 11 the tile under the MX numerics, where the dense models' prompt runs
+take it by default; this section is the prototype's.)
 
 - **Rows a weight pass are not what prefill lacks.** A pass needs about MCOLS rows (4-bit) or
   2 MCOLS (int8) to reach the MXU's multiply rate (section 2), and the card's prompt runs are
@@ -629,7 +630,7 @@ Expert-major's -1.7 s (35B) / -1.9 s (26B) adds to the MoE rows once the pfB A/B
 ## 10. In the engine (2026-10-12)
 
 The tile now serves every card model family's prefill, opt-in: `Engine(tile_runs=True)` or
-`OTPU_TILE=1` (prefill.tile_flag). Dense models take tiled prompt runs (prefill.py's tile mode:
+`OTPU_TILE=1` (prefill.tile_flag; with the MX numerics the dense models' default: 11.3). Dense models take tiled prompt runs (prefill.py's tile mode:
 tiled.compile_tile_run at a run-time position, a program per bucket and kind as today's prompt
 runs); MoE models take tiled expert-major layer runs (Engine.layer_tile:
 tiled.compile_layer_tile). Branch tiled-prefill.
@@ -830,8 +831,9 @@ dsp-pump's MX column the same (+268 LUT, +72 FF). The MX build carries ACT_ROWS 
 
 ### 10.6 Next
 
-- **Card, today's bitstream (the lead schedules it):** an OTPU_TILE=1 qual of the dense models
-  (prompt runs -9 to -10% a row on Phi-4-mini, LFM2-2.6B and Qwen3.5-4B, -6.6% on
+- **Card, today's bitstream (the lead schedules it; the tree before MX, bebf375f: after the MX
+  merge the host refuses a bitstream without the MX numerics):** an OTPU_TILE=1 qual of the
+  dense models (prompt runs -9 to -10% a row on Phi-4-mini, LFM2-2.6B and Qwen3.5-4B, -6.6% on
   Qwen3-0.6B, -3% on LFM2.5-230M in co-simulation; the rest within +-0.4%) and the 26B's
   expert-major prefill with tiled layer runs of 4 rows (Engine layer_major=4; chatmoe
   token-exact against today's; a TTFT A/B against expert-major at R = 2). New images: the
@@ -840,3 +842,211 @@ dsp-pump's MX column the same (+268 LUT, +72 FF). The MX build carries ACT_ROWS 
 - **With the MX build (ACT_ROWS 16):** T = 8-16; references recomputed with OTPU_TILE=1 and
   OTPU_ACT_ROWS=16 (MX changes them anyway).
 - **Looped attention** (10.3) for long prompts, with the MCOLS 8 / MX work.
+
+## 11. Under MX (2026-10-12)
+
+The MX stack (mx-column 761f7ccc, merged into this branch as c0e11bbd: docs/mx_mxu.md) changes
+two things the tile leaned on:
+
+- **One Sa a QACT.** QACT gives each row one scale Sa over the blocks it writes (power-of-two
+  offsets under it a sub-block), and an MM's rows read the blocks of one Sa (docs/isa.md MM).
+  Under the previous numerics a part's quantize_into (a KV head's outputs, an MLP piece, a
+  convolution channel part) wrote the bytes one QACT of the whole tile would (an fp32 scale a
+  block); under MX each part is a QACT range of its own (Builder.stationary's qranges, the
+  merge's fix), so W_o's dot is an MM a range added up with ACC: not today's bits, and slower,
+  each range MM reading every W_o row's elements and scale row in short pieces (the MX scale
+  reader fetches a row's Sw in a cycle of its own where it shares no line: an MM of KB = 2
+  takes about twice its chunks' cycles), and a 4-bit range cannot start at an odd block
+  (Phi-4-mini's G = 3 at d = 128).
+- **An MM's output is one exact integer**, replayed or paired, so PAIR changes no bit: the
+  PAIR exception of 10.2 is gone.
+
+**The tile quantizes each operand over today's columns** (3fd2cc78, 7b0237f8, 5e0eaa08):
+
+- the attention's outputs are quantized at once into W_o's operand (_attention_tile,
+  _gemma_attention_tile: `whole`, as _attention_rows' dot(o_all, wo)). Each part's outputs go
+  to the image's I/O scratch as the part ends (io "o", ACT_ROWS x n_q d words, the descriptors'
+  `oscr`; Gemma 4: its widest heads; a row a store) and come back as one load once the heads
+  are done. Gathered in TMEM instead ([T, n_q d] beside the heads' work, the forms with
+  `oscr=False`, tried after: no stores, a shorter program) they took 16-32K words, which cost
+  rows (Qwen3.5's 16 rows were 12, E2B's 8 were 4) and time (Qwen3-0.6B's 16-row tile: 94.9K
+  cycles a row against 86.5K in the range forms);
+- the MLP's activation is one QACT a down chunk (_mlp_tile: pieces of `sub` columns into a
+  [T, C] tile when sub < C, C the MX chunk of mlp._chunk; mlp_sub counts the tile);
+- LFM2's gated product goes whole into out_proj's operand (_conv_tile);
+- each with quantize(free=True): a stationary otherwise keeps its source tile in TMEM (the [T,
+  C] tiles of every chunk stayed until the down projection: Qwen3-0.6B 8 rows instead of 16).
+
+So **a tiled run is today's bits on the MX ISA**, every family and form, PAIR on or off
+(tests/test_tiled.py: the prompt runs of 10.2's families and the expert-major layer runs bit
+for bit; test_tiled_prompt_runs_pair_alike: today's 2-row runs pair, the same bits). A dense
+model's tiled references equal today's; refs.py still keys OTPU_TILE (a MoE run's range
+forms, below, are not today's bits), and OTPU_ACT_ROWS by value (RUNTIME_ENV).
+
+**Placement: next-fit first** (82e150a8). The load back needs [T, n_q d] words in one piece
+(Qwen3-0.6B at 16 rows: 32K of the 64K-word TMEM), and two long-lived tiles left mid-TMEM
+split it: the attention's q / k norm gains (loaded after x at the next-fit cursor, alive to
+the layer's end) and Gemma 4's RoPE rows (loaded after x's gather, whose temporaries had moved
+the cursor 26K words on). Next-fit failed there, trace_fit's best-fit fit, and best-fit runs
+slower: it reuses the words just freed, which work still running reads. Qwen3-0.6B's 16-row
+tile was 94.9K cycles a row placed best-fit, 87.4K next-fit; E2B's 8-row tile 585.3K against
+578.8K. Now the gains go when the heads are done, gemma4_tile loads the RoPE rows before x,
+and _first_fit tries every form placed next-fit before any best-fit.
+
+**The range forms stay** (`whole=False`, tiled.ranges). A layer run's rows are the engine's
+(layer_major), so compile_layer_tile tries them after the whole forms; a prompt run whose
+outputs whole do not fit takes fewer rows instead (prefill._probe_tile over variants: whole
+forms only). Their accuracy (tests/test_tiled.py, the tiny models' logits after two prompts,
+KL divergence from the fp32 forward, reference_logits; ranges / today's):
+
+| model | 1st prompt | 2nd prompt | ranges from today's |
+|---|---|---|---|
+| Qwen3 (G = 2, 16 rows) | 0.0128 / 0.0126 | 0.0156 / 0.0173 | 0.0028, 0.0033 |
+| Phi-4-mini's shape (G = 3, int8) | 1.90e-4 / 1.69e-4 | 2.31e-4 / 2.30e-4 | 5.9e-5, 6.0e-5 |
+| Qwen3.5 (16 rows) | 0.0188 / 0.0179 | 0.0177 / 0.0147 | 0.0029, 0.0014 |
+
+The range forms are as close to the fp32 forward as today's runs (each part's Sa is its own
+row maximum: a finer scale), only not the same bits; the Gemma 4 MoE's 8-row layer runs in
+ranges are 6.3e-5 from its 4-row runs. RTL = ISA in both forms (test_tiled_prompt_run_on_rtl,
+test_tiled_expert_major_layer_run_on_rtl).
+
+### 11.1 Rows a tile holds under MX
+
+Compile only, MCOLS 4, ACT_ROWS 16, the card's 64K-word TMEM, fp4 layers, int8 head, the
+model's first layers (11.2's), whole forms: the most rows of 16 / 12 / 8 / 4 whose forms fit
+TMEM (instructions at depth 3), and the rows the engine takes on the card, whose IMEM holds 4K
+instructions (P and L at depth 3, else 2: SHALLOW; prefill._probe_tile's rule at T; d2: at
+depth 2; best: only best-fit placement fits). Today's rows: 10.3's.
+
+| model | today | bucket 2: TMEM | bucket 2: card | bucket 8: TMEM | bucket 8: card |
+|---|---|---|---|---|---|
+| Qwen3-0.6B | 8 | 16 (3,176) | 16 | 16 (7,726) | 12 (d2) |
+| Qwen3.5-0.8B | 4 | 16 (4,105) | 12 | 16 (6,441) | 12 (d2) |
+| Qwen3.5-2B | 4 | 16 (5,772) | 12 (best) | 16 (8,108) | 8 |
+| Qwen3.5-4B | 3 | 8 (4,355) | 4 | 8 (6,691) | 4 |
+| LFM2-2.6B | 3 | 12 (6,853) | 4 | 12 (13,675) | 4 (d2) |
+| LFM2.5-230M | 8 | 16 (4,453) | 12 | 16 (9,003) | 8 (d2) |
+| Phi-4-mini | 3 | 12 (4,798) | 8 | 12 (11,620) | 4 |
+| SmolLM3-3B | 4 | 16 (4,267) | 12 | 16 (8,817, best) | 8 (d2) |
+| Gemma 4 E2B | 4 | 12 (5,185) | 8 | 12 (7,250) | 8 (d2) |
+| Gemma 4 E4B | 4 | 8 (2,364) | 8 | 8 (2,556) | 8 |
+
+**On the card IMEM, not TMEM, sets the rows of most models**: through the I/O scratch the
+whole forms fit TMEM at as many rows as before MX (10.3) or more, but a packed tile's unrolled
+attention makes their programs longer than 4K instructions at 12-16 rows (10.3's long-prompt
+note, now at bucket 2 too). Where that leaves 4 rows (Qwen3.5-4B, LFM2-2.6B) the gain is that
+of 10.4's T = 4 column, within 0.4% of 8 rows before MX. The looped attention (10.3) is what
+gives the card TMEM's rows.
+
+Expert-major layer runs (MCOLS 4, ACT_ROWS 16, OTPU_TILE=1; every program within IMEM; the
+form the search took):
+
+| model | layer | 4 rows | 8 rows |
+|---|---|---|---|
+| gemma-4-26B-A4B (int8) | sliding | whole | whole |
+| | global | whole | ranges (x spilled) |
+| Qwen3.5-35B-A3B (fp4) | DeltaNet | (no W_o) | (no W_o) |
+| | attention | whole | whole (x spilled) |
+
+With the I/O scratch only the 26B's global layers at 8 rows ([8, 16 x 512] outputs and the
+heads' work beside them) take the range forms.
+
+### 11.2 Measured (RTL co-simulation, MX): cycles and DRAM bytes a row
+
+Prompt runs, as 10.4's (tools/perf_prompt.py --phases: one P run at the start of bucket 2, the
+model's first layers, fp4 layers, int8 head; MCOLS 4, ACT_ROWS 16, the card's memory path), on
+the shipping tree (mx-column 8b33206e with the default: the MX RTL with the card's 4 epilogue
+lanes, MXU_E 4). Today's: the MX build's prompt runs at the rows they take (3-row runs pair at
+2, docs/prefill.md 7); the tile's: the whole forms through the I/O scratch, placed next-fit, at
+the rows the engine takes on the card (11.1). Cycles a row, and the DRAM bytes a row on port B
+(the weights' stream, K / V, every LD and ST: the profile's port-B transfers x D = 128 bytes;
+port A's scale words not counted):
+
+| model (layers) | today: cycles (rows) | tile: cycles (rows) | cycles | today: MB a row | tile: MB a row | bytes |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B (2) | 89.8K (8) | 82.6K (16) | -8.0% | 4.14 | 2.12 | -49% |
+| Phi-4-mini (2) | 483.3K (2) | 433.1K (8) | -10.4% | 52.7 | 15.0 | -72% |
+| Qwen3.5-4B (4) | 1,133.0K (2) | 1,007.4K (4) | -11.1% | 125.9 | 69.9 | -44% |
+| LFM2-2.6B (6) | 1,109.0K (2) | 996.0K (4) | -10.2% | 123.0 | 62.4 | -49% |
+| Qwen3.5-0.8B (4) | 285.0K (4) | 286.3K (12) | +0.5% | 17.4 | 13.1 | -24% |
+| LFM2.5-230M (6) | 170.4K (8) | 164.7K (12) | -3.4% | 6.06 | 3.80 | -37% |
+| SmolLM3-3B (4) | 661.4K (4) | 655.1K (12) | -0.9% | 41.4 | 15.4 | -63% |
+| Gemma 4 E2B (5) | 580.7K (4) | 574.1K (8) | -1.1% | 27.1 | 15.3 | -44% |
+
+By level (dataflow's ledger: tools/dataflow.py at 46609834 on branch dataflow, the ISA
+simulator on a zero image, the same runs; a row, over the model's first layers as above; DRAM
+reads and writes, the K / V re-stream its attention's part; TMEM and ACT RAM as words x 4 and
+bytes; the scratch: the outputs' ST and LD at tiled.py's sites):
+
+| model | DRAM a row: today -> tile | K / V re-stream | TMEM read | TMEM written | ACT RAM written | scratch round trip |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B | 4.61 -> 2.49 MB (-46%) | 2.20 -> 1.11 MB | +3% | -1% | -37% | 32 KB (1.3% of DRAM) |
+| Phi-4-mini | 56.5 -> 16.2 MB (-71%) | 2.21 -> 2.21 MB | +2% | 0% | -30% | 48 KB (0.3%) |
+| Qwen3.5-4B | 134.1 -> 74.1 MB (-45%) | 1.09 -> 1.09 MB | -3% | -4% | -42% | 32 KB (0.04%) |
+| LFM2-2.6B | 132.1 -> 67.0 MB (-49%) | 1.70 -> 1.70 MB | -2% | -2% | -42% | 32 KB (0.05%) |
+| Qwen3.5-0.8B | 18.4 -> 13.7 MB (-25%) | 0.54 -> 0.54 MB | 0% | 0% | 0% | 16 KB (0.1%) |
+| LFM2.5-230M | 6.62 -> 4.21 MB (-36%) | 1.67 -> 0.85 MB | 0% | -2% | -27% | 16 KB (0.4%) |
+| SmolLM3-3B | 45.1 -> 16.8 MB (-63%) | 2.23 -> 2.23 MB | +2% | +1% | 0% | 64 KB (0.4%) |
+| Gemma 4 E2B | 29.2 -> 16.5 MB (-44%) | 3.24 -> 3.24 MB | +6% | +3% | -4% | 101 KB (0.6%) |
+
+The weights' stream is what the tile cuts (each weight read once for T rows); the K / V
+re-stream halves where G <= MCOLS / 2 packs two rows a stream (Qwen3-0.6B, LFM2.5-230M) and is
+unchanged elsewhere; TMEM traffic a row stays within -4% to +6% (the scratch's round trip and
+the staging of the whole operands against fewer per-run tiles); the ACT RAM's writes a row
+fall by up to 42% where today's runs pair: PAIR's DUP writes each row of a 4-bit layer's
+operand twice at M <= MCOLS / 2 (Qwen3.5-4B, 2 rows: 187 KB a row, 109 KB with PAIR off, the
+same as the 4-row tile's; dataflow's reading, checked); its reads (the stationary for every
+weight chunk) are the same a row.
+
+- **Bytes first.** The tile streams each weight once for its T rows: a row's DRAM traffic falls
+  by a quarter to three quarters on every model, cycles by 8-11% where today's runs hold 2 rows
+  (the 4-bit layers' MXU knee at MCOLS 4 rows) or Qwen3-0.6B's G = 2 packs two rows a K / V
+  stream, and by 1-3% where the MXU, not the weights' stream, sets the time (G >= MCOLS,
+  DeltaNet). Qwen3.5-0.8B is the one +0.5% (DeltaNet-bound, 12 rows in runs of 8); its bytes
+  still fall 24%.
+- **The epilogue lanes matter to the tile.** Before the E 4 merge (2 lanes, the same tree
+  otherwise) Qwen3-0.6B's 16-row tile was 87.4K (-3.0% against 90.1K), now 82.6K; the 3-row
+  models' gains were within 0.5 points of these (Phi-4-mini 443.5K, -10.1%; Qwen3.5-4B 8 rows
+  1,006.4K; LFM2-2.6B 8 rows 997.6K). Before MX (10.4, the 2-lane MXU) the tile's gains were
+  the same: -9.7% to -10.7% on the 3-row models, -8.7% on Qwen3-0.6B.
+- **The I/O scratch's round trip**: a whole form stores the attention's outputs (fp32) a part
+  at a time and loads them back whole, 2 x 4 x n_q d bytes a row a layer through DRAM and the
+  same through TMEM: 16 KiB on Qwen3-0.6B (n_q d = 2,048), 24 KiB on Phi-4-mini, 32 KiB on
+  E2B's global layers; the ledger finds exactly that, 0.04-1.3% of the tile's DRAM bytes a
+  row (Qwen3-0.6B's 1.3% against ~0.5 MB of fp4 weights a row a layer at 16 rows).
+  It buys today's bits (one Sa over W_o's operand); the range forms, which skip it, are within
+  ~1% in cycles (Qwen3-0.6B at 16 rows 86.5K against 87.4K, 2 lanes; Qwen3.5-0.8B 285.0K,
+  SmolLM3 666.8K, E2B at 12 rows 573.6K, Qwen3.5-4B at 12 1,011.2K) and as close to the fp32
+  forward as today's (11), not the same bits.
+- **More rows is not always cheaper** (SmolLM3: 12 rows 664.1K against 16 668.2K, 2 lanes);
+  the engine takes the largest T that fits (a cost-aware T: 10.4's note on Gemma 4).
+
+### 11.3 On by default
+
+The tiled prompt runs are the default with the MX numerics (0a50b82d, 7f92a846):
+prefill.tile_flag takes OTPU_TILE unset (or empty) as on, OTPU_TILE=0 off, and an engine's
+tile_runs True / False first; one slice only (a two-slice configuration keeps today's runs:
+prefill.tiling). tests/test_prefill.py and test_prefill_gemma4.py test today's prompt runs
+(OTPU_TILE=0 there), tests/test_tiled.py the tiled ones against them (MTP's drafter after tiled
+runs too). An engine with prompt runs then grows its image's I/O rows to ACT_ROWS (16 on the MX
+target) and a bucket's runs are the tile's where one fits it, today's elsewhere; the bits are
+today's. A MoE model's tiled expert-major layer runs stay opt-in (prefill.layer_tile_flag:
+tile_runs True, or OTPU_TILE set and not 0): they go with the expert-major switch, which ships
+on its own, and without them a MoE image holds no mask tiles (its layout and expert slots as
+before). tools/qual/refs.py keys OTPU_TILE as it is set: the default's references are the card's
+default's; OTPU_TILE=0 and =1 have keys of their own.
+
+### 11.4 Next
+
+- **Card, the MX build (ACT_ROWS 16; the lead schedules it):** the dense models' qual with the
+  default, token-exact against today's (the same bits), and the prompt runs' gain where 11.2
+  shows it: Phi-4-mini, LFM2-2.6B and Qwen3.5-4B -10 to -11% a row, Qwen3-0.6B -8%, LFM2.5-230M
+  -3%; then, with the expert-major switch, the 26B's expert-major prefill with tiled layer
+  runs (10.6's A/B; its global layers' 8-row runs may take the range forms: chatmoe's tokens
+  checked against today's, not assumed).
+- **IMEM** holds most models to fewer rows than TMEM on the card (11.1: Qwen3.5-4B and
+  LFM2-2.6B at 4); the looped attention (10.3) lifts it.
+- **A cost-aware T** (Qwen3.5-0.8B +0.5% at 12 rows; SmolLM3 12 rows cheaper than 16).
+- **The scratch's round trip** (11.2) is the price of one Sa over W_o's operand; dataflow's
+  epilogue fold (the row scale applied in the MXU's epilogue lanes) may let the parts be
+  quantized as they end without it.

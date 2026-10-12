@@ -34,10 +34,11 @@ today's bits, as close to the fp32 forward. Qwen3 and the Llama-likes on its cod
 (llama.py: Phi-4-mini, SmolLM3), Qwen3.5 (gated attention and the MLP tiled, its DeltaNet rows
 today's: they already stream each weight once a run, pair of heads by pair) and LFM2 / LFM2.5.
 
-Prompt runs (opentpu/llm/prefill.py, docs/prefill.md) take this kernel when the engine's
-tile_runs (or OTPU_TILE=1) is on: compile_tile_run's programs at a run-time position of a
-bucket, their tokens from out[], as compile_prompt_run's. A MoE model's expert-major layer runs
-(docs/offload.md 13.11) take it as well (Engine.layer_tile: gemma4_layer_tile, T rows of a
+Prompt runs (opentpu/llm/prefill.py, docs/prefill.md) take this kernel by default (not with the
+engine's tile_runs False or OTPU_TILE=0: prefill.tile_flag): compile_tile_run's programs at a
+run-time position of a bucket, their tokens from out[], as compile_prompt_run's. A MoE model's
+expert-major layer runs (docs/offload.md 13.11) take it when asked for (tile_runs True or
+OTPU_TILE=1: prefill.layer_tile_flag; Engine.layer_tile: gemma4_layer_tile, T rows of a
 chunk through one layer from their records; compile_layer_tile), the mixer's and the dense
 MLP's weights once for the T rows, the experts left to the layer's expert run as today.
 """
@@ -1043,7 +1044,7 @@ LAYER_KERNELS = {"gemma4": gemma4_layer_tile, "qwen35": qwen35_layer_tile}
 def layer_family(img) -> str | None:
     """The image's family when a tiled expert-major layer run serves it (LAYER_KERNELS: a MoE
     image with prefill rows, the expert server's words and the mask tiles, which a MoE model's
-    image holds when OTPU_TILE is on as it is built), else None."""
+    image holds when OTPU_TILE=1 as it is built: prefill.layer_tile_flag), else None."""
     name = type(img).__module__.rsplit(".", 1)[-1]
     ok = name in LAYER_KERNELS and getattr(img, "prefill_rows", 0) and \
         getattr(img, "offload", None) is not None and "amask" in (img.lookup or {})

@@ -11,7 +11,7 @@ from opentpu.llm import prefill as PF
 from opentpu.llm.qwen3 import Engine
 
 from test_gemma4 import _cfg, tiny  # noqa: F401 (tiny: the fixture)
-from test_prefill import _static
+from test_prefill import _static, _todays_runs  # noqa: F401 (today's prompt runs: OTPU_TILE=0)
 
 
 @pytest.mark.parametrize("wf, host, P1, P2", [

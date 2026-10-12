@@ -19,6 +19,13 @@ from test_qwen35 import _tiny_model
 pytest.importorskip("torch")
 
 
+@pytest.fixture(autouse=True)
+def _todays_runs(monkeypatch):
+    """Today's prompt runs (OTPU_TILE=0): the tiled ones, the default, are tests/test_tiled.py's,
+    against these."""
+    monkeypatch.setenv("OTPU_TILE", "0")
+
+
 def test_split():
     """R_max rows a run; the rows before conv_k - 1 in a compile-time run; a run-time run's rows
     in one bucket; the last run L."""

@@ -726,11 +726,12 @@ class Image(EmbedHost):
         self.io = {"x": b.alloc(4 * H * rows), "cos": b.alloc(2 * spec.rope_dim * rows),
                    "sin": b.alloc(2 * spec.rope_dim * rows), "gf": b.alloc(4 * H),
                    "logits": b.alloc(4 * spec.vocab * rows),
-                   # a tiled run's attention outputs, a part at a time (tiled.py: OSCR)
-                   "o": b.alloc(4 * cfg.act_rows * self.nq_loc * spec.head_dim),
                    "hs": b.alloc(4 * 2 * self.nl),     # per pair: decays of a, b; betas
                    "gr": b.alloc(4 * 2 * self.nl * self.grows),    # chunked prefill, per row:
                    "on": b.alloc(4 * 4 * spec.lin_dv * self.grows)}    # decays, betas; a head
+        from .prefill import tile_scratch   # a tiled run's attention outputs, a part at a time
+        if tile_scratch(spec, layer_runs=True):     # (tiled.py; a MoE image's: opt-in)
+            self.io["o"] = b.alloc(4 * cfg.act_rows * self.nq_loc * spec.head_dim)
         if spec.mtp:                # the final norm's rows (the MTP's input), the draft ids
             self.io.update(hid=b.alloc(4 * H * rows), draft=b.alloc(4 * rows))   # group's outputs
         if self.prefill_rows:       # its residual stream, and moe_ffn_rows' outputs (a
@@ -792,12 +793,13 @@ class Image(EmbedHost):
                           and getattr(spec, "embed", "f32") == "int8" and spec.moe is not None)
         if embed_host and not lookup:
             raise ValueError("embed_host needs the image's lookup tables (lookup=True)")
-        from .prefill import tile_flag      # (a MoE model's mask tiles: its tiled layer runs,
+        # (a MoE model's mask tiles: its tiled layer runs, opt-in: OTPU_TILE=1 as it is built)
+        from .prefill import layer_tile_flag
         self.lookup = _lookup_alloc(b, spec, cap, D=D, head=self.head if shared else None,
                                     M=cfg.MCOLS, embed_host=bool(embed_host),
                                     rows=self.grows,                # (layer 0's R rows)
-                                    imem=cfg.IMEM_WORDS,            # OTPU_TILE as it is built)
-                                    masks=bool(self.prefill_rows) and tile_flag(None)) \
+                                    imem=cfg.IMEM_WORDS,
+                                    masks=bool(self.prefill_rows) and layer_tile_flag(None)) \
             if lookup else {}
         if lookup and spec.mtp:     # the MTP loop's chain area (opentpu/llm/mtp.py)
             from .mtp import gen_alloc
@@ -1353,7 +1355,8 @@ class Image(EmbedHost):
             cosr=_tdesc(self.io["cos"], (self.rows, spec.rope_dim // 2)),
             sinr=_tdesc(self.io["sin"], (self.rows, spec.rope_dim // 2)),
             logitsr=_tdesc(self.io["logits"], (self.rows, spec.vocab)),
-            oscr=_tdesc(self.io["o"], (self.cfg.act_rows, self.nq_loc * spec.head_dim)),
+            oscr=_tdesc(self.io["o"], (self.cfg.act_rows, self.nq_loc * spec.head_dim))
+            if "o" in self.io else None,
             hs=_tdesc(self.io["hs"], (nl // 2, 4)),
             gr=_tdesc(self.io["gr"], (self.grows, 2 * nl)),
             on=_tdesc(self.io["on"], (self.grows, self.og * dv)),

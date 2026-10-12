@@ -493,28 +493,75 @@ def test_tiled_gemma4_prompt_runs_are_todays(tmp_path_factory, monkeypatch, mcol
         assert any(k[0] == "prompt tile" for k in tile)
 
 
-@pytest.mark.parametrize("how", ["kwarg", "env"])
+@pytest.mark.parametrize("how", ["default", "kwarg", "env"])
 def test_engine_tile_runs_rows(tmp_path_factory, monkeypatch, how):
-    """Engine(tile_runs=True), or OTPU_TILE=1 where it says nothing: its image's I/O rows grow
-    to the configuration's ACT_ROWS (an L run of T rows writes row T - 1's logits) and a
-    prompt's runs are tiled ones of up to ACT_ROWS rows; without either, neither."""
+    """Tiled prompt runs by default (OTPU_TILE unset, or Engine(tile_runs=True), or OTPU_TILE=1
+    where it says nothing): the image's I/O rows grow to the configuration's ACT_ROWS (an L run
+    of T rows writes row T - 1's logits) and a prompt's runs are tiled ones of up to ACT_ROWS
+    rows; with Engine(tile_runs=False), or OTPU_TILE=0 where it says nothing, neither (today's
+    runs, the same bits)."""
     W, spec, cfg, kw = _family("qwen3", tmp_path_factory)
     cfg = dataclasses.replace(cfg, MCOLS=4, ACT_ROWS=16)
     monkeypatch.delenv("OTPU_TILE", raising=False)
-    off = Engine(spec, W, cap=512, cfg=cfg, rows=8, resident=True, prompt_runs=True, **kw)
+    off = Engine(spec, W, cap=512, cfg=cfg, rows=8, resident=True, prompt_runs=True,
+                 tile_runs=False, **kw)
     assert off.rows == 8 and not PF.tiling(off)
+    monkeypatch.setenv("OTPU_TILE", "0")
+    off0 = Engine(spec, W, cap=512, cfg=cfg, rows=8, resident=True, prompt_runs=True, **kw)
+    assert off0.rows == 8 and not PF.tiling(off0)
+    monkeypatch.delenv("OTPU_TILE")
     if how == "env":
         monkeypatch.setenv("OTPU_TILE", "1")
-        eng = Engine(spec, W, cap=512, cfg=cfg, rows=8, resident=True, prompt_runs=True, **kw)
-    else:
-        eng = Engine(spec, W, cap=512, cfg=cfg, rows=8, resident=True, prompt_runs=True,
-                     tile_runs=True, **kw)
+    eng = Engine(spec, W, cap=512, cfg=cfg, rows=8, resident=True, prompt_runs=True,
+                 **(dict(kw, tile_runs=True) if how == "kwarg" else kw))
     assert eng.rows == eng.image.rows == 16 and PF.tiling(eng)
     toks = [int(t) for t in np.random.default_rng(3).integers(0, 1000, 40)]
     lg = eng.prefill(toks)
     assert [s["rows"] for s in eng.stats] == [16, 16, 8]
     want = off.prefill(toks)
     assert np.array_equal(lg.view(np.uint32), want.view(np.uint32))
+
+
+def test_tile_default_leaves_two_slices_today(monkeypatch):
+    """The default reaches one slice only (tiled.check): a design configuration's engine (two
+    slices) keeps its rows and today's prompt runs, the tiled default on."""
+    import test_prefill as TP
+    W, spec, cfg, kw = TP._model("qwen3-design")
+    monkeypatch.delenv("OTPU_TILE", raising=False)
+    eng = Engine(spec, W, cap=512, cfg=cfg, resident=True, prompt_runs=True, **kw)
+    assert cfg.S == 2 and eng.rows == TP.PREFILL_ROWS and not PF.tiling(eng)
+    toks = [int(t) for t in np.random.default_rng(4).integers(0, 1000, 30)]
+    eng.prefill(toks)
+    assert eng._prompt_progs and not any(k[0] == "prompt tile" for k in eng._prompt_progs)
+
+
+@pytest.mark.parametrize("P1", [40, 245])
+def test_tiled_mtp_prompt_runs_are_todays(P1):
+    """MTP (Qwen3.5's drafter: the tiled P / L runs store their hidden rows, today's M runs
+    follow each), the tiled prompt runs against today's (tile_runs False): a prompt, greedy
+    decoding with the drafter, then the next turn's prompt from the committed slot (at P1 245
+    across the bucket's end): the tokens, the runs' drafts, the DeltaNet states and windows and
+    the MTP layer's KV cache bit for bit."""
+    import test_prefill as TP
+    from opentpu.llm.mtp import MTPDecoder, MTPStats, mtp_engine
+    _, W, spec = TP._tiny_model(8, init=0.2)
+    W = TP._mtp_weights(W, spec)
+    r = np.random.default_rng(P1)
+    p1, p2 = [int(t) for t in r.integers(0, 1000, P1)], [int(t) for t in r.integers(0, 1000, 9)]
+    a, b = (MTPDecoder(mtp_engine(spec, W, cap=512, cfg=TP.CFG, prompt_runs=True, tile_runs=t))
+            for t in (True, False))
+    assert PF.tiling(a.eng) and not PF.tiling(b.eng)
+    sa, sb = a.generate(p1, max_new=6), b.generate(p1, max_new=6)
+    assert sa.tokens == sb.tokens and a.slot == b.slot and a.eng.pos == b.eng.pos
+    assert [x[:2] for x in sa.runs] == [x[:2] for x in sb.runs]
+    q = [sa.tokens[-1]] + p2
+    assert a.prefill(q, MTPStats()) == b.prefill(q, MTPStats())
+    n = a.eng.pos
+    assert n == b.eng.pos == P1 + 5 + len(q)
+    assert all(np.array_equal(x, y) for x, y in
+               zip(TP._states(a.eng, spec, a.slot), TP._states(b.eng, spec, b.slot)))
+    assert all(np.array_equal(x, y) for x, y in zip(TP._mtp_kv(a.eng, n), TP._mtp_kv(b.eng, n)))
+    assert any(k[0] == "prompt tile" for k in a.eng._prompt_progs)
 
 
 @pytest.fixture(scope="module")
@@ -524,6 +571,23 @@ def gmoe(tmp_path_factory):
     import test_gemma4_moe as TGM
     return TGM._model(tmp_path_factory, "tmoe", enable_moe_block=True, num_experts=8,
                       top_k_experts=2, moe_intermediate_size=96)
+
+
+def test_tiled_layer_runs_stay_opt_in(gmoe, monkeypatch):
+    """The tiled prompt runs' default does not reach a MoE model: with OTPU_TILE unset its
+    expert-major layer runs are today's (Engine.layer_tile off) and its image holds neither the
+    mask tiles nor the I/O scratch (prefill.tile_scratch: the layout, and so the expert slots,
+    as before); OTPU_TILE=1 asks for them."""
+    _, W, spec = gmoe
+    cfg = board_config(DRAM_BYTES=1 << 26, ACT_ROWS=16)
+    kw = dict(cap=1024, cfg=cfg, rows=1, wformat="fp4", experts=6, layer_major=4,
+              expert_major=True)
+    monkeypatch.delenv("OTPU_TILE", raising=False)
+    a = Engine(spec, W, **kw)
+    assert not a.layer_tile and "amask" not in a.image.lookup and "o" not in a.image.io
+    monkeypatch.setenv("OTPU_TILE", "1")
+    b = Engine(spec, W, **kw)
+    assert b.layer_tile and "amask" in b.image.lookup and "o" in b.image.io
 
 
 @pytest.mark.parametrize("wf, T, R", [("int8", 8, 0), ("fp4", 8, 4), ("fp4", 6, 3)])
@@ -667,8 +731,10 @@ def test_tiled_expert_major_layer_run_on_rtl(gmoe, monkeypatch, have_verilator, 
 
 
 def test_reference_key_tells_tiled_runs():
-    """tools/qual/refs.py: OTPU_TILE is in a reference's key (env_key: the hashed sources read
-    it), so a tiled qual's references are its own."""
+    """tools/qual/refs.py: OTPU_TILE is in a reference's key as it is set (env_key: the hashed
+    sources read it). Unset, the default (tiled prompt runs), it is not: references computed
+    with the default are the card's default's. OTPU_TILE=0 (today's prompt runs) and =1 (a MoE
+    model's tiled layer runs too) are keys of their own."""
     import importlib.util
     import os
     root = Path(__file__).resolve().parents[1]
@@ -680,6 +746,8 @@ def test_reference_key_tells_tiled_runs():
         assert "OTPU_TILE" not in refs.env_key()
         os.environ["OTPU_TILE"] = "1"
         assert refs.env_key()["OTPU_TILE"] == "1"
+        os.environ["OTPU_TILE"] = "0"
+        assert refs.env_key()["OTPU_TILE"] == "0"
     finally:
         os.environ.pop("OTPU_TILE", None)
         if old is not None:

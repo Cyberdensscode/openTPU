@@ -906,9 +906,10 @@ class Image(EmbedHost):
         rd = spec.rope_dim
         self.io = {"x": b.alloc(4 * H * R), "cos": b.alloc(2 * rd * R),
                    "sin": b.alloc(2 * rd * R), "gf": b.alloc(4 * H),
-                   "logits": b.alloc(4 * spec.vocab * R),
-                   # a tiled run's attention outputs, a part at a time (tiled.py: OSCR)
-                   "o": b.alloc(4 * cfg.act_rows * self.nq_loc * d)}
+                   "logits": b.alloc(4 * spec.vocab * R)}
+        from .prefill import tile_scratch   # a tiled run's attention outputs, a part at a time
+        if tile_scratch(spec, layer_runs=False):    # (tiled.py; a dense image's)
+            self.io["o"] = b.alloc(4 * cfg.act_rows * self.nq_loc * d)
         self.layer0 = b.next
         self.mats = {"wq": (self.nq_loc * d, H), "wk": (self.nkv_loc * d, H),
                      "wv": (self.nkv_loc * d, H), "wo": (self.h_loc, spec.n_q * d),
@@ -1145,7 +1146,8 @@ class Image(EmbedHost):
             cosr=_tdesc(self.io["cos"], (self.rows, rh)),
             sinr=_tdesc(self.io["sin"], (self.rows, rh)),
             logitsr=_tdesc(self.io["logits"], (self.rows, spec.vocab)),
-            oscr=_tdesc(self.io["o"], (cfg.act_rows, self.nq_loc * d)),
+            oscr=_tdesc(self.io["o"], (cfg.act_rows, self.nq_loc * d)) if "o" in self.io
+            else None,
             head=_qdesc(*self.head, self.v_loc, H, D, self.head_format), v_loc=self.v_loc,
             **_lookup_desc(self.lookup, spec, self.cap))
 
@@ -2118,10 +2120,12 @@ class Engine:
     run-time positions, its tokens from out[] (opentpu/llm/prefill.py): compiled once per
     bucket and kind, not per prompt. A dense model's resident image (prefill.supported). With
     the pipeline, bucket 1's are loaded or compiled on a thread as the engine starts
-    (prefill.warm). tile_runs (docs/tiled_prefill.md; None: OTPU_TILE=1 turns them on): the
-    prompt runs tiled (opentpu/llm/tiled.py), up to ACT_ROWS rows a run, the image's I/O rows
-    at least ACT_ROWS; with expert_major a MoE model's layer runs of more than one row
-    (layer_tile: tiled.compile_layer_tile, on an image built with OTPU_TILE=1: its mask tiles).
+    (prefill.warm). tile_runs (docs/tiled_prefill.md; None: OTPU_TILE's choice, on unless it
+    is 0: prefill.tile_flag): the prompt runs tiled (opentpu/llm/tiled.py), up to ACT_ROWS
+    rows a run, the image's I/O rows at least ACT_ROWS; False: today's. With expert_major a
+    MoE model's layer runs of more than one row, opt-in: tile_runs True or OTPU_TILE=1
+    (prefill.layer_tile_flag; layer_tile: tiled.compile_layer_tile, on an image built with
+    OTPU_TILE=1: its mask tiles).
 
     rollback(k) takes the context back to its first k tokens (a chat's next turn, whose
     template renders the last reply differently from what was fed: opentpu/llm/snapshot.py).
@@ -2146,7 +2150,8 @@ class Engine:
         self.spec, self.cap, self.block = spec, cap, block
         self.prog_cache = PC.enabled() if prog_cache is None else bool(prog_cache)
         self.prompt_runs = prompt_runs
-        self.tile_runs = tile_runs          # (None: OTPU_TILE's choice, prefill.tile_flag)
+        self.tile_runs = tile_runs          # (None: OTPU_TILE's choice, prefill.tile_flag:
+        #                                     on unless OTPU_TILE=0)
         self.batch, self.rows = batch, max(rows, batch)
         wkw = dict(wformat=wformat, head_format=head_format)
         if experts is not None:             # a MoE model's expert slots per layer
@@ -2161,9 +2166,10 @@ class Engine:
         if lookup:
             wkw["lookup"] = True
         self.cfg = cfg or device_config(spec, cap, batch=batch, rows=self.rows, **wkw)
-        if prompt_runs and PF.tile_flag(tile_runs) and self.cfg.act_rows > self.rows:
-            # tiled prompt runs of up to ACT_ROWS rows (prefill.py): the image's I/O rows hold
-            # an L run's last row's logits (row T - 1)
+        if prompt_runs and PF.tile_flag(tile_runs) and self.cfg.S == 1 and \
+                self.cfg.act_rows > self.rows:
+            # tiled prompt runs of up to ACT_ROWS rows (prefill.py; one slice): the image's I/O
+            # rows hold an L run's last row's logits (row T - 1)
             self.rows = self.cfg.act_rows
             if cfg is None:
                 self.cfg = device_config(spec, cap, batch=batch, rows=self.rows, **wkw)
@@ -2267,11 +2273,12 @@ class Engine:
                                       and not self.layer_hint):
             raise ValueError("expert-major MoE needs layer-major prefill, the expert server "
                              "with pooled slots, and no layer hints (its runs post needs)")
-        # expert-major runs of more than one row tiled (tile_runs, None: OTPU_TILE; tiled.py's
-        # compile_layer_tile: the layer's weights once for the run's rows, up to ACT_ROWS of
-        # them; the image's mask tiles, which OTPU_TILE gives a MoE image as it is built)
+        # expert-major runs of more than one row tiled, opt-in (tile_runs True, None: OTPU_TILE
+        # set and not 0: prefill.layer_tile_flag; tiled.py's compile_layer_tile: the layer's
+        # weights once for the run's rows, up to ACT_ROWS of them; the image's mask tiles,
+        # which OTPU_TILE=1 gives a MoE image as it is built)
         from . import tiled as TL
-        self.layer_tile = bool(self.expert_major and PF.tile_flag(tile_runs)
+        self.layer_tile = bool(self.expert_major and PF.layer_tile_flag(tile_runs)
                                and TL.layer_family(self.image))
         if self.layer_tile and self.layer_major > self.cfg.act_rows:
             raise ValueError(f"tiled layer runs of {self.layer_major} rows: one MM over them "
