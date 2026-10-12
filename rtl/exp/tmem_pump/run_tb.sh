@@ -7,6 +7,7 @@
 #   i1n3           IMPL 1, NCP 3: the ASIC's banked TMEM (3 copies, the slice's CPY) against 2
 #                  pumped copies (3 of their 4 slots)
 #   i1n4           IMPL 1, NCP 4: 4 banked copies against 2 pumped copies (4 slots)
+#   i1n3q, i1n4q   the same with request-priority addresses (otpu_tmem RQ, the slice's gnt_q)
 # WORDS 4096 (a hot window of 256 words) and 65536 (the card's size, a window of 1024).
 set -e
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
@@ -32,3 +33,5 @@ one i0_byp -GIMPL=0 -GWORDS=4096 -GSEED=5 -GBYP=1
 one i0_64k -GIMPL=0 -GWORDS=65536 -GHOT=1024 -GSEED=2
 one i1n3   -GIMPL=1 -GNCP=3 "-GCPYV=$CPY3" -GWORDS=4096 -GSEED=3
 one i1n4   -GIMPL=1 -GNCP=4 "-GCPYV=$CPY4" -GWORDS=4096 -GSEED=4
+one i1n3q  -GIMPL=1 -GNCP=3 "-GCPYV=$CPY3" -GWORDS=4096 -GSEED=6 -GRQ=1
+one i1n4q  -GIMPL=1 -GNCP=4 "-GCPYV=$CPY4" -GWORDS=4096 -GSEED=7 -GRQ=1

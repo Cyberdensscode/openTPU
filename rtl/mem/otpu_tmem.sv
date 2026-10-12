@@ -39,6 +39,11 @@
 // port's lanes in one bank read one word), and the bank's address comes from that port's granted
 // lanes (r_en), not its requests. Writes are broadcast to every copy, one per bank (WPB = 1).
 // The registered write stage, the bypass and the lanes' data path are IMPL 0's.
+// RQ (IMPL 1): a copy's bank address comes from the requests instead, the port first in the
+// slice's priority order (PRANK, smaller first) among those on the copy that ask for the bank;
+// the slice's arbiter then grants a unit only where it is that port (otpu_slice TMEM_RQ), so the
+// granted port's address is the one at the RAM and the grants reach no RAM pin (on the FPGA, the
+// grant-to-address path of IMPL 1 does not close at the core clock: docs/tmem_pump.md).
 module otpu_tmem #(
   parameter int WORDS = 1 << 16,
   parameter int LANES = 8,
@@ -53,7 +58,9 @@ module otpu_tmem #(
   parameter int SID   = 0,
   parameter int IMPL  = 0,                // 0: a copy per read port (block RAM); 1: banked (see top)
   parameter int NCP   = 1,                // IMPL 1: copies
-  parameter logic [NRP-1:0][1:0] CPY = '0 // IMPL 1: each read port's copy (< NCP)
+  parameter logic [NRP-1:0][1:0] CPY = '0, // IMPL 1: each read port's copy (< NCP)
+  parameter bit   RQ    = 1'b0,           // IMPL 1: bank addresses from the requests (see top)
+  parameter logic [NRP-1:0][2:0] PRANK = '0 // RQ: each read port's priority (0 first)
 ) (
   input  logic                                clk,
   input  logic [NRP-1:0][LANES-1:0]           r_en,     // granted reads
@@ -191,7 +198,8 @@ module otpu_tmem #(
     wire  [BW+IW-1:0]         a0 = r_addr[p][0][BW+IW-1:0];
     wire  [BW-1:0]            rot = a0[BW-1:0];
     // IMPL 1: a copy's bank serves the one port granted in it, so its enables are the grants
-    wire  [LANES-1:0]         rs = (IMPL == 1) ? r_en[p] : r_req[p];
+    // (RQ: the requests, the copy picks by priority)
+    wire  [LANES-1:0]         rs = (IMPL == 1 && !RQ) ? r_en[p] : r_req[p];
     always_comb begin
       b_en = '0; b_a = '0;
       if (GEN_R[p]) begin
@@ -256,7 +264,19 @@ module otpu_tmem #(
    if (host_of(p) == p) begin : g_copy
     logic [LANES-1:0]         b_en;
     logic [LANES-1:0][IW-1:0] b_a;
-    if (IMPL == 1) begin : g_bk
+    if (IMPL == 1 && RQ) begin : g_bq
+      // per bank, the asking port on this copy first in priority (ranks are distinct per copy)
+      always_comb begin
+        b_en = '0; b_a = '0;
+        for (int b = 0; b < LANES; b++)
+          for (int r = NRP - 1; r >= 0; r--)
+            for (int g = 0; g < NRP; g++)
+              if (CPY[g] == CPY[p] && int'(PRANK[g]) == r && pb_en[g][b]) begin
+                b_en[b] = 1'b1;
+                b_a[b] = pb_a[g][b];
+              end
+      end
+    end else if (IMPL == 1) begin : g_bk
       always_comb begin
         b_en = '0; b_a = '0;
         for (int g = 0; g < NRP; g++)

@@ -47,6 +47,9 @@ module otpu_tmem_pump #(
   parameter int IMPL  = 0,
   parameter int NCP   = 1,                 // IMPL 1: slots
   parameter logic [NRP-1:0][2:0] CPY = '0, // IMPL 1: each read port's slot (< NCP)
+  parameter bit    RQ    = 1'b0,           // IMPL 1: slot addresses from the requests by PRANK
+                                           // (otpu_tmem RQ; the slice's TMEM_RQ arbiter)
+  parameter logic [NRP-1:0][2:0] PRANK = '0,
   parameter string STYLE = "block",        // the banks' ram_style ("block", "ultra")
   parameter bit    BYP   = 1'b0            // keep otpu_tmem's bypass (redundant here: see below)
 ) (
@@ -170,7 +173,7 @@ module otpu_tmem_pump #(
     logic [LANES-1:0][IW-1:0] b_a;
     wire  [BW+IW-1:0]         a0 = r_addr[p][0][BW+IW-1:0];
     wire  [BW-1:0]            rot = a0[BW-1:0];
-    wire  [LANES-1:0]         rs = (IMPL == 1) ? r_en[p] : r_req[p];
+    wire  [LANES-1:0]         rs = (IMPL == 1 && !RQ) ? r_en[p] : r_req[p];
     always_comb begin
       b_en = '0; b_a = '0;
       if (GEN_R[p]) begin
@@ -202,7 +205,18 @@ module otpu_tmem_pump #(
   logic [NRP-1:0][LANES-1:0][IW-1:0] h_a;
   for (genvar p = 0; p < NRP; p++) begin : g_host
     if (host_of(p) == p) begin : g_h
-      if (IMPL == 1) begin : g_bk
+      if (IMPL == 1 && RQ) begin : g_bq
+        always_comb begin
+          h_en[p] = '0; h_a[p] = '0;
+          for (int b = 0; b < LANES; b++)
+            for (int r = NRP - 1; r >= 0; r--)
+              for (int g = 0; g < NRP; g++)
+                if (CPY[g] == CPY[p] && int'(PRANK[g]) == r && pb_en[g][b]) begin
+                  h_en[p][b] = 1'b1;
+                  h_a[p][b] = pb_a[g][b];
+                end
+        end
+      end else if (IMPL == 1) begin : g_bk
         always_comb begin
           h_en[p] = '0; h_a[p] = '0;
           for (int g = 0; g < NRP; g++)
@@ -309,9 +323,10 @@ module otpu_tmem_pump #(
   end
 
 `ifndef SYNTHESIS
-  // IMPL 1: at most one granted port per slot and bank (the slice's arbiter, gnt_k)
+  // IMPL 1: at most one granted port per slot and bank (the slice's arbiter, gnt_k; RQ: the
+  // requests may meet, the arbiter grants the first)
   always @(posedge clk)
-    if (IMPL == 1)
+    if (IMPL == 1 && !RQ)
       for (int b = 0; b < LANES; b++)
         for (int p = 0; p < NRP; p++)
           for (int q = p + 1; q < NRP; q++)

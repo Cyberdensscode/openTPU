@@ -16,7 +16,8 @@ module tb_tmem_pump #(
   parameter int CYCLES = 200000,
   parameter int SEED   = 1,
   parameter int HOT    = 256,       // the hot window's words
-  parameter bit BYP    = 1'b0       // otpu_tmem_pump's (redundant) bypass
+  parameter bit BYP    = 1'b0,      // otpu_tmem_pump's (redundant) bypass
+  parameter bit RQ     = 1'b0       // IMPL 1: request-priority addresses (otpu_tmem RQ)
 );
   localparam int LANES = 8, NRP = 8, NWP = 4, BW = 3;
   localparam int P_MXU = 0, P_DMA = 1, P_Q = 2, P_VA = 3, P_VB = 4, P_Q3 = 5, P_Q2 = 6, P_COLL = 7;
@@ -32,6 +33,9 @@ module tb_tmem_pump #(
   endfunction
   localparam logic [NRP-1:0][2:0] CPY3 = cpy3();
   localparam logic [NRP-1:0][1:0] CPY2 = cpy2();
+  // the slice's priority ranks (otpu_slice PRANK): DMA, COLL, VPU, MXU, QUANT
+  //                                       COLL  Q2    Q3    VB    VA    Q     DMA   MXU
+  localparam logic [NRP-1:0][2:0] PRANK = {3'd1, 3'd4, 3'd4, 3'd2, 3'd2, 3'd4, 3'd0, 3'd3};
 
   logic clk = 1'b0, clk_f = 1'b1;
   always #2 clk_f = ~clk_f;          // 4 ns: rises at 4, 8, 12, ...
@@ -45,12 +49,13 @@ module tb_tmem_pump #(
 
   otpu_tmem #(.WORDS(WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .WPB(1), .GEN_R(GEN_R),
               .GEN_W(GEN_W), .SH_HOST(P_DMA), .SH_MASK(IMPL == 0 ? SH_MASK : '0), .SID(0),
-              .IMPL(IMPL), .NCP(NCP), .CPY(CPY2)) u_ref (
+              .IMPL(IMPL), .NCP(NCP), .CPY(CPY2), .RQ(RQ), .PRANK(PRANK)) u_ref (
     .clk, .r_en, .r_req, .r_addr, .r_data(rd_ref), .w_en, .w_req, .w_gnt, .w_addr, .w_data,
     .dump(1'b0));
   otpu_tmem_pump #(.WORDS(WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .GEN_R(GEN_R),
                    .GEN_W(GEN_W), .SH_HOST(P_DMA), .SH_MASK(IMPL == 0 ? SH_MASK : '0),
-                   .IMPL(IMPL), .NCP(NCP), .CPY(CPY3), .BYP(BYP)) u_dut (
+                   .IMPL(IMPL), .NCP(NCP), .CPY(CPY3), .BYP(BYP), .RQ(RQ),
+                   .PRANK(PRANK)) u_dut (
     .clk, .clk_f, .r_en, .r_req, .r_addr, .r_data(rd_dut), .w_en, .w_req, .w_gnt, .w_addr,
     .w_data);
 
@@ -161,10 +166,11 @@ module tb_tmem_pump #(
             if (ports[P_COLL] && rq[P_COLL] != '0 && (rq[P_DMA] != '0 || rq[P_Q3] != '0))
               ok = 1'b0;
           end
-          if (ok) begin
-            rg |= ports;
+          if (ok) rg |= ports;
+          // the banks taken for the groups after: the granted groups' (gnt_k), or with RQ
+          // every asking group's, granted or not (otpu_slice gnt_q)
+          if (ok || RQ)
             for (int c = 0; c < NCP; c++) occ[c] |= need[c];
-          end
         end
         for (int p = 0; p < NRP; p++) begin
           r_req[p] = rq[p];
@@ -181,8 +187,8 @@ module tb_tmem_pump #(
         end
       end
     end
-    $display("TB_RESULT %s IMPL %0d NCP %0d WORDS %0d BYP %0d: %0d cycles, %0d lane reads, %0d lane writes, %0d mismatches",
-             mism == 0 ? "PASS" : "FAIL", IMPL, NCP, WORDS, BYP, CYCLES, reads, wrs, mism);
+    $display("TB_RESULT %s IMPL %0d NCP %0d RQ %0d WORDS %0d BYP %0d: %0d cycles, %0d lane reads, %0d lane writes, %0d mismatches",
+             mism == 0 ? "PASS" : "FAIL", IMPL, NCP, RQ, WORDS, BYP, CYCLES, reads, wrs, mism);
     $finish;
   end
 endmodule

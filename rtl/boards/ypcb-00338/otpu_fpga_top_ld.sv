@@ -35,6 +35,7 @@ module otpu_fpga_top_ld #(
   parameter int MXU_IMPL = 2,               // MXU dot product: 2 systolic (docs/mxu_systolic.md), 0 adder tree
   parameter int TMEM_IMPL = 0,              // TMEM: 0 a copy per read port (production), 1 banked
                                             //   (three copies, docs/tmem_pump.md)
+  parameter bit TMEM_RQ = 1'b0,             // TMEM_IMPL 1: request-priority bank addresses
   parameter int LANES = 8,                  // VPU lanes / TMEM banks (8 or 16)
   parameter int ULANES = 8,                 // TMEM lanes of the MXU and the quantizer
   parameter int CORE_KHZ = 100000,          // core_clk as the block design makes it (CORE_KHZ register)
@@ -258,7 +259,7 @@ module otpu_fpga_top_ld #(
   // ---- the accelerator and XDMA on the channels
   logic [2:0] board_led;
   otpu_native_sys #(.MCOLS(MCOLS), .ACT_ROWS(ACT_ROWS), .VPU_CL(VPU_CL), .MXU_IMPL(MXU_IMPL),
-                    .TMEM_IMPL(TMEM_IMPL), .LANES(LANES),
+                    .TMEM_IMPL(TMEM_IMPL), .TMEM_RQ(TMEM_RQ), .LANES(LANES),
                     .ULANES(ULANES), .CORE_KHZ(CORE_KHZ), .BUILD_ID(BUILD_ID), .DDR_MTS(DDR_MTS),
                     .DSTEP(DSTEP), .HOSTCAL(1'b1), .XREG(PCIE_GEN == 2),
                     .PLATFORM(PLATFORM), .ARCH_HASH(ARCH_HASH)) u_sys (

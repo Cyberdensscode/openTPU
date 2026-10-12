@@ -45,8 +45,10 @@ module otpu_slice
   parameter int ULANES     = LANES,   // TMEM lanes of the MXU and the quantizer (<= LANES)
   parameter int PQ_WIN     = 64,      // cycles per P/Q counter window (+bucket= in simulation)
   parameter bit HAS_DSTEP  = 1'b1,    // streams (DSTEP, STREAM): SE's tail in the VPU
-  parameter int TMEM_IMPL  = 0        // TMEM: 0 a copy per read port (FPGA block RAM), 1 banked
+  parameter int TMEM_IMPL  = 0,       // TMEM: 0 a copy per read port (FPGA block RAM), 1 banked
                                       //   (three copies of 1R1W RAMs: an ASIC; otpu_tmem)
+  parameter bit TMEM_RQ    = 1'b0     // TMEM_IMPL 1: the banks' addresses from the requests by
+                                      //   priority, and the arbiter grants by them (gnt_q)
 ) (
   input  logic          clk,
   input  logic          sys_rst,
@@ -123,6 +125,10 @@ module otpu_slice
   localparam int NCP = 3;
   localparam logic [NRP-1:0][1:0] CPY = {2'd2, 2'd1, 2'd2, 2'd1, 2'd0, 2'd0, 2'd2, 2'd0};
   //                                    COLL  Q2    Q3    VB    VA    Q     DMA   MXU
+  // TMEM_RQ: each read port's rank in the arbiter's priority order (its group's: DMA, COLL, VPU,
+  // MXU, QUANT), for the copies' request-priority bank addresses (otpu_tmem RQ)
+  localparam logic [NRP-1:0][2:0] PRANK = {3'd1, 3'd4, 3'd4, 3'd2, 3'd2, 3'd4, 3'd0, 3'd3};
+  //                                       COLL  Q2    Q3    VB    VA    Q     DMA   MXU
   initial if (TMEM_IMPL == 1 && (RPB != 1 || WPB != 1))
     $fatal(1, "otpu_slice: TMEM_IMPL 1 needs RPB = 1 and WPB = 1 (RPB %0d WPB %0d)", RPB, WPB);
   localparam int W_DMA = 0, W_MXU = 1, W_COLL = 2, W_VPU = 3, NWP = 4;
@@ -227,7 +233,8 @@ module otpu_slice
   otpu_tmem #(.WORDS(TMEM_WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .WPB(WPB),
               .GEN_R(NRP'(1) << P_MXU), .GEN_W(NWP'(1) << W_MXU),
               .SH_HOST(P_DMA), .SH_MASK((NRP'(1) << P_Q3) | (NRP'(1) << P_COLL)),
-              .SID(SID), .IMPL(TMEM_IMPL), .NCP(NCP), .CPY(CPY)) u_tmem (
+              .SID(SID), .IMPL(TMEM_IMPL), .NCP(NCP), .CPY(CPY), .RQ(TMEM_RQ),
+              .PRANK(PRANK)) u_tmem (
     .clk, .r_en, .r_req(rq_en), .r_addr, .r_data, .w_en, .w_req(wq_en), .w_gnt, .w_addr,
     .w_data, .dump);
   assign coll_rdata = r_data[P_COLL];
@@ -476,11 +483,11 @@ module otpu_slice
     cgl_m = aok[G_COLL];
   end
 
-  logic [NG-1:0] gnt_k;
-  logic          cgl_k;
+  logic [NG-1:0] gnt_k, gnt_q;
+  logic          cgl_k, cgl_q;
   always_comb begin
-    gnt = ARB_MASK ? gnt_m : (TMEM_IMPL == 1) ? gnt_k : gnt_c;
-    coll_gnt_local = ARB_MASK ? cgl_m : (TMEM_IMPL == 1) ? cgl_k : cgl_c;
+    gnt = ARB_MASK ? gnt_m : (TMEM_IMPL == 1) ? (TMEM_RQ ? gnt_q : gnt_k) : gnt_c;
+    coll_gnt_local = ARB_MASK ? cgl_m : (TMEM_IMPL == 1) ? (TMEM_RQ ? cgl_q : cgl_k) : cgl_c;
     for (int p = 0; p < NRP; p++) r_en[p] = rq_en[p];
     for (int p = 0; p < NWP; p++) w_en[p] = wq_en[p];
     w_gnt = '1;
@@ -566,6 +573,40 @@ module otpu_slice
       end
       if (ok) begin rk |= uk; wk |= vk; end
     end
+  end
+
+  // The banked TMEM with request-priority addresses (TMEM_IMPL 1, TMEM_RQ): a group's reads are
+  // blocked where a group before it asks for the same copy and bank, granted or not (each copy's
+  // bank address is the first asking port's: otpu_tmem RQ), so the RAMs' addresses come from the
+  // requests alone and the grants reach no RAM pin. Its write banks are admitted as gnt_m's, a
+  // chain of single bits over the pairwise conflicts (acf).
+  logic [NG-1:0][NCP-1:0][LANES-1:0] qk;
+  logic [NG-1:0]                     qblk;
+  always_comb begin
+    logic [NRP-1:0] rp;
+    for (int g = 0; g < NG; g++) begin
+      rp = grp_rports(g);
+      qk[g] = '0;
+      for (int p = 0; p < NRP; p++)
+        if (rp[p])
+          for (int l = 0; l < LANES; l++)
+            if (rq_en[p][l]) qk[g][CPY[p]][r_addr[p][l][BW-1:0]] = 1'b1;
+    end
+    for (int g = 0; g < NG; g++) begin
+      qblk[g] = 1'b0;
+      for (int h = 0; h < g; h++) if ((qk[g] & qk[h]) != '0) qblk[g] = 1'b1;
+    end
+  end
+  always_comb begin
+    logic [NG-1:0] ok;
+    for (int g = 0; g < NG; g++) begin
+      ok[g] = !qblk[g];
+      for (int h = 0; h < g; h++) if (ok[h] && acf[g][h]) ok[g] = 1'b0;
+      if (g == G_Q && q_awant && !sw_rdy) ok[g] = 1'b0;    // QST write the DRAM cannot take
+    end
+    gnt_q = ok;
+    gnt_q[G_COLL] = coll_gnt;      // every slice must grant the collective
+    cgl_q = ok[G_COLL];
   end
 
   // ---- DRAM ports

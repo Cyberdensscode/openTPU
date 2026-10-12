@@ -31,6 +31,7 @@ module otpu_board #(
   parameter int WIN        = 16,
   parameter int TMEM_IMPL  = 0,         // TMEM: 0 a copy per read port, 1 banked (three copies;
                                          //   otpu_slice: RPB 1, WPB 1)
+  parameter bit TMEM_RQ    = 1'b0,      // TMEM_IMPL 1: request-priority bank addresses
   parameter int RPB        = (TMEM_IMPL == 1) ? 1 : 8 * LANES,  // every read lane (TMEM is
                                           // replicated per read port): the slice's shallow
                                           // write-mask arbiter
@@ -280,7 +281,7 @@ module otpu_board #(
                .TMEM_WORDS(TMEM_WORDS), .IMEM_WORDS(IMEM_WORDS), .FIFO_DEPTH(FIFO_DEPTH),
                .LANES(LANES), .WIN(WIN), .RPB(RPB), .WPB(WPB), .MXU_IMPL(MXU_IMPL),
                .MXU_CL(MXU_CL), .VPU_CL(VPU_CL), .ULANES(ULANES), .PQ_WIN(PQ_WIN),
-               .HAS_DSTEP(DSTEP), .TMEM_IMPL(TMEM_IMPL)) u_slice (
+               .HAS_DSTEP(DSTEP), .TMEM_IMPL(TMEM_IMPL), .TMEM_RQ(TMEM_RQ)) u_slice (
     .clk, .sys_rst(x_srst[0]), .rst(x_rst[0]), .rinit(x_arg[0]), .ld_start(x_ld_start[0]),
     .ld_addr(x_ld_addr[0]), .ld_n(x_ld_n[0]),
     .ld_busy(q_ld_busy[0]), .a_rdy, .b_rdy, .sw_rdy, .wr_idle(q_wr_idle[0]),
@@ -338,7 +339,7 @@ module otpu_board #(
                  .ACT_ROWS(ACT_ROWS), .TMEM_WORDS(TMEM_WORDS), .IMEM_WORDS(IMEM_WORDS),
                  .FIFO_DEPTH(FIFO_DEPTH), .LANES(LANES), .WIN(WIN), .RPB(RPB), .WPB(WPB),
                  .MXU_IMPL(MXU_IMPL), .MXU_CL(MXU_CL), .VPU_CL(VPU_CL), .ULANES(ULANES),
-                 .PQ_WIN(PQ_WIN), .HAS_DSTEP(DSTEP), .TMEM_IMPL(TMEM_IMPL)) u_slice (
+                 .PQ_WIN(PQ_WIN), .HAS_DSTEP(DSTEP), .TMEM_IMPL(TMEM_IMPL), .TMEM_RQ(TMEM_RQ)) u_slice (
       .clk, .sys_rst(x_srst[s]), .rst(x_rst[s]), .rinit(x_arg[s]), .ld_start(x_ld_start[s]),
       .ld_addr(x_ld_addr[s]), .ld_n(x_ld_n[s]),
       .ld_busy(q_ld_busy[s]), .a_rdy, .b_rdy, .sw_rdy, .wr_idle(q_wr_idle[s]),
