@@ -1374,6 +1374,37 @@ reproduces section 5's row to the LUT.
   the 16-row datapath alone takes 15.5K here (8.9K at 8 rows), while today's MXU is a 4-row,
   unpumped one with its issuer, FIFOs and TMEM ports, which these tops leave out.
 
+**What the 272 RAMB36 hold** (`otpu_actram`). One copy of distinct rows: row r is only in column
+r mod MCOLS (group r div MCOLS), a column being a bank of D / 32 pieces of 32 bytes (four 64-bit
+RAMB36 a piece) and a 64-bit record RAM. At ACT_ROWS 16 the store is 16 rows x 128 blocks x (128
++ 8) bytes, 256 KiB of int8 and 16 KiB of records, at MCOLS 4 and at MCOLS 16 alike. What grows
+is the read: the array takes MCOLS x D bytes a cycle (each column its own row's block) and a
+RAMB36 port gives 8, so the banks are MCOLS x D / 8 data RAMB36 (64 at MCOLS 4, 256 at 16) plus
+MCOLS record RAMs. At MCOLS 4 they are full (4 groups x 128 blocks = 512 entries); at MCOLS 16 a
+quarter full (128 of 512): the 4x is the port's width, not copies. The one row held twice is QACT
+DUP for PAIR (M <= MCOLS / 2: row r also in column r + M, which reads the odd blocks), a second
+write into columns the MM would leave idle and no RAM of its own (`tools/dataflow.py` counts its
+bytes twice in act_wr; docs/tiled_prefill.md 11.2). So:
+- **The idle depth is free capacity.** The same 272 RAMB36 hold ACT_ROWS 64 at MCOLS 16 (four
+  groups, full depth), and replay streams each weight row from DRAM once for all the MM's rows
+  (group 0 pops a row's chunks, the later groups read the same FIFO entries): a quarter of the
+  weight bytes a prompt row against ACT_ROWS 16, with no more block RAM (the array's cycles and
+  the replay rule KB <= DEPTH unchanged).
+- **Fewer RAMs take a faster port, not fewer copies.** Reading at the pumped clock (266.67 MHz,
+  two half-rows a slow cycle into a register stage a bank; not built) gives 16 bytes a RAMB36 a
+  slow cycle: 128 data and 8 record RAMB36 at MCOLS 16, 136 freed (half depth at ACT_ROWS 16,
+  full at 32). The records (16 x 128 x 64 bits) could also leave block RAM for LUT RAM (16 freed,
+  a few thousand LUTs).
+- **32 columns:** 4,096 bytes a cycle, 512 + 32 RAMB36 at the slow clock (256 + 16 pumped), full
+  at ACT_ROWS 128. On an ASIC the store is ACT_ROWS x K bytes in macros MCOLS x D bytes wide, so
+  its area follows the bits held (256 KiB at ACT_ROWS 16, for any MCOLS) and the port width sets
+  the macros' aspect, not their count.
+- **S slices:** when slices split an MM's outputs, each gathers the activations and quantizes them
+  into its own ACT RAM, so the rows are held S times. One store would feed the slices' arrays in
+  lockstep from one MCOLS x D-byte read a cycle over a registered broadcast tree (16 Kbit wide at
+  MCOLS 16), freeing S - 1 stores at the price of one slice's stall stalling all. The YPCB builds
+  S 1.
+
 **The drain at 16 rows.** An output costs the array KB cycles (a 128-element chunk a block) and
 the drain ceil(M / E) (the head row's M live results, E a cycle; bank conflicts aside): drain /
 array, at ACT_ROWS = MCOLS = 16 (no replay up to 16 rows):
