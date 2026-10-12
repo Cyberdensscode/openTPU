@@ -14,9 +14,10 @@ layer runs or steps, the card's decode loop, a host-sampled step).
 The settings default to the ones measured best on the card (docs/offload.md 10-13): the slots
 filling the DRAM, replaced by decayed use; the prompt layer by layer in runs of two rows with
 every slot serving the running layer (Qwen3.5-MoE, Gemma 4 MoE; LFM2-MoE's prompt runs token
-by token); a request's disk reads queued at once; the idle parts read ahead and halt-aware; the
-checkpoint's pages given back once the image is written. `defaults(spec)` holds each family's
-weight formats.
+by token), and from EM_ROWS new rows a call on each MoE layer's experts in one expert run,
+streamed as needs in whole-expert idle parts (expert-major, 13.15, 13.16); a request's disk
+reads queued at once; the idle parts read ahead and halt-aware; the checkpoint's pages given
+back once the image is written. `defaults(spec)` holds each family's weight formats.
 
 A pool is checked before the image is built (check_pool): it must exist, have this image's
 layout and key (moe.pool_key: the MXU's numerics, the quantizer's code, the format, D, the
@@ -31,6 +32,7 @@ from dataclasses import replace
 from pathlib import Path
 
 LAYER_MAJOR = 2         # the prompt's rows a layer run (docs/offload.md 13.7: R = 2, pooled)
+NEED_PART = 4 << 20     # expert-major's idle-poll part: a whole expert (13.15's A/B ran 4 MiB)
 DEFAULT = "default"     # engine's pool: the checkpoint's own (default_pool)
 IDLE_PARTS = ("v1", "ra", "halt", "v2")      # ExpertServer's idle parts (13.12)
 # each family's weight formats on the card (wformat, head_format, formats), the MX formats'
@@ -41,6 +43,16 @@ IDLE_PARTS = ("v1", "ra", "halt", "v2")      # ExpertServer's idle parts (13.12)
 FORMATS = {"lfm2": ("nvfp4", "int8", None),
            "qwen35": ("fp4", "int8", "attn=nvfp4,delta=nvfp4,mlp=nvfp4"),
            "gemma4": ("int8", "fp4", "experts=nvfp4")}
+# each family's least new prompt rows a call for expert-major (docs/offload.md 13.16): below
+# them the layer-major prompt (pooled, a request a run) is as fast on the card or faster. A
+# short call has few mixer runs to hide its needs behind: they land mostly while its expert
+# runs wait, an idle part an expert (35B 1.06 ms, 26B 1.89 ms) against a request's 0.82 /
+# 1.59 ms a miss (session emdef: Qwen3.5-35B-A3B's turns of 24 and 31 new tokens +0.50 /
+# +0.39 s TTFT, each a call and the 4 rows after its snapshot; gemma-4-26B-A4B-it's 25 even,
+# 31 -0.36 s). Session emdef2's crossover, expert-major calls against layer-major: the 35B's
+# +0.27 s at 27 rows, -0.21 s at 45 (even at about 37); the 26B's at 21 rows over four pairs
+# (emdef2, emdef3) -0.086 s, its device time a gain in each
+EM_ROWS = {"qwen35": 44, "gemma4": 20}
 
 
 class PoolError(ValueError):
@@ -53,9 +65,19 @@ def streams(spec) -> bool:
     return getattr(spec, "moe", None) is not None
 
 
+def _family(spec) -> str:
+    return type(spec).__module__.rsplit(".", 1)[-1]
+
+
 def defaults(spec) -> tuple:
     """(wformat, head_format, formats) of a MoE model's family on the card (FORMATS)."""
-    return FORMATS.get(type(spec).__module__.rsplit(".", 1)[-1], ("fp4", "int8", None))
+    return FORMATS.get(_family(spec), ("fp4", "int8", None))
+
+
+def em_rows_of(spec) -> int:
+    """The least new prompt rows a call of a MoE model's family runs expert-major by default
+    (EM_ROWS; 0: every call)."""
+    return EM_ROWS.get(_family(spec), 0)
 
 
 def probe(spec, cfg, cap: int, experts: int | None = None, **kw):
@@ -70,6 +92,19 @@ def fit_experts(spec, cfg, cap: int, image=None, **kw) -> int:
     (image: its probe, if made already)."""
     L = (image or probe(spec, cfg, cap, **kw)).offload
     return min(spec.moe.E, (cfg.DRAM_BYTES - L.slots[0][0]) // (L.layers * L.pitch))
+
+
+def expert_major_fits(spec, image, experts: int) -> bool:
+    """Whether expert-major's needs always find a slot (docs/offload.md 13.14, 13.15): while
+    layer j runs, the server takes no victim from layers j - 1, j and j + 1, whose experts hold
+    at most 3 E slots, so the pooled slots less the scratch of the largest chunk (the image's
+    prefill rows, a record each) must be at least 3 E. The card's: 35B 1720 - 26 at chat's KV
+    capacity (1680 - 26 at moe_card's) against 768, 26B 540 - 17 against 384; a tiny test
+    model's 2 slots a layer are not (12 - 20 against 24)."""
+    from opentpu.llm.moe import em_record
+    L = image.offload
+    scratch = -(-image.prefill_rows * em_record(spec.hidden, spec.moe.k) // L.pitch)
+    return L.layers * experts - scratch >= 3 * L.E
 
 
 def default_pool(model_dir, efmt: str) -> Path:
@@ -128,7 +163,8 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
            formats: str | None = None, embed: str | None = None,
            embed_host: bool | None = None, hints: bool | None = None,
            layer_major: int | None = None, pooled: bool = True, embed_runs: bool = False,
-           layer_ahead=None, expert_major: bool = False, ahead_part: int | None = None,
+           layer_ahead=None, expert_major: bool | None = None, em_rows: int | None = None,
+           ahead_part: int | None = None,
            idle_parts: str = "v2", willneed: bool = True, pool_map: bool = True,
            release_weights: bool = True, create: bool = False, W=None, **kw):
     """The Engine of the MoE checkpoint at `model` on `backend` ("isa", or a backend factory
@@ -143,7 +179,12 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
     an untied embedding table on the host (None: the image's choice, a MoE's own table there);
     hints: the router's prefetch hints (None: the Spec's, off); layer_major: the prompt layer
     by layer in runs of that many rows (None: LAYER_MAJOR where the image has layer runs, else
-    0, token by token), pooled / embed_runs / layer_ahead / expert_major / ahead_part: Engine's;
+    0, token by token), pooled / embed_runs / layer_ahead / expert_major / ahead_part: Engine's
+    (expert_major None: on wherever the prompt is layer-major with pooled slots, no
+    layer_ahead and room for its needs, expert_major_fits, docs/offload.md 13.15, for the
+    prefill_layers calls of at least em_rows new rows (None: the family's EM_ROWS, 13.16;
+    gate_expert_major); True: on for every call unless em_rows says otherwise; ahead_part
+    None: NEED_PART with it, else Engine's);
     idle_parts: ExpertServer's read ahead and halt-aware parts (IDLE_PARTS); willneed: a
     request's disk reads queued at once (PoolFile.willneed); pool_map, release_weights:
     Engine's. create: a missing pool is made and each expert packed on its first use (else
@@ -176,6 +217,9 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
         ekw.update(layer_major=layer_major, pooled=pooled, embed_runs=embed_runs)
         if layer_ahead:                         # the next layer's experts during a layer's runs
             ekw.update(layer_ahead=layer_ahead)
+        if expert_major is None:                # (the default since session pfB, 13.15;
+            expert_major = pooled and not layer_ahead and expert_major_fits(spec, img, experts)
+            em_rows = em_rows_of(spec) if em_rows is None else em_rows  # from EM_ROWS, 13.16)
         if expert_major:                        # a layer's experts in one run a chunk
             ekw.update(expert_major=True)
     kw.setdefault("rows", 1)
@@ -183,10 +227,14 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
                  resident=True, experts=experts, pool_file=pool, backend=backend,
                  release_weights=release_weights, pool_map=pool_map, **ekw, **kw)
     eng.pool_path = pool
+    if eng.expert_major and em_rows:            # (a short call layer-major: 13.16)
+        gate_expert_major(eng, em_rows)
     srv = eng.server
     if eng.layer_ahead and not (pooled and hasattr(srv, "ahead_layer")):
         raise ValueError("layer_ahead needs pooled slots and a server that streams ahead "
                          "(ExpertServer.ahead_layer)")
+    if ahead_part is None and eng.expert_major:     # (the needs: a whole expert a part)
+        ahead_part = NEED_PART
     if ahead_part:                              # (the hints' and needs' idle-poll part)
         eng.ahead_part = ahead_part
     srv.policy = policy                         # the slots' replacement
@@ -196,6 +244,34 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
     if willneed and pf is not None:             # a request's misses read from the disk at once
         srv.ahead = pf.willneed
     return eng
+
+
+def gate_expert_major(eng, rows: int) -> None:
+    """An expert-major Engine's prompts expert-major only in its prefill_layers calls of at
+    least `rows` new rows, layer-major (pooled, a request a run) in the shorter ones (docs/
+    offload.md 13.16): a chat turn of a model with state (Qwen3.5's, Gemma 4's sliding rings)
+    is two calls, its part up to the snapshot at the reply's start and the few rows after it.
+    Each call sets the Engine's expert_major for its runs and takes that mode's layer runs
+    (their compiled programs: a key does not hold the mode, an expert-major run posts needs
+    where the other requests its experts); after it the Engine is as before (expert_major on).
+    eng.em_rows: the threshold; eng.em_last: the last call's (rows, expert-major);
+    eng.em_calls: the calls [layer-major, expert-major]."""
+    base = eng.prefill_layers
+    runs = {True: (eng._layer_runs, eng._layer_next), False: ({}, {})}
+    eng.em_rows, eng.em_last, eng.em_calls = rows, None, [0, 0]
+
+    def prefill_layers(tokens, logits: bool = True):
+        on = len(tokens) >= rows
+        eng.expert_major = on
+        eng._layer_runs, eng._layer_next = runs[on]
+        try:
+            return base(tokens, logits)
+        finally:
+            eng.expert_major = True
+            eng._layer_runs, eng._layer_next = runs[True]
+            eng.em_last = (len(tokens), on)
+            eng.em_calls[on] += 1
+    eng.prefill_layers = prefill_layers
 
 
 def poll_idle(eng, mode: str | None):

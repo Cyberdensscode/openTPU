@@ -89,7 +89,7 @@ def card(model: str, ref: dict, n: int, experts: int, cap: int, pool: str | None
          legacy_serve: bool = False, embed_runs: bool = False,
          poll_idle: str | None = None, prefill_trace: str | None = None,
          layer_ahead: str | None = None, ahead_part: int | None = None,
-         idle_parts: str = "v2", expert_major: bool = False) -> dict:
+         idle_parts: str = "v2", expert_major: bool | None = None) -> dict:
     import hashlib
     import pickle
     from opentpu.isasim import board_config
@@ -118,6 +118,7 @@ def card(model: str, ref: dict, n: int, experts: int, cap: int, pool: str | None
                     release_weights=release_weights, create=True)  # (10.6, 10.7)
     load_s = time.time() - t
     spec, srv = eng.spec, eng.server
+    expert_major = eng.expert_major             # (None: streamed.engine's default, 13.15)
     experts = eng.image.offload.slots[0][1]     # (slots per layer: 0 filled the DRAM)
     srv.history, per_req = [], []               # each request's ids and misses
     serve, pool_of, mem = srv.serve, srv.pool, srv.mem
@@ -219,6 +220,8 @@ def card(model: str, ref: dict, n: int, experts: int, cap: int, pool: str | None
     t, t_pre = time.time(), time.perf_counter()
     lg = eng.prefill(ids if host_loop else ids[:-1])
     t_end = time.perf_counter()
+    if getattr(eng, "em_last", None) is not None:   # (the default's: from EM_ROWS rows, 13.16)
+        expert_major = eng.em_last[1]
     snap_end, pev, srv.events = snap() if snap else None, srv.events, None
     for o, k, v in undo:                        # the decode as before
         if v is None:
@@ -239,7 +242,8 @@ def card(model: str, ref: dict, n: int, experts: int, cap: int, pool: str | None
         if t_ is not None:
             t_.host_idle = 0.0
     prefill_s = time.time() - t
-    pre = len(per_req) if layer_major else 0    # layer-major: a request per layer run
+    pre = len(per_req) if layer_major else 0    # layer-major: a request per layer run (none
+                                                # expert-major, but the token steps')
     khz = (getattr(eng.backend, "info", None) or {}).get("core_khz")
     done = [r for r in runs if len(r) > 2]
     run_s = sum(r[2] - r[1] for r in done)      # each run's start .. its wait's return
@@ -323,7 +327,7 @@ def card(model: str, ref: dict, n: int, experts: int, cap: int, pool: str | None
     J, E = L.layers, L.E
     T = (len(per_req) - pre) // J               # whole tokens (the last request may be unread)
     mpt = np.array(per_req[pre:pre + T * J]).reshape(T, J).sum(1)  # misses per token
-    prompt = (0 if host_loop else 1) if pre else len(ids)   # the prompt's tokens among them
+    prompt = (0 if host_loop else 1) if layer_major else len(ids)  # the prompt's tokens among
     dec = mpt[prompt:]
     if trace:                                   # the card's routes, as router_trace.py's
         req = np.array(srv.history[pre:pre + T * J]).reshape(T, J, -1)
@@ -359,6 +363,7 @@ def card(model: str, ref: dict, n: int, experts: int, cap: int, pool: str | None
                 embed_runs=embed_runs if layer_major else None,
                 layer_ahead=layer_ahead if layer_major else None,
                 expert_major=expert_major if layer_major else None,
+                em_rows=getattr(eng, "em_rows", 0) if layer_major else None,
                 ahead_part=eng.ahead_part if eng.layer_hint or eng.expert_major else None,
                 release_weights=release_weights, willneed=willneed, pool_map=pool_map,
                 legacy_serve=legacy_serve, poll_idle=poll_idle,
@@ -367,7 +372,8 @@ def card(model: str, ref: dict, n: int, experts: int, cap: int, pool: str | None
                                 staged=getattr(srv.mem, "staged", None)),
                 pacer=dict(sleeps=pacer.sleeps, slept_s=round(pacer.slept, 3),
                            kinds=len(pacer.gaps)) if pacer is not None else None,
-                prefill_requests=pre or None, prefill_misses=sum(per_req[:pre]) if pre else None,
+                prefill_requests=pre if layer_major else None,
+                prefill_misses=sum(per_req[:pre]) if layer_major else None,
                 prefill_time=prefill_time,
                 load_s=round(load_s), prefill_s=round(prefill_s), generate_s=round(gen_s),
                 loop="host" if host_loop else "card", embed=spec.embed,
@@ -456,14 +462,18 @@ def main():
                          "order, the card's hints (each layer run's router of the next layer on "
                          "its output rows, 13.9) or by their use in router traces "
                          "(comma-separated .npz)")
-    ap.add_argument("--expert-major", action="store_true",
+    ap.add_argument("--expert-major", action=argparse.BooleanOptionalAction, default=None,
                     help="--layer-major with pooled slots: each MoE layer of a chunk routed in "
                          "its runs, its experts in one expert run (Engine expert_major; "
-                         "docs/offload.md 13.11, 13.13; the server's need lines and scratch: 13.14)")
+                         "docs/offload.md 13.11, 13.13; the server's need lines and scratch: "
+                         "13.14). The default with --layer-major, pooled slots and no "
+                         "--layer-ahead (13.15) for a prompt of the family's "
+                         "streamed.EM_ROWS rows or more (13.16); --expert-major for any "
+                         "prompt, --no-expert-major for the layer-major base")
     ap.add_argument("--ahead-part", type=int, metavar="KiB",
                     help="--layer-ahead hint and --expert-major: the KiB an idle poll sends of "
-                         "a queued expert (default qwen3.AHEAD_PART, 1024; at least a slot: one "
-                         "part an expert)")
+                         "a queued expert (default: expert-major streamed.NEED_PART, 4096, the "
+                         "hints qwen3.AHEAD_PART, 1024; at least a slot: one part an expert)")
     ap.add_argument("--embed-runs", action="store_true",
                     help="--layer-major with the embed runs and compile-time-position runs "
                          "for an embedding table on the host (Engine embed_runs; needs a "
