@@ -6,9 +6,10 @@
 #     "TAG zero: vpu_hack.py cosim-arguments" (vpu_pump's lists' format)
 #   candidates: lines "NAME K=V ..." (the run's environment). OTPU_SIM_PLUSARGS=a,b adds
 #     simulator plusargs (otpu_seq's +hz_*, otpu_vpu's +vt_*); HZLOG=1 writes otpu_seq's hazard
-#     statistics to <outdir>/<tag>.hz; KOUT=1 writes the wait-count oracle to <outdir>/<wl>.k;
-#     WC=1 runs on the wait counts of <outdir>/<wl>.k (a KOUT candidate's, run first); KOUT=x /
-#     WC=x: <outdir>/<wl>.x.k.
+#     statistics to <outdir>/<tag>.<n>.hz; KOUT=1 writes the wait-count oracle to
+#     <outdir>/<wl>.<n>.k; WC=1 runs on the wait counts of <outdir>/<wl>.<n>.k (a KOUT
+#     candidate's, run first); KOUT=x / WC=x: <outdir>/<wl>.x.<n>.k. <n> counts a tool's
+#     simulations (the MoE tool runs one per prefix).
 # Results: <outdir>/<workload>__<candidate>.log (ends with rc=N and the wall time). A run whose
 # log ends in rc=0 is skipped. Usage, from anywhere:
 #   rtl/exp/seq_vpu/run_cosim.sh <outdir> <P> <workloads> <candidates> NAME...
@@ -31,11 +32,11 @@ one() {   # workload candidate args...
   local pa=""
   for kv in "${cenv[@]}"; do
     case $kv in
-      HZLOG=1) pa="$pa,+hz_log=$O/$tag.hz" ;;
-      KOUT=1) pa="$pa,+hz_kout=$O/$wl.k" ;;
-      KOUT=*) pa="$pa,+hz_kout=$O/$wl.${kv#KOUT=}.k" ;;
-      WC=1) pa="$pa,+hz_wc=$O/$wl.k" ;;
-      WC=*) pa="$pa,+hz_wc=$O/$wl.${kv#WC=}.k" ;;
+      HZLOG=1) pa="$pa,+hz_log=$O/$tag.%n.hz" ;;
+      KOUT=1) pa="$pa,+hz_kout=$O/$wl.%n.k" ;;
+      KOUT=*) pa="$pa,+hz_kout=$O/$wl.${kv#KOUT=}.%n.k" ;;
+      WC=1) pa="$pa,+hz_wc=$O/$wl.%n.k" ;;
+      WC=*) pa="$pa,+hz_wc=$O/$wl.${kv#WC=}.%n.k" ;;
       OTPU_SIM_PLUSARGS=*) pa="$pa,${kv#OTPU_SIM_PLUSARGS=}" ;;
       *) env+=("$kv") ;;
     esac

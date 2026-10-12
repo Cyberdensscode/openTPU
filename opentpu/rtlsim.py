@@ -204,6 +204,7 @@ MEMORY = {"AXI": os.environ.get("OTPU_AXI", "0") == "1",
 # clock (the rate / 8) with the core at LDC_MHZ (OTPU_LDC_MHZ; 0: the controller's clock). The
 # stall, bandwidth and latency settings do not apply.
 LDC_MODELS = {1066: "otpu_ldc_ch.v"}
+_SIM_RUNS = 0                   # simulations run by this process (OTPU_SIM_PLUSARGS's %n)
 
 
 def ldc_plusargs(mts: int, mhz: float = 0) -> list[str]:
@@ -317,8 +318,12 @@ def _run(cfg, programs: list, images: list, dram_lat: int = 8, max_cycles: int =
             f"{r:x} {ad // 4:x} {v & 0xFFFFFFFF:x}\n" for r, ad, v in pk))
     args = [str(exe), f"+dir={tmp}", f"+max_cycles={max_cycles}"] + (["+trace"] if trace else [])
     args += list(plusargs or [])
-    # e.g. OTPU_SIM_PLUSARGS=+hz_rh=1,+hz_log=/path (docs/seq_vpu.md; commas or spaces)
-    args += [x for x in _re.split(r"[\s,]+", os.environ.get("OTPU_SIM_PLUSARGS", "")) if x]
+    # e.g. OTPU_SIM_PLUSARGS=+hz_rh=1,+hz_log=/path (docs/seq_vpu.md; commas or spaces); %n is
+    # this process's simulation count (0, 1, ...), so each run of a tool gets its own files
+    global _SIM_RUNS
+    args += [x.replace("%n", str(_SIM_RUNS))
+             for x in _re.split(r"[\s,]+", os.environ.get("OTPU_SIM_PLUSARGS", "")) if x]
+    _SIM_RUNS += 1
     args += [f"+arg{k}={int(v) & 0xFFFFFFFF}" for k, v in enumerate(run_args or [])]
     if again:
         args += [f"+runs={1 + len(again)}"] + (["+reload"] if reload else [])
