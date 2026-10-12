@@ -281,3 +281,36 @@ def quantize(x, axis=-1):
     inv = np.where(zero, F32(0), mul(F32(127), recip(amax))).astype(np.float32)
     q = q8(mul(x, inv))
     return q, np.squeeze(s, axis=axis)
+
+
+MX_DMAX = 31           # the largest power-of-two offset of a quantizer group (docs/isa.md)
+
+
+def mx_offset(a, amax):
+    """d of docs/isa.md "Quantization": the largest d <= MX_DMAX with a * 2^d <= amax (a <= amax,
+    both flushed and >= 0), from the exponent fields and the fraction bits; 0 where a is 0."""
+    ab, mb = bits(a).astype(np.int64), bits(amax).astype(np.int64)
+    d = (mb >> 23) - (ab >> 23) - ((ab & 0x7FFFFF) > (mb & 0x7FFFFF))
+    return np.where(ab == 0, 0, np.clip(d, 0, MX_DMAX)).astype(np.uint8)
+
+
+def quantize_mx(x, g: int, row_mode: bool = False):
+    """docs/isa.md "Quantization" of the rows of x [rows, n] with groups of g elements (QACT:
+    D/4, QST: D): the row's S = amax * inv127, inv = 127 * recip(amax), each group's offset d
+    (0 in row mode) and q = q8(x * (inv * 2^d)). Returns (int8 q [rows, n], fp32 S [rows],
+    uint8 d [rows, n / g])."""
+    x = ftz(x)
+    rows, n = x.shape
+    ax = bits(fabs(x))
+    amax = from_bits(np.max(ax, axis=1))                              # [rows]
+    zero = amax == 0
+    s = np.where(zero, F32(0), mul(amax, INV127)).astype(np.float32)
+    inv = np.where(zero, F32(0), mul(F32(127), recip(amax))).astype(np.float32)
+    if row_mode:
+        d = np.zeros((rows, n // g), np.uint8)
+    else:
+        a = from_bits(np.max(ax.reshape(rows, n // g, g), axis=2))     # [rows, n/g]
+        d = mx_offset(a, amax[:, None])
+    invg = mul(inv[:, None], np.ldexp(F32(1), d.astype(np.int32)).astype(np.float32))
+    q = q8(mul(x.reshape(rows, n // g, g), invg[:, :, None])).reshape(rows, n)
+    return q, s, d

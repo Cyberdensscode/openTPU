@@ -20,9 +20,13 @@ OPNAMES = {NOP: "NOP", HALT: "HALT", LI: "LI", ADDI: "ADDI", LOOP: "LOOP", BAR: 
 F_UNIT, F_ACC, F_RMAX, F_ASCALE = 0x1, 0x2, 0x4, 0x8     # MM
 # MM weight format, flags[5:4] (docs/isa.md "Weight formats")
 WF_SHIFT = 4
-W8, W4I, W4F = 0, 1, 2          # int8 + fp32 scale | int4 / E2M1 + two-level scale word
-WFORMATS = {"int8": W8, "int4": W4I, "fp4": W4F}
+# int8 | int4 / E2M1 with a 6-bit multiplier per D/4 | E2M1 with an E4M3 scale per D/8; every
+# format a per-row fp32 scale Sw and power-of-two offsets dw under it (MX, docs/mx_mxu.md)
+W8, W4I, W4F, WNV = 0, 1, 2, 3
+WFORMATS = {"int8": W8, "int4": W4I, "fp4": W4F, "nvfp4": WNV}
+MX_W = {W8: 16, W4I: 11, W4F: 11, WNV: 13}   # the shift window W of each format
 F_PAIR = 0x40                   # MM, 4-bit only: column reuse, two K-blocks per cycle and row
+F_RSC = 0x80                    # MM: row scales only (each scale row is Sw[n]; dw 0, m 1)
 F_ROW, F_CSCALE, F_RSCALE = 0x1, 0x2, 0x4   # QACT (QST: F_ROW)
 F_DUP = 0x8                     # QACT: also write the rows to ACT rows rows..2*rows-1 (PAIR)
 F_HALF = 0x2                    # QST, ROW mode: write only the first half of each row
@@ -375,24 +379,30 @@ def stream_hw_cfg(d: StreamDesc, flags: int = 0) -> dict | None:
 
 
 def mm(sa, ssa, out, n, kb, rs, ors, m, ab, srs, unit=False, acc=False, rmax=False,
-       ascale=None, wf=W8, pair=False, ra=0, rb=0, rc=0, comment=""):
-    """MM. With `ascale` (a TMEM address; needs unit and acc) the old accumulator is first
-    multiplied by a per-row factor: y = T[out] * T[ascale + j] + a.w (the flash-attention
-    rescale, done in the MXU epilogue). The address travels in the (unused) scale field.
-    `wf`: the streamed weights' format (W8, W4I, W4F). `pair` (4-bit only): column reuse,
-    ACT row j + m carries the odd K-blocks of row j and both terms of a chunk are summed
-    before the partial sums (docs/isa.md, "Column reuse")."""
-    _check(0 < n < 65536 and 0 < kb < 65536 and 0 < m < 256 and 0 <= ab < 256
-           and 0 <= ors < 65536, f"MM: n {n}, kb {kb}, m {m}, ab {ab}, ors {ors}")
-    _check(wf in (W8, W4I, W4F), f"MM: weight format {wf}")
+       ascale=None, wf=W8, pair=False, k0=0, rsc=False, ra=0, rb=0, rc=0, comment=""):
+    """MM (docs/isa.md). With `ascale` (a TMEM address; needs unit and acc) the old accumulator
+    is first multiplied by a per-row factor: y = T[out] * T[ascale + j] + a.w (the
+    flash-attention rescale, done in the MXU epilogue). The address travels in the (unused)
+    scale field. `wf`: the streamed weights' format (W8, W4I, W4F, WNV). `pair` (4-bit only):
+    column reuse, ACT row j + m carries the odd K-blocks of row j ("Column reuse"). `k0`: the
+    MM's first block within the scale rows at `ssa` (each row starts with its Sw). `rsc`: the
+    scale rows are Sw alone (one word a row: the K cache)."""
+    _check(0 < n < 65536 and 0 < kb < 256 and 0 < m < 256 and 0 <= ab < 256
+           and 0 <= ors < 65536 and 0 <= k0 < 256,
+           f"MM: n {n}, kb {kb}, m {m}, ab {ab}, ors {ors}, k0 {k0}")
+    _check(wf in (W8, W4I, W4F, WNV), f"MM: weight format {wf}")
     _check(not pair or wf != W8, "MM: PAIR needs 4-bit weights")
+    _check(not pair or k0 % 2 == 0, "MM: PAIR needs an even k0")
+    _check(not rsc or wf != WNV, "MM: RSC does not take NVFP4")
     if ascale is not None:
         _check(unit and acc, "MM: ASCALE needs UNIT and ACC")
         ssa = ascale
     fl = (F_UNIT if unit else 0) | (F_ACC if acc else 0) | (F_RMAX if rmax else 0) | \
-        (F_ASCALE if ascale is not None else 0) | (F_PAIR if pair else 0) | (wf << WF_SHIFT)
+        (F_ASCALE if ascale is not None else 0) | (F_PAIR if pair else 0) | \
+        (F_RSC if rsc else 0) | (wf << WF_SHIFT)
     return Instr(MM, ra=ra, rb=rb, rc=rc, flags=fl,
-                 w=_w(sa, ssa, out, n | (kb << 16), rs, ors | (m << 16) | (ab << 24), srs),
+                 w=_w(sa, ssa, out, n | (kb << 16) | (k0 << 24), rs,
+                      ors | (m << 16) | (ab << 24), srs),
                  comment=comment)
 
 

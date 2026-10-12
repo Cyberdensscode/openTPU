@@ -85,7 +85,9 @@ class Slice:
             self.dram[: len(dram)] = dram
         self.tmem = np.zeros(cfg.TMEM_WORDS, dtype=np.uint32)
         self.act = np.zeros((cfg.act_rows, cfg.ACT_BLOCKS * cfg.D), dtype=np.int8)
+        # the scale record of each (row, block): the row's Sa and the sub-blocks' offsets da
         self.ascale = np.zeros((cfg.act_rows, cfg.ACT_BLOCKS), dtype=np.float32)
+        self.adoff = np.zeros((cfg.act_rows, cfg.ACT_BLOCKS, Q.NSUB), dtype=np.uint8)
         self.R = [0] * 16
         self.pc = 0
         self.stack: list[list[int]] = []
@@ -414,18 +416,57 @@ class Slice:
                 self.tput(np.array([ka + j * ks]), regs[4 + j][-1:])
 
     # ---------------------------------------------------------------- MXU
+    def _mx_scales(self, wf, ssa, srs, N, KB, k0, unit, rsc):
+        """The weights' scale rows (docs/isa.md "Weight formats"): Sw [N] fp32, and per (row,
+        block, group) the offset dw and the multiplier m [N, KB, G] (G = 8 groups of D/8 for
+        NVFP4, else the 4 sub-blocks of D/4)."""
+        G = 8 if wf == I.WNV else Q.NSUB
+        if unit:
+            return (np.ones(N, np.float32), np.zeros((N, KB, G), np.int64),
+                    np.ones((N, KB, G), np.int64))
+        align = 16 if wf == I.WNV else 8 if wf in (I.W4I, I.W4F) and not rsc else 4
+        if ssa % align or srs % align:
+            raise SimError(f"MM: ssa and srs must be multiples of {align}")
+        rows = ssa + np.arange(N) * srs
+        sw = self.m32[self._widx(rows)].view(np.float32)
+        if rsc:
+            return sw, np.zeros((N, KB, G), np.int64), np.ones((N, KB, G), np.int64)
+        kk = k0 + np.arange(KB)
+        if wf == I.W8:                    # one dw byte per block after Sw
+            ba = rows[:, None] + 4 + kk[None, :]
+            if ba.max() >= self.cfg.DRAM_BYTES:
+                raise SimError("MM: scale rows out of range")
+            dw = np.repeat(self.dram[ba].astype(np.int64)[:, :, None], G, axis=2)
+            return sw, dw, np.ones((N, KB, G), np.int64)
+        if wf in (I.W4I, I.W4F):          # a word per block after Sw and a reserved word
+            word = self.m32[self._widx(rows[:, None] + 8 + 4 * kk[None, :])].astype(np.int64)
+            dw = np.repeat((word & 0xFF)[:, :, None], G, axis=2)
+            m = np.stack([(word >> (8 + 6 * b)) & 63 for b in range(G)], -1)
+            return sw, dw, m
+        # NVFP4: eight E4M3 bytes per block after Sw and three reserved words
+        ba = rows[:, None, None] + 16 + 8 * kk[None, :, None] + np.arange(8)[None, None, :]
+        if ba.max() >= self.cfg.DRAM_BYTES:
+            raise SimError("MM: scale rows out of range")
+        e4 = self.dram[ba].astype(np.int64)
+        if np.any(e4 & 0x80):
+            raise SimError("MM: an NVFP4 scale with the sign bit set")
+        E, Mt = (e4 >> 3) & 15, e4 & 7
+        return sw, 15 - np.maximum(E, 1), np.where(E > 0, 8 + Mt, Mt)
+
+    MM_CHUNK = 1 << 22                    # (row, output, block, group) terms per numpy pass
+
     def _mm(self, ins: I.Instr) -> None:
         cfg, w = self.cfg, ins.w
         D = cfg.D
         sa = (self.reg(ins.ra) + w[0]) & 0xFFFFFFFF
         ssa = (self.reg(ins.rb) + w[1]) & 0xFFFFFFFF
         out = (self.reg(ins.rc) + w[2]) & 0xFFFFFFFF
-        N, KB = w[3] & 0xFFFF, w[3] >> 16
+        N, KB, k0 = w[3] & 0xFFFF, (w[3] >> 16) & 0xFF, (w[3] >> 24) & 0xFF
         rs = w[4]
         ors, M, ab = w[5] & 0xFFFF, (w[5] >> 16) & 0xFF, w[5] >> 24
         srs = w[6]
         unit, accf = bool(ins.flags & I.F_UNIT), bool(ins.flags & I.F_ACC)
-        pair = bool(ins.flags & I.F_PAIR)
+        pair, rsc = bool(ins.flags & I.F_PAIR), bool(ins.flags & I.F_RSC)
         R = 2 * M if pair else M                          # ACT rows read
         if not N or not KB:
             raise SimError("MM: N and KB must be at least 1")
@@ -436,69 +477,63 @@ class Slice:
         if pair and R > cfg.MCOLS:
             raise SimError("MM: PAIR needs 2*M <= MCOLS")
         wf = (ins.flags >> I.WF_SHIFT) & 3
-        if wf not in (I.W8, I.W4I, I.W4F):
-            raise SimError("MM: bad weight format")
         if pair and wf == I.W8:
             raise SimError("MM: PAIR needs 4-bit weights")
-        if pair and not unit and (ssa % 8 or srs % 8):
-            raise SimError("MM: PAIR reads a chunk's two scale words at once: ssa and srs must "
-                           "be multiples of 8")
+        if pair and k0 % 2:
+            raise SimError("MM: PAIR needs an even k0")
+        if rsc and wf == I.WNV:
+            raise SimError("MM: RSC does not take NVFP4")
+        if ins.flags & I.F_ASCALE and not (unit and accf):
+            raise SimError("MM: ASCALE needs UNIT and ACC")
         bpb = D if wf == I.W8 else D // 2                 # streamed bytes per K-block
         if sa % D or rs % D or sa + (N - 1) * rs + -(-KB * bpb // D) * D > cfg.DRAM_BYTES:
             raise SimError("MM: streamed rows must be D-byte aligned and in range")
         wv = np.lib.stride_tricks.as_strided(self.dram[sa:], (N, KB, bpb),
                                              (rs, bpb, 1))               # [N, KB, bpb], no copy
-        if unit:
-            wsw = None
-        else:
-            wsi = self._widx(ssa + np.arange(N)[:, None] * srs + 4 * np.arange(KB)[None, :])
-            wsw = self.m32[wsi]
-        act = self.act[:R, ab * D:(ab + KB) * D].reshape(R, KB, D).astype(np.float64)
         if wf == I.W8:
-            ws = np.ones((N, KB), np.float32) if unit else wsw.view(np.float32)
-            # exact int32 block dot products (|sum| <= D * 127 * 128), via float64 BLAS
-            isum = np.einsum("jki,nki->jnk", act, wv.view(np.int8).astype(np.float64),
-                             optimize=True).astype(np.int64)               # [M, N, KB]
+            wel = wv.view(np.int8)
         else:
-            # 4-bit: integer elements, four sub-block sums scaled by their multipliers m_b
-            # (exact: |isum| <= 15 * D * 127 * 12 < 2^24), then the block's bf16 scale
-            w = Q.DEC["int4" if wf == I.W4I else "fp4"][Q.unpack4(wv)].astype(np.float64)
-            if unit:
-                ws = np.ones((N, KB), np.float32)
-                mb = np.ones((N, KB, Q.NSUB))
-            else:
-                ws = F.ftz((wsw << np.uint32(16)).view(np.float32))
-                mb = np.stack([(wsw >> np.uint32(16 + 4 * b)) & np.uint32(15)
-                               for b in range(Q.NSUB)], -1).astype(np.float64)
-            sub = np.einsum("jkbi,nkbi->jnkb", act.reshape(R, KB, Q.NSUB, D // Q.NSUB),
-                            w.reshape(N, KB, Q.NSUB, D // Q.NSUB), optimize=True)
-            isum = np.einsum("jnkb,nkb->jnk", sub, mb).astype(np.int64)   # [R, N, KB]
-        t = F.mul(F.i2f(isum), ws[None, :, :])                            # [R, N, KB]
-        t = F.mul(t, self.ascale[:R, ab:ab + KB][:, None, :])
-        if pair:
-            # column reuse: row j's even blocks from ACT row j, its odd blocks from ACT row
-            # j + M; the two terms of a chunk are added (+0 for a missing odd block) first
-            ev, od = t[:M, :, 0::2], t[M:, :, 1::2]
-            if od.shape[2] < ev.shape[2]:
-                od = np.concatenate([od, np.zeros((M, N, 1), np.float32)], axis=2)
-            t = F.add(ev, od)
-        acc = F.interleaved_sum(t.reshape(M * N, t.shape[2]), F.MM_PARTIALS,
-                                pad=-0.0).reshape(M, N)                 # MM: no pad terms
+            wel = Q.DEC["int4" if wf == I.W4I else "fp4"][Q.unpack4(wv)]
+        sw, dw, mw = self._mx_scales(wf, ssa, srs, N, KB, k0, unit, rsc)
+        G = dw.shape[2]
+        # the ACT row of each (output row, block): PAIR takes the odd blocks from row j + M
+        kk = np.arange(KB)
+        rsel = np.arange(M)[:, None] + np.where(pair & (kk % 2 == 1), M, 0)[None, :]   # [M, KB]
+        sa_rows = self.ascale[:R, ab:ab + KB]
+        if np.any(sa_rows.view(np.uint32) != sa_rows[np.arange(R) % M][:, :1].view(np.uint32)):
+            raise SimError("MM: the ACT rows' blocks hold different Sa (more than one QACT)")
+        act = self.act[:R, ab * D:(ab + KB) * D].reshape(R, KB, D)
+        act = act[rsel, kk[None, :]].astype(np.float64)                 # [M, KB, D]
+        da = self.adoff[:R, ab:ab + KB][rsel, kk[None, :]].astype(np.int64)   # [M, KB, 4]
+        da = np.repeat(da, G // Q.NSUB, axis=2)                          # [M, KB, G]
+        W = I.MX_W[wf]
+        acc = np.zeros((M, N), np.int64)
+        step = max(1, self.MM_CHUNK // max(1, M * KB * G))
+        for n0 in range(0, N, step):
+            n1 = min(N, n0 + step)
+            # exact group sums (|c| < 2^19, float64 BLAS), B = m << sh (sh < 0: the group drops)
+            c = np.einsum("jkgi,nkgi->jnkg", act.reshape(M, KB, G, D // G),
+                          wel[n0:n1].reshape(n1 - n0, KB, G, D // G).astype(np.float64),
+                          optimize=True).astype(np.int64)                  # [M, n, KB, G]
+            sh = W - dw[None, n0:n1] - da[:, None]                             # [M, n, KB, G]
+            B = np.where(sh >= 0, mw[None, n0:n1] << np.maximum(sh, 0), 0)
+            acc[:, n0:n1] = (B * c).sum(axis=(2, 3))
+        y = F.mul(F.mul(F.i2f(acc), sw[None, :]),
+                  F.mul(self.ascale[:M, ab][:, None], np.float32(2.0 ** -W)))
         idx = out + np.arange(M)[:, None] * ors + np.arange(N)[None, :]
-        if ins.flags & I.F_ASCALE:                 # y = old * alpha[j] + acc
-            if not (unit and accf):
-                raise SimError("MM: ASCALE needs UNIT and ACC")
+        if ins.flags & I.F_ASCALE:                 # y = old * alpha[j] + y
             alpha = self.tget(ssa + np.arange(M))[:, None]
-            acc = F.add(F.mul(self.tget(idx), alpha), acc)
+            y = F.add(F.mul(self.tget(idx), alpha), y)
         elif accf:
-            acc = F.add(self.tget(idx), acc)
-        self.tput(idx, acc)
+            y = F.add(self.tget(idx), y)
+        self.tput(idx, y)
         if ins.flags & I.F_RMAX:                   # row max of the written values, in n order
-            mx = F.chain_max(acc)
+            mx = F.chain_max(y)
             self.tput(out + M * ors + np.arange(M), mx)
 
     # ---------------------------------------------------------------- quantizer
-    def _quant_groups(self, src, rows, KB, srs, row_mode, cscale=None, rscale=None):
+    def _quant_rows(self, src, rows, KB, srs, g, row_mode, cscale=None, rscale=None):
+        """docs/isa.md "Quantization" of rows rows x KB*D at src (groups of g elements)."""
         D = self.cfg.D
         idx = src + np.arange(rows)[:, None] * srs + np.arange(KB * D)[None, :]
         x = self.tget(idx)                                                  # [rows, KB*D]
@@ -506,13 +541,7 @@ class Slice:
             x = F.mul(x, self.tget(rscale + np.arange(rows))[:, None])
         if cscale is not None:                     # QACT CSCALE: x * T[cscale + c]
             x = F.mul(x, self.tget(cscale + np.arange(KB * D))[None, :])
-        if row_mode:
-            q, s = F.quantize(x, axis=1)                                    # s: [rows]
-            s = np.repeat(s[:, None], KB, axis=1)
-        else:
-            q, s = F.quantize(x.reshape(rows, KB, D), axis=2)               # s: [rows, KB]
-            q = q.reshape(rows, KB * D)
-        return q, s.astype(np.float32)
+        return F.quantize_mx(x, g, row_mode)
 
     def _qact(self, ins: I.Instr) -> None:
         cfg, w = self.cfg, ins.w
@@ -524,10 +553,12 @@ class Slice:
             raise SimError("QACT out of ACT RAM bounds")
         cs = (w[3] & 0xFFFFFFFF) if ins.flags & I.F_CSCALE else None
         rsc = (w[4] & 0xFFFFFFFF) if ins.flags & I.F_RSCALE else None
-        q, s = self._quant_groups(src, rows, KB, srs, bool(ins.flags & I.F_ROW), cs, rsc)
+        q, s, d = self._quant_rows(src, rows, KB, srs, cfg.D // Q.NSUB,
+                                   bool(ins.flags & I.F_ROW), cs, rsc)
         for r0 in ((0, rows) if dup else (0,)):     # DUP: rows r and r + rows, same bytes
             self.act[r0:r0 + rows, ab * cfg.D:(ab + KB) * cfg.D] = q
-            self.ascale[r0:r0 + rows, ab:ab + KB] = s
+            self.ascale[r0:r0 + rows, ab:ab + KB] = s[:, None]
+            self.adoff[r0:r0 + rows, ab:ab + KB] = d.reshape(rows, KB, Q.NSUB)
 
     def _qst(self, ins: I.Instr) -> None:
         cfg, w = self.cfg, ins.w
@@ -540,20 +571,25 @@ class Slice:
         half = bool(ins.flags & I.F_HALF)
         if half and not row_mode:
             raise SimError("QST: HALF needs ROW mode")
-        q, s = self._quant_groups(src, rows, KB, srs, row_mode)
+        q, s, d = self._quant_rows(src, rows, KB, srs, cfg.D, row_mode)
         ne = KB * cfg.D // 2 if half else KB * cfg.D   # HALF: the row's first half only
         baddr = dst + np.arange(rows)[:, None] * drs + np.arange(ne)[None, :] * es
         if np.any(baddr < 0) or np.any(baddr >= cfg.DRAM_BYTES):
             raise SimError("QST: byte address out of range")
-        if row_mode:
-            sa = sdst + 4 * np.arange(rows)
-        else:
-            sa = sdst + 4 * (np.arange(rows)[:, None] * KB + np.arange(KB)[None, :])
-        swi = self._widx(sa)
-        if _overlap(baddr, (4 * swi.reshape(-1)[:, None] + np.arange(4)).reshape(-1)):
+        if row_mode:                               # the RSC scale row: S
+            sbytes = np.zeros((rows, 4), np.uint8)
+            sbytes[:, :4] = s[:, None].view(np.uint8)
+        else:                                      # the int8 scale row: S, then the bytes d_k
+            sbytes = np.zeros((rows, 4 + 4 * -(-KB // 4)), np.uint8)
+            sbytes[:, :4] = s[:, None].view(np.uint8)
+            sbytes[:, 4:4 + KB] = d
+        sa = sdst + np.arange(rows)[:, None] * sbytes.shape[1] + np.arange(sbytes.shape[1])
+        if sdst % 4 or np.any(sa >= cfg.DRAM_BYTES):
+            raise SimError("QST: bad scale address")
+        if _overlap(baddr, sa.reshape(-1)):
             raise SimError("QST: the data and scale ranges overlap")
         self.dram[baddr] = q[:, :ne].view(np.uint8)
-        self.m32[swi] = (s[:, 0] if row_mode else s).view(np.uint32)
+        self.dram[sa] = sbytes
 
     # ---------------------------------------------------------------- VPU
     def _vop(self, ins: I.Instr) -> None:
