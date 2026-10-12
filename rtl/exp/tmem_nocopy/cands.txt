@@ -86,3 +86,11 @@ r8iR OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=8 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1
 r8hR OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=8 OTPU_TMEM_SBP=3 OTPU_TMEM_SBH=2 OTPU_TMEM_RPL=1
 r16hR OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=16 OTPU_TMEM_SBP=3 OTPU_TMEM_SBH=2 OTPU_TMEM_RPL=1
 r16h OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=16 OTPU_TMEM_SBP=3 OTPU_TMEM_SBH=2
+# ... fewer readers (A4): the MXU's accumulation kept in the MXU (92% of its reads are its own
+# results) and the row factor in a register: the MXU and QUANT 3 ports read no RAM
+s8iqA OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_rq=1,+tm_cpy=90000900
+s16h2qA OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3,+tm_sbh=2,+tm_rq=1,+tm_cpy=90000900
+# ... one true dual-port copy, its two ports split over the units' ports (port B: DMA, MXU, QUANT,
+# VPU A; port A: VPU B, QUANT 3, QUANT 2, COLL and the writes): a unit's ports never share a RAM port
+s8xq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_rq=1,+tm_cpy=00001111,+tm_tdp=1,+tm_wcpy=1
+s8hxq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_sbh=2,+tm_rq=1,+tm_cpy=00001111,+tm_tdp=1,+tm_wcpy=1

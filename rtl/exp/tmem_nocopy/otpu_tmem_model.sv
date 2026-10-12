@@ -26,6 +26,9 @@
 //   +tm_bufm=H  the ports with lines, a hex mask by port index [ff]
 //   +tm_share=0 two ports reading the same word still take two reads (no address compare) [1]
 //   +tm_tdp=1   true dual-port RAMs: a write takes one of the RAM's tm_rps accesses (one copy)
+//   +tm_wcpy=K  tdp: the writes take their access on "copy" K's RAMs [0]; with tm_cpy splitting
+//               the ports over copies 0 and 1 and tm_rps 1, one true dual-port copy whose port B
+//               serves copy 0's ports and port A copy 1's and the writes
 // Two reads of the same word share a RAM read (+tm_share=1). A unit whose own reads need more than R reads of
 // one RAM (two of its ports in one sub-bank, different words) reads them over several cycles: it
 // is granted after ceil(n / R) - 1 more cycles (a holding register in the unit).
@@ -55,12 +58,12 @@ module otpu_tmem_model #(
 );
   localparam int BW = $clog2(LANES);
   localparam int MC = 8, MSB = 16, MR = 4, MB = 8;   // copies, sub-banks, reads, lines
-  int nsb, lsb, sbp, sbh, rps, rq, nbuf, share, tdp;
+  int nsb, lsb, sbp, sbh, rps, rq, nbuf, share, tdp, wcpy;
   int cpy [NRP], psk [NRP];
   logic [NRP-1:0] bufm;
   initial begin
     string s;
-    nsb = 8; sbp = 3; sbh = 0; rps = 1; rq = 0; nbuf = 0; bufm = '1; share = 1; tdp = 0;
+    nsb = 8; sbp = 3; sbh = 0; rps = 1; rq = 0; nbuf = 0; bufm = '1; share = 1; tdp = 0; wcpy = 0;
     void'($value$plusargs("tm_nsb=%d", nsb));
     void'($value$plusargs("tm_sbp=%d", sbp));
     void'($value$plusargs("tm_sbh=%d", sbh));
@@ -70,6 +73,7 @@ module otpu_tmem_model #(
     void'($value$plusargs("tm_bufm=%h", bufm));
     void'($value$plusargs("tm_share=%d", share));
     void'($value$plusargs("tm_tdp=%d", tdp));
+    void'($value$plusargs("tm_wcpy=%d", wcpy));
     for (int p = 0; p < NRP; p++) begin cpy[p] = 0; psk[p] = 0; end
     if ($value$plusargs("tm_cpy=%s", s))
       for (int p = 0; p < NRP && p < s.len(); p++) cpy[p] = int'(s[p]) - 48;
@@ -82,8 +86,8 @@ module otpu_tmem_model #(
     for (int p = 0; p < NRP; p++)
       if (cpy[p] != 9 && (cpy[p] < 0 || cpy[p] >= MC))
         $fatal(1, "otpu_tmem_model: port %0d's copy %0d (0..%0d or 9)", p, cpy[p], MC - 1);
-    $display("TMMODEL cfg sid=%0d nsb=%0d sbp=%0d sbh=%0d rps=%0d rq=%0d nbuf=%0d bufm=%h share=%0d tdp=%0d cpy=%0d%0d%0d%0d%0d%0d%0d%0d",
-             SID, nsb, sbp, sbh, rps, rq, nbuf, bufm, share, tdp, cpy[0], cpy[1], cpy[2], cpy[3], cpy[4],
+    $display("TMMODEL cfg sid=%0d nsb=%0d sbp=%0d sbh=%0d rps=%0d rq=%0d nbuf=%0d bufm=%h share=%0d tdp=%0d wcpy=%0d cpy=%0d%0d%0d%0d%0d%0d%0d%0d",
+             SID, nsb, sbp, sbh, rps, rq, nbuf, bufm, share, tdp, wcpy, cpy[0], cpy[1], cpy[2], cpy[3], cpy[4],
              cpy[5], cpy[6], cpy[7]);
   end
 
@@ -160,7 +164,7 @@ module otpu_tmem_model #(
               gw[w_addr[p][l][BW-1:0]] = 1'b1;
               if (tdp != 0 && ng < NGL) begin
                 a = w_addr[p][l];
-                gk[ng] = (32'(a[BW-1:0]) << 4) | 32'(sbank(a));
+                gk[ng] = (32'(wcpy) << 8) | (32'(a[BW-1:0]) << 4) | 32'(sbank(a));
                 gr[ng] = 32'h8000_0000 | (a >> BW);
                 ng++;
               end

@@ -5,6 +5,8 @@ co-simulation's trace (otpu_slice +tmtrace; rtl/exp/tmem_nocopy/run_cosim.sh TRA
     python3 tools/tmem_trace.py stats  FILE.tt [...]    activity, overlap, streams, reuse
     python3 tools/tmem_trace.py screen FILE.tt [...]    one-copy organizations, no feedback
     python3 tools/tmem_trace.py json   FILE.tt [...]    both, as one JSON line per file
+    python3 tools/tmem_trace.py flow   FILE.tt [...]    who wrote the words each port reads, how
+                                                        long before, and how often they are re-read
 
 A trace holds one or more simulations (a record of kind 15 starts each). Records are three
 little-endian 32-bit words {cycle, info, value}; info[3:0] the kind, [7:4] the port or unit,
@@ -200,6 +202,65 @@ def screen(seg: np.ndarray, cands: list[tuple]) -> dict:
     return out
 
 
+WPORTS = ["DMA", "MXU", "COLL", "VPU"]
+
+
+def flow(seg: np.ndarray) -> dict:
+    """Producer -> consumer. For every word a read port reads: the write port that last wrote it
+    before the read's cycle (a read sees the writes of earlier cycles only; "init": none in the
+    trace), the cycles between them, and whether the port read that same written word before (a
+    re-read, which a register file or a buffer in the unit could serve instead of TMEM)."""
+    rc, rp, ra = lanes(seg, (0, 2))
+    wc, wp, wa = lanes(seg, (1, 3))
+    n_r, n_w = len(rc), len(wc)
+    addr = np.concatenate([ra, wa]).astype(np.int64)
+    cyc = np.concatenate([rc, wc]).astype(np.int64)
+    isw = np.concatenate([np.zeros(n_r, bool), np.ones(n_w, bool)])
+    port = np.concatenate([rp, wp]).astype(np.int64)
+    # one event list by address, then cycle, a cycle's reads before its writes
+    o = np.lexsort((isw, cyc, addr))
+    addr, cyc, isw, port = addr[o], cyc[o], isw[o], port[o]
+    idx = np.arange(len(o))
+    start = np.r_[True, addr[1:] != addr[:-1]]
+    gs = np.maximum.accumulate(np.where(start, idx, 0))
+    lw = np.maximum.accumulate(np.where(isw, idx, -1))
+    lw = np.where(lw >= gs, lw, -1)                   # the address's latest write so far
+    r = ~isw
+    r_lw, r_port, r_cyc, r_addr = lw[r], port[r], cyc[r], addr[r]
+    has = r_lw >= 0
+    prod = np.where(has, port[np.maximum(r_lw, 0)], -1)
+    dist = np.where(has, r_cyc - cyc[np.maximum(r_lw, 0)], -1)
+    # a re-read: the same port read the same written word (or, unwritten, the same address)
+    # before; the events are in cycle order within an address, so rank within (word, port)
+    key = np.where(has, r_lw * 16 + r_port, -(r_addr * 16 + r_port) - 1)
+    order = np.argsort(key, kind="stable")
+    sk = key[order]
+    st = np.r_[True, sk[1:] != sk[:-1]]
+    pos = np.arange(len(sk))
+    rank = np.empty(len(key), np.int64)
+    rank[order] = pos - np.maximum.accumulate(np.where(st, pos, 0))
+    first = rank == 0
+    out = {"reads": int(n_r), "writes": int(n_w), "by_port": {}}
+    for i in range(8):
+        sel = r_port == i
+        if not sel.any():
+            continue
+        d = {"words": int(sel.sum()), "reread": float((~first[sel]).mean()), "from": {}}
+        for j, nm in [(-1, "init")] + list(enumerate(WPORTS)):
+            m = sel & (prod == j)
+            if not m.any():
+                continue
+            e = {"share": float(m.sum() / sel.sum()), "reread": float((~first[m]).mean())}
+            if j >= 0:
+                dd = dist[m]
+                e["d_med"] = int(np.median(dd))
+                e["d_le16"] = float((dd <= 16).mean())
+                e["d_le256"] = float((dd <= 256).mean())
+            d["from"][nm] = e
+        out["by_port"][PORTS[i]] = d
+    return out
+
+
 CANDS = [  # name, sub-banks, field bit, hash, reads per RAM, ports off the RAM
     ("c1", 1, 3, 0, 1, ()), ("c1r2", 1, 3, 0, 2, ()), ("c1r2q", 1, 3, 0, 2, ("Q3",)),
     ("c1r3", 1, 3, 0, 3, ()),
@@ -218,7 +279,7 @@ CANDS = [  # name, sub-banks, field bit, hash, reads per RAM, ports off the RAM
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("cmd", choices=["stats", "screen", "json"])
+    ap.add_argument("cmd", choices=["stats", "screen", "json", "flow"])
     ap.add_argument("files", nargs="+")
     a = ap.parse_args(argv)
     for f in a.files:
@@ -229,6 +290,10 @@ def main(argv=None) -> int:
                 res["stats"] = stats(seg)
             if a.cmd in ("screen", "json"):
                 res["screen"] = screen(seg, CANDS)
+            if a.cmd == "flow":
+                res["flow"] = flow(seg)
+                print(json.dumps(res))
+                continue
             if a.cmd == "json":
                 print(json.dumps(res))
             else:
