@@ -12,7 +12,8 @@
 #   ku-v2b  pumped 3 copies, block RAM          ku-v2u  the same in UltraRAM
 #   ku-v1b  otpu_tmem IMPL 1 (3 copies of block RAM at 250 MHz)
 #   ku-v2u300  pumped UltraRAM at 300 / 600 MHz
-# The boards' own parts at 250 / 500 MHz (omarchy has them; opentpu has no UltraScale+ part):
+#   ku-v2b-200, ku-v2u-200  pumped 3 copies at 200 / 400 MHz (the BCU1525's likely core clock)
+# The boards' own parts at 250 / 500 MHz (need a Virtex UltraScale+ license; not run, xcku5p stands in):
 #   vu9-v2b, vu9-v2u    pumped 3 copies, block RAM / UltraRAM, xcvu9p-fsgd2104-2L-e (BCU1525)
 #   vu47-v2b, vu47-v2u  the same on xcvu47p-fsvh2892-2-e (AWS F2)
 # One copy pumped at 3x / 4x (VAR 5, PK 3 / 4: 5 / 7 banked slots, reads a cycle later):
@@ -52,6 +53,8 @@ for s in "$@"; do
     ku-v2u)  viv $s 2 65536  $KU ultra 4.0 4.0 4.0 2 ;;
     ku-v1b)  viv $s 1 65536  $KU block 4.0 4.0 4.0 2 ;;
     ku-v2u300) viv $s 2 65536 $KU ultra 3.333 4.0 4.0 2 ;;
+    ku-v2b-200) viv $s 2 65536 $KU block 5.0 8.0 8.0 4 ;;
+    ku-v2u-200) viv $s 2 65536 $KU ultra 5.0 8.0 8.0 4 ;;
     vu9-v2b)  viv $s 2 65536  $VU9 block 4.0 4.0 4.0 2 ;;
     vu9-v2u)  viv $s 2 65536  $VU9 ultra 4.0 4.0 4.0 2 ;;
     vu47-v2b) viv $s 2 65536  $VU47 block 4.0 4.0 4.0 2 ;;
