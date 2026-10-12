@@ -394,8 +394,17 @@ chunk) in both designs, so compare differences, not totals.
     result FIFO's write enable fanning out to its three LUT RAM copies, which a replica fixes;
     the other MX runs have at least +1.0 ns. Today's MCOLS 8 has +0.079 ns (hi0 to the PEs'
     INMODE).
-  - The new slow paths, all at or above those worst paths: the column end's shift into the B
-    port, the accumulating DSP, PAIR's 48-bit add and the lane's i2f48.
+  - The new slow paths have room (`paths.tcl` on the routed checkpoints, 2 / 4 columns, ns):
+
+    | path | 7-series | xcku5p |
+    |---|---:|---:|
+    | the column end's shift into the B port (6 levels) | +2.351 / +2.143 | +3.814 / +3.413 |
+    | the accumulating DSP's OPMODE | +5.852 / +5.181 | +6.451 / +6.161 |
+    | its P to the row registers | +6.012 / +5.374 | +6.360 / +6.382 |
+    | the lane's i2f48 (13 levels on the 7-series) | +2.551 / +2.390 | +3.777 / +3.624 |
+    | PAIR's 48-bit add | +4.802 / +3.373 | +6.139 / +5.601 |
+    | the result FIFO's write | +2.168 / +0.329 | +4.695 / +3.593 |
+    | the chain ends into the column end (7-series: one fast period; xcku5p: the packed split) | +0.334 / +0.103 | +4.592 / +4.190 |
   - On the xcku5p every path has at least +1.37 ns.
 - **Against today, on the 7-series:**
   - 4 rows: -22% LUTs, -27% flip-flops, -48% DSPs, -29% slices.
