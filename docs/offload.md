@@ -4280,15 +4280,112 @@ Bit for bit:
 The tests:
 - test_em_pass_rows_from_the_configuration: the rule on seven configurations.
 - test_expert_major_prefill_is_bit_exact (Qwen3.5-MoE) and
-  test_moe_expert_major_prefill_is_bit_exact (Gemma 4) compare against token-by-token decoding
-  at the configuration's C (4) and at C = 1, 2 and 3. They cover the logits, the states, the KV
-  cache and the decode steps after.
+  test_moe_expert_major_prefill_is_bit_exact (Gemma 4) compare against token-by-token decoding.
+  - They run at the configuration's C (4 with build B's MCOLS 4 and PAIR; 8 for int8 at the
+    tests' default MCOLS 8) and at C = 1, 2 and 3.
+  - They cover the logits, the states, the KV cache and the decode steps after.
 
-The card A/B: tools/offload/sessions/emc1.sh (not run yet). On the MX host it runs C = 2 (A,
---em-pass 2) against the configuration's C = 4 (B) in ABBA x 4 order, plus L: the same engine
-with every call layer-major (--em-rows 100000), twice. The turns are emdef2's three and a fourth
-of about 130 new tokens. Per pair it reports TTFT, device time, and the decode hit rate and
-MB/token: does expert-major's slot fill after the prompt cost decode hits?
+The co-sims (moe_prefill_cosim.py em on hwe-bench, 2026-10-12, emc e7c65617). They use the MX RTL
+with the card's LiteDRAM, DDR3-1066 and 133.33 MHz, 13.17's synthetic routing, and the first
+layer; every check passed. C = 2 runs the same tree with --em-pass 2.
+
+| model | rows | C, S | passes | ms | ms a pass | MB a row (weights) | instructions |
+|:--|--:|:--|--:|--:|--:|--:|--:|
+| 35B | 131 | 2, 0 | 565 | 69.41 | 0.1229 | 7.53 (7.38) | 117 |
+| 35B | 131 | 4, 2 | 320 | 65.87 | 0.2059 | 4.32 (4.18) | 189 |
+| 26B | 124 | 2, 0 | 515 | 127.02 | 0.2466 | 14.84 (14.65) | 139 |
+| 26B | 124 | 4, 2 | 272 | 117.30 | 0.4312 | 7.92 (7.74) | 234 |
+
+- C = 4 cuts the expert run by 5.1 % (35B) and 7.7 % (26B), and its bytes by 43 % and 47 %.
+- 13.17's model said -9 to -11 %.
+- The MX expert is a little larger than 13.17's (1.71 MB against 1.67 on the 35B), so C = 2 runs
+  69.41 / 127.02 ms here against 13.17's 63.19 / 121.78.
+
+Where the time goes. The 35B's runs with --profile (cycles by source line):
+
+| place | C = 2 | C = 4 |
+|:--|--:|--:|
+| swiglu_down (the expert: stream and MXU) | 7,367,290 | 7,035,829 |
+| the rows' norm, (x x 1 / rms) x g (VPU) | 735,082 | 795,123 |
+| the quantize (QACT) | 464,430 | 388,970 |
+| the outputs' stores | 344,078 | 345,445 |
+| the rows' loads | 218,549 | 110,272 |
+| the run | 9,254,664 | 8,782,803 |
+
+- swiglu_down meets the model exactly. The expert is 12,288 chunks: a full pass of 4 takes 2
+  cycles a chunk (MXU-bound), and a short pass or a pass of 2 takes the stream's ~1.12. At C = 4
+  that is 245 x 24,576 + 75 x 13,800 = 7.06 M cycles; 7.04 M was measured.
+- The rest, 1.6-1.8 M cycles (18-20 %), is each row's load, norm, quantize and store. It runs
+  in series with the expert's stream, and its total does not change with C: 1,130 rows are
+  loaded either way. 13.17's model folded it into a pass's fixed 12 µs, so it overstated C = 4's
+  gain.
+- Next lever: overlap a pass's rows (load, norm, quantize) with the previous pass's MM. That
+  needs a second [C, H] row tile (16K words on the 35B; the 26B's TMEM is tight) and the
+  sequencer letting VPU work run past an MM in flight.
+
+The card (session emc1, 2026-10-12, the lead's run of tools/offload/sessions/emc1.sh):
+- On MX production (deploy_mx_8b33206e, build 8b33206e), the host tree emc e7c65617.
+- A: --em-pass 2. B: the configuration's C = 4. L: every call layer-major (--em-rows 100000).
+- A warm-up, then A1 B1 B2 A2 L1 B3 A3 A4 B4 L2.
+- Every run's tokens equal the warm-up's and the ISA references' first two turns. fail 0.
+
+B - A, of the means over four pairs (TTFT; device time, the prompt's tokens over the device rate):
+
+| model | turn | prompt | calls | TTFT B - A (pairs) | TTFT | device |
+|:--|--:|--:|:--|:--|--:|--:|
+| 35B | 3 | 49 | 45E + 4L | +0.017 -0.076 -0.178 +0.241 | +0.001 s | -0.001 s |
+| 35B | 4 | 161 | 157E + 4L | +0.055 -0.478 -0.159 -0.272 | -0.213 s (-1.7 %) | -0.309 s (-2.6 %) |
+| 26B | 1 | 25 | 21E + 4L | +0.049 -0.011 -0.007 -0.591 | -0.140 s | -0.143 s (-2.9 %) |
+| 26B | 2 | 31 | 27E + 4L | -0.297 -0.145 -0.371 -0.526 | -0.335 s | -0.362 s (-6.9 %) |
+| 26B | 3 | 50 | 46E + 4L | -0.273 -0.106 -0.294 -0.442 | -0.279 s | -0.240 s (-3.4 %) |
+| 26B | 4 | 161 | 157E + 4L | -0.754 -0.755 -0.723 -0.647 | -0.720 s (-3.7 %) | -0.730 s (-3.9 %) |
+
+- The 35B's turns 1-2 (20 and 27 rows) run layer-major in both arms, so they show no change.
+- Decode is the same in A and B: the same tokens, hits and MB/token.
+- The swap is host-only: it keeps deploy_mx's bitstream.
+
+Expert-major against layer-major after the prompt (the A and B runs against L):
+
+| model | turn | em - L: TTFT | decode hit rate | MB/token |
+|:--|--:|--:|--:|--:|
+| 35B | 3 | -0.014 s | -0.0131 | +7.19 |
+| 35B | 4 | -2.566 s | -0.0346 | +18.94 (+9.4 %) |
+| 26B | 1 | -0.218 s | -0.0089 | +8.16 |
+| 26B | 2 | -0.449 s | +0.0308 | -28.19 |
+| 26B | 3 | -1.083 s | +0.0070 | -6.35 |
+| 26B | 4 | -3.014 s | +0.0147 | -13.46 |
+
+Next: the slots expert-major leaves (not built).
+- The 35B's long expert-major prompt leaves worse slots for the decode: -0.035 hits, +18.9
+  MB/token on its first 16 tokens.
+- The likely cause:
+  - The expert run takes its passes in the order of each expert's first entry in the chunk,
+    and the server loads the experts in that order. The slots therefore end holding the experts
+    first seen late in the prompt, often rare ones.
+  - Layer-major ends with the experts of the prompt's last rows, which the decode's first
+    tokens tend to reuse.
+- Proposal: order the last chunk's passes, and the server's loads for it, by each expert's last
+  row in the chunk.
+  - The kernel side: bucket the entries from the last row back, then run the pass table from
+    its end.
+  - The server side: it has every need line of the chunk before the expert run waits.
+  - Every expert is still loaded once, so it costs no bytes, and the slots end as layer-major's.
+- An offline check on the router traces supports it (tools/offload/em_slotsim.py: 41 slots a
+  layer on the 35B, 16 on the 26B; a 157-row prompt, its last 4 rows layer-major as the chat's; then the trace's next
+  rows as the decode, under LRU; all windows, layers and texts):
+  - 35B, first 16 decode rows: layer-major's end state 0.696 hits, 166.5 MB/token;
+    first-appearance order 0.677, 177.0 MB; last-row order 0.696, 166.7 MB.
+    - So the reorder saves ~10.5 MB/token, 6 %, the card's sign at about half its size.
+    - Over 64 decode rows the loss shrinks to 3.0 MB/token, as the decode refills the slots.
+    - The prompt's S most frequent experts do slightly better than either: 0.706, 161.1 MB.
+  - 26B: the four layer-major tail rows' 32 entries cover its 16 slots, so every order gives the
+    same 0.623. The card's em gain there (turns 2-4) is not modeled.
+- Bytes it would save: on the card, 18.9 MB/token over a reply's first tokens after a long
+  expert-major prompt on the 35B. That is ~0.3 GB of H2C a 16-token reply (~0.1 s at the link's
+  placed ~3 GB/s), and nothing on short prompts (layer-major already).
+- A post-prompt refill instead would cost what it loads: the 35B's 41 slots x 40 layers x 1.71
+  MB = 2.8 GB to refill every slot, about 150 tokens of the saving. Only a targeted refill of the
+  last rows' experts missing from the slots could pay, and the reorder makes it unnecessary.
 
 ## 14. Chatting with a streamed MoE (otpu-chat)
 
