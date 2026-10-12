@@ -255,16 +255,22 @@ module otpu_seq
   //   +hz_kout=FILE        write the wait counts: per pc and unit, the least rank (1 = the unit's
   //                        last instruction) of an older instruction it conflicts with, over the
   //                        pc's dynamic instances (the compiler's static view, no loop peeling)
+  //   +hz_kclamp=K         with +hz_wc: each count clamped to K (fewer bits a field: K = 1 is a
+  //                        bit per unit, "wait for all its older instructions")
+  //   +hz_kc=1             the oracle on the window's (coarsened) footprints: a compiler that
+  //                        knows the ranges only to the granules of +hz_tg / +hz_dg
   //   +hz_log=FILE         hazard statistics at the end of the run (stall cycles by unit and by
   //                        what they wait for, dependencies by class and kind, rank histograms)
-  int  hz_tg = 0, hz_dg = 0, hz_win = 0;
-  bit  hz_rh = 0, hz_dh = 0, hz_ino = 0, hz_rob = 0, hz_wc = 0, hz_cs = 0;
+  int  hz_tg = 0, hz_dg = 0, hz_win = 0, hz_kclamp = 0;
+  bit  hz_rh = 0, hz_dh = 0, hz_ino = 0, hz_rob = 0, hz_wc = 0, hz_cs = 0, hz_kc = 0;
   int  hz_uq [NUNITS];
   initial begin
     string s;
     void'($value$plusargs("hz_tg=%d", hz_tg));
     void'($value$plusargs("hz_dg=%d", hz_dg));
     void'($value$plusargs("hz_win=%d", hz_win));
+    void'($value$plusargs("hz_kclamp=%d", hz_kclamp));
+    hz_kc = $test$plusargs("hz_kc=1");
     hz_rh = $test$plusargs("hz_rh=1");
     hz_dh = $test$plusargs("hz_dh=1");
     hz_ino = $test$plusargs("hz_ino=1");
@@ -957,7 +963,8 @@ module otpu_seq
         r = $fscanf(fd, "%d %d %d %d %d %d %d %d %d\n", pc, k[0], k[1], k[2], k[3], k[4], k[5],
                     k[6], n);
         if (r >= 8 && pc >= 0 && pc < NPC)
-          for (int j = 0; j < 7; j++) wc_k[pc][j] = k[j];
+          for (int j = 0; j < 7; j++)
+            wc_k[pc][j] = (hz_kclamp > 0 && k[j] > hz_kclamp) ? hz_kclamp : k[j];
       end
       $fclose(fd);
       hz_wc = 1'b1;
@@ -1036,7 +1043,7 @@ module otpu_seq
           for (int j = 0; j < KMAX; j++)
             if (j < hist_n[u]) begin
               logic [1:0] cf;
-              cf = conf_s(c_fpx, hist[u][j]);
+              cf = conf_s(hz_kc ? c_fp : c_fpx, hist[u][j]);
               if (cf[1] && kk[u] == 0) kk[u] = j + 1;
               if (cf[0] && kd[u] == 0) kd[u] = j + 1;
             end
@@ -1051,7 +1058,7 @@ module otpu_seq
         hz_seen[pc] = 1'b1;
         hz_cnt[pc]++;
         for (int j = KMAX - 1; j > 0; j--) hist[cu][j] <= hist[cu][j - 1];
-        hist[cu][0] <= c_fpx;
+        hist[cu][0] <= hz_kc ? c_fp : c_fpx;
         hist_n[cu] <= (hist_n[cu] < KMAX) ? hist_n[cu] + 1 : KMAX;
       end
       // ---- every cycle of the run: what each unit does, and what a blocked one waits for

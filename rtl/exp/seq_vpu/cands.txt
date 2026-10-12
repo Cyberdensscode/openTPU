@@ -30,6 +30,13 @@ w12 OTPU_SIM_PLUSARGS=+hz_win=12
 # then per-pc wait counts from the oracle (what a compiler without loop peeling would emit)
 ino OTPU_SIM_PLUSARGS=+hz_ino=1 HZLOG=1
 wc OTPU_SIM_PLUSARGS=+hz_ino=1 WC=1 HZLOG=1
+# fewer bits a count: 2-bit fields (k clamped to 3), one bit a unit (k clamped to 1: wait for
+# all of the unit's older instructions)
+wc2 OTPU_SIM_PLUSARGS=+hz_ino=1,+hz_kclamp=3 WC=1
+wc1 OTPU_SIM_PLUSARGS=+hz_ino=1,+hz_kclamp=1 WC=1 HZLOG=1
+# a compiler that knows the ranges to 256-word / 1 MB granules only (its oracle: i0g8, run first)
+i0g8 OTPU_SIM_PLUSARGS=+hz_rh=1,+hz_dh=1,+hz_tg=8,+hz_dg=20,+hz_kc=1 KOUT=g8
+wcg8 OTPU_SIM_PLUSARGS=+hz_ino=1 WC=g8
 # per-unit queues instead of the shared window (caps per unit: DMA, MXU, QUANT, VPU, COLL)
 inoq4 OTPU_SIM_PLUSARGS=+hz_ino=1,+hz_uq=4:4:4:4:2
 wcq4 OTPU_SIM_PLUSARGS=+hz_ino=1,+hz_uq=4:4:4:4:2 WC=1
