@@ -689,3 +689,57 @@ TMEM_IMPL=3 boards/ypcb-00338/run_vivado.sh
 # the TMEM's own tests
 PYTHONPATH=. python3 -m pytest -q tests/test_rtl.py -k tmem_random_traffic
 ```
+
+## Merging onto the MCOLS 8 tree
+
+The branch is main 810632e2 plus the TMEM studies: the earlier one, `docs/tmem_pump.md` (the
+`TMEM_IMPL 1` / `TMEM_RQ` / `TMEM_NCP` knobs, `rtl/exp/tmem_pump`), and this one. It shares base
+810632e2 with mx-column (02d0fb68), waitc-mx (e274fc4a), infra-merge (7469c18d), tile-default and
+dataflow. Trial merges (`git merge-tree`, 2026-10-12) conflict only in parameter lists, port
+connections and build arguments. Each one resolves by keeping both sides:
+
+1. **mx-column** (tile-default and dataflow conflict in the same places):
+   - **Parameter lists and slice instances.** `otpu_top`, `tb_top`, `otpu_board` (both `u_slice`),
+     `otpu_native_sys` and `otpu_fpga_top_ld`: keep `MXU_E` / `QUANT_XD` and the `TMEM_*` list,
+     and `.clk_f` in the port connections.
+   - **Build arguments.** This one is a renumbering, not only a text conflict. mx-column's 13th
+     positional argument to `create_project.tcl` is `MXU_E`, the same position as this branch's
+     `TMEM_IMPL` (then `TMEM_RQ`, `TMEM_X`). Put the TMEM's three after `MXU_E` (`lindex` 13, 14,
+     15), in the same order in `run_vivado.sh`'s call. The generic string takes `MXU_E=$MXU_E` and
+     `$TMEM_GEN`. The Makefile's `bit` line passes `MXU_E` and `TMEM_IMPL` / `TMEM_RQ` / `TMEM_X`.
+2. **waitc-mx.** The resolutions below are the ones the WAITC co-simulations ran (b5d6bcef +
+   ffd1140c: `wcmP1`, `wcmP2s`):
+   - **`otpu_slice`'s parameter list.** `SEQ_WC` goes after `TMEM_SDM`, which then needs a comma.
+   - **`otpu_slice`'s `u_seq`.** Use `.WAITC(SEQ_WC)` with this branch's
+     `.ucmd(ucmd_s), .ustart(ustart_s), .urdy(urdy_s), .udone(udone_s)` (TMEM_IMPL 2's delayed
+     starts and completions).
+   - **`otpu_vpu`'s read enable.** Keep WAITC's `red_thr` and the replays' `!rhold`:
+     `en_q <= ss_act_d ? ss_pe : (...) && red_thr; en_r <= en_q && !rhold;`, else
+     `en_r <= (...) && red_thr && !rhold;`.
+   - **`rtlsim.py`.** Keep both blocks (`OTPU_SEQ_WC`, the `OTPU_TMEM_*` knobs) and either
+     `OTPU_SIM_PLUSARGS` comment.
+   - **Board tops, systems and `create_project.tcl`** (both boards). Keep both `SEQ_WC` and the
+     TMEM generics.
+3. **infra-merge:**
+   - **`create_project.tcl`.** Keep the `TRACE_DEPTH` / `COLL_GATHER` block next to the TMEM block.
+     Both sides' fields go in the `puts` line and the generic string.
+   - **Tops' parameter lists.** Keep both sides.
+   - **`tb_board`'s `dut`.** Keep `.COLL_GATHER(COLL_GATHER)` and `.clk_f(1'b0)`.
+
+Files only this branch changes, to keep as they are:
+- `rtl/mem/otpu_tmem.sv`, with `otpu_pump_bank` at its end; its copy is gone from
+  `rtl/exp/tmem_pump/otpu_tmem_pump.sv`.
+- `boards/ypcb-00338/vivado/tmem_knobs.tcl`.
+- `boards/ypcb-00338/constraints/otpu_clk2x.tcl`.
+- The block designs' `core_clk2x` port: `bd_native.tcl`, the BCU1525's `bd.tcl`, and both lint stubs
+  of the wrapper.
+- `tests/test_target.py`, where the grant model is simulation-only.
+
+After the merge, run:
+- `make lint` of both boards, at the defaults and at `TMEM_IMPL 3` with the pick's generics;
+- `test_tmem_random_traffic`;
+- one co-simulation at the pick (`r2pgRs`, or `r2pgRs1` on the real 2x clock).
+
+The MCOLS 8 build is `TMEM_IMPL=3` (the default knobs) at `CORE_MHZ` 133.33 or 100. Both are even
+dividers; 120.755 is not. A pumped MX column widens the tops' `clk_f` condition (today
+`TMEM_PMP == 1`) and adds its section to `otpu_clk2x.tcl`.
