@@ -292,6 +292,9 @@ class HW:
     rows: int = 0                   # prefill rows a run (0: the TMEM / IMEM fit)
     batch_rows: int = 0             # rows of a batched decode run (0: rows a pass)
     moe_rows: str = "all"           # a layer run's union experts on all R rows, or "gather"
+    moe_ids: int = 16               # expert ids a MoE layer run's request holds (R k <= 16)
+    kernel: str = "today"           # prompt runs: today's compile_rows, or "tiled" (the tile
+                                    # kernel: packed attention, overlapped projections)
     host_run_ms: float = 0.6        # the host's time a run (prompt runs, batched steps)
     note: str = ""
 
@@ -381,21 +384,26 @@ CAL = {
     "dstep_words": 8.0,
     "moe_alpha": 0.6,               # a run's union of R rows' experts: k R^alpha (consecutive
                                     # tokens share experts), at most the prompt's curve
+    "att_serial": True,             # attention between the matmuls, not under their stream
+    "att_head": 0.0,                # cycles a row's entry a KV head (and q-group pass) ...
+    "att_blk": 0.0,                 # ... and a 256-token block of it (0: the KV stream binds)
+    "tile_layer": 0.0,              # the tile kernel: cycles a layer and run outside the MXU
+    "tile_row": 4874.0,             # ... and a row (x hidden / 1024)
+    "tile_card": 1.06,              # the card's prompt runs over compile_rows' co-sim
     "coll": 1500.0,
     "moe_layer": 6000.0,
     "moe_expert": 600.0,
     "link_lead_ms": 0.15,           # the host's lead a request (it sees it, starts the DMA)
-    "moe_run_ms": 0.2,
-    "moe_ids": 16,                  # expert ids a MoE layer run's request line holds (R k <= 16)              # the host's time a layer run (start, HALTED, between)
+    "moe_run_ms": 0.2,              # the host's time a layer run (start, HALTED, between)
     "prefill_exposed": 0.85,
     "miss_scale": 1.2,
 }
 
 
-KAPPA = {                           # `scoreboard.py fit` (2026-10-11)
-    "gemma4": (3.6074, 1.0332), "lfm2": (0.0, 0.3303), "lfm2-2.6b": (0.2927, 0.4359),
-    "phi4-mini": (0.3225, 0.6516), "qwen3": (0.0, 0.8956), "qwen35": (0.0, 1.4153),
-    "qwen35-2b": (0.3459, 0.0), "qwen35-4b": (0.2989, 0.0), "smollm3": (0.303, 0.7391)}
+KAPPA = {                           # `scoreboard.py fit` (2026-10-12, serial attention)
+    "gemma4": (3.7081, 0.8979), "lfm2": (0.0, 0.3077), "lfm2-2.6b": (0.4237, 0.3046),
+    "phi4-mini": (0.5064, 0.3276), "qwen3": (0.0, 0.8988), "qwen35": (0.0, 1.2847),
+    "qwen35-2b": (0.2813, 0.0), "qwen35-4b": (0.0, 0.0), "smollm3": (0.4908, 0.635)}
 CAL["kappa"].update(KAPPA)
 
 
@@ -470,14 +478,39 @@ def layer_cycles(m: dict, i: int, lay: dict, hw: HW, fmt: tuple, ctxs: list,
         mxu += mxu_cycles(p, f, R, hw)
     byts = math.ceil(R / hw.rows_pass) * wbytes
     over = over_cycles(m, hw, R)
-    rec = 0.0
+    rec = att = 0.0
+    tiled = hw.kernel == "tiled" and R > 1 and ctxs[-1] - ctxs[0] == R - 1   # a prompt run
     if lay["kind"] in ("attn", "sliding", "global"):
         kvb = kv_token_bytes(lay["head_dim"])
         G = max(1, lay["q_heads"] // lay["kv_heads"])
         passes = math.ceil(G / hw.mcols)
-        for c in ctxs:
-            byts += lay["kv_heads"] * kvb * (att_tokens(lay, c) * passes +
-                                             (0 if lay.get("kv_shared") else 1))
+        kv = lat = 0.0
+        if tiled:
+            # the tile kernel (the tiling agent's): MCOLS / G rows share an entry a KV head
+            # (packed attention), its K and V products on the MXU, the projections of the next
+            # head streaming meanwhile: the layer is bound by the MXU with attention's MMs added
+            pack = max(1, hw.mcols // G)
+            for g0 in range(0, R, pack):
+                n = att_tokens(lay, ctxs[min(R, g0 + pack) - 1])
+                kv += lay["kv_heads"] * kvb * n * passes
+                mxu += lay["kv_heads"] * passes * 2 * n * _pad(lay["head_dim"]) / D / \
+                    hw.mxu_pump
+            byts += kv + (0 if lay.get("kv_shared") else R * lay["kv_heads"] * kvb)
+        else:
+            for c in ctxs:
+                n = att_tokens(lay, c)
+                kv += lay["kv_heads"] * kvb * n * passes
+                byts += 0 if lay.get("kv_shared") else lay["kv_heads"] * kvb  # the row's K, V
+                lat += lay["kv_heads"] * passes * (CAL["att_head"] + CAL["att_blk"] * n / BLOCK)
+            if CAL["att_serial"]:
+                # attention runs between the layer's matmuls (its q, k, v before, o after): a
+                # row's entry a KV head streams the head's blocks (the card's prompt runs and
+                # batched steps: the KV stream binds it, att_blk 0) and waits on its scores,
+                # softmax and V product
+                s_ = CAL["vpu_share"]
+                att = max(kv / S / hw.bw(), lat / S * (s_ / hw.vpu + 1 - s_))
+            else:
+                byts += kv
     elif lay["kind"] == "delta":
         dn = lay["deltanet"]
         # the recurrence: the first row's DSTEPs hide behind the layer's weight stream (their
@@ -499,9 +532,23 @@ def layer_cycles(m: dict, i: int, lay: dict, hw: HW, fmt: tuple, ctxs: list,
     if S > 1:
         over += R * CAL["coll"]
     mem = byts / S / hw.bw()
-    cyc = max(mem, mxu / S) + rec + over
+    if tiled and lay["kind"] in ("attn", "sliding", "global"):
+        # what the tile kernel leaves outside the MXU: a layer's and a row's (its co-sim at
+        # MCOLS 4 and 8, T 4-16: the vector work it does not overlap, the MMs' fills)
+        s_ = CAL["vpu_share"]
+        over = (CAL["tile_layer"] + CAL["tile_row"] * R) * m["hidden"] / 1024 * \
+            (s_ / hw.vpu + 1 - s_) + (R * CAL["coll"] if S > 1 else 0.0)
+        # its co-sim is compile_rows-like; the card's prompt runs cost ~6% over that (their
+        # RunWords, mask loads, per-row V^T appends: tiling's slopes against the card's B0)
+        mxu *= CAL["tile_card"]
+        over *= CAL["tile_card"]
+    cyc = max(mem, mxu / S) + att + rec + over
     if split:
-        return cyc, dict(bytes=byts, mem=mem, mxu=mxu / S, rec=rec, over=over)
+        return cyc, dict(bytes=byts + (kv if att and not tiled else 0.0), mem=mem, mxu=mxu / S,
+                         rec=rec,
+                         over=over, att=att,
+                         b_mem=mem if mem >= mxu / S else 0.0,
+                         b_mxu=mxu / S if mxu / S > mem else 0.0)
     return cyc
 
 
@@ -537,8 +584,10 @@ def run_cycles(m: dict, hw: HW, fmt: tuple, ctxs: list, logits: int = 1,
                experts: float | None = None, split: bool = False):
     """Cycles of one device run: len(ctxs) rows through every layer, `logits` of them with
     logits (the LM head streams once for them)."""
-    tot = CAL["run"] + ple_cycles(m, hw, fmt, len(ctxs))
-    parts = dict(bytes=0.0, mem=0.0, mxu=0.0, rec=0.0, over=0.0)
+    ple = ple_cycles(m, hw, fmt, len(ctxs))
+    tot = CAL["run"] + ple
+    parts = dict(bytes=0.0, mem=0.0, mxu=0.0, rec=0.0, over=CAL["run"], att=0.0, b_mem=0.0,
+                 b_mxu=0.0)
     for i, lay in layers(m):
         c, p = layer_cycles(m, i, lay, hw, fmt, ctxs, experts, split=True)
         tot += c
@@ -546,7 +595,47 @@ def run_cycles(m: dict, hw: HW, fmt: tuple, ctxs: list, logits: int = 1,
             parts[k] += p[k]
     if logits:
         tot += head_cycles(m, hw, fmt, logits)
-    return (tot, parts) if split else tot
+    if split:
+        # the head and the PLE projection stream or compute like a layer's weights
+        R = len(ctxs)
+        side = []
+        if logits:
+            _, hf, formats = fmt
+            hf = group_format("head", 0, hf, formats)
+            side.append((m["head"] * BITS[hf] / 8 * math.ceil(logits / hw.rows_pass),
+                         mxu_cycles(m["head"], hf, logits, hw)))
+            parts["over"] += logits * CAL["head_row"]
+        if "ple" in m:
+            f = group_format("ple", 0, fmt[0], fmt[2])
+            side.append((m["ple"]["proj"] * BITS[f] / 8 * math.ceil(R / hw.rows_pass),
+                         mxu_cycles(m["ple"]["proj"], f, R, hw)))
+        for byts, mx in side:
+            a, b = byts / hw.S / hw.bw(), mx / hw.S
+            parts["b_mem" if a >= b else "b_mxu"] += max(a, b)
+        return tot, parts
+    return tot
+
+
+UNITS = ("stream", "MXU", "attention", "DSTEP", "overhead", "host link", "host")
+
+
+def shares(parts: dict, hw: HW, extra: dict | None = None) -> dict:
+    """The share of a time each unit binds: the weight stream (the port or the memory,
+    whichever is slower), the MXU, attention (its KV stream and latency), DeltaNet's DSTEP
+    recurrence, the overhead (vector unit, control, runs); extra: other parts, in cycles
+    (host link, host)."""
+    d = {"stream": parts["b_mem"], "MXU": parts["b_mxu"], "attention": parts.get("att", 0.0),
+         "DSTEP": parts["rec"], "overhead": parts["over"]}
+    d.update(extra or {})
+    tot = sum(d.values()) or 1.0
+    return {k: v / tot for k, v in d.items()}
+
+
+def bound(sh: dict, hw: HW) -> str:
+    """The unit with the largest share, the stream named by what bounds it (port / memory)."""
+    k = max(sh, key=sh.get)
+    name = hw.bound() if k == "stream" else k
+    return f"{name} {100 * sh[k]:.0f}%"
 
 
 def bytes_per_token(m: dict, fmt: tuple, ctx: int) -> float:
@@ -566,9 +655,10 @@ def decode(name: str, hw: HW, wformat: str = "fp4", ctx: int = 512) -> dict:
     every token: the host adds nothing a token)."""
     m = model(name)
     fmt = formats_of(name, wformat)
-    cyc = run_cycles(m, hw, fmt, [ctx])
+    cyc, parts = run_cycles(m, hw, fmt, [ctx], split=True)
+    sh = shares(parts, hw)
     return dict(tok_s=hw.mhz * 1e6 / cyc, mcycles=cyc / 1e6,
-                mb_token=bytes_per_token(m, fmt, ctx) / MB)
+                mb_token=bytes_per_token(m, fmt, ctx) / MB, shares=sh, bound=bound(sh, hw))
 
 
 _RMAX: dict | None = None
@@ -643,17 +733,30 @@ def prefill(name: str, hw: HW, wformat: str = "fp4", P: int = 1024, p0: int = 0)
     m = model(name)
     fmt = formats_of(name, wformat)
     cyc, runs, p, rows = 0.0, 0, p0, []
+    acc = {}
     while p < p0 + P:
         R = prefill_rows(name, hw, p // BLOCK + 1, fmt[0] if not fmt[2] else "mix")
         n = min(R, p0 + P - p, BLOCK - p % BLOCK if R < BLOCK else R)
         last = p + n >= p0 + P
-        cyc += run_cycles(m, hw, fmt, [p + r for r in range(n)], logits=1 if last else 0)
+        c, parts = run_cycles(m, hw, fmt, [p + r for r in range(n)], logits=1 if last else 0,
+                              split=True)
+        cyc += c
+        for k, v in parts.items():
+            acc[k] = acc.get(k, 0.0) + v
         runs += 1
         rows.append(R)
         p += n
     t = cyc / (hw.mhz * 1e6) + runs * hw.host_run_ms / 1e3
-    return dict(rows=rows[0], rows_last=rows[-1], runs=runs, ttft_s=t, tok_s=P / t,
-                device_s=cyc / (hw.mhz * 1e6))
+    sh = shares(acc, hw, {"host": runs * hw.host_run_ms * hw.mhz * 1e3})
+    out = dict(rows=rows[0], rows_last=rows[-1], runs=runs, ttft_s=t, tok_s=P / t,
+               device_s=cyc / (hw.mhz * 1e6), shares=sh, bound=bound(sh, hw),
+               kernel=hw.kernel)
+    if hw.kernel == "tiled":
+        # the host takes today's kernel (and its rows) where that is faster
+        other = prefill(name, hw.replace(kernel="today", rows=0), wformat, P, p0)
+        if other["ttft_s"] < t:
+            return other
+    return out
 
 
 def batch(name: str, hw: HW, users: int, wformat: str = "fp4", ctx: int = 512) -> dict:
@@ -664,14 +767,20 @@ def batch(name: str, hw: HW, users: int, wformat: str = "fp4", ctx: int = 512) -
     fmt = formats_of(name, wformat)
     rb = hw.batch_rows or hw.rows_pass
     cyc, runs, left = 0.0, 0, users
+    acc = {}
     while left > 0:
         n = min(rb, left)
-        cyc += run_cycles(m, hw, fmt, [ctx] * n, logits=n)
+        c, parts = run_cycles(m, hw, fmt, [ctx] * n, logits=n, split=True)
+        cyc += c
+        for k, v in parts.items():
+            acc[k] = acc.get(k, 0.0) + v
         runs += 1
         left -= n
-    t = cyc / (hw.mhz * 1e6) + (runs * hw.host_run_ms / 1e3 if users > 1 else 0.0)
+    host = runs * hw.host_run_ms / 1e3 if users > 1 else 0.0
+    t = cyc / (hw.mhz * 1e6) + host
+    sh = shares(acc, hw, {"host": host * hw.mhz * 1e6})
     return dict(users=users, total_tok_s=users / t, user_tok_s=1 / t, runs=runs,
-                device_ms=cyc / (hw.mhz * 1e3))
+                device_ms=cyc / (hw.mhz * 1e3), shares=sh, bound=bound(sh, hw))
 
 
 # ------------------------------------------------------------------------------- MoE
@@ -730,7 +839,8 @@ def moe_decode(name: str, hw: HW, ctx: int = 512) -> dict:
     base, _, formats = fmt = formats_of(name, "auto")
     fit = moe_fit(name, hw)
     f = hw.mhz * 1e6
-    card = run_cycles(m, hw, fmt, [ctx]) / f
+    cc, parts = run_cycles(m, hw, fmt, [ctx], split=True)
+    card = cc / f
     misses = _misses(name, fit["frac"])                 # a token's, beyond the fast memory
     host = _misses(name, min(1.0, (fit["slots"] + fit["far_slots"]) / fit["experts"])) \
         if fit["far_slots"] else misses                 # ... and beyond the far tier too
@@ -754,35 +864,44 @@ def moe_decode(name: str, hw: HW, ctx: int = 512) -> dict:
         if mf:                                          # read from the far tier instead
             exposed += mf * (eb / (hw.far_gbps * GB) - fast)
     t = card + exposed
+    sh = shares(parts, hw, {"host link": exposed * f})
     return dict(tok_s=1 / t, card_tok_s=1 / card, misses=misses, far_misses=far,
                 link_s=link, exposed_s=exposed, resident=fit["resident"],
-                slots=fit["slots"], frac=fit["frac"])
+                slots=fit["slots"], frac=fit["frac"], shares=sh, bound=bound(sh, hw))
 
 
 def moe_prefill(name: str, hw: HW, P: int = 1024, R: int | None = None) -> dict:
     """MoE prefill, layer-major (docs/offload.md 13): runs of R rows a layer (default 2, the
-    card's; --rows, at most the request line's ids / top-k: CAL moe_ids), every slot serving
+    card's; --rows, at most the request's ids / top-k: --moe-ids), every slot serving
     the running layer, so a layer's misses are its prompt's distinct experts; each run
     streams its rows' union of experts. A DeltaNet model's first conv_k - 1 rows run as
-    decode steps (docs/offload.md 13.6)."""
+    decode steps (docs/offload.md 13.6). The layer runs are their own kernel: --kernel does
+    not apply."""
     m = model(name)
     fmt = formats_of(name, "auto")
+    hw = hw.replace(kernel="today")
     fit = moe_fit(name, hw)
-    R = R or min(hw.rows or 2, max(1, int(CAL["moe_ids"]) // fit["top_k"]))
+    R = R or min(hw.rows or max(2, hw.moe_ids // fit["top_k"]),
+                 max(1, hw.moe_ids // fit["top_k"]))
     eeff = MOE_EEFF[name]
     steps = 0
     dn = next((x["deltanet"] for _, x in layers(m) if "deltanet" in x), None)
     if dn and P > 1:
         steps = min(P - 1, dn.get("conv_k", 4) - 1)
     cyc, runs = 0.0, 0
+    acc = dict(b_mem=0.0, b_mxu=0.0, rec=0.0, over=0.0, att=0.0)
     for i, lay in layers(m):
         p = steps
         while p < P:
             n = min(R, P - p)
             ex = union(lay["moe"]["experts"], lay["moe"]["top_k"], n, eeff) \
                 if "moe" in lay else None
-            cyc += layer_cycles(m, i, lay, hw, fmt, [p + r for r in range(n)], ex) + \
-                CAL["run"]
+            c, parts = layer_cycles(m, i, lay, hw, fmt, [p + r for r in range(n)], ex,
+                                    split=True)
+            cyc += c + CAL["run"]
+            for k in acc:
+                acc[k] += parts[k]
+            acc["over"] += CAL["run"]
             runs += 1
             p += n
     cyc += head_cycles(m, hw, fmt, 1)
@@ -797,10 +916,14 @@ def moe_prefill(name: str, hw: HW, P: int = 1024, R: int | None = None) -> dict:
         link = U * (1 - fit["frac"] - far) * eb / (hw.pcie_gbps * GB)
         if far:
             link += U * far * eb / (hw.far_gbps * GB)
-    t = device + CAL["prefill_exposed"] * link + runs * CAL["moe_run_ms"] / 1e3
+    host = runs * CAL["moe_run_ms"] / 1e3
+    t = device + CAL["prefill_exposed"] * link + host
     if steps:
         t += steps / moe_decode(name, hw, 0)["tok_s"]
-    return dict(ttft_s=t, tok_s=P / t, device_s=device, link_s=link, rows=R, runs=runs)
+    f = hw.mhz * 1e6
+    sh = shares(acc, hw, {"host link": CAL["prefill_exposed"] * link * f, "host": host * f})
+    return dict(ttft_s=t, tok_s=P / t, device_s=device, link_s=link, rows=R, runs=runs,
+                shares=sh, bound=bound(sh, hw))
 
 
 # ------------------------------------------------------------------------------- the scoreboard
@@ -840,20 +963,43 @@ def summary(sc: dict) -> dict:
                             for v in sc["moe"].values()]))
 
 
-def compare(base: HW, new: HW, **kw) -> dict:
+def bounds(sc: dict) -> dict:
+    """What binds each workload: the units' shares of the time averaged over the models (the
+    summary's points: the longest prompt, the most users, MoE decode and prefill), the
+    largest named ("port 81%", "MXU 64%", "overhead 40%", "host link 55%")."""
+    hw = HW(**sc["hw"])
+    P = max(next(iter(sc["prefill"].values())))
+    U = max(next(iter(sc["batch"].values())))
+    groups = dict(decode=[v["shares"] for v in sc["decode"].values()],
+                  prefill=[v[P]["shares"] for v in sc["prefill"].values()],
+                  batch=[v[U]["shares"] for v in sc["batch"].values()],
+                  moe=[x for v in sc["moe"].values()
+                       for x in (v["decode"]["shares"], v["prefill"][P]["shares"])])
+    out = {}
+    for k, xs in groups.items():
+        if xs:
+            keys = {u for x in xs for u in x}
+            out[k] = bound({u: sum(x.get(u, 0.0) for x in xs) / len(xs) for u in keys}, hw)
+    return out
+
+
+def compare(base: HW, new: HW, full: bool = False, **kw):
     """Each workload's ratio new / base and their geometric mean, "score" (the four weighed
-    equally)."""
-    a, b = summary(scoreboard(base, **kw)), summary(scoreboard(new, **kw))
+    equally); full: also (the base's bounds, the new configuration's bounds)."""
+    sa, sb = scoreboard(base, **kw), scoreboard(new, **kw)
+    a, b = summary(sa), summary(sb)
     r = {k: b[k] / a[k] for k in a}
     r["score"] = _gmean(list(r.values()))
-    return r
+    return (r, bounds(sa), bounds(sb)) if full else r
 
 
 WHATIFS = [
     ("MCOLS 8", dict(mcols=8)),
     ("TMEM x2 (8 ACT RAM rows)", dict(tmem_words=131072, act_rows=8)),
     ("TMEM x4 (16 ACT RAM rows)", dict(tmem_words=262144, act_rows=16)),
-    ("tiled prefill, 64 rows a run", dict(rows=64, act_rows=64, imem=0)),
+    ("64 rows a run, today's kernel", dict(rows=64, act_rows=64, imem=0)),
+    ("tile kernel, 16 rows a run (64K TMEM)", dict(kernel="tiled", rows=16)),
+    ("tile kernel, 16 rows, MCOLS 8", dict(kernel="tiled", rows=16, mcols=8)),
     ("8 users in one pass (replay)", dict(batch_rows=8, act_rows=8)),
     ("VPU x2", dict(vpu=2.0)),
     ("MXU pumped x2", dict(mxu_pump=2.0)),
@@ -862,14 +1008,18 @@ WHATIFS = [
                                                  vpu=2.0)),
     ("port 256 B a cycle (memory permitting)", dict(port_bytes=256)),
     ("port 256 B + MXU x2", dict(port_bytes=256, mxu_pump=2.0)),
+    ("MoE runs of 8 rows (64-id requests)", dict(moe_ids=64)),
+    ("MoE runs of 8 rows, each row its experts", dict(moe_ids=64, moe_rows="gather")),
 ]
 
 
 def whatifs(b: str = "ypcb", wformat: str = "fp4", items=None) -> list:
+    """[(label, overrides, ratios, the board's bounds, the what-if's bounds)]."""
     base = board(b)
     out = []
     for label, kw in items or WHATIFS:
-        out.append((label, kw, compare(base, base.replace(**kw), wformat=wformat)))
+        r, bb, bn = compare(base, base.replace(**kw), full=True, wformat=wformat)
+        out.append((label, kw, r, bb, bn))
     return out
 
 
@@ -917,6 +1067,19 @@ CARD_PREFILL = [  # (model, formats, prompt P, rows a run, device Mcycles, sourc
     ("qwen35-4b", ("fp4", "int8", ""), 237, 3, 2441.7, "fmvf, 79 runs"),
     ("qwen35", ("fp4", "int8", ""), 237, 4, 412.8, "pa, 3.096 s, 60 runs"),
     ("qwen35-2b", ("fp4", "int8", ""), 237, 4, 752.6, "pa, 5.645 s, 60 runs"),
+    # docs/prefill.md 7: a first prompt (A0) and a next turn of 13 tokens (B1), prompt runs
+    ("qwen3", ("int8", "int8", ""), 24, 4, 30.5, "fmvf A0, 6 runs"),
+    ("qwen3", ("int8", "int8", ""), 13, 4, 21.4, "fmvf B1, 4 runs", 267),
+    ("lfm2", ("int8", "int8", ""), 21, 4, 9.9, "fmvf A0, 6 runs"),
+    ("lfm2", ("int8", "int8", ""), 13, 4, 7.0, "fmvf B1, 4 runs", 269),
+    ("lfm2-2.6b", ("int8", "int8", "conv=fp4,mlp=fp4"), 21, 4, 111.3, "fmvf A0, 6 runs"),
+    ("lfm2-2.6b", ("int8", "int8", "conv=fp4,mlp=fp4"), 13, 3, 91.5, "fmvf B1, 5 runs", 269),
+    ("smollm3", ("int8", "int8", "gateup@9-35=fp4"), 80, 4, 482.4, "fmvf A0, 20 runs"),
+    ("smollm3", ("int8", "int8", "gateup@9-35=fp4"), 13, 4, 94.3, "fmvf B1, 4 runs", 322),
+    ("phi4-mini", ("int8", "int8", "mlp@4-27=fp4"), 15, 3, 141.2, "fmvf A0, 5 runs"),
+    ("phi4-mini", ("int8", "int8", "mlp@4-27=fp4"), 13, 3, 135.4, "fmvf B1, 5 runs", 258),
+    ("gemma4", ("int8", "int8", ""), 13, 4, 76.2, "fmvf A0, 4 runs"),
+    ("gemma4", ("int8", "int8", ""), 13, 4, 76.2, "fmvf B1, 4 runs", 224),
 ]
 CARD_BATCH = [    # (model, formats, rows, context, device ms a run, source)
     ("qwen3", ("int8", "int8", ""), 1, 64, 39.5, "1025907f serve"),
@@ -936,6 +1099,39 @@ COSIM = [         # (model, formats, rows, position, cycles, what, hw overrides)
     ("qwen3", ("int8", "int8", ""), 0, 544, 5471471, "decode (litedram.md)", {}),
     ("lfm2", ("int8", "int8", ""), 0, 544, 2012426, "decode (litedram.md)", {}),
     ("qwen35", ("int8", "int8", ""), 0, 544, 6764651, "decode (litedram.md)", {}),
+    # the tiling agent's (tools/perf_tiled.py, branch tiled-prefill): today's kernel on the
+    # card's configuration, the first 2 layers, rows from 256, no logits; cycles a row x R
+    ("qwen3", ("fp4", "int8", ""), 4, 256, round(83.6e3 * 4), "2 layers, R 4 (tiling)", {},
+     2),
+]
+COSIM_TILED = [   # the tiling agent's tile kernel at TMEM 64K: Qwen3-0.6B, 2 layers, rows from
+                  # pos, no logits; cycles a row (2026-10-12; its MXU 96-97% busy at MCOLS 4)
+    ("qwen3", (f, "int8", ""), T, pos, round(c * 1e3 * T),
+     f"2 layers, tile kernel, MCOLS {mc}, T {T}" + (f" at {pos}" if pos != 256 else ""),
+     {"kernel": "tiled", "mcols": mc, "act_rows": T if T > mc else 0}, 2)
+    for f, mc, pos, cs in (("fp4", 4, 256, (79.5, 76.5, 76.4)), ("int8", 4, 256, (84.7, 76.5, 76.4)),
+                           ("fp4", 8, 256, (49.1, 45.1, 44.4)), ("int8", 8, 256, (82.5, 48.8, 44.4)),
+                           ("fp4", 4, 1024, (None, None, 92.4)), ("fp4", 8, 1024, (None, None, 58.4)))
+    for T, c in zip((4, 8, 16), cs) if c]
+LAYER_COSIM_TILING = [  # the tiling agent's slopes (2 - 1 layers), today's compile_rows on the
+                        # card's configuration (ACT_ROWS 4, TMEM 64K): checked, not fitted
+    ("qwen3", ("int8", "int8", ""), (1, 2), 4, 100, 40.9e3, "tiling, compile_rows"),
+    ("qwen3", ("int8", "int8", ""), (1, 2), 4, 256, 44.6e3, "tiling, compile_rows"),
+    ("qwen3", ("int8", "int8", ""), (1, 2), 4, 267, 44.6e3, "tiling, compile_rows"),
+    ("qwen3", ("fp4", "int8", ""), (1, 2), 4, 256, 41.8e3, "tiling, compile_rows"),
+]
+LAYER_COSIM = [   # (model, formats, layers [lo, hi), rows, position, cycles a row and layer, src)
+    # docs/prefill.md 8: the slope from 4 to 8 layers, no logits
+    ("qwen35-4b", ("fp4", "int8", ""), (4, 8), 3, 544, 322.3e3, "prefill.md 8"),
+    ("qwen35-4b", ("fp4", "int8", ""), (4, 8), 2, 544, 278.0e3, "prefill.md 8"),
+    ("phi4-mini", ("int8", "int8", "mlp=fp4"), (4, 5), 3, 128, 277.9e3, "prefill.md 8"),
+    ("phi4-mini", ("int8", "int8", "mlp=fp4"), (4, 5), 2, 128, 279.2e3, "prefill.md 8"),
+    ("phi4-mini", ("int8", "int8", ""), (4, 5), 3, 128, 291.0e3, "prefill.md 8"),
+    ("phi4-mini", ("int8", "int8", ""), (4, 5), 2, 128, 431.1e3, "prefill.md 8"),
+    ("smollm3", ("int8", "int8", "gateup=fp4"), (4, 5), 3, 3968, 255.1e3, "prefill.md 8"),
+    ("smollm3", ("int8", "int8", "gateup=fp4"), (4, 5), 2, 3968, 281.2e3, "prefill.md 8"),
+    ("smollm3", ("int8", "int8", ""), (4, 5), 3, 3968, 263.6e3, "prefill.md 8"),
+    ("smollm3", ("int8", "int8", ""), (4, 5), 2, 3968, 372.0e3, "prefill.md 8"),
 ]
 CARD_MOE = [      # (model, quantity, measured, source)
     ("qwen35-35b", "decode tok/s", 5.30, "s17, 128 tokens, 103 misses a token"),
@@ -969,23 +1165,61 @@ def points() -> list:
     for name, fmt, mc, _, src in CARD_DECODE:
         out.append(dict(group="decode", model=name, fmt=fmt, runs=[([544], 1)], hw={},
                         y=mc * 1e6, label=f"{name} {'/'.join(x for x in fmt if x)} ({src})"))
-    for name, fmt, P, R, mc, src in CARD_PREFILL:
-        out.append(dict(group="prefill", model=name, fmt=fmt, runs=_prompt_runs(P, R), hw={},
-                        y=mc * 1e6, label=f"{name} {P} tokens, R {R} ({src})"))
+    for name, fmt, P, R, mc, src, *p0 in CARD_PREFILL:
+        p0 = p0[0] if p0 else 0
+        at = f" at {p0}" if p0 else ""
+        out.append(dict(group="prefill", model=name, fmt=fmt, runs=_prompt_runs(P, R, p0),
+                        hw={}, y=mc * 1e6, label=f"{name} {P} tokens{at}, R {R} ({src})"))
     for name, fmt, R, ctx, ms, src in CARD_BATCH:
         out.append(dict(group="batched", model=name, fmt=fmt, runs=[([ctx] * R, R)], hw={},
                         y=ms * 133.33e3, label=f"{name} {R} rows at {ctx} ({src})"))
-    for name, fmt, R, pos, cyc, what, kw in COSIM:
+    for name, fmt, R, pos, cyc, what, kw, *nl in COSIM:
         runs = [([pos], 1)] if R == 0 else [([pos + r for r in range(R)], 0)]
-        out.append(dict(group="co-sim", model=name, fmt=fmt, runs=runs, hw=kw, y=cyc,
-                        label=f"{name} {fmt[0]} {what}"))
+        out.append(dict(group="co-sim 2-layer" if nl else "co-sim", model=name, fmt=fmt,
+                        runs=runs, hw=kw, y=cyc,
+                        label=f"{name} {fmt[0]} {what}", n_layers=nl[0] if nl else 0))
+    for name, fmt, R, pos, cyc, what, kw, nl in COSIM_TILED:
+        out.append(dict(group="co-sim tile kernel", model=name, fmt=fmt,
+                        runs=[([pos + r for r in range(R)], 0)], hw=kw, y=cyc,
+                        label=f"{name} {fmt[0]} {what}", n_layers=nl, cosim_kernel=True))
+    for grp, rows in (("co-sim layer", LAYER_COSIM),
+                      ("co-sim layer (compile_rows)", LAYER_COSIM_TILING)):
+        for name, fmt, span, R, pos, cyc, src in rows:
+            fs = "/".join(x for x in fmt if x)
+            out.append(dict(group=grp, model=name, fmt=fmt, hw={}, y=cyc, span=span,
+                            ctxs=[pos + r for r in range(R)], nofit=grp != "co-sim layer",
+                            label=f"{name} {fs} layer, R {R} at {pos} ({src})"))
     return out
+
+
+def truncated(m: dict, n: int) -> dict:
+    """The model's first n layers."""
+    runs, left = [], n
+    for k, lay in m["runs"]:
+        if left <= 0:
+            break
+        runs.append([min(k, left), lay])
+        left -= k
+    return dict(m, runs=runs, n_layers=n)
 
 
 def point_cycles(pt: dict) -> float:
     hw = BOARDS["ypcb"].replace(**pt["hw"])
     m = model(pt["model"])
-    return sum(run_cycles(m, hw, pt["fmt"], ctxs, logits=lg) for ctxs, lg in pt["runs"])
+    if "span" in pt:                                    # a row's cycles a layer
+        lo, hi = pt["span"]
+        L = list(layers(m))
+        return sum(layer_cycles(m, i, L[i][1], hw, pt["fmt"], pt["ctxs"])
+                   for i in range(lo, hi)) / (hi - lo) / len(pt["ctxs"])
+    if pt.get("n_layers"):
+        m = truncated(m, pt["n_layers"])
+    save = CAL["tile_card"]
+    if pt.get("cosim_kernel"):                          # the co-sim's own kernel, no card cost
+        CAL["tile_card"] = 1.0
+    try:
+        return sum(run_cycles(m, hw, pt["fmt"], ctxs, logits=lg) for ctxs, lg in pt["runs"])
+    finally:
+        CAL["tile_card"] = save
 
 
 def _with_kappa(name, k, f):
@@ -1044,7 +1278,8 @@ def fit_model(name: str, pts: list) -> tuple:
 def fit(pts=None) -> dict:
     """kappa of every model with card points (decode, prefill, batched; the co-sim's
     prefill run where the card has none)."""
-    pts = pts if pts is not None else [p for p in points() if not p["hw"]]
+    pts = pts if pts is not None else [p for p in points() if not p["hw"] and
+                                       not p.get("n_layers") and not p.get("nofit")]
     out = {}
     for name in sorted({p["model"] for p in pts}):
         out[name] = fit_model(name, [p for p in pts if p["model"] == name])
@@ -1057,7 +1292,7 @@ def validate(loo: bool = True) -> list:
     formats)."""
     out = []
     pts = points()
-    fitted = [p for p in pts if not p["hw"]]
+    fitted = [p for p in pts if not p["hw"] and not p.get("n_layers") and not p.get("nofit")]
     for pt in pts:
         got = point_cycles(pt)
         e = 100 * (got / pt["y"] - 1)
@@ -1085,6 +1320,66 @@ def validate(loo: bool = True) -> list:
             got = moe_prefill(name, hw, int(re.search(r"\((\d+)", q).group(1)))["ttft_s"]
         out.append(("MoE", f"{name} {q} ({src})", val, got, 100 * (got / val - 1), None))
     return out
+
+
+def cosim_layers(path) -> list:
+    """A co-sim campaign's layers (tools/scoreboard_cosim.py run, prefixes 1:2...): each pair of
+    consecutive prefixes of one configuration gives the last layer's cycles, the run's own
+    cost and its LM head cancelling. Returns dicts of the configuration, the layer, its
+    measured and modelled cycles."""
+    recs = [json.loads(x) for x in Path(path).read_text().splitlines() if x.strip()]
+    recs = [r for r in recs if "cycles" in r and r.get("layers", "").isdigit()]
+    key = ("model", "rows", "pos", "batch", "wformat", "head_format", "formats", "mcols",
+           "act_rows", "lanes", "tmem", "mem", "S", "mhz", "bw", "lat", "mts")
+    by = {}
+    for r in recs:
+        by.setdefault(tuple(r.get(k) for k in key), {})[int(r["layers"])] = r["cycles"]
+    out = []
+    for k, cyc in by.items():
+        r = dict(zip(key, k))
+        name = SHORT.get(r["model"])
+        if not name:
+            continue
+        m = model(name)
+        L = list(layers(m))
+        hw = BOARDS["ypcb"].replace(mcols=r["mcols"], act_rows=r["act_rows"] or 0,
+                                    vpu=r["lanes"] / 8, tmem_words=r["tmem"], S=r["S"],
+                                    mhz=r["mhz"])
+        if r["mem"] == "port":
+            hw = hw.replace(gbps=1e4 * r["bw"] / 100)
+        fmt = (r["wformat"], r["head_format"], r["formats"] or "")
+        R, pos = r["rows"], r["pos"]
+        ctxs = [pos] if R == 0 else [pos] * R if r["batch"] else [pos + i for i in range(R)]
+        ns = sorted(cyc)
+        for a, b in zip(ns, ns[1:]):
+            got = sum(layer_cycles(m, i, L[i][1], hw, fmt, ctxs) for i in range(a, b))
+            what = (f"{name} {fmt[0]} layer {a}{'-' + str(b - 1) if b - a > 1 else ''} "
+                    f"({L[a][1]['kind']}) " +
+                    ("decode" if R == 0 else f"{'batch' if r['batch'] else 'R'} {R}") +
+                    f" at {pos}")
+            cfg = ", ".join(f"{n} {r[n]}" for n, d in (("mcols", 4), ("act_rows", 0),
+                                                       ("lanes", 8), ("tmem", 65536),
+                                                       ("S", 1), ("mem", "ldc"))
+                            if r[n] not in (d, None))
+            out.append(dict(what=what, config=cfg or "ypcb", measured=cyc[b] - cyc[a],
+                            model=got, error=100 * (got / (cyc[b] - cyc[a]) - 1), rec=r))
+    return out
+
+
+def cosim_report(path, md: bool = False) -> str:
+    rows = cosim_layers(path)
+    L = ["| layer | configuration | co-sim cycles | model | error |", "|---|---|---:|---:|---:|"] \
+        if md else []
+    for x in rows:
+        L.append(f"| {x['what']} | {x['config']} | {x['measured']:,} | {x['model']:,.0f} | "
+                 f"{x['error']:+.1f}% |" if md else
+                 f"{x['what']:44s} {x['config']:36s} {x['measured']:11,} {x['model']:11,.0f} "
+                 f"{x['error']:+6.1f}%")
+    if rows:
+        e = [abs(x["error"]) for x in rows]
+        L += ["", f"co-sim layers: mean |error| {sum(e) / len(e):.1f}% (max {max(e):.1f}%), "
+                  f"{len(e)} layers"]
+    return "\n".join(L)
 
 
 def validate_report(md: bool = False) -> str:
@@ -1138,24 +1433,31 @@ def render(sc: dict, md: bool = False) -> str:
           f"{s['decode']:.1f} tok/s, prefill {P} {s['prefill']:.1f} tok/s, batched {U} users "
           f"{s['batch']:.1f} tok/s in all, MoE {s['moe']:.2f} (sqrt of decode x prefill {P} "
           f"tok/s)", ""]
+    bd = bounds(sc)
+    L += ["bound (the unit taking the largest share of the time, averaged over the models): " +
+          ", ".join(f"{k} {bd[k]}" for k in ("decode", "prefill", "batch", "moe") if k in bd),
+          ""]
     Ps = list(next(iter(sc["prefill"].values())))
     head = ["model", "decode tok/s", "MB/token"] + \
         [h for P in Ps for h in (f"prefill {P} tok/s", f"TTFT {P} s")] + ["rows a run"]
     rows = []
+    head += ["decode bound", f"prefill {Ps[-1]} bound"]
     for n, d in sc["decode"].items():
         pf = sc["prefill"][n]
         rr = pf[Ps[-1]]
         rows.append([n, _f(d["tok_s"]), _f(d["mb_token"], 0)] +
                     [x for P in Ps for x in (_f(pf[P]["tok_s"]), _f(pf[P]["ttft_s"], 2))] +
                     [str(rr["rows"]) + ("" if rr["rows_last"] == rr["rows"] else
-                                        f"..{rr['rows_last']}")])
+                                        f"..{rr['rows_last']}"), d["bound"], rr["bound"]])
     table(head, rows)
     Us = list(next(iter(sc["batch"].values())))
-    table(["batched decode, total / each tok/s"] + [f"{u} users" for u in Us],
-          [[n] + [f"{v[u]['total_tok_s']:.1f} / {v[u]['user_tok_s']:.1f}" for u in Us]
-           for n, v in sc["batch"].items()])
+    table(["batched decode, total / each tok/s"] + [f"{u} users" for u in Us] +
+          [f"{Us[-1]} users bound"],
+          [[n] + [f"{v[u]['total_tok_s']:.1f} / {v[u]['user_tok_s']:.1f}" for u in Us] +
+           [v[Us[-1]]["bound"]] for n, v in sc["batch"].items()])
     head = ["MoE", "experts on the card", "decode tok/s", "misses a token"] + \
-        [h for P in Ps for h in (f"prefill {P} tok/s", f"TTFT {P} s")]
+        [h for P in Ps for h in (f"prefill {P} tok/s", f"TTFT {P} s")] + \
+        ["decode bound", f"prefill {Ps[-1]} bound"]
     rows = []
     for n, v in sc["moe"].items():
         f, d = v["fit"], v["decode"]
@@ -1163,30 +1465,36 @@ def render(sc: dict, md: bool = False) -> str:
             (f" + {f['far_slots']} far" if f["far_slots"] else "")
         rows.append([n, where, _f(d["tok_s"], 2), _f(d["misses"], 0)] +
                     [x for P in Ps for x in (_f(v["prefill"][P]["tok_s"]),
-                                             _f(v["prefill"][P]["ttft_s"], 1))])
+                                             _f(v["prefill"][P]["ttft_s"], 1))] +
+                    [d["bound"], v["prefill"][Ps[-1]]["bound"]])
     table(head, rows)
     return "\n".join(L)
 
 
 def whatifs_report(b: str = "ypcb", md: bool = False, wformat: str = "fp4") -> str:
     res = whatifs(b, wformat)
-    head = ["what-if (against " + b + ")", "decode", "prefill", "batched", "MoE", "score"]
+    W = ("decode", "prefill", "batch", "moe")
+    head = ["what-if (against " + b + ")", "decode", "prefill", "batched", "MoE", "score",
+            "bound after: decode / prefill / batched / MoE"]
     L = []
     if md:
-        L += ["| " + " | ".join(head) + " |", "|---|---:|---:|---:|---:|---:|"]
+        L += ["| " + " | ".join(head) + " |", "|---|---:|---:|---:|---:|---:|---|"]
     else:
         L.append(f"{head[0]:44s} {'decode':>8s} {'prefill':>8s} {'batched':>8s} {'MoE':>8s} "
-                 f"{'score':>8s}")
-    for label, kw, r in res:
-        cells = [f"{r[k]:.3f}x" for k in ("decode", "prefill", "batch", "moe", "score")]
-        L.append("| " + " | ".join([label] + cells) + " |" if md else
-                 f"{label:44s} " + " ".join(f"{c:>8s}" for c in cells))
+                 f"{'score':>8s}  {head[-1]}")
+    rows = [(f"({b} itself)", {k: 1.0 for k in W + ("score",)}, res[0][3])] + \
+        [(label, r, bn) for label, _, r, _, bn in res]
+    for label, r, bn in rows:
+        cells = [f"{r[k]:.3f}x" for k in W + ("score",)]
+        bd = " / ".join(bn.get(k, "-") for k in W)
+        L.append("| " + " | ".join([label] + cells + [bd]) + " |" if md else
+                 f"{label:44s} " + " ".join(f"{c:>8s}" for c in cells) + "  " + bd)
     return "\n".join(L)
 
 
 # ------------------------------------------------------------------------------- CLI
 OVERRIDES = ("S", "mcols", "act_rows", "mxu_pump", "tmem_words", "rows", "batch_rows",
-             "moe_rows", "vpu", "mhz", "mem", "mts", "channels", "mem_eff", "port_bytes", "gbps",
+             "moe_rows", "moe_ids", "kernel", "vpu", "mhz", "mem", "mts", "channels", "mem_eff", "port_bytes", "gbps",
              "pcie_gbps", "fast_gb", "imem")
 
 
@@ -1203,17 +1511,20 @@ def main(argv=None):
                                  epilog=__doc__.split("\n\n", 2)[2].split("Python")[0])
     ap.add_argument("cmd", nargs="?", default="report",
                     choices=["report", "compare", "whatifs", "validate", "fit", "boards",
-                             "models", "gen-models"])
-    ap.add_argument("paths", nargs="*", help="gen-models: checkpoint directories")
+                             "models", "gen-models", "cosim"])
+    ap.add_argument("paths", nargs="*", help="gen-models: checkpoint directories; cosim: "
+                    "tools/scoreboard_cosim.py run's JSON lines")
     ap.add_argument("--board", default="ypcb", choices=list(BOARDS))
     ap.add_argument("-S", type=int)
     for k, t in (("mcols", int), ("act-rows", int), ("mxu-pump", float), ("tmem-words", int),
                  ("rows", int), ("batch-rows", int), ("vpu", float), ("mhz", float),
                  ("mts", float), ("channels", int), ("mem-eff", float), ("port-bytes", int),
-                 ("gbps", float), ("pcie-gbps", float), ("fast-gb", float), ("imem", int)):
+                 ("gbps", float), ("pcie-gbps", float), ("fast-gb", float), ("imem", int),
+                 ("moe-ids", int)):
         ap.add_argument("--" + k, type=t)
     ap.add_argument("--mem", choices=["ddr3", "ddr4", "hbm"])
     ap.add_argument("--moe-rows", choices=["all", "gather"])
+    ap.add_argument("--kernel", choices=["today", "tiled"])
     ap.add_argument("--wformat", default="fp4", choices=["fp4", "int8", "auto", "mix"])
     ap.add_argument("--ctx", type=int, default=512)
     ap.add_argument("--models", help="comma list of short names (default: " +
@@ -1243,6 +1554,10 @@ def main(argv=None):
     if a.cmd == "fit":
         print(json.dumps(fit(), indent=1))
         return
+    if a.cmd == "cosim":
+        for p in a.paths:
+            print(cosim_report(p, md=a.markdown))
+        return
     if a.cmd == "validate":
         print(validate_report(md=a.markdown))
         return
@@ -1255,8 +1570,9 @@ def main(argv=None):
         base = board(a.board)
         print(render(scoreboard(base, a.wformat, a.ctx, names), a.markdown))
         print(render(sc, a.markdown))
-        r = compare(base, hw, wformat=a.wformat, ctx=a.ctx, names=names)
+        r, bb, bn = compare(base, hw, full=True, wformat=a.wformat, ctx=a.ctx, names=names)
         print("what-if / board: " + ", ".join(f"{k} {v:.3f}x" for k, v in r.items()))
+        print("bound, board -> what-if: " + ", ".join(f"{k} {bb[k]} -> {bn[k]}" for k in bn))
     else:
         print(render(sc, a.markdown))
     if a.json:

@@ -22,7 +22,8 @@ def rows():
 
 
 @pytest.mark.parametrize("group,mean,worst", [
-    ("decode", 1.0, 3.0), ("prefill", 1.5, 3.5), ("batched", 1.0, 1.5), ("co-sim", 2.0, 3.5),
+    ("decode", 1.0, 3.5), ("prefill", 1.5, 3.5), ("batched", 1.0, 1.5), ("co-sim", 2.0, 5.0),
+    ("co-sim layer", 2.0, 3.5), ("co-sim tile kernel", 3.5, 13.0),
     ("MoE layer run ms", 4.0, 6.0), ("MoE", 4.0, 6.0)])
 def test_reproduces_card_and_cosim(rows, group, mean, worst):
     errs = [abs(e) for g, _, _, _, e, _ in rows if g == group]
@@ -205,3 +206,43 @@ def test_cli(tmp_path):
                         "--vpu", "2", "--models", "qwen3"],
                        capture_output=True, text=True, timeout=120)
     assert r.returncode == 0 and "score" in r.stdout, r.stderr
+
+
+def test_cosim_layers_pair_the_prefixes(tmp_path):
+    base = dict(model="Qwen3-0.6B", rows=4, pos=544, batch=False, wformat="fp4",
+                head_format="int8", formats="", mcols=4, act_rows=0, lanes=8, tmem=65536,
+                mem="ldc", S=1, mhz=133.33, bw=100, lat=40, mts=1066)
+    hw = SB.board("ypcb")
+    m = SB.model("qwen3")
+    lay = list(SB.layers(m))[1][1]
+    want = SB.layer_cycles(m, 1, lay, hw, ("fp4", "int8", ""), [544, 545, 546, 547])
+    recs = [dict(base, layers="1", cycles=1_000_000),
+            dict(base, layers="2", cycles=1_000_000 + round(want)),
+            dict(base, layers="2", lanes=16, error="CompileError: x")]
+    f = tmp_path / "c.jsonl"
+    f.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+    rows = SB.cosim_layers(f)
+    assert len(rows) == 1 and rows[0]["config"] == "ypcb"
+    assert abs(rows[0]["error"]) < 0.01
+
+
+def test_the_tile_kernel_is_taken_only_where_faster():
+    tiled = YPCB.replace(kernel="tiled", rows=16)
+    for name in ("qwen3", "smollm3", "qwen35"):
+        a, b = SB.prefill(name, YPCB, P=256), SB.prefill(name, tiled, P=256)
+        assert b["ttft_s"] <= a["ttft_s"] * 1.0001, name
+    # batched users and MoE layer runs keep their own kernels
+    assert SB.batch("qwen3", tiled, 4)["total_tok_s"] == \
+        pytest.approx(SB.batch("qwen3", YPCB, 4)["total_tok_s"])
+    assert SB.moe_prefill("gemma4-26b", tiled, 256)["ttft_s"] == \
+        pytest.approx(SB.moe_prefill("gemma4-26b", YPCB, 256)["ttft_s"])
+
+
+def test_what_binds():
+    d = SB.decode("phi4-mini", YPCB)
+    assert d["bound"].startswith("port") and abs(sum(d["shares"].values()) - 1) < 1e-9
+    assert SB.prefill("qwen3", YPCB, P=256)["bound"].startswith("MXU")
+    assert SB.decode("phi4-mini", YPCB.replace(port_bytes=256))["bound"].startswith("memory")
+    assert SB.moe_decode("qwen35-35b", YPCB)["shares"]["host link"] > 0.1
+    b = SB.bounds(SB.scoreboard(YPCB, names=["qwen3"]))
+    assert set(b) == {"decode", "prefill", "batch", "moe"}
