@@ -52,6 +52,12 @@ workloads through the workloads agent's scoreboard. Nothing here ran on the card
   rows); MoE expert FFNs of 4-16 rows -45 to -48% (-68 to -72% on 16 rows); single-user decode 0.
   Scoreboard (YPCB): 8 rows 1.00x decode, 1.38x prefill, 1.74x batched, 1.00x MoE; 16 rows with 4x
   TMEM 1.00 / 2.09 / 2.78 / 1.00.
+- **Every card model** (3.6: 13 models, 2000 tokens, the MoE models whole, the Gemma 4 -it
+  models on their chat): the MX defaults (int8 kinds in `int8x`; a production 4-bit kind in
+  NVFP4 where it pays its 5.9% more bytes, else `fp4x6`) are better than today on all 13, by 0.04
+  to 2.9 points of dKL, for -2.0 to +4.5% of decode time. NVFP4 pays in most 4-bit kinds (every
+  non-Gemma gate / up, the MoE models' dense kinds, LFM2.5-8B-A1B's experts), not in the 35B's
+  streamed experts. Without NVFP4, LFM2.5-8B-A1B would be 2.3 points worse than today.
 - **A side finding**: a TMEM above 64K words serializes the sequencer (16-bit TMEM ranges in its
   dependency window): +70% on an 8-row prefill at 256K words until the ranges are widened
   (section 4).
@@ -237,6 +243,392 @@ The MM's accumulation order changes (exact integers, then three roundings), and 
 format's scale, the weights' and the activations'. Every image is re-quantized and every reference
 recomputed (refcache keys, validate.py's card comparisons, the token-exact tests' expected tokens).
 The user decides (section 7).
+
+### 3.6 The card models: NVFP4 per kind, and MX against today
+
+Every card model at 2000 tokens of docs/isa.md, the Gemma 4 -it models also of a chat (below)
+(`tools/exp/mx_formats.py run`, hwe-bench, 2026-10-12; the checkpoints at omarchy's Hugging Face
+revisions, three shards' sha256 compared).
+Each run holds, besides float and int8 (today's int8 weights, head and a8: the dKL reference):
+
+- **today**: the production configuration in today's encodings (int8 / fp4, a8), as the card
+  picks it (`otpu-chat --wformat auto`: `formats.MIXES`; Gemma 4 E4B-it's `fit_formats`;
+  `streamed.FORMATS` for the MoE models): Qwen3-0.6B, LFM2.5-230M, Qwen3.5-0.8B / 2B and Gemma 4
+  E2B-it int8 everywhere; Qwen3.5-4B `delta=fp4,mlp=fp4`; LFM2-2.6B `conv=fp4,mlp=fp4`; SmolLM3
+  `gateup@9-35=fp4`; Phi-4-mini `mlp@4-29=fp4`; E4B-it `head=fp4,gateup@0-11=fp4`; LFM2.5-8B-A1B
+  and Qwen3.5-35B-A3B fp4 everywhere with an int8 head; gemma-4-26B-A4B-it int8 layers, fp4
+  experts and head. The LM head is int8 except where named; routers are int8.
+- **mx:...**: the same configuration on the MX column: int8 kinds in `int8x` (routers too),
+  `a8x32` activations, the drops on, and each of the production's 4-bit kinds in `fp4x6` (F) or
+  `nvfp4r` (N), every combination (a 2^n factorial over the n 4-bit kinds; gate / up and down
+  separately where the MLP is 4-bit).
+- **opp:...**: an int8 kind of production in NVFP4 on top (a speed opportunity: reported, not
+  applied).
+
+What the emulation covers beyond 3.3's three models:
+
+- **K as QST writes it.** The K cache is int8 per token and head with one fp32 and a 2^-d per
+  128-block (docs/isa.md QST; d = 128 is one fp32 a token, RSC), not `a8x32`; q, P and the MM
+  inputs are `a8x32`, V int8 per token as today. (3.3's rows had K in `a8x32`: MX int8 against
+  today was -0.41 / -0.07 / -0.12 there on Qwen3-0.6B / Qwen3.5-0.8B / LFM2.5-230M, -0.25 /
+  -0.04 / -0.11 here.)
+- **MoE.** LFM2-MoE and Qwen3.5-MoE: every layer, every expert the 2000 tokens route to (the
+  whole model, not a sample), each variant routing on its own activations through its own
+  router (int8 / int8x; LFM2: sigmoid + bias, Qwen3.5: the softmax of the top 8 and the shared
+  expert's gate); the shared expert is the MLP kind. Gemma 4 26B-A4B as
+  `tools/gemma4_quant_eval.py`: the router on the unit norm, the experts on the norm times
+  `pre_feedforward_layernorm_2`'s gain (not folded), `per_expert_scale` folded into the down
+  projection, the width padded to 768. Each expert is read once and quantized once per format
+  on worker processes.
+- **Gemma 4** (E2B-it, E4B-it with per-layer embeddings, KV sharing, the soft cap): every variant
+  runs layer after layer together, each with its own K / V for the shared layers. The PLE table
+  is a gather's records, not an MM format, and stays as the image places it: fp4 on E2B-it's
+  card, int8 on E4B-it's host (the int8 reference: int8).
+- With today's formats the extended paths give `lfm2.emulated_logits`, `qwen35.emulated_logits`
+  and `gemma4_quant_eval.emulate`'s logits to 1.6e-15 on tiny random models
+  (`mx_formats.py check`).
+
+**The rule's arithmetic.** Decode time a token is T(b) = T0 + k b in the weight bytes b, fitted
+through each model's card int8 and 4-bit (int8 head) decode (README, docs/formats.md: Qwen3-0.6B
+21.6 / 31.3 tok/s, LFM2.5-230M 59.0 / 85.8, Qwen3.5-0.8B 17.6 / 24.5, Qwen3.5-2B 8.02 / 12.09,
+SmolLM3 5.00 / 8.74, LFM2-2.6B 6.13 / 11.15, Phi-4-mini 3.99 / 6.56) at the runs' bytes
+(`mx_formats.row_bytes`: int8x 8.06 bits a weight, fp4x6 4.25, nvfp4 4.5 with their row
+words); Qwen3.5-4B its fp4 5.88 tok/s and the 2B's slope; Gemma 4 E2B docs/formats.md's
+T = 13.375 M + 8.04 K (b - 1412 MiB) cycles, E4B the same slope (an estimate). A kind in NVFP4
+instead of fp4x6 costs s% of decode time, so it must gain at least 0.1 s points of dKL. Its
+gain is the factorial's main effect: per token, the mean over the 2^(n-1) pairs of combinations
+that differ in that kind alone of KL(NVFP4) - KL(fp4x6), with its SE over the tokens. A kind
+takes NVFP4 when that gain beats 0.1 s by at least 1 SE (formats.md's margin for a default),
+else fp4x6. The MoE models' experts also set the slots and the streamed bytes (below).
+
+**The defaults.** Every int8 kind of production stays 8-bit in `int8x` (the head too, where it is
+int8), the activations `a8x32`, and each 4-bit kind takes NVFP4 where its gain pays its bytes by 1
+SE, else `fp4x6`. The Gemma 4 instruct checkpoints are decided on their chat (below), where the
+float model is calibrated, with docs/isa.md as the cross-check:
+
+| model | production today | MX default: 4-bit kinds (the rest int8x) | MX - today, points (SE) | decode time vs today |
+|:--|:--|:--|--:|--:|
+| Qwen3-0.6B | int8 | none | -0.25 (0.05) | -1.7% |
+| LFM2.5-230M | int8 | none | -0.11 (0.01) | -1.8% |
+| Qwen3.5-0.8B | int8 | none | -0.04 (0.01) | -1.7% |
+| Qwen3.5-2B | int8 | none | -0.08 (0.01) | -2.0% |
+| Gemma 4 E2B-it (chat) | int8 (fp4 PLE table) | none | -0.50 (0.14) | -1.9% |
+| Qwen3.5-4B | `delta=fp4,mlp=fp4` | `delta=fp4x6, gateup=nvfp4, down=nvfp4` | -1.03 (0.14) | +2.1% |
+| LFM2-2.6B | `conv=fp4,mlp=fp4` | `conv=nvfp4, gateup=nvfp4, down=fp4x6` | -1.69 (0.33) | +4.0% |
+| SmolLM3-3B | `gateup@9-35=fp4` | `gateup@9-35=nvfp4` | -0.28 (0.06) | +0.2% |
+| Phi-4-mini | `mlp@4-29=fp4` | `gateup@4-29=nvfp4, down@4-29=fp4x6` | -0.35 (0.09) | +0.2% |
+| Gemma 4 E4B-it (chat) | `head=fp4,gateup@0-11=fp4` | `head=fp4x6, gateup@0-11=fp4x6` | -0.34 (0.08) | -1.6% |
+| LFM2.5-8B-A1B | fp4, int8 head | `attn=nvfp4, conv=nvfp4, mlp=nvfp4, experts=nvfp4` | -2.47 (0.60) | +4.5% |
+| Qwen3.5-35B-A3B | fp4, int8 head | `attn=nvfp4, delta=nvfp4, mlp=nvfp4, experts=fp4x6` | -0.76 (0.18) | +3.0% |
+| gemma-4-26B-A4B-it (chat) | int8, `experts=fp4`, fp4 head | `head=fp4x6, experts=fp4x6` | -2.87 (2.27) | -0.3% |
+
+No model is worse on its MX default than today: every one is better beyond its SE (the 26B by 1.3
+SE). Within its SE NVFP4 is at least as accurate as `fp4x6` in every kind of every model but one,
+the 26B's head on docs/isa.md (+4.4 (2.0)); so no per-kind default trades one model's accuracy for
+another's: where the defaults differ, the gain does not pay the kind's 5.9% more bytes
+(Qwen3.5-4B's DeltaNet, LFM2-2.6B's and Phi-4-mini's down projections, Phi-4-mini's at 0.96 SE,
+just under the margin; the 35B's streamed experts; E4B-it's head and gate / up on the chat). The
+26B's default (`fp4x6` everywhere) is provisional: experts in NVFP4 are the robust alternative
+(below). E4B-it's NVFP4 head would not fit its 4 GiB image anyway (4114.6 MiB at cap 2048, the MX
+compiler's measure). Gemma's LM head is its tied embedding: the gather reads the head's rows, so
+the head's format is the embedding's in GATHER too, as the emulation runs it.
+
+**The dense models with 4-bit kinds.** NVFP4 pays in the gate / up projections of the four
+non-Gemma models (2.1 to 3.3 SE over its bar), in LFM2-2.6B's conv and in Qwen3.5-4B's down
+projections. It does not in Qwen3.5-4B's DeltaNet (-0.07 for a bar of 0.11), LFM2-2.6B's down
+projections (-0.14 for 0.14), Phi-4-mini's (-0.12 for 0.07: 0.96 SE, just under the margin), or
+anywhere in E4B-it on its chat (head -0.02, gate / up -0.005; on docs/isa.md -0.37 and -0.23,
+both over their bars). The kinds interact a little (Qwen3.5-4B's down gains -0.10 with the
+DeltaNet in `fp4x6`, -0.20 with it in NVFP4), which the main effect averages. Against today
+every default is better, by 0.28 to 1.69 points, for -1.6 to +4.0% of decode time; `fp4x6`
+alone is better or equal (-0.09 to -0.58; SmolLM3 +0.05, 0.8 SE).
+
+**Qwen3.5-4B** (card fp4 + slope 8.15 K/MiB):
+
+| 4-bit kind | NVFP4 - fp4x6, points (SE) | decode time | bar | margin | default |
+|:--|--:|--:|--:|--:|:--|
+| delta | -0.07 (0.08) | +1.11% | 0.112 | -0.47 SE | fp4x6 |
+| gateup | -0.41 (0.08) | +1.69% | 0.169 | +2.85 SE | NVFP4 |
+| down | -0.16 (0.05) | +0.78% | 0.078 | +1.62 SE | NVFP4 |
+
+| row | dKL % (SE) | against today, points (SE) | MiB a token | decode time vs today |
+|:--|--:|--:|--:|--:|
+| int8 | +0.00 (0.00) | -5.25 (0.16) | 4135 | +53.4% |
+| today (production) | +5.25 (0.16) | +0.00 (0.00) | 2573 | +0.0% |
+| MX, every 4-bit kind fp4x6 | +4.67 (0.12) | -0.58 (0.13) | 2562 | -0.4% |
+| **MX, NVFP4 in gateup, down (default)** | +4.23 (0.12) | -1.03 (0.14) | 2634 | +2.1% |
+| MX, every 4-bit kind NVFP4 | +4.04 (0.10) | -1.22 (0.15) | 2667 | +3.2% |
+
+**LFM2-2.6B** (card int8 / fp4 fit, k 8.43 K/MiB):
+
+| 4-bit kind | NVFP4 - fp4x6, points (SE) | decode time | bar | margin | default |
+|:--|--:|--:|--:|--:|:--|
+| conv | -0.36 (0.15) | +0.83% | 0.083 | +1.90 SE | NVFP4 |
+| gateup | -0.80 (0.21) | +3.00% | 0.300 | +2.37 SE | NVFP4 |
+| down | -0.14 (0.11) | +1.35% | 0.136 | +0.03 SE | fp4x6 |
+
+| row | dKL % (SE) | against today, points (SE) | MiB a token | decode time vs today |
+|:--|--:|--:|--:|--:|
+| int8 | +0.00 (0.00) | -7.48 (0.31) | 2527 | +76.9% |
+| today (production) | +7.48 (0.31) | +0.00 (0.00) | 1406 | +0.0% |
+| MX, every 4-bit kind fp4x6 | +6.93 (0.28) | -0.55 (0.30) | 1408 | +0.2% |
+| **MX, NVFP4 in conv, gateup (default)** | +5.79 (0.20) | -1.69 (0.33) | 1465 | +4.0% |
+| MX, every 4-bit kind NVFP4 | +5.73 (0.22) | -1.75 (0.35) | 1485 | +5.4% |
+
+**SmolLM3-3B** (card int8 / fp4 fit, k 8.51 K/MiB):
+
+| 4-bit kind | NVFP4 - fp4x6, points (SE) | decode time | bar | margin | default |
+|:--|--:|--:|--:|--:|:--|
+| gateup | -0.33 (0.05) | +1.62% | 0.162 | +3.27 SE | NVFP4 |
+
+| row | dKL % (SE) | against today, points (SE) | MiB a token | decode time vs today |
+|:--|--:|--:|--:|--:|
+| int8 | +0.00 (0.00) | -2.14 (0.07) | 3024 | +22.7% |
+| today (production) | +2.14 (0.07) | +0.00 (0.00) | 2444 | +0.0% |
+| MX, every 4-bit kind fp4x6 | +2.19 (0.07) | +0.05 (0.06) | 2409 | -1.4% |
+| **MX, every 4-bit kind NVFP4 (default)** | +1.86 (0.07) | -0.28 (0.06) | 2450 | +0.2% |
+
+**Phi-4-mini** (card int8 / fp4 fit, k 8.52 K/MiB):
+
+| 4-bit kind | NVFP4 - fp4x6, points (SE) | decode time | bar | margin | default |
+|:--|--:|--:|--:|--:|:--|
+| gateup | -0.27 (0.06) | +1.43% | 0.143 | +2.09 SE | NVFP4 |
+| down | -0.12 (0.05) | +0.68% | 0.068 | +0.97 SE | fp4x6 |
+
+| row | dKL % (SE) | against today, points (SE) | MiB a token | decode time vs today |
+|:--|--:|--:|--:|--:|
+| int8 | +0.00 (0.00) | -2.89 (0.15) | 3772 | +31.4% |
+| today (production) | +2.89 (0.15) | +0.00 (0.00) | 2836 | +0.0% |
+| MX, every 4-bit kind fp4x6 | +2.80 (0.15) | -0.09 (0.08) | 2801 | -1.2% |
+| **MX, NVFP4 in gateup (default)** | +2.54 (0.14) | -0.35 (0.09) | 2843 | +0.2% |
+| MX, every 4-bit kind NVFP4 | +2.41 (0.14) | -0.47 (0.10) | 2863 | +0.9% |
+
+**Gemma 4 E4B-it, the chat** (E2B slope, fixed part x 42/35 (estimate)):
+
+| 4-bit kind | NVFP4 - fp4x6, points (SE) | decode time | bar | margin | default |
+|:--|--:|--:|--:|--:|:--|
+| head | -0.02 (0.04) | +0.53% | 0.052 | -0.69 SE | fp4x6 |
+| gateup | -0.00 (0.04) | +0.49% | 0.049 | -1.27 SE | fp4x6 |
+
+| row | dKL % (SE) | against today, points (SE) | MiB a token | decode time vs today |
+|:--|--:|--:|--:|--:|
+| int8 | +0.00 (0.00) | -0.55 (0.07) | 4567 | +14.6% |
+| today (production) | +0.55 (0.07) | +0.00 (0.00) | 3947 | +0.0% |
+| **MX, every 4-bit kind fp4x6 (default)** | +0.21 (0.07) | -0.34 (0.08) | 3881 | -1.6% |
+| MX, every 4-bit kind NVFP4 | +0.18 (0.06) | -0.36 (0.08) | 3923 | -0.6% |
+
+**The int8 models.** MX int8 (`int8x`, `a8x32`) is better than today's int8 on every one and
+1.7-2.0% faster (8.06 bits a weight against 8.25: the scale words):
+
+**Qwen3-0.6B** (card int8 / fp4 fit, k 9.11 K/MiB):
+
+| row | dKL % (SE) | against today, points (SE) | MiB a token | decode time vs today |
+|:--|--:|--:|--:|--:|
+| int8 (production) | +0.00 (0.00) | +0.00 (0.00) | 586 | +0.0% |
+| **MX: int8x, a8x32 (default)** | -0.25 (0.05) | -0.25 (0.05) | 575 | -1.7% |
+
+**LFM2.5-230M** (card int8 / fp4 fit, k 9.11 K/MiB):
+
+| row | dKL % (SE) | against today, points (SE) | MiB a token | decode time vs today |
+|:--|--:|--:|--:|--:|
+| int8 (production) | +0.00 (0.00) | +0.00 (0.00) | 226 | +0.0% |
+| **MX: int8x, a8x32 (default)** | -0.11 (0.01) | -0.11 (0.01) | 221 | -1.8% |
+
+**Qwen3.5-0.8B** (card int8 / fp4 fit, k 8.99 K/MiB):
+
+| row | dKL % (SE) | against today, points (SE) | MiB a token | decode time vs today |
+|:--|--:|--:|--:|--:|
+| int8 (production) | +0.00 (0.00) | +0.00 (0.00) | 739 | +0.0% |
+| **MX: int8x, a8x32 (default)** | -0.04 (0.01) | -0.04 (0.01) | 725 | -1.7% |
+
+**Qwen3.5-2B** (card int8 / fp4 fit, k 8.55 K/MiB):
+
+| row | dKL % (SE) | against today, points (SE) | MiB a token | decode time vs today |
+|:--|--:|--:|--:|--:|
+| int8 (production) | +0.00 (0.00) | +0.00 (0.00) | 1850 | +0.0% |
+| **MX: int8x, a8x32 (default)** | -0.08 (0.01) | -0.08 (0.01) | 1811 | -2.0% |
+
+**Gemma 4 E2B-it, the chat** (formats.md E2B model):
+
+| row | dKL % (SE) | against today, points (SE) | MiB a token | decode time vs today |
+|:--|--:|--:|--:|--:|
+| int8 | +0.00 (0.00) | -0.33 (0.11) | 2242 | +0.0% |
+| today (production) | +0.33 (0.11) | +0.00 (0.00) | 2242 | +0.0% |
+| **MX: int8x, a8x32 (default)** | -0.16 (0.14) | -0.50 (0.14) | 2196 | -1.9% |
+
+**Speed opportunities: the rule's reference.** The user decided (2026-10-12) that the formats rule
+on the MX column takes MX int8 (`int8x`, `a8x32`) as its reference: a mix qualifies if its dKL
+against MX int8 is at most 0.1 x its decode gain over MX int8, by 1 SE for a default. Against
+today's int8 (formats.md's reference until now, which banks MX's own gain) faster mixes would
+qualify on five models, for information: Qwen3.5-4B its attention in 4-bit (NVFP4 everywhere +5.04
+for +55%, 3.6 SE under its bar), SmolLM3-3B its down projections 9-26 (+3.69 for +41%, 3.8 SE),
+Qwen3.5-2B `mlp=nvfp4r` (+2.64 for +27.5%, 2.1 SE; `gateup=nvfp4r` +1.49 for +18%, 8.0 SE), E4B-it
+its down projections 0-11 with an NVFP4 head (the chat: +0.28 for +19%, 19.7 SE; even as a step
+from its MX default +0.07 for +2.2%, 2.0 SE; but the head does not fit the image) and E2B-it its
+NVFP4 head (the chat: +0.68 for +9.4%, 1.6 SE). Against MX int8 none of the int8 models'
+opportunities qualifies: the closest are Qwen3.5-2B's gate / up (+1.57 for +15%, bar 1.53, -1.2
+SE) and E2B-it's head (+0.84 for +7.4%, bar 0.74, -0.7 SE). Qwen3.5-4B's and SmolLM3's runs have
+no MX int8 row: as a step from their MX default, a stricter test, they fail by 3.5 to 7.1 SE; the
+rule's own test is pending. A reference better and faster than today's int8 only raises a mix's
+dKL and lowers its bar, so what fails against today's int8 fails against MX int8: Qwen3-0.6B,
+LFM2.5-230M and Qwen3.5-0.8B (13 to 49 SE over the bars), LFM2-2.6B (its attention in 4-bit, 6
+SE), Phi-4-mini (2.2 SE) and the MoE models (8 to 10 SE). The rows within 3 SE of their bar or
+under it (the Gemmas on the chat; all of them in `tools/exp/mx_acc.json`):
+
+| model | opportunity (weights; head) | dKL % (SE) | gain over int8 | bar | margin | against MX int8: dKL, points (SE) | gain | bar | margin |
+|:--|:--|--:|--:|--:|--:|--:|--:|--:|--:|
+| Qwen3.5-2B | `int8x,gateup=nvfp4r` | +1.49 (0.03) | +17.7% | 1.77 | +8.0 SE | +1.57 (0.03) | +15.3% | 1.53 | -1.2 SE |
+| Qwen3.5-2B | `int8x,mlp=nvfp4r` | +2.64 (0.05) | +27.5% | 2.75 | +2.1 SE | +2.71 (0.06) | +25.0% | 2.50 | -3.9 SE |
+| Gemma 4 E2B-it | `int8x,down@25-34=nvfp4r` | +0.43 (0.15) | +5.3% | 0.53 | +0.7 SE | +0.59 (0.10) | +3.4% | 0.34 | -2.6 SE |
+| Gemma 4 E2B-it | `int8x,attn@25-34=nvfp4r,mlp@25-34=nvfp4r` | +2.14 (0.27) | +14.5% | 1.45 | -2.6 SE | +2.30 (0.25) | +12.3% | 1.24 | -4.3 SE |
+| Gemma 4 E2B-it | `int8x`; head nvfp4r | +0.68 (0.16) | +9.4% | 0.94 | +1.6 SE | +0.84 (0.15) | +7.4% | 0.74 | -0.7 SE |
+| Qwen3.5-4B | `nvfp4r` | +5.04 (0.13) | +55.0% | 5.50 | +3.6 SE | +0.82 (0.10) | +3.1% | 0.31 | -5.2 SE (a step from the MX default) |
+| Qwen3.5-4B | `fp4x6,attn=nvfp4r` | +5.65 (0.14) | +60.9% | 6.09 | +3.1 SE | +1.42 (0.10) | +7.0% | 0.70 | -7.1 SE (a step from the MX default) |
+| SmolLM3-3B | `int8x,gateup=nvfp4r,down@9-26=nvfp4r` | +3.69 (0.12) | +41.3% | 4.13 | +3.8 SE | +1.83 (0.08) | +15.4% | 1.54 | -3.5 SE (a step from the MX default) |
+| SmolLM3-3B | `int8x,gateup=fp4x6,down@9-26=fp4x6` | +4.29 (0.12) | +45.7% | 4.57 | +2.4 SE | +2.43 (0.10) | +19.0% | 1.90 | -5.3 SE (a step from the MX default) |
+| SmolLM3-3B | `int8x,gateup=nvfp4r` | +2.98 (0.10) | +31.1% | 3.12 | +1.4 SE | +1.12 (0.07) | +7.1% | 0.71 | -6.1 SE (a step from the MX default) |
+| Phi-4-mini | `int8x,attn=nvfp4r,mlp@4-29=nvfp4r` | +5.09 (0.19) | +46.7% | 4.67 | -2.2 SE | +2.55 (0.12) | +11.9% | 1.19 | -11.8 SE (a step from the MX default) |
+| Gemma 4 E4B-it | `int8x,mlp@0-11=nvfp4r`; head nvfp4r | +0.28 (0.08) | +19.0% | 1.90 | +19.7 SE | +0.07 (0.07) | +2.2% | 0.22 | +2.0 SE (a step from the MX default) |
+
+**The MoE models.** What ran is the whole model, not a sample: every layer and every expert
+that the 2000 tokens route to (Qwen3.5-35B-A3B 217-256 of 256 a layer, gemma-4-26B-A4B-it
+100-123 of 128, LFM2.5-8B-A1B of its 32, 4 a token), each variant through its own router on its
+own activations, so a format's routing changes are in its dKL. The text is the one limit: one
+document's tokens reach each expert as often as its content routes there.
+
+**The streamed MoE models' time.** Their experts live in DRAM slots filled over PCIe, so an
+expert format's bytes cost twice: in the DRAM reads of the k routed experts a token, and in the
+link's streaming of the misses, of which a larger expert brings more bytes a miss and, through
+fewer slots, more misses. A dense kind's bytes also take slot space. The model, from
+docs/offload.md's card runs: T = T_today (5.3 tok/s for Qwen3.5-35B-A3B, 3.68 for the 26B,
+15.0 for LFM2.5-8B-A1B from /dev/shm) + 8.1 K cycles a MiB of DRAM reads more + T_today x link
+share (the link busy over the wall: 0.40, 0.48; the 8B 0.01 at 98.5% hits) x (the expert's size
+ratio - 1 + 0.7 x the share of slots lost: cachesim's 7% fewer slots gave 5% more misses), with
+today's slots (1680, 540, 616) and the slot space they hold. NVFP4 experts so cost the 35B about
++5.9% of decode time where their DRAM reads alone say +1.2%: an estimate, so a choice close to
+its bar is named as such. `fp4x6`'s row head (`Sw` and a reserved word, 8 bytes) makes a row 8
+bytes longer than today's fp4: +2.9% on a 512-element row (the 35B's down projections), +1.5% on
+the 35B's experts, which the misses pay again (+1.0% of decode for MX `fp4x6` against today).
+
+**LFM2.5-8B-A1B** (MoE: today 15.0 tok/s, link 1% of it, 616 slots, misses x0.7 the slots lost):
+
+| 4-bit kind | NVFP4 - fp4x6, points (SE) | decode time | bar | margin | default |
+|:--|--:|--:|--:|--:|:--|
+| attn | -0.73 (0.33) | +0.19% | 0.019 | +2.16 SE | NVFP4 |
+| conv | -0.93 (0.33) | +0.91% | 0.091 | +2.53 SE | NVFP4 |
+| mlp | -1.92 (0.25) | +0.26% | 0.026 | +7.66 SE | NVFP4 |
+| experts | -1.19 (0.25) | +3.06% | 0.306 | +3.52 SE | NVFP4 |
+
+| row | dKL % (SE) | against today, points (SE) | MiB a token | decode time vs today |
+|:--|--:|--:|--:|--:|
+| int8 | +0.00 (0.00) | -24.99 (0.61) | 1658 | +63.1% |
+| today (production) | +24.99 (0.61) | +0.00 (0.00) | 980 | +0.0% |
+| MX, every 4-bit kind fp4x6 | +27.25 (0.64) | +2.26 (0.60) | 980 | +0.0% |
+| **MX, every 4-bit kind NVFP4 (default)** | +22.51 (0.54) | -2.47 (0.60) | 1027 | +4.5% |
+
+**Qwen3.5-35B-A3B** (MoE: today 5.3 tok/s, link 40% of it, 1680 slots, misses x0.7 the slots lost):
+
+| 4-bit kind | NVFP4 - fp4x6, points (SE) | decode time | bar | margin | default |
+|:--|--:|--:|--:|--:|:--|
+| attn | -0.30 (0.08) | +0.36% | 0.036 | +3.30 SE | NVFP4 |
+| delta | -0.39 (0.10) | +1.35% | 0.135 | +2.53 SE | NVFP4 |
+| mlp | -0.18 (0.04) | +0.19% | 0.019 | +3.78 SE | NVFP4 |
+| experts | -0.10 (0.06) | +5.88% | 0.588 | -8.59 SE | fp4x6 |
+
+| row | dKL % (SE) | against today, points (SE) | MiB a token | decode time vs today |
+|:--|--:|--:|--:|--:|
+| int8 | +0.00 (0.00) | -4.76 (0.18) | 2897 | +91.9% |
+| today (production) | +4.76 (0.18) | +0.00 (0.00) | 1745 | +0.0% |
+| MX, every 4-bit kind fp4x6 | +4.86 (0.18) | +0.11 (0.13) | 1746 | +1.0% |
+| **MX, NVFP4 in attn, delta, mlp (default)** | +4.00 (0.16) | -0.76 (0.18) | 1794 | +3.0% |
+| MX, every 4-bit kind NVFP4 | +4.01 (0.14) | -0.74 (0.17) | 1831 | +9.0% |
+
+**gemma-4-26B-A4B-it, the chat** (MoE: today 3.68 tok/s, link 48% of it, 540 slots, misses x0.7 the slots lost):
+
+| 4-bit kind | NVFP4 - fp4x6, points (SE) | decode time | bar | margin | default |
+|:--|--:|--:|--:|--:|:--|
+| head | -0.99 (1.22) | +0.97% | 0.097 | +0.73 SE | fp4x6 |
+| experts | +1.75 (1.98) | +6.62% | 0.662 | -1.22 SE | fp4x6 |
+
+| row | dKL % (SE) | against today, points (SE) | MiB a token | decode time vs today |
+|:--|--:|--:|--:|--:|
+| int8 | +0.00 (0.00) | -15.18 (1.95) | 3807 | +88.6% |
+| today (production) | +15.18 (1.95) | +0.00 (0.00) | 2753 | +0.0% |
+| **MX, every 4-bit kind fp4x6 (default)** | +12.30 (2.37) | -2.87 (2.27) | 2729 | -0.3% |
+| MX, every 4-bit kind NVFP4 | +13.07 (2.41) | -2.11 (2.31) | 2805 | +7.3% |
+
+On Qwen3.5-35B-A3B NVFP4 pays in the dense kinds (attention, DeltaNet, the shared expert: 2.5 to
+3.8 SE over their bars) and not in the experts (-0.10 (0.06) for a bar of 0.59: their bytes are
+paid twice; the choice holds at the DRAM share alone, bar 0.12). MX in `fp4x6` alone equals
+today there (+0.11 (0.13)). LFM2.5-8B-A1B streams nearly nothing (98.5% of its experts resident),
+so its experts cost only their DRAM reads, and NVFP4 pays in every kind, the experts by 3.5 SE.
+Its kinds interact strongly (the same kind's pairs range from -4.2 to +1.9 points), and today's
+fp4 sits 25 points from int8, the largest of the card models: there MX in `fp4x6` alone is
+**worse than today**, +2.26 (0.60) points: the one model where the MX column without NVFP4
+clearly loses accuracy (the 26B's +4.9 (3.4) on docs/isa.md is 1.4 SE).
+
+gemma-4-26B-A4B-it is the outlier: on docs/isa.md the instruct checkpoint is far from calibrated
+(float perplexity 682), and under int8 alone 321 of the 2000 tokens are more than a nat from
+float (dKL -68 for float); NVFP4 experts cut that damage broadly (-20.0 (2.9) points against
+`fp4x6`, still -13.2 without the 50 most extreme tokens each side), where an NVFP4 head
+costs +4.4 (2.0). On the chat below, where the float model is calibrated (perplexity 25.3), the
+experts' format does not matter (+1.75 (1.98); +0.24 without the 50 extreme tokens each side)
+and the default is `fp4x6` everywhere: the table above is the chat's, both texts side by side
+below.
+
+**Gemma 4 -it on their chat.** docs/isa.md is plain prose to the instruct checkpoints (float
+perplexity 150, 98 and 682 for E2B-it, E4B-it and the 26B-it), on which even int8 moves the 26B
+far from float. [gemma4.md](gemma4.md) also scores them on a chat (`tools/chat_text.py`:
+E2B-it's own replies to 16 questions in one conversation, rendered by its template; the same
+file, omarchy's `gemma-it/chat-it.json`, the first 2000 of its 2637 tokens, `mx_formats.py run
+--ids`), and so does this, every variant again. Decided (the lead, 2026-10-12): the Gemma -it
+defaults follow the chat, docs/isa.md is the cross-check.
+
+| model | | docs/isa.md | the chat |
+|:--|:--|--:|--:|
+| Gemma 4 E2B-it | float perplexity (int8's) | 149.6 (153.3) | 3.54 (3.62) |
+| | float against int8, dKL | -4.69 (0.24) | -1.46 (0.12) |
+| | MX int8 - today | -1.78 (0.19) | -0.50 (0.14) |
+| | `int8x,down@25-34=nvfp4r`: margin against int8 / as a step from MX | +9.1 / -3.5 SE | +0.7 / -2.6 SE |
+| | `int8x,attn@25-34=nvfp4r,mlp@25-34=nvfp4r`: margin against int8 / as a step from MX | +5.0 / -5.0 SE | -2.6 / -4.3 SE |
+| | `int8x,mlp@15-34=nvfp4r`: margin against int8 / as a step from MX | +3.1 / -4.4 SE | -4.1 / -5.7 SE |
+| | `int8x`, head nvfp4r: margin against int8 / as a step from MX | +8.4 / -2.2 SE | +1.6 / -0.7 SE |
+| Gemma 4 E4B-it | float perplexity (int8's) | 98.0 (95.0) | 4.34 (4.40) |
+| | float against int8, dKL | -1.89 (0.16) | -0.83 (0.07) |
+| | head: NVFP4 - fp4x6 (bar 0.05) | -0.37 (0.10), +3.3 SE: NVFP4 | -0.02 (0.04), -0.7 SE: fp4x6 |
+| | gateup: NVFP4 - fp4x6 (bar 0.05) | -0.23 (0.11), +1.6 SE: NVFP4 | -0.00 (0.04), -1.3 SE: fp4x6 |
+| | MX default - today | -2.04 (0.38) | -0.34 (0.08) |
+| | MX in `fp4x6` alone - today | -1.44 | -0.34 |
+| | `int8x,mlp@0-11=nvfp4r`, head nvfp4r: margin against int8 / as a step from MX | +5.5 / -2.6 SE | +19.7 / +2.0 SE |
+| gemma-4-26B-A4B-it | float perplexity (int8's) | 681.9 (912.4) | 25.32 (25.96) |
+| | float against int8, dKL | -68.07 (3.58) | -18.03 (1.94) |
+| | head: NVFP4 - fp4x6 (bar 0.10) | +4.43 (2.02), -2.2 SE: fp4x6 | -0.99 (1.22), +0.7 SE: fp4x6 |
+| | experts: NVFP4 - fp4x6 (bar 0.66) | -19.96 (2.89), +6.7 SE: NVFP4 | +1.75 (1.98), -1.2 SE: fp4x6 |
+| | MX default - today | -15.21 (3.36) | -2.87 (2.27) |
+| | MX in `fp4x6` alone - today | +4.90 | -2.87 |
+| | `int8x,attn=nvfp4r,experts=nvfp4r`, head nvfp4r: margin against int8 / as a step from MX | -9.9 / -14.2 SE | -8.8 / -7.8 SE |
+| | `int8x,mlp=nvfp4r,experts=nvfp4r`, head nvfp4r: margin against int8 / as a step from MX | -8.3 / -12.1 SE | -8.2 / -7.7 SE |
+
+The chat lowers every format's cost (today's E4B-it mix +0.55 against int8 there, +2.30 on
+docs/isa.md) and NVFP4's gains with it: E4B-it keeps `fp4x6` in its head and gate / up, the 26B
+in its experts and head. On the 26B the two texts disagree (above): on docs/isa.md NVFP4 experts
+are worth 20 points and MX in `fp4x6` alone is +4.9 (3.4) against today; on the chat they are
+worth nothing. Experts in NVFP4 (+6.6% decode, estimated) are the alternative for text far from
+the chat; the user decides.
+
+**Drops.** The share of (row, output, 16-element) terms the windows drop is 0 to 7e-7 in the rows
+with no 4-bit kind and at most 7.3e-5 in any MX row (Qwen3.5-0.8B in `fp4x6` everywhere), the
+range 3.3 measured at no cost (drops on - off: -0.02 to 0 points).
+
+**What ran where.** Every run on hwe-bench (2026-10-12; 2000 tokens; 6 BLAS threads and 6
+quantizer processes; 3 min for LFM2.5-230M to 82 min for Qwen3.5-35B-A3B), no proxy model: the
+checkpoints at omarchy's Hugging Face revisions (Qwen3.5-35B-A3B 59d61f3c, gemma-4-26B-A4B-it
+4d7ae498, Phi-4-mini cfbefacb, ...), shard sha256s equal to omarchy's (Phi-4-mini, Qwen3.5-4B,
+Qwen3.5-35B-A3B). The -it checkpoints read docs/isa.md as plain text after `<bos>`, as
+formats.md's Gemma 4 rows do, and the chat above. The decode-time model is the card's for the
+dense models, an estimate for E4B-it (E2B's slope) and for the MoE models (above). The runs'
+numbers (every row's dKL, SE, bytes and drops; each kind's effect, cost and bar; the opportunities
+against both references; the defaults and the decisions) are `tools/exp/mx_acc.json`.
 
 ## 4. Attention on shared lanes
 
@@ -488,6 +880,9 @@ rows, E = MCOLS/4 costs the experts +26% / +30% (+9% / +11% with chunks of 1024,
 - **E**: MCOLS/2 (no measured cost; 2 lanes at 4 rows, 4 at 8) or MCOLS/4 (one lane, ~1.3K LUTs,
   fewer; needs the chunk rule and TMEM, and the MoE experts still lose 9-11% on 16 rows).
 - **Card time**: a qualification on the card needs a session the lead schedules (none used here).
+- **Decided (the user, 2026-10-12)**: the formats rule on the MX column takes MX int8 (`int8x`,
+  `a8x32`) as its reference; the per-kind defaults are 3.6's table. Open: the 26B's experts in
+  NVFP4 (+6.6% decode, estimated) for text far from the chat (3.6).
 
 ## 8. Implementation plan
 
