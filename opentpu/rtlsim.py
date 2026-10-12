@@ -177,7 +177,8 @@ if UARCH["MXU_IMPL"] == 1:
 if os.environ.get("OTPU_VPU_CL"):
     UARCH["VPU_CL"] = int(os.environ["OTPU_VPU_CL"])
 # EXPERIMENTAL (docs/seq_vpu.md): otpu_seq's wait counts instead of its scoreboard (WAITC; the
-# counts from +hz_sync, OTPU_SIM_PLUSARGS): OTPU_SEQ_WC=1
+# counts from +hz_sync, OTPU_SIM_PLUSARGS; with OTPU_WAITS=1 the compiler's, opentpu.waits, the
+# run's arguments unknown, OTPU_WAITS=args: known): OTPU_SEQ_WC=1
 if os.environ.get("OTPU_SEQ_WC"):
     UARCH["SEQ_WC"] = BOARD_UARCH["SEQ_WC"] = int(os.environ["OTPU_SEQ_WC"])
 # TMEM lanes of the MXU and the quantizer when fewer than LANES (timing only): OTPU_ULANES=8
@@ -328,6 +329,17 @@ def _run(cfg, programs: list, images: list, dram_lat: int = 8, max_cycles: int =
     args += [x.replace("%n", str(_SIM_RUNS))
              for x in _re.split(r"[\s,]+", os.environ.get("OTPU_SIM_PLUSARGS", "")) if x]
     _SIM_RUNS += 1
+    if os.environ.get("OTPU_WAITS") and {**UARCH, **(uarch or {})}.get("SEQ_WC"):
+        from . import waits as W
+        if cfg.S != 1:
+            raise ValueError("OTPU_WAITS: one slice (one +hz_sync file)")
+        wst: dict = {}
+        words = W.wait_counts(programs[0], cfg.D, cfg.S, stats=wst,
+                              args=run_args if os.environ["OTPU_WAITS"] == "args" else None)
+        W.sync_file(words, tmp / "sync_0.txt")
+        print(f"waits: {len(words)} instructions, {wst['visits']} visits, "
+              f"{len(wst['widened'])} loops widened, {wst['unreached']} unreached", flush=True)
+        args += [f"+hz_sync={tmp / 'sync_0.txt'}"]
     args += [f"+arg{k}={int(v) & 0xFFFFFFFF}" for k, v in enumerate(run_args or [])]
     if again:
         args += [f"+runs={1 + len(again)}"] + (["+reload"] if reload else [])

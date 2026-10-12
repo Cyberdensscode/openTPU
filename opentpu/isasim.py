@@ -732,10 +732,15 @@ class Machine:
 
     def run(self, max_steps: int = 10_000_000) -> "Machine":
         steps = 0
+        # OTPU_WAITS_CHECK=1: each program's wait counts (opentpu.waits, otpu_seq WAITC) checked
+        # against this run (no effect on the result: the counts only order the units)
+        chk = {} if os.environ.get("OTPU_WAITS_CHECK") else None
         while not all(s.halted for s in self.slices):
             progressed = False
             for s in self.slices:
                 while not s.halted and s.waiting is None and s.polling is None:
+                    if chk is not None:
+                        self._waits_issue(chk, s)
                     s.step()
                     steps += 1
                     progressed = True
@@ -743,6 +748,8 @@ class Machine:
                         raise SimError("step limit exceeded")
                     if s.halted and s.chain is not None:
                         self._chain(s)
+                        if chk is not None:
+                            chk.pop(s.sid, None)
             live = [s for s in self.slices if not s.halted]
             if live and all(s.waiting is not None for s in live):
                 if len(live) != len(self.slices):
@@ -774,6 +781,15 @@ class Machine:
             if not progressed:
                 raise SimError("deadlock")
         return self
+
+    def _waits_issue(self, chk: dict, s: Slice) -> None:
+        from . import waits as W
+        c = chk.get(s.sid)
+        if c is None or c.prog is not s.prog:
+            c = chk[s.sid] = W.Checker(s.prog, W.wait_counts(s.prog, self.cfg.D, self.cfg.S),
+                                       self.cfg.D, self.cfg.S)
+        if 0 <= s.pc < len(s.prog) and s.prog[s.pc].op in W.UNIT:
+            c.issue(s.pc, [s.reg(r) for r in range(16)])
 
     def _gather(self) -> None:
         sl = self.slices

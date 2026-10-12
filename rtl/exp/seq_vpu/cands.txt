@@ -44,6 +44,10 @@ wcr OTPU_SEQ_WC=1 SYNC=1 HZLOG=1
 wcr1 OTPU_SEQ_WC=1 OTPU_SIM_PLUSARGS=+hz_kclamp=1 SYNC=1
 # the resident decode's counts from position 544 at 700 (lists/resident.txt)
 wcx OTPU_SEQ_WC=1 SYNCFROM=dr_q3
+# the compiler's counts (opentpu.waits: from the program alone, the run's arguments unknown;
+# wcca: known), the RTL's check that they cover every conflict on the window
+wcc OTPU_SEQ_WC=1 OTPU_WAITS=1 HZLOG=1
+wcca OTPU_SEQ_WC=1 OTPU_WAITS=args
 # per-unit queues instead of the shared window (caps per unit: DMA, MXU, QUANT, VPU, COLL)
 inoq4 OTPU_SIM_PLUSARGS=+hz_ino=1,+hz_uq=4:4:4:4:2
 wcq4 OTPU_SIM_PLUSARGS=+hz_ino=1,+hz_uq=4:4:4:4:2 WC=1
