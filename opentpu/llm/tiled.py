@@ -260,7 +260,7 @@ def _attention_tile(res: Res, lw, c, s_, pos, T: int, spec, block: int, parts: i
     _attend_heads(qhs, kvc, kvh, seqs, block, scale, depth=depth, emit=emit)
     xs = None
     if whole:
-        ost = ol.quantize(o_all)
+        ost = ol.quantize(o_all, free=True)
         del o_all
     _add_parts(res.back(), [ost], [lw.wo], parts)              # x += W_o o, by output parts
 
@@ -323,13 +323,13 @@ def _mlp_tile(x, lw, spec, parts: int, sub: int, act=silu, g=None, out=None, xs=
         if i + 1 < len(pieces):
             nxt = gate_up(*pieces[i + 1])                      # streams while the VPU works
         if sub == C:                                           # the chunk's activation
-            acts[c0] = ol.quantize(act(g) * u)
+            acts[c0] = ol.quantize(act(g) * u, free=True)
         else:
             if s0 == 0:
                 a = ol.empty([T, C])
             a[:, s0:s0 + sub].set(act(g) * u)
             if s0 + sub == C:
-                acts[c0] = ol.quantize(a)
+                acts[c0] = ol.quantize(a, free=True)
                 a = None
         del g, u
     xs = nxt = None                     # the operand's ACT blocks are free for the down MMs
@@ -419,7 +419,7 @@ def _conv_tile(x, lw, pos: RunRows, spec, parts: int, cparts: int):
         y[:, c0:c0 + cp].set(acc * ol.dot(xs, lw.win[n + c0:n + c0 + cp, :]))
         del acc
     xs = None
-    yst = ol.quantize(y)
+    yst = ol.quantize(y, free=True)
     del y
     _add_parts(x, [yst], [lw.wout], parts)
     return x
@@ -690,7 +690,7 @@ def _gemma_attention_tile(res: Res, lw, m, pos: RunRows, ropes, T: int, block: i
     _attend_heads(qhs, kv, kvh, seqs, block, ol.LOG2E, depth=depth, emit=emit)
     xs = None
     if whole:
-        ost = ol.quantize(o_all)
+        ost = ol.quantize(o_all, free=True)
         del o_all
     x = res.back()
     y = ol.empty([T, spec.hidden])
