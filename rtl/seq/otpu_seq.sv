@@ -44,7 +44,7 @@ module otpu_seq
   // footprints: per in-order unit (DMA, MXU, QUANT, COLL) a 4-bit count k (0: no wait, else
   // until the unit's k-th last instruction before this one has completed; and the MM's stream
   // start's k for the DMA and the quantizer), and for the VPU, which starts its oldest ready
-  // instruction, a mask of the VPU instructions 1..15 back it waits for. No footprints, no range
+  // instruction, a mask of the VPU instructions 1..31 back it waits for. No footprints, no range
   // compares. 0: today's scoreboard.
   parameter bit WAITC      = 1'b0
 ) (
@@ -397,10 +397,11 @@ module otpu_seq
     end
   end
   // WAITC: the sidecar RAM of wait entries, read beside IMEM: rows of 4 entries of SWW bits
-  // (the counts' 28, the VPU mask's 15; 1024 x 172 bits for a 4096-instruction IMEM: five
-  // RAMB36). The loader writes a row from 4 entries as they are in DRAM (64 bits each: the
-  // counts' word, then the mask's)
-  localparam int SWW = 43;
+  // (the counts' 28, the VPU mask's VMW; 1024 x 236 bits for a 4096-instruction IMEM). The
+  // loader writes a row from 4 entries as they are in DRAM (64 bits each: the counts' word,
+  // then the mask's)
+  localparam int VMW = 31;        // the VPU mask: the VPU instructions 1..VMW back
+  localparam int SWW = 28 + VMW;
   localparam int NSROW = IMEM_WORDS / 32;
   localparam int SRW = $clog2(NSROW);
   logic [SWW-1:0] ir_sync;        // the wait entry of the instruction at pc
@@ -412,7 +413,7 @@ module otpu_seq
 `endif
     always_comb
       for (int e = 0; e < 4; e++)
-        sc_pk[SWW * e +: SWW] = {sc_data[64 * e + 32 +: 15], sc_data[64 * e +: 28]};
+        sc_pk[SWW * e +: SWW] = {sc_data[64 * e + 32 +: VMW], sc_data[64 * e +: 28]};
     otpu_ram_1r1w #(.W(4 * SWW), .N(NSROW), .STYLE("auto"), .ZERO(1'b0)) u_sync (
       .clk, .we(sc_we && !sc_off), .wa(SRW'(sc_row)), .wd(sc_pk), .re(fe),
       .ra(SRW'(fa_n / 4)), .rd(srow));
@@ -420,9 +421,9 @@ module otpu_seq
 `ifndef SYNTHESIS
     // simulation: the wait entries from +hz_sync_s<SID>=FILE or +hz_sync=FILE (lines "pc k0 ..
     // k6 n [mask]": opentpu.waits' with the VPU mask; +hz_kout's, the oracle's, without: the
-    // mask is then the VPU instructions k3 .. 15 back), each count clamped to +hz_kclamp; an
+    // mask is then the VPU instructions k3 .. VMW back), each count clamped to +hz_kclamp; an
     // instruction the file does not name waits for every unit's last instruction and the
-    // VPU's 15. With a file the loader's entries (boot, HALT CHAIN) are dropped
+    // VPU's VMW. With a file the loader's entries (boot, HALT CHAIN) are dropped
     initial begin
       string fn, ln;
       int fd, pc, r, n, kc, mk;
@@ -431,7 +432,7 @@ module otpu_seq
       fn = "";
       void'($value$plusargs("hz_kclamp=%d", kc));
       for (int rr = 0; rr < NSROW; rr++)
-        for (int w = 0; w < 4; w++) u_sync.g_auto.mem[rr][SWW * w +: SWW] = {15'h7fff, 28'h111_1111};
+        for (int w = 0; w < 4; w++) u_sync.g_auto.mem[rr][SWW * w +: SWW] = {{VMW{1'b1}}, 28'h111_1111};
       if (!$value$plusargs($sformatf("hz_sync_s%0d=%%s", SID), fn))
         void'($value$plusargs("hz_sync=%s", fn));
       sc_off = (fn != "");
@@ -447,8 +448,8 @@ module otpu_seq
             wd = '0;
             for (int j = 0; j < 7; j++)
               wd[4 * j +: 4] = 4'((kc > 0 && k[j] > kc) ? kc : (k[j] > 15) ? 15 : k[j]);
-            if (r >= 10) wd[28 +: 15] = 15'(mk);
-            else if (k[3] > 0) wd[28 +: 15] = 15'h7fff << ((k[3] > 15 ? 15 : k[3]) - 1);
+            if (r >= 10) wd[28 +: VMW] = VMW'(mk);
+            else if (k[3] > 0) wd[28 +: VMW] = {VMW{1'b1}} << ((k[3] > 15 ? 15 : k[3]) - 1);
             u_sync.g_auto.mem[pc / 4][SWW * (pc % 4) +: SWW] = wd;
           end
         end
@@ -507,7 +508,7 @@ module otpu_seq
   fp_t         q_fp;             // Q's footprint ranges (otpu_pkg form)
   fps_t        c_fp;
   logic        have_free;
-  logic        wc_hold;          // WAITC: a VPU instruction waits for the one 15 back
+  logic        wc_hold;          // WAITC: a VPU instruction waits for the one VMW back
   wire         c_go = c_v && have_free && !wc_hold;
   wire         q_adv = !c_v || c_go;            // Q hands its instruction to C
   wire         s_adv = !q_v || q_adv;           // S hands its instruction to Q
@@ -567,33 +568,39 @@ module otpu_seq
   // so the test is on the sign of the difference: a slot's target stays within WIN of the
   // count). The unit's own wait is ignored: the unit starts in order. The VPU starts its oldest
   // ready instruction and completes them out of order: a slot's VPU producers are a mask over
-  // the VPU instructions outstanding (vout, by index mod 16), cleared as each completes. A VPU
-  // instruction is dispatched once the one 15 before it has completed (wc_hold), so at most 15
-  // are outstanding and a mask of 15 names every one a later instruction may wait for.
+  // the VPU instructions outstanding (vout, by index mod VMW + 1), cleared as each completes. A
+  // VPU instruction is dispatched once the one VMW before it has completed (wc_hold), so every
+  // older one has (each younger one's dispatch waited for its own), and a mask of VMW names
+  // every one a later instruction may wait for. A VPU instruction's slot is freed when it
+  // completes, so younger ones pass an old one blocked on its producers: the hold binds when
+  // VMW of them have (docs/seq_vpu.md 4.5: VMW 15 cost up to 0.8% of prefill; 31 nothing on
+  // the runs measured)
   localparam int CW = 8;
   localparam int NWT = NUNITS + 2;
   logic [CW-1:0]    wd_n [NUNITS], wc_n [NUNITS];
-  logic [15:0]      vout;                     // VPU instructions outstanding (index mod 16)
-  logic [15:0]      vpend [WIN];              // a slot's VPU producers still outstanding
-  logic [3:0]       vix [WIN];                // a VPU slot's index mod 16
-  logic [15:0]      v_fin;                    // the VPU's completion this cycle (index mod 16)
+  localparam int VN = VMW + 1;                // VPU indices kept (mod VN)
+  localparam int VIW = $clog2(VN);
+  logic [VN-1:0]    vout;                     // VPU instructions outstanding (index mod VN)
+  logic [VN-1:0]    vpend [WIN];              // a slot's VPU producers still outstanding
+  logic [VIW-1:0]   vix [WIN];                // a VPU slot's index mod VN
+  logic [VN-1:0]    v_fin;                    // the VPU's completion this cycle (index mod VN)
   logic [CW-1:0]    wt [WIN][NWT];
   logic [NWT-1:0]   wv [WIN];
   logic [WIN-1:0]   w_all, w_dram;            // the slot's waits (all / the stream's) are met
 `ifndef SYNTHESIS
   // EXPERIMENTAL, simulation only (docs/seq_vpu.md): +wc_vx=1 takes a slot's VPU producers from
   // today's range check (fp_seg, conf_s: vxd) instead of its mask; +wc_vgate=G holds a VOP
-  // until the one G back has completed instead of 15 (G = 0: never; G > 15 or 0 only with
-  // +wc_vx, the mask names 15)
+  // until the one G back has completed instead of VMW (G = 0: never; G > VMW or 0 only with
+  // +wc_vx, the mask names VMW)
   bit             wc_vx = 1'b0;
-  int             wc_vg = 15;
+  int             wc_vg = VMW;
   logic [WIN-1:0] vxd [WIN];
   fps_t           sfpx [WIN];
   logic [CW-1:0]  vxi [WIN];
   initial begin
     wc_vx = $test$plusargs("wc_vx=1");
     void'($value$plusargs("wc_vgate=%d", wc_vg));
-    if ((wc_vg == 0 || wc_vg > 15) && !wc_vx)
+    if ((wc_vg == 0 || wc_vg > VMW) && !wc_vx)
       $fatal(1, "otpu_seq: +wc_vgate=%0d needs +wc_vx=1", wc_vg);
   end
 `endif
@@ -603,9 +610,9 @@ module otpu_seq
   always_comb begin
     v_fin = '0;
     if (udone[U_VPU]) v_fin[vix[uq[U_VPU][uq_h[U_VPU][SW-1:0]]]] = 1'b1;
-    wc_hold = WAITC && c_unit == U_VPU && vout[4'(wd_n[U_VPU] + 1'b1)];
+    wc_hold = WAITC && c_unit == U_VPU && vout[VIW'(wd_n[U_VPU] + 1'b1)];
 `ifndef SYNTHESIS
-    if (wc_vg != 15) begin
+    if (wc_vg != VMW) begin
       wc_hold = 1'b0;
       if (WAITC && c_unit == U_VPU && wc_vg > 0)
         for (int j = 0; j < WIN; j++)
@@ -902,7 +909,7 @@ module otpu_seq
 `endif
 `ifndef SYNTHESIS
       // WAITC: the wait entry covers every dependency conflict() finds on the window (a slot
-      // of the same unit, but the VPU, needs none: it started first); a VPU slot is at most 15
+      // of the same unit, but the VPU, needs none: it started first); a VPU slot is at most VMW
       // back
       if (WAITC && c_go) begin
         for (int i = 0; i < WIN; i++)
@@ -910,7 +917,7 @@ module otpu_seq
             int ui;
             ui = 0;
             for (int u = 0; u < NUNITS; u++) if (soh[i][u]) ui = u;
-            if (ui == U_VPU && wc_vg > 0 && wc_vg <= 15) begin
+            if (ui == U_VPU && wc_vg > 0 && wc_vg <= VMW) begin
               logic [CW-1:0] rk;
               rk = wd_n[U_VPU] - sidx[i];
               if (rk == 0 || rk > CW'(wc_vg))
@@ -918,7 +925,7 @@ module otpu_seq
                        spc[i], rk);
               if (conflict(c_ref, sfp_ref[i]) && !c_sync[28 + int'(rk) - 1])
                 $fatal(1, "otpu_seq: WAITC: pc %0d's VPU mask %h misses slot %0d (pc %0d, %0d back)",
-                       c_pc, c_sync[28 +: 15], i, spc[i], rk);
+                       c_pc, c_sync[28 +: VMW], i, spc[i], rk);
             end
             for (int j = 0; j < NWT; j++)
               if (wunit(j) == ui && ui != int'(c_unit) && ui != U_VPU &&
@@ -966,7 +973,8 @@ module otpu_seq
 `endif
       if (WAITC) begin
         for (int u = 0; u < NUNITS; u++) if (udone[u] && u != U_VPU) wc_n[u] <= wc_n[u] + 1'b1;
-        vout <= (vout & ~v_fin) | ((c_go && c_unit == U_VPU) ? 16'(1) << wd_n[U_VPU][3:0] : '0);
+        vout <= (vout & ~v_fin) |
+                ((c_go && c_unit == U_VPU) ? VN'(1) << wd_n[U_VPU][VIW-1:0] : '0);
         for (int i = 0; i < WIN; i++) vpend[i] <= vpend[i] & ~v_fin;
       end
       // readiness (for the profiler: when did the dependencies clear)
@@ -1003,7 +1011,7 @@ module otpu_seq
         sdepd[free_slot] <= ndepd;
         sfp[free_slot] <= c_fp;
         if (WAITC) begin
-          logic [15:0] m;
+          logic [VN-1:0] m;
           for (int j = 0; j < NWT; j++) begin
             logic [3:0] k;
             k = c_sync[4 * j +: 4];
@@ -1012,10 +1020,10 @@ module otpu_seq
           end
           // the VPU mask: bit r - 1 names the VPU instruction r back (index wd_n - r)
           m = '0;
-          for (int r = 1; r < 16; r++)
-            if (c_sync[28 + r - 1]) m[4'(wd_n[U_VPU] - CW'(r))] = 1'b1;
+          for (int r = 1; r <= VMW; r++)
+            if (c_sync[28 + r - 1]) m[VIW'(wd_n[U_VPU] - CW'(r))] = 1'b1;
           vpend[free_slot] <= m & vout & ~v_fin;
-          vix[free_slot] <= 4'(wd_n[c_unit]);
+          vix[free_slot] <= VIW'(wd_n[c_unit]);
           wd_n[c_unit] <= wd_n[c_unit] + 1'b1;
         end
 `ifndef SYNTHESIS
@@ -1329,7 +1337,7 @@ module otpu_seq
       if (!halted && hz_fd != 0) begin
         st_cyc++;
         if (c_v && !have_free) st_wfull++;
-        if (c_v && have_free && wc_hold) st_vhold++;   // WAITC: a VOP held for the one 15 back
+        if (c_v && have_free && wc_hold) st_vhold++;   // WAITC: a VOP held for the one VMW back
         if (rl_wait) st_rlw++;
         for (int u = 0; u < NUNITS; u++) begin
           logic [WIN-1:0] pend;
@@ -1439,8 +1447,8 @@ module otpu_seq
 
 `ifndef SYNTHESIS
   initial if (WIN > 32) $fatal(1, "otpu_seq: the trace events hold 32 window slots");
-  // WAITC: a count of 4 bits and the VPU mask of 15 name a unit's 15 last instructions; an
-  // in-order unit's 16th last has completed only if the window holds no more than 16
+  // WAITC: a count of 4 bits names a unit's 15 last instructions; an in-order unit's 16th last
+  // has completed only if the window holds no more than 16
   initial if (WAITC && WIN > 16) $fatal(1, "otpu_seq: WAITC needs WIN <= 16 (%0d)", WIN);
   string dir;
   logic [31:0] init_w [IMEM_WORDS];

@@ -789,7 +789,7 @@ class Board:
     def waitc(self) -> bool:
         """The bitstream's sequencer takes wait entries (CFG_UARCH bit24, SEQ_WC, EXPERIMENTAL:
         docs/seq_vpu.md): every program loads with its entries (load_program). Its window must
-        be 16 or less (the entries' counts and mask name a unit's last 15): a target of this
+        be 16 or less (the entries' counts name a unit's last 15): a target of this
         tree with more is refused (ConfigMismatch)."""
         i = self._info or self.info()
         c = i["cfg"]

@@ -154,7 +154,7 @@ def test_bad_target_files(tmp_path):
         p.write_text(good.replace(*edit))
         with pytest.raises(T.TargetError, match=msg):
             T.load(str(p))
-    # otpu_seq's wait entries (SEQ_WC) name a unit's last 15 instructions: a window of 16 at most
+    # otpu_seq's wait entries (SEQ_WC) count a unit's last 15 instructions: a window of 16 at most
     p = tmp_path / "nangate45-small.toml"
     wc = good.replace("SEQ_WC = false", "SEQ_WC = true")
     p.write_text(wc)

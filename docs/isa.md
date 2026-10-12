@@ -505,7 +505,7 @@ units overlapping wherever the waits allow. A wrong wait entry is a wrong progra
 are undefined), like an out-of-range address.
 
 **Semantics.** An entry is two words: the counts' word, seven 4-bit counts `k_j = w0[4j+3:4j]`
-(bits 28..31 are 0), and the VPU mask's word, `vmask = w1[14:0]` (bits 15..31 are 0). The units
+(bits 28..31 are 0), and the VPU mask's word, `vmask = w1[30:0]` (bit 31 is 0). The units
 are U0 DMA (`LD ST DSTEP STREAM WAITW`), U1 MXU (`MM`), U2 quantizer (`QACT QST`), U3 VPU
 (`VOP`), U4 collective (`BAR GATHER RLD`); control instructions (`NOP HALT LI ADDI LOOP`) have
 no entry that matters.
@@ -514,7 +514,7 @@ no entry that matters.
   order has completed, and with it every older instruction of Uj. These units start their
   instructions in program order and complete them in order.
 - `k_5`, `k_6`: the same for an `MM`'s weight stream (its DRAM reads), on U0 and U2.
-- `k_3` is 0: the VPU's waits are the mask. Bit `r - 1` of `vmask` (r = 1..15): the instruction
+- `k_3` is 0: the VPU's waits are the mask. Bit `r - 1` of `vmask` (r = 1..31): the instruction
   does not start (an `MM`: is not released) until the r-th last `VOP` before it has completed.
   The VPU starts the oldest of its instructions whose waits are met, so `VOP`s complete out of
   order: the mask names each `VOP` the instruction depends on (a `VOP`'s own included), not the
@@ -522,10 +522,12 @@ no entry that matters.
 - `k_j = 0`: no wait on that unit; an instruction's own unit needs none, except the VPU's (its
   mask): the DMA, the MXU, the quantizer and the collective unit start their instructions in
   order and finish one's memory accesses before the next one's begin.
-- Nothing past 15 is ever needed. On a unit that starts in order, an instruction 16 or more
-  instructions of its unit back has completed: the sequencer's window holds 16 instructions,
-  and that one and its 15 younger ones of the unit would all hold one. A `VOP` is dispatched
-  only once the `VOP` 15 before it has completed, so the 16th last `VOP` has completed too.
+- Nothing past 15 (a count) or 31 (the mask) is ever needed. On a unit that starts in order, an
+  instruction 16 or more instructions of its unit back has completed: the sequencer's window
+  holds 16 instructions, and that one and its 15 younger ones of the unit would all hold one. A
+  `VOP` is dispatched only once the `VOP` 31 before it has completed, so every older `VOP` has
+  too (a `VOP`'s window slot is freed when it completes, so younger ones can pass a `VOP`
+  blocked on its producers; the hold binds only at 31 apart).
 
 A correct wait entry waits, for every older instruction that may still run and whose footprint
 (the TMEM, DRAM and ACT RAM ranges it may read or write: `otpu_pkg` `footprint()`) conflicts
@@ -556,8 +558,8 @@ refuses such a bitstream).
 **Compiler.** `opentpu/waits.py` `wait_counts(program)` computes them from the program alone:
 an abstract execution with the registers as intervals (the run's arguments bounded by their
 variables where the program says so, every RLD value unknown), each instruction's footprint
-over every value its registers may hold, and per unit the last 15 instructions' footprints,
-joined where paths can meet (a loop's exits, a count the program does not know); a pc's count
+over every value its registers may hold, and per unit the last 15 instructions' footprints
+(the VPU's last 31), joined where paths can meet (a loop's exits, a count the program does not know); a pc's count
 is the smallest over all its visits, its mask the union. It is conservative: an unknown address
 conflicts with every address of its space.
 

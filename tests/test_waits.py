@@ -119,8 +119,8 @@ def test_rank_beyond_the_window_needs_no_count():
     w = W.wait_counts(prog, args=[0] * 8)
     assert k(w, 16)[W.U_DMA] == 0                    # 16th last DMA instruction: done
     # the VPU starts out of order, and the sequencer dispatches a VPU instruction once the one
-    # 15 before it has completed: the 15th last may run, the 16th last has completed
-    for n, want in ((14, 1 << 14), (15, 0)):
+    # 31 (VMAX) before it has completed: the 31st last may run, the 32nd last has completed
+    for n, want in ((W.VMAX - 1, 1 << (W.VMAX - 1)), (W.VMAX, 0)):
         prog = [vop(I.V_ADD, 100, 400, 400)] + [vop(I.V_ADD, 500 + 8 * i, 400, 400)
                                                for i in range(n)] + [I.ld(0, 100, 8), I.halt()]
         w = W.wait_counts(prog, args=[0] * 8)
@@ -202,7 +202,7 @@ def test_waitc_rtl_matches_isa(have_verilator, monkeypatch, S, boot):
 
 def _ooo_program(n_after):
     """A VOP held by a long LD, then n_after independent VOPs (the VPU starts them around it,
-    and from the 15th on each waits for the held one: the sequencer's hold), then a VOP that
+    and from the 31st on each waits for the held one: the sequencer's hold), then a VOP that
     reads the held one's and the 3rd last's results, and an ST of it."""
     prog = [I.ld(0, 0, 4096), vop(I.V_ADD, 5000, 0, 0, rows=8, cols=64)]
     for i in range(n_after):
@@ -212,10 +212,10 @@ def _ooo_program(n_after):
     return prog
 
 
-@pytest.mark.parametrize("n_after", [6, 20])
+@pytest.mark.parametrize("n_after", [6, 20, 40])
 def test_waitc_rtl_vpu_out_of_order(have_verilator, monkeypatch, n_after):
     """WAITC: the VPU starts younger VOPs around a held one (a mask per consumer), and holds
-    the 16th; the RTL's state equals the ISA simulator's."""
+    the 32nd; the RTL's state equals the ISA simulator's."""
     from opentpu import Config, rtlsim
     from opentpu.isasim import Machine
     monkeypatch.setenv("OTPU_WAITS", "1")
@@ -224,11 +224,11 @@ def test_waitc_rtl_vpu_out_of_order(have_verilator, monkeypatch, n_after):
     rng = np.random.default_rng(n_after)
     img = np.zeros(1 << 20, np.uint8)
     img[:4 * 4096] = rng.uniform(-1, 1, 4096).astype(np.float32).view(np.uint8)
-    img[20000 * 4:21500 * 4] = rng.uniform(-1, 1, 1500).astype(np.float32).view(np.uint8)
-    prog.insert(0, I.ld(20000 * 4, 20000, 1500))     # the VOPs' inputs first
+    img[20000 * 4:23000 * 4] = rng.uniform(-1, 1, 3000).astype(np.float32).view(np.uint8)
+    prog.insert(0, I.ld(20000 * 4, 20000, 3000))     # the VOPs' inputs first
     w = W.wait_counts(prog)
-    # the held VOP n_after + 1 back (none past 15: it has completed), the 3rd last
-    assert vm(w, len(prog) - 3) == ((1 << n_after) if n_after < 15 else 0) | 0b100
+    # the held VOP n_after + 1 back (none past VMAX: it has completed), the 3rd last
+    assert vm(w, len(prog) - 3) == ((1 << n_after) if n_after < W.VMAX else 0) | 0b100
     m = Machine(cfg, [prog], [img.copy()]).run()
     drams, tmems, _ = rtlsim.run(cfg, [prog], [img.copy()], uarch={"SEQ_WC": 1, "WIN": 16})
     assert np.array_equal(tmems[0], m.slices[0].tmem)

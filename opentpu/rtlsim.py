@@ -308,7 +308,7 @@ def _run(cfg, programs: list, images: list, dram_lat: int = 8, max_cycles: int =
     sync_arg: list = []
     ua = {**UARCH, **(uarch or {})}
     if ua.get("SEQ_WC") and ua.get("WIN", 16) > 16:
-        raise ValueError("SEQ_WC (otpu_seq WAITC) needs WIN <= 16: 4-bit counts, a 15-bit VPU mask")
+        raise ValueError("SEQ_WC (otpu_seq WAITC) needs WIN <= 16: 4-bit counts name a unit's last 15")
     wmode = os.environ.get("OTPU_WAITS")
     if wmode is None and "hz_sync" not in os.environ.get("OTPU_SIM_PLUSARGS", ""):
         wmode = "1"

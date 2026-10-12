@@ -163,7 +163,7 @@ def load(name: str | None = None) -> Target:
         raise TargetError(f"{path}: bad arch (S >= 1, D a multiple of 32, LANES a power of two)")
     if raw["arch"]["SEQ_WC"] and raw["uarch"]["WIN"] > 16:
         raise TargetError(f"{path}: SEQ_WC (otpu_seq's wait entries) needs WIN <= 16: 4-bit "
-                          f"counts and a 15-bit VPU mask name a unit's last 15 instructions")
+                          f"counts name a unit's last 15 instructions")
     if a["DRAM_BYTES"] > 1 << 32:
         raise TargetError(f"{path}: DRAM_BYTES over 4 GiB: DRAM addresses are 32 bits per slice "
                           f"(more slices, or the reserved window register: docs/targets.md)")

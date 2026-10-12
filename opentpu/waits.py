@@ -3,7 +3,7 @@ docs/isa.md "Wait counts", docs/seq_vpu.md).
 
 With WAITC the sequencer computes no footprints and compares no ranges. Each instruction carries a
 64-bit wait entry beside it: a word of seven 4-bit counts, k_j in bits [4j+3:4j], and a word with
-the VPU mask in bits [14:0].
+the VPU mask in bits [30:0].
   count k_j = k > 0 holds the instruction until the k-th last instruction of unit U(j) before it
   (in program order) has completed, and with it every older one of that unit (DMA, MXU, QUANT and
   COLL start and complete in order); k = 0 waits for nothing on U(j).
@@ -13,22 +13,24 @@ the VPU mask in bits [14:0].
                     over DRAM conflicts only;
     j = 3:          unused (0): the VPU's is the mask.
   VPU mask bit r - 1 holds the instruction until the r-th last VPU instruction before it has
-  completed (r = 1..15). The VPU starts its oldest ready instruction, so they complete out of
+  completed (r = 1..31). The VPU starts its oldest ready instruction, so they complete out of
   order: the mask names each producer, not the nearest and all older.
 An in-order unit's own count is not needed (it starts in order and finishes an instruction before
 the next touches memory); the VPU's own producers are in its mask. A producer 16 or more of its
 unit back has completed: for an in-order unit an incomplete one holds a window slot, and so does
 each younger one of its unit (the window has 16 slots); the sequencer dispatches a VPU
-instruction only once the one 15 before it has completed. So 4-bit counts and a 15-bit mask are
-exact.
+instruction only once the one 31 before it has completed (a VPU instruction's slot is freed when
+it completes, so younger ones pass an old one blocked on its producers; docs/seq_vpu.md 4.5: a
+hold at 15 cost up to 0.8% of prefill). So 4-bit counts and a 31-bit mask are exact.
 
 wait_counts() computes the entries from the program alone, conservatively: an abstract execution
 of the program (registers as intervals, the run's arguments R8..R15 and every RLD unknown unless
 given or bounded), each instruction's footprint the otpu_pkg footprint() of every value its
-registers may hold, and per unit the last 15 instructions' footprints, joined where paths meet (a
-loop's exits, a count the program does not know). A pc's count is the smallest over all its
-visits, its mask the union. Loops the budget cannot run (or whose count is unknown beyond CAP
-iterations) run on widened registers to a fixed point, which covers every later iteration.
+registers may hold, and per unit the last 15 instructions' footprints (the VPU's last 31), joined
+where paths meet (a loop's exits, a count the program does not know). A pc's count is the smallest
+over all its visits, its mask the union. Loops the budget cannot run (or whose count is unknown
+beyond CAP iterations) run on widened registers to a fixed point, which covers every later
+iteration.
 
 Checker checks entries against a concrete execution (the ISA simulator's): every conflict otpu_pkg
 conflict() finds with an older instruction that may still be running is waited for.
@@ -59,12 +61,14 @@ U_DMA, U_MXU, U_Q, U_VPU, U_COLL = 0, 1, 2, 3, 4
 NUNITS, NW = 5, 7
 WIN = 16
 KMAX = WIN - 1                    # ranks a count names; older producers have completed
-VMASK = 0x7FFF                    # the VPU mask: the last 15 VPU instructions
-DEFAULT = 0x0111_0111 | (VMASK << 32)  # a pc never reached: every unit's last, the VPU's 15
+VMAX = 31                         # VPU instructions the mask names (the sequencer's hold)
+VMASK = (1 << VMAX) - 1           # the VPU mask: the last 31 VPU instructions
+DEFAULT = 0x0111_0111 | (VMASK << 32)  # a pc never reached: every unit's last, the VPU's 31
 UNIT = {I.LD: U_DMA, I.ST: U_DMA, I.DSTEP: U_DMA, I.STREAM: U_DMA, I.WAITW: U_DMA,
         I.MM: U_MXU, I.QACT: U_Q, I.QST: U_Q, I.VOP: U_VPU,
         I.BAR: U_COLL, I.GATHER: U_COLL, I.RLD: U_COLL}
 WUNIT = (U_DMA, U_MXU, U_Q, U_VPU, U_COLL, U_DMA, U_Q)
+DEPTH = tuple(VMAX if u == U_VPU else KMAX for u in range(NUNITS))   # history per unit
 CAP = 4                           # iterations of an unknown count run before widening
 BUDGET = 4_000_000                # instruction visits before known counts widen too
 MAXR = 12                         # ranges a joined footprint keeps per (space, read / write)
@@ -300,8 +304,8 @@ def _fjoin(a: Fp, b: Fp) -> Fp:
 
 # ------------------------------------------------------------------------- abstract state
 class _State:
-    """Registers (intervals) and, per unit, its last KMAX instructions' footprints (newest
-    first)."""
+    """Registers (intervals) and, per unit, its last DEPTH[u] instructions' footprints
+    (newest first: KMAX, the VPU's VMAX)."""
     __slots__ = ("R", "H")
 
     def __init__(self, R, H):
@@ -396,7 +400,7 @@ class _Pass:
                 m |= 1 << i
         self.vmask[pc] = m
         H = list(st.H)
-        H[u] = (fp,) + H[u][:KMAX - 1]
+        H[u] = (fp,) + H[u][:DEPTH[u] - 1]
         R = st.R
         if op == I.RLD and ins.rd:
             R = list(R)
@@ -643,8 +647,8 @@ def entries_many(items, D: int, S: int, pool=None) -> list:
 class Checker:
     """Checks wait entries on a concrete execution: feed it each unit instruction as it issues
     in program order (pc, the registers then). A conflict with an older instruction of another
-    unit (or a VPU instruction's with an older one) within KMAX of its unit that the entry does
-    not wait for raises."""
+    unit (or a VPU instruction's with an older one) within KMAX of its unit (VMAX of the VPU)
+    that the entry does not wait for raises."""
 
     def __init__(self, prog, words, D: int = 128, S: int = 1):
         self.prog, self.words, self.D, self.S = prog, words, D, S
@@ -678,7 +682,7 @@ class Checker:
                             f"instruction (pc {epc})")
                     break
         self.H[u].insert(0, (fp, pc))
-        del self.H[u][KMAX:]
+        del self.H[u][DEPTH[u]:]
         self.n += 1
 
 
