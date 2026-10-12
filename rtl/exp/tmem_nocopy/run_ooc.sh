@@ -24,7 +24,10 @@
 #   k7-r8xgR, k7-r4xgR, k7-r2xgR   those placed and routed
 #   k7-r4pgR, k7-r2pgR, k7-r1pgR   one copy pumped at 2x (VAR 7, otpu_tmem PMP 1) with replays
 #              and guests, 4 / 2 / 1 RAMs a bank; s-r4pgR, s-r2pgR, s-r1pgR synthesis only;
-#              k7-r1pgR-128k, k7-r1pgR-256k
+#              k7-r1pgR-128k, k7-r2pgR-128k, k7-r1pgR-256k; k7-p3-128k P3 at 128K words
+#   ku-p3, ku-r1pgR, ku-r2pgR   P3 and the pumped one copy on xcku5p-2 at 200 / 400 MHz
+#   k7-r1pgRs, k7-r2pgRs (and -128k)   the pumped one copy with the screen's RAM sides (QUANT and
+#              VPU A on port A: TMEM_SDM 12)
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 O=${1:?outdir}; shift
 mkdir -p "$O"
@@ -69,6 +72,14 @@ for s in "$@"; do
     k7-r1pgR) viv $s 7 65536 1 3 $K7 7.5 0 1 0 - 0 1 ;;
     k7-r1pgR-128k) viv $s 7 131072 1 3 $K7 7.5 0 1 0 - 0 1 ;;
     k7-r1pgR-256k) viv $s 7 262144 1 3 $K7 7.5 0 1 0 - 0 1 ;;
+    k7-r2pgR-128k) viv $s 7 131072 2 3 $K7 7.5 0 1 0 - 0 1 ;;
+    k7-r1pgRs) viv $s 7 65536 1 3 $K7 7.5 0 1 0 - 0 1 12 ;;
+    k7-r2pgRs) viv $s 7 65536 2 3 $K7 7.5 0 1 0 - 0 1 12 ;;
+    k7-r2pgRs-128k) viv $s 7 131072 2 3 $K7 7.5 0 1 0 - 0 1 12 ;;
+    k7-p3-128k) viv $s 6 131072 8 3 $K7 7.5 0 1 0 ;;
+    ku-p3)    viv $s 6 65536 8 3 $KU 5.0 0 1 1 ;;
+    ku-r1pgR) viv $s 7 65536 1 3 $KU 5.0 0 1 1 - 0 1 ;;
+    ku-r2pgR) viv $s 7 65536 2 3 $KU 5.0 0 1 1 - 0 1 ;;
     k7-r4xgR) viv $s 5 65536 4 3 $K7 7.5 0 0 0 - 0 1 ;;
     k7-r2xgR) viv $s 5 65536 2 3 $K7 7.5 0 0 0 - 0 1 ;;
     k7-v0m)   viv $s 0 65536 8 3 $K7 7.5 0 1 0 ;;

@@ -194,9 +194,11 @@ if os.environ.get("OTPU_TMEM_IMPL"):
 # OTPU_TMEM_TDP=1 the RAMs are true dual-port, a unit's ports on different RAM ports; with
 # OTPU_TMEM_GST=1 QUANT 3 and COLL are the DMA's guests (one data select for the three); with
 # OTPU_TMEM_PMP=2 (TDP) the RAMs are pumped at 2x (their model: a write takes no read port)
-for _k in ("NSB", "SBP", "SBH", "RPL", "TDP", "GST", "PMP"):
+# OTPU_TMEM_PRK / OTPU_TMEM_SDM (int, 0x... allowed): the read ports' ranks and RAM sides
+# (otpu_slice TMEM_PRK / TMEM_SDM)
+for _k in ("NSB", "SBP", "SBH", "RPL", "TDP", "GST", "PMP", "PRK", "SDM"):
     if os.environ.get("OTPU_TMEM_" + _k):
-        UARCH["TMEM_" + _k] = int(os.environ["OTPU_TMEM_" + _k])
+        UARCH["TMEM_" + _k] = int(os.environ["OTPU_TMEM_" + _k], 0)
 # TMEM lanes of the MXU and the quantizer when fewer than LANES (timing only): OTPU_ULANES=8
 if os.environ.get("OTPU_ULANES"):
     UARCH["ULANES"] = int(os.environ["OTPU_ULANES"])

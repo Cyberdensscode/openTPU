@@ -35,6 +35,8 @@ module tb_top;
   parameter bit TMEM_TDP   = 1'b0;    // TMEM_IMPL 3: true dual-port RAMs
   parameter bit TMEM_GST   = 1'b0;    // TMEM_IMPL 3: QUANT 3 and COLL the DMA's guests
   parameter int TMEM_PMP   = 0;       // TMEM_TDP: 2 the pumped RAMs' model
+  parameter int TMEM_PRK   = 0;       // TMEM_IMPL 3: the read ports' ranks (otpu_slice)
+  parameter int TMEM_SDM   = -1;      // TMEM_TDP: the read ports' RAM sides (otpu_slice)
 
   logic clk = 1'b0, sys_rst = 1'b1, rst = 1'b1, dump = 1'b0;
   logic ld_start = 1'b0, ld_busy;
@@ -50,7 +52,7 @@ module tb_top;
              .TMEM_IMPL(TMEM_IMPL), .TMEM_RQ(TMEM_RQ), .TMEM_NCP(TMEM_NCP),
              .TMEM_NSB(TMEM_NSB), .TMEM_SBP(TMEM_SBP), .TMEM_SBH(TMEM_SBH),
              .TMEM_RPL(TMEM_RPL), .TMEM_TDP(TMEM_TDP), .TMEM_GST(TMEM_GST),
-             .TMEM_PMP(TMEM_PMP)) dut (
+             .TMEM_PMP(TMEM_PMP), .TMEM_PRK(TMEM_PRK), .TMEM_SDM(TMEM_SDM)) dut (
     .clk, .sys_rst, .rst, .rinit, .ld_start, .ld_addr, .ld_n, .ld_busy, .all_halted, .any_error, .icount,
     .dump);
 

@@ -27,6 +27,8 @@ module tmem_nc_top #(
   parameter int SBP = 3,
   parameter int SBH = 0,
   parameter bit GST = 1'b0,          // VAR 4 / 5: QUANT 3 and COLL the DMA's guests (TMEM_GST)
+  parameter int SDM = -1,            // VAR 5 / 7: the read ports' RAM sides (otpu_slice TMEM_SDM)
+  parameter int PRK = 0,             // VAR 4 / 5 / 7: the read ports' ranks (otpu_slice TMEM_PRK)
   parameter bit MMCM = 1'b0,
   parameter int FAMILY = 0,
   parameter real CLKIN_NS = 7.5
@@ -49,9 +51,13 @@ module tmem_nc_top #(
   localparam logic [NRP-1:0] GEN_R = NRP'(1) << P_MXU;
   localparam logic [NWP-1:0] GEN_W = NWP'(1) << W_MXU;
   localparam logic [NRP-1:0] SH_MASK = (NRP'(1) << P_Q3) | (NRP'(1) << P_COLL);
-  localparam logic [NRP-1:0] TM_SIDE = (NRP'(1) << P_VB) | (NRP'(1) << P_Q3) | (NRP'(1) << P_Q2) |
-                                       (NRP'(1) << P_COLL);
-  localparam logic [NRP-1:0][2:0] PRANK3 = {3'd1, 3'd6, 3'd7, 3'd3, 3'd2, 3'd5, 3'd0, 3'd4};
+  // the read ports' RAM sides as otpu_slice's TM_SIDED (pumped, VAR 7: QUANT and VPU A on port A)
+  localparam logic [NRP-1:0] TM_SIDED = (VAR == 7) ? ((NRP'(1) << P_Q) | (NRP'(1) << P_VA)) :
+                                        ((NRP'(1) << P_VB) | (NRP'(1) << P_Q3) | (NRP'(1) << P_Q2) |
+                                         (NRP'(1) << P_COLL));
+  localparam logic [NRP-1:0] TM_SIDE = (SDM >= 0) ? NRP'(SDM) : TM_SIDED;
+  localparam logic [NRP-1:0][2:0] PRANK3D = {3'd1, 3'd6, 3'd7, 3'd3, 3'd2, 3'd5, 3'd0, 3'd4};
+  localparam logic [NRP-1:0][2:0] PRANK3 = (PRK != 0) ? (3 * NRP)'(PRK) : PRANK3D;
   localparam logic [NRP-1:0][2:0] RGRP = {3'(G_COLL), 3'(G_Q), 3'(G_Q), 3'(G_VPU), 3'(G_VPU),
                                           3'(G_Q), 3'(G_DMA), 3'(G_MXU)};
   function automatic logic [NRP-1:0] grp_rports(input int g);

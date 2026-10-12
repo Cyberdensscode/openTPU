@@ -64,9 +64,13 @@ module otpu_slice
                                       //   unit's ports on different RAM ports (TM_SIDE)
   parameter bit TMEM_GST   = 1'b0,    // TMEM_IMPL 3: QUANT 3 and COLL the DMA's guests, as
                                       //   TMEM_IMPL 0's (otpu_tmem GST: one data select)
-  parameter int TMEM_PMP   = 0        // TMEM_TDP: 2 the pumped RAMs' model at the core clock (a
+  parameter int TMEM_PMP   = 0,       // TMEM_TDP: 2 the pumped RAMs' model at the core clock (a
                                       //   write takes no read port; otpu_tmem PMP; 1, the RAMs
                                       //   at 2x, needs a 2x clock the slice does not have)
+  parameter int TMEM_PRK   = 0,       // TMEM_IMPL 3: the read ports' ranks (3 bits a port, port p
+                                      //   at bit 3p; 0: PRANK3, below)
+  parameter int TMEM_SDM   = -1       // TMEM_TDP: the read ports' RAM sides (bit p: port p on
+                                      //   port A; -1: TM_SIDED, below)
 ) (
   input  logic          clk,
   input  logic          sys_rst,
@@ -179,15 +183,20 @@ module otpu_slice
   localparam int G_DMA = 0, G_COLL = 1, G_VPU = 2, G_MXU = 3, G_Q = 4, NG = 5;
   // TMEM_IMPL 3: every read port its own rank (the groups' order, DMA COLL VPU MXU QUANT; within
   // a group in port order) and its group
-  localparam logic [NRP-1:0][2:0] PRANK3 = {3'd1, 3'd6, 3'd7, 3'd3, 3'd2, 3'd5, 3'd0, 3'd4};
+  localparam logic [NRP-1:0][2:0] PRANK3D = {3'd1, 3'd6, 3'd7, 3'd3, 3'd2, 3'd5, 3'd0, 3'd4};
   //                                        COLL  Q2    Q3    VB    VA    Q     DMA   MXU
+  localparam logic [NRP-1:0][2:0] PRANK3 = (TMEM_PRK != 0) ? (3 * NRP)'(TMEM_PRK) : PRANK3D;
   localparam logic [NRP-1:0][2:0] RGRP = {3'(G_COLL), 3'(G_Q), 3'(G_Q), 3'(G_VPU), 3'(G_VPU),
                                           3'(G_Q), 3'(G_DMA), 3'(G_MXU)};
-  // TMEM_TDP: the RAM port each read port asks on (1: port A, which the writes take first): the
-  // MXU, the DMA, QUANT and VPU A on port B; VPU B, QUANT 3, QUANT 2 and COLL on port A (the
-  // VPU's and the quantizer's operands never share a RAM port)
-  localparam logic [NRP-1:0] TM_SIDE = (NRP'(1) << P_VB) | (NRP'(1) << P_Q3) | (NRP'(1) << P_Q2) |
-                                       (NRP'(1) << P_COLL);
+  // TMEM_TDP: the RAM port each read port asks on (1: port A). The VPU's and the quantizer's
+  // operands never share a RAM port. Pumped (TMEM_PMP), where the write takes neither: QUANT and
+  // VPU A on port A, the MXU, the DMA (with its guests), VPU B and QUANT 2 on port B (the fewest
+  // replays of every split, docs/tmem_nocopy.md 6.4). Not pumped, where the writes take port A
+  // first: VPU B, QUANT 3, QUANT 2 and COLL on port A, the busy readers on port B
+  localparam logic [NRP-1:0] TM_SIDED = (TMEM_PMP != 0) ? ((NRP'(1) << P_Q) | (NRP'(1) << P_VA)) :
+                                        ((NRP'(1) << P_VB) | (NRP'(1) << P_Q3) | (NRP'(1) << P_Q2) |
+                                         (NRP'(1) << P_COLL));
+  localparam logic [NRP-1:0] TM_SIDE = (TMEM_SDM >= 0) ? NRP'(TMEM_SDM) : TM_SIDED;
   initial if (TMEM_PMP == 1) $fatal(1, "otpu_slice: TMEM_PMP 1 needs a 2x clock (2: its model)");
   initial if (TMEM_IMPL == 3 && (WPB != 1 || ARB_MASK != TMEM_RPL))
     $fatal(1, "otpu_slice: TMEM_IMPL 3 needs WPB = 1 (WPB %0d), and RPB >= %0d with TMEM_RPL",
@@ -874,11 +883,13 @@ module otpu_slice
   // TMEM read demand (docs/tmem_pump.md; simulation only, a TMEMSTAT line at the end): each cycle
   // out of reset and before the halt, how many read streams ask (MXU; the DMA's copy: DMA,
   // QUANT 3, COLL; QUANT; VPU A; VPU B; QUANT 2: 0..6), the most read ports asking for one bank
-  // (0..8), the same with a write asking for that bank (0..9), and the cycles the MXU, QUANT, the
-  // VPU and the collective lost to the arbitration
-  longint ts_cyc, ts_lose [4], ts_n [7], ts_d [NRP + 1], ts_dw [NRP + 2];
+  // (0..8), the same with a write asking for that bank (0..9), the cycles the MXU, QUANT, the
+  // VPU and the collective lost to the arbitration, and each read port's reads (rd: cycles it
+  // reads) and lost reads (rpl: TMEM_RPL's replays, tm_lost)
+  longint ts_cyc, ts_lose [4], ts_n [7], ts_d [NRP + 1], ts_dw [NRP + 2], ts_rd [NRP], ts_rpl [NRP];
   initial begin
     ts_cyc = 0;
+    for (int i = 0; i < NRP; i++) begin ts_rd[i] = 0; ts_rpl[i] = 0; end
     for (int i = 0; i < 4; i++) ts_lose[i] = 0;
     for (int i = 0; i < 7; i++) ts_n[i] = 0;
     for (int i = 0; i <= NRP; i++) ts_d[i] = 0;
@@ -907,6 +918,10 @@ module otpu_slice
         if (c + int'(wb[b]) > dwm) dwm = c + int'(wb[b]);
       end
       ts_cyc++; ts_n[n]++; ts_d[dm]++; ts_dw[dwm]++;
+      for (int p = 0; p < NRP; p++) begin
+        if (|r_en[p]) ts_rd[p]++;
+        if (tm_lost[p]) ts_rpl[p]++;
+      end
       if (lose_mxu) ts_lose[0]++;
       if (lose_q)   ts_lose[1]++;
       if (lose_vpu) ts_lose[2]++;
@@ -921,6 +936,10 @@ module otpu_slice
     for (int i = 0; i <= NRP; i++) s = {s, $sformatf("%s%0d", (i > 0) ? "," : "", ts_d[i])};
     s = {s, " dw="};
     for (int i = 0; i <= NRP + 1; i++) s = {s, $sformatf("%s%0d", (i > 0) ? "," : "", ts_dw[i])};
+    s = {s, " rd="};
+    for (int i = 0; i < NRP; i++) s = {s, $sformatf("%s%0d", (i > 0) ? "," : "", ts_rd[i])};
+    s = {s, " rpl="};
+    for (int i = 0; i < NRP; i++) s = {s, $sformatf("%s%0d", (i > 0) ? "," : "", ts_rpl[i])};
     $display("%s", s);
   end
 
