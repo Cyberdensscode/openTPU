@@ -73,9 +73,12 @@ module otpu_tmem #(
   parameter int   TOPP  = 0,              // RPL: the port whose request comes before the replays
   parameter bit   TDP   = 1'b0,           // IMPL 3: true dual-port RAMs (see IMPL 3 below)
   parameter logic [NRP-1:0] SIDE = '0,    // TDP: each read port's RAM port (1: A, the writes')
-  parameter bit   GST   = 1'b0            // IMPL 3: SH_MASK's ports are SH_HOST's guests (see IMPL 3)
+  parameter bit   GST   = 1'b0,           // IMPL 3: SH_MASK's ports are SH_HOST's guests (see IMPL 3)
+  parameter int   PMP   = 0               // TDP: 1 the RAMs pumped at 2x on clk_f (otpu_pump_bank), 2
+                                          //   its model at the core clock (see IMPL 3)
 ) (
   input  logic                                clk,
+  input  logic                                clk_f,    // PMP 1: 2 x clk, aligned (else unused)
   input  logic [NRP-1:0][LANES-1:0]           r_en,     // granted reads
   input  logic [NRP-1:0][LANES-1:0]           r_req,    // requested reads (r_en before the grant)
   input  logic [NRP-1:0][LANES-1:0][31:0]     r_addr,
@@ -99,8 +102,9 @@ module otpu_tmem #(
   initial if (TDP && IMPL != 3) $fatal(1, "otpu_tmem: TDP needs IMPL 3");
   initial if (GST && (IMPL != 3 || (RPL && SH_HOST != TOPP)))
     $fatal(1, "otpu_tmem: GST needs IMPL 3, and SH_HOST = TOPP with RPL (no replay of a guest's read)");
-  initial if (IMPL == 3 && (NSB < 2 || (1 << $clog2(NSB)) != NSB || SBP < BW || SBP + $clog2(NSB) > BW + IW))
-    $fatal(1, "otpu_tmem: IMPL 3 sub-banks NSB %0d (a power of 2, >= 2) at bit SBP %0d", NSB, SBP);
+  initial if (IMPL == 3 && (NSB < 1 || (1 << $clog2(NSB)) != NSB || SBP < BW || SBP + $clog2(NSB) > BW + IW))
+    $fatal(1, "otpu_tmem: IMPL 3 sub-banks NSB %0d (a power of 2) at bit SBP %0d", NSB, SBP);
+  initial if (PMP != 0 && !TDP) $fatal(1, "otpu_tmem: PMP needs TDP (its read ports' sides)");
   initial if (IMPL == 1) for (int p = 0; p < NRP; p++)
     if (CPY[p] >= NCP) $fatal(1, "otpu_tmem: port %0d's copy %0d >= NCP %0d", p, CPY[p], NCP);
   // the read port that holds each port's copy: IMPL 0, the port itself or SH_HOST (a guest);
@@ -312,6 +316,14 @@ module otpu_tmem #(
   // port A of a RAM being written loses unless it reads the written word (a read takes the
   // bypass, a replay port A's read-first word). On the 7-series a true dual-port RAMB36 is at most
   // 36 bits wide: a RAM of 1K words is one RAMB36, as in the simple dual-port.
+  // PMP (with TDP): the RAMs pumped at twice the core clock (1: otpu_pump_bank on clk_f, as P3's
+  // copies, docs/tmem_pump.md): both RAM ports read at the core edge and the write lands at the fast
+  // edge between, so a write takes no read port (no port-A conflicts) and a read at the core edge
+  // sees the landing write in the RAM (no bypass). A replay then must not meet a write of its word
+  // landing in its winning cycle either (the ordering of docs/tmem_nocopy.md 5.1 keeps it out). 2:
+  // the same at the core clock for simulation (a write port of its own, the bypass kept): the
+  // same words and cycles as 1, without the second clock.
+  // NSB 1: one RAM a bank (no sub-banks, no data select).
   // GST: IMPL 0's guests (SH_MASK, the slice's QUANT 3 and COLL): a guest reads only while SH_HOST
   // and the guests before it ask nothing (the slice's q3_blk / coll_blk), so it has no asker of its
   // own: SH_HOST's asker asks for the first guest that reads, and the guests take its data (one
@@ -337,15 +349,17 @@ module otpu_tmem #(
   // RAM's address is its side's first port's (no priority multiplexer)
   if (IMPL == 3) begin : g_one
     localparam int LSB = $clog2(NSB);
+    localparam int LW  = (LSB > 0) ? LSB : 1;  // a sub-bank number's width (NSB 1: always 0)
     localparam int SO  = SBP - BW;             // the sub-bank field's offset in a bank row
+    localparam bit BYP = PMP != 1;             // the bypass (a pumped RAM has the landing write)
     localparam int RW  = IW - LSB;             // a RAM's address bits
     localparam int RD  = BD / NSB;             // a RAM's words
     localparam int NS  = TDP ? 2 : 1;          // a RAM's read ports
-    function automatic logic [LSB-1:0] hash(input logic [IW-1:0] hi);
-      logic [LSB-1:0] x;
+    function automatic logic [LW-1:0] hash(input logic [IW-1:0] hi);
+      logic [LW-1:0] x;
       x = '0;
-      if (SBH == 1) x = LSB'(hi);
-      if (SBH == 2) for (int f = 0; f < IW; f += LSB) x = x ^ LSB'(hi >> f);
+      if (LSB > 0 && SBH == 1) x = LW'(hi);
+      if (LSB > 0 && SBH == 2) for (int f = 0; f < IW; f += LW) x = x ^ LW'(hi >> f);
       return x;
     endfunction
     function automatic logic [RW-1:0] ram_row(input logic [IW-1:0] row);
@@ -354,8 +368,9 @@ module otpu_tmem #(
       lo = row & ((IW'(1) << SO) - IW'(1));
       return RW'((hi << SO) | lo);
     endfunction
-    function automatic logic [LSB-1:0] sub_of(input logic [IW-1:0] row);
-      return row[SO +: LSB] ^ hash(row >> (SO + LSB));
+    function automatic logic [LW-1:0] sub_of(input logic [IW-1:0] row);
+      if (LSB == 0) return '0;
+      return LW'(row >> SO) ^ hash(row >> (SO + LSB));
     endfunction
 `ifndef SYNTHESIS
     // the bank row held in RAM k's row r (the dump)
@@ -363,7 +378,7 @@ module otpu_tmem #(
       logic [IW-1:0] hi, lo, f;
       hi = IW'(r >> SO);
       lo = IW'(r & ((1 << SO) - 1));
-      f = IW'(LSB'(k) ^ hash(hi));
+      f = (LSB == 0) ? '0 : IW'(LW'(k) ^ hash(hi));
       return int'((hi << (SO + LSB)) | (f << SO) | lo);
     endfunction
 `endif
@@ -393,7 +408,7 @@ module otpu_tmem #(
     // each asker's banks, bank rows, sub-banks and RAM rows
     logic [NRP-1:0][LANES-1:0]          ae;
     logic [NRP-1:0][LANES-1:0][IW-1:0]  aa;
-    logic [NRP-1:0][LANES-1:0][LSB-1:0] asb;
+    logic [NRP-1:0][LANES-1:0][LW-1:0]  asb;
     logic [NRP-1:0][LANES-1:0][RW-1:0]  arw;
     for (genvar i = 0; i < NRP; i++) begin : g_as
 `ifdef OTPU_TMEM_ABL_RPL
@@ -428,7 +443,7 @@ module otpu_tmem #(
     logic [NRP-1:0][LANES-1:0] wk;
     for (genvar i = 0; i < NRP; i++) begin : g_wk
       for (genvar b = 0; b < LANES; b++) begin : g_b
-        if (sd_of(i) == 1) begin : g_a
+        if (sd_of(i) == 1 && PMP == 0) begin : g_a
           assign wk[i][b] = pw_v[b][0] && sub_of(pw_a[b][0]) == asb[i][b];
         end else begin : g_b0
           assign wk[i][b] = 1'b0;
@@ -443,7 +458,7 @@ module otpu_tmem #(
       for (genvar k = 0; k < NSB; k++) begin : g_k
         logic [NRP-1:0] rq, win;
         for (genvar i = 0; i < NRP; i++) begin : g_i
-          assign rq[i] = ae[i][b] && asb[i][b] == LSB'(k);
+          assign rq[i] = ae[i][b] && asb[i][b] == LW'(k);
           assign win[i] = rq[i] && !(|(rq & bf[i]));
         end
         always_comb
@@ -525,7 +540,7 @@ module otpu_tmem #(
     // RAM reads first); one landing while it loses again is not.
     always @(posedge clk)
       for (int p = 0; p < NRP; p++)
-        if (RPL && rpv[p] && lost[p])
+        if (RPL && rpv[p] && (lost[p] || PMP == 1))
           for (int b = 0; b < LANES; b++)
             if (rpe[p][b] && pw_v[b][0] && pw_a[b][0] == rpa[p][b])
               $fatal(1, "TMEM%0d: port %0d's word %0d awaiting a replay was written at %0t", SID, p,
@@ -543,11 +558,37 @@ module otpu_tmem #(
 `else
         assign wd = pw_d[b][0] ^ fault(0, b, pw_a[b][0]);
 `endif
-        wire wh = pw_v[b][0] && sub_of(pw_a[b][0]) == LSB'(k);
+        wire wh = pw_v[b][0] && sub_of(pw_a[b][0]) == LW'(k);
         // (inferred here: 64 otpu_ram_1r1w cells of this size in the slice crash Verilator 5.046's
         // front end, an internal fault; the cell is this RAM)
+        if (PMP == 1) begin : g_pmp
+          // pumped at 2x: port A reads side 1, port B side 0 at the core edge, the write lands at
+          // the fast edge between (P3's bank)
+          otpu_pump_bank #(.N(RD), .STYLE("block"), .FW(1'b1)) u_pb (
+            .clk, .clk_f, .wv(wh), .wa(ram_row(pw_a[b][0])), .wd,
+            .rena(s_en[b][k][1]), .ra(s_a[b][k][1]), .renb(s_en[b][k][0]), .rb(s_a[b][k][0]),
+            .qa(s_q[b][k][1]), .qb(s_q[b][k][0]));
+`ifndef SYNTHESIS
+          // the dump: a shadow of the RAM's words (the same writes), not a reference into u_pb
+          logic [31:0] shd [RD];
+          initial for (int r = 0; r < RD; r++) shd[r] = '0;
+          always @(posedge clk) begin
+            if (dump)
+              for (int r = 0; r < RD; r++) img[row_of(k, r) * LANES + b] = shd[r];
+            if (wh) shd[ram_row(pw_a[b][0])] <= wd;
+          end
+`endif
+        end else begin : g_ram
         (* ram_style = "block" *) logic [31:0] mem [RD];
-        if (TDP) begin : g_tdp
+        if (PMP == 2) begin : g_pm2
+          // the model of PMP 1 at the core clock: the write on a port of its own, both read ports
+          always_ff @(posedge clk) begin
+            if (wh) mem[ram_row(pw_a[b][0])] <= wd;
+            if (s_en[b][k][1]) s_q[b][k][1] <= mem[s_a[b][k][1]];
+          end
+          always_ff @(posedge clk)
+            if (s_en[b][k][0]) s_q[b][k][0] <= mem[s_a[b][k][0]];
+        end else if (TDP) begin : g_tdp
           // port A: the write, else its side's read; read-first (a replay of the written word
           // takes the word before the write)
           wire [RW-1:0] ra = wh ? ram_row(pw_a[b][0]) : s_a[b][k][1];
@@ -570,6 +611,7 @@ module otpu_tmem #(
           if (dump)
             for (int r = 0; r < RD; r++) img[row_of(k, r) * LANES + b] = mem[r];
 `endif
+        end
       end
     end
     // each port's data: per bank, the RAM it asked on its side (registered with the read), or the
@@ -579,7 +621,7 @@ module otpu_tmem #(
       assign pq[p] = pq[SH_HOST];
      end else begin : g_ho
       localparam int SD = sd_of(p);
-      logic [LANES-1:0][LSB-1:0] ss;
+      logic [LANES-1:0][LW-1:0]  ss;
       logic [LANES-1:0]          bh;
       always_ff @(posedge clk)
         for (int b = 0; b < LANES; b++)
@@ -592,7 +634,7 @@ module otpu_tmem #(
             bh[b] <= 1'b0;
           end else if (qe[p][b]) begin
             ss[b] <= sub_of(qa[p][b]);
-            bh[b] <= pw_v[b][0] && pw_a[b][0] == qa[p][b];
+            bh[b] <= BYP && pw_v[b][0] && pw_a[b][0] == qa[p][b];
           end
       always_comb
 `ifdef OTPU_TMEM_ABL_DSEL

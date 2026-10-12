@@ -13,16 +13,17 @@
 // replay of it wins (the cycle a read or replay loses, the port's lanes are not checked); SBH
 // hashes the sub-bank. TDP: true dual-port RAMs, port 2 on their port A with the writes, ports 0
 // and 1 on port B. GST: port 2 is port 0's guest (it reads only while port 0 asks nothing; its
-// group is not granted otherwise, as the slice's q3_blk).
+// group is not granted otherwise, as the slice's q3_blk). PMP (with TDP): 1 the RAMs pumped on clk_f
+// (2 x clk: every core edge a fast edge, the writes at the fast edge between), 2 its model.
 module tb_tmem #(parameter int IMPL = 0, parameter int NSB = 4, parameter int SBP = 2,
                  parameter int SBH = 0, parameter bit RPL = 1'b0, parameter bit TDP = 1'b0,
-                 parameter bit GST = 1'b0);
+                 parameter bit GST = 1'b0, parameter int PMP = 0);
   localparam int WORDS = 256, LANES = 4, NRP = 3, NWP = 2, WPB = 1, CYCLES = 20000;
   localparam int BW = $clog2(LANES);
   localparam int NCP = 2;
   localparam logic [NRP-1:0][2:0] CPY = {3'd1, 3'd0, 3'd0};
 
-  logic clk = 0;
+  logic clk = 0, clk_f = 0;
   logic [NRP-1:0][LANES-1:0]       r_en, r_req;
   logic [NRP-1:0][LANES-1:0][31:0] r_addr, r_data;
   logic [NWP-1:0][LANES-1:0]       w_en, w_req;
@@ -34,8 +35,8 @@ module tb_tmem #(parameter int IMPL = 0, parameter int NSB = 4, parameter int SB
   otpu_tmem #(.WORDS(WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .WPB(WPB), .IMPL(IMPL),
               .NCP(NCP), .CPY(CPY), .NSB(NSB), .SBP(SBP), .PRANK({3'd2, 3'd1, 3'd0}),
               .GRP(GRP), .SBH(SBH), .RPL(RPL), .TOPP(0), .TDP(TDP), .SIDE(3'b100), .GST(GST),
-              .SH_HOST(0), .SH_MASK(GST ? 3'b100 : 3'b000)) dut (
-    .clk, .r_en, .r_req, .r_addr, .r_data, .w_en, .w_req, .w_gnt, .w_addr, .w_data,
+              .SH_HOST(0), .SH_MASK(GST ? 3'b100 : 3'b000), .PMP(PMP)) dut (
+    .clk, .clk_f, .r_en, .r_req, .r_addr, .r_data, .w_en, .w_req, .w_gnt, .w_addr, .w_data,
     .blk_x, .blk_s, .lost, .frz, .dump(1'b0));
 
   logic [31:0] ref_mem [WORDS];
@@ -156,7 +157,7 @@ module tb_tmem #(parameter int IMPL = 0, parameter int NSB = 4, parameter int SB
           end
       for (int i = 0; i < wrote.size() && i < 8; i++) recent[(cyc * 3 + i) % 8] = wrote[i];
       last_wrote = wrote;
-      clk = 1; #1; clk = 0; #1;
+      clk = 1; clk_f = 1; #1; clk_f = 0; #1; clk = 0; clk_f = 1; #1; clk_f = 0; #1;
       // ---- every lane shows its last granted read
       for (int p = 0; p < NRP; p++)
         for (int l = 0; l < LANES; l++)

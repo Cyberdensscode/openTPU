@@ -12,6 +12,8 @@
 //          tm_lost, as otpu_vpu's WBUF en_r)
 //   VAR 5  VAR 4 with true dual-port RAMs (otpu_slice TMEM_TDP: the MXU, the DMA, QUANT and VPU A
 //          on port B; VPU B, QUANT 3, QUANT 2 and COLL on port A with the writes)
+//   VAR 7  VAR 5 with the RAMs pumped at 2x (otpu_tmem PMP 1: a write takes no read port, no
+//          bypass; clk_f from the MMCM, as VAR 6)
 //   VAR 6  P3: the copies pumped at 2x (rtl/exp/tmem_pump/otpu_tmem_pump IMPL 0, three copies)
 //          with the board's arbiter, as VAR 0; the clocks from an MMCM (core and 2x core)
 // MMCM 1 (VAR 6 always): the core clock from an MMCM on clk (CLKIN_NS; FAMILY 0 7-series, 1
@@ -72,7 +74,7 @@ module tmem_nc_top #(
   endfunction
 
   logic ck, ck_f;                  // the core clock and (VAR 6) the 2x clock
-  if (MMCM || VAR == 6) begin : g_mmcm
+  if (MMCM || VAR == 6 || VAR == 7) begin : g_mmcm
     logic clkfb, ck_u, ckf_u;
     if (FAMILY == 0) begin : g_k7
       MMCME2_ADV #(
@@ -144,7 +146,7 @@ module tmem_nc_top #(
 
   logic [NRP-1:0] tm_bx, tm_bs, tm_sv, tm_pre, tm_lost, tm_frz;
   logic           v_en;            // VAR 4: the VPU's registered enable (otpu_vpu en_r)
-  if (VAR == 4 || VAR == 5) begin : g_v4
+  if (VAR == 4 || VAR == 5 || VAR == 7) begin : g_v4
     logic [NG-1:0] frzg;
     always_comb
       for (int g = 0; g < NG; g++)
@@ -229,7 +231,7 @@ module tmem_nc_top #(
     if (!gnt[G_MXU])  begin r_en[P_MXU] = '0; w_en[W_MXU] = '0; end
     if (!gnt[G_Q])    begin r_en[P_Q] = '0; r_en[P_Q2] = '0; r_en[P_Q3] = '0; end
     if (VAR == 3 && !gnt[G_VPU]) begin r_en[P_VA] = '0; r_en[P_VB] = '0; end
-    if ((VAR == 4 || VAR == 5) && !v_en) begin r_en[P_VA] = '0; r_en[P_VB] = '0; end
+    if ((VAR == 4 || VAR == 5 || VAR == 7) && !v_en) begin r_en[P_VA] = '0; r_en[P_VB] = '0; end
     if (!gnt[G_VPU])  w_en[W_VPU] = '0;
     if (!gnt[G_COLL]) begin r_en[P_COLL] = '0; w_en[W_COLL] = '0; end
     if (VAR == 3)
@@ -252,9 +254,9 @@ module tmem_nc_top #(
     otpu_tmem #(.WORDS(WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .WPB(1), .GEN_R(GEN_R),
                 .GEN_W(GEN_W), .SH_HOST(P_DMA), .SH_MASK((VAR == 0 || GST) ? SH_MASK : '0), .SID(0),
                 .IMPL(VAR == 0 ? 0 : 3), .PRANK(PRANK3), .NSB(NSB), .SBP(SBP), .GRP(RGRP),
-                .SBH(SBH), .RPL(VAR >= 4), .RPLM(~(NRP'(1) << P_COLL)), .TOPP(P_DMA),
-                .TDP(VAR == 5), .SIDE(TM_SIDE), .GST(GST)) u_tmem (
-      .clk(ck), .r_en, .r_req(rq_t), .r_addr, .r_data, .w_en, .w_req(wq_en), .w_gnt, .w_addr,
+                .SBH(SBH), .RPL(VAR == 4 || VAR == 5 || VAR == 7), .RPLM(~(NRP'(1) << P_COLL)), .TOPP(P_DMA),
+                .TDP(VAR == 5 || VAR == 7), .SIDE(TM_SIDE), .GST(GST), .PMP(VAR == 7 ? 1 : 0)) u_tmem (
+      .clk(ck), .clk_f(ck_f), .r_en, .r_req(rq_t), .r_addr, .r_data, .w_en, .w_req(wq_en), .w_gnt, .w_addr,
       .w_data, .blk_x(tm_bx), .blk_s(tm_bs), .lost(tm_lost), .frz(tm_frz), .dump(1'b0));
   end
 endmodule

@@ -62,8 +62,11 @@ module otpu_slice
                                       //   board's arbiter (ARB_MASK) with the replays' holds
   parameter bit TMEM_TDP   = 1'b0,    // TMEM_IMPL 3: true dual-port RAMs (otpu_tmem TDP), a
                                       //   unit's ports on different RAM ports (TM_SIDE)
-  parameter bit TMEM_GST   = 1'b0     // TMEM_IMPL 3: QUANT 3 and COLL the DMA's guests, as
+  parameter bit TMEM_GST   = 1'b0,    // TMEM_IMPL 3: QUANT 3 and COLL the DMA's guests, as
                                       //   TMEM_IMPL 0's (otpu_tmem GST: one data select)
+  parameter int TMEM_PMP   = 0        // TMEM_TDP: 2 the pumped RAMs' model at the core clock (a
+                                      //   write takes no read port; otpu_tmem PMP; 1, the RAMs
+                                      //   at 2x, needs a 2x clock the slice does not have)
 ) (
   input  logic          clk,
   input  logic          sys_rst,
@@ -185,6 +188,7 @@ module otpu_slice
   // VPU's and the quantizer's operands never share a RAM port)
   localparam logic [NRP-1:0] TM_SIDE = (NRP'(1) << P_VB) | (NRP'(1) << P_Q3) | (NRP'(1) << P_Q2) |
                                        (NRP'(1) << P_COLL);
+  initial if (TMEM_PMP == 1) $fatal(1, "otpu_slice: TMEM_PMP 1 needs a 2x clock (2: its model)");
   initial if (TMEM_IMPL == 3 && (WPB != 1 || ARB_MASK != TMEM_RPL))
     $fatal(1, "otpu_slice: TMEM_IMPL 3 needs WPB = 1 (WPB %0d), and RPB >= %0d with TMEM_RPL",
            WPB, NRP * LANES);
@@ -353,8 +357,9 @@ module otpu_slice
               .SID(SID), .IMPL((TMEM_IMPL == 2) ? 0 : TMEM_IMPL), .NCP(NCP), .CPY(CPY), .RQ(TMEM_RQ),
               .PRANK((TMEM_IMPL == 3) ? PRANK3 : PRANK), .NSB(TMEM_NSB), .SBP(TMEM_SBP),
               .GRP(RGRP), .SBH(TMEM_SBH), .RPL(TMEM_RPL), .RPLM(~(NRP'(1) << P_COLL)),
-              .TOPP(P_DMA), .TDP(TMEM_TDP), .SIDE(TM_SIDE), .GST(TMEM_GST)) u_tmem (
-    .clk, .r_en, .r_req(rq_t), .r_addr, .r_data, .w_en, .w_req(wq_en), .w_gnt, .w_addr,
+              .TOPP(P_DMA), .TDP(TMEM_TDP), .SIDE(TM_SIDE), .GST(TMEM_GST),
+              .PMP(TMEM_PMP)) u_tmem (
+    .clk, .clk_f(1'b0), .r_en, .r_req(rq_t), .r_addr, .r_data, .w_en, .w_req(wq_en), .w_gnt, .w_addr,
     .w_data, .blk_x(tm_bx), .blk_s(tm_bs), .lost(tm_lost), .frz(tm_frz), .dump);
   assign coll_rdata = r_data[P_COLL];
   // the units' TMEM requests

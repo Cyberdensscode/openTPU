@@ -192,8 +192,9 @@ if os.environ.get("OTPU_TMEM_IMPL"):
 # with the sub-bank at word-address bit OTPU_TMEM_SBP, hashed by OTPU_TMEM_SBH (1, 2); with
 # OTPU_TMEM_RPL=1 lost reads are replayed under the board's arbiter (otpu_slice TMEM_RPL); with
 # OTPU_TMEM_TDP=1 the RAMs are true dual-port, a unit's ports on different RAM ports; with
-# OTPU_TMEM_GST=1 QUANT 3 and COLL are the DMA's guests (one data select for the three)
-for _k in ("NSB", "SBP", "SBH", "RPL", "TDP", "GST"):
+# OTPU_TMEM_GST=1 QUANT 3 and COLL are the DMA's guests (one data select for the three); with
+# OTPU_TMEM_PMP=2 (TDP) the RAMs are pumped at 2x (their model: a write takes no read port)
+for _k in ("NSB", "SBP", "SBH", "RPL", "TDP", "GST", "PMP"):
     if os.environ.get("OTPU_TMEM_" + _k):
         UARCH["TMEM_" + _k] = int(os.environ["OTPU_TMEM_" + _k])
 # TMEM lanes of the MXU and the quantizer when fewer than LANES (timing only): OTPU_ULANES=8

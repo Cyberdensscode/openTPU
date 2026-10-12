@@ -2,7 +2,8 @@
 # (the TMEM and the slice's arbiter for it, every input and output registered):
 #   vivado -mode batch -nojournal -source rtl/exp/tmem_nocopy/ooc.tcl -tclargs <out> <VAR> \
 #     <WORDS> <NSB> <SBP> <PART> <PERIOD_NS> [SBH] [MMCM] [FAMILY] [ABL] [SYNTHONLY] [GST]
-# MMCM 1 (VAR 6, P3, always): the core clock (and 2x) from an MMCM on clk (FAMILY 0 7-series, 1
+# MMCM 1 (VAR 6, P3, and VAR 7, the pumped one copy, always): the core clock (and 2x) from an MMCM
+# on clk (FAMILY 0 7-series, 1
 # UltraScale+), with the pumped copies' multicycle paths (rtl/exp/tmem_pump/ooc.tcl's). ABL: an
 # otpu_tmem ablation (DSEL, CMP, RPL, AMUX: OTPU_TMEM_ABL_*; a LUT breakdown only, the TMEM is
 # wrong with one), "-" none. SYNTHONLY 1: stop after opt_design (utilization only). GST 1: QUANT 3
@@ -13,7 +14,7 @@ lassign [lrange $argv 1 end] var words nsb sbp part period sbh mmcm family abl s
 if {$gst eq ""} { set gst 0 }
 if {$sbh eq ""} { set sbh 0 }
 if {$mmcm eq ""} { set mmcm 0 }
-if {$var == 6} { set mmcm 1 }
+if {$var == 6 || $var == 7} { set mmcm 1 }
 if {$family eq ""} { set family 0 }
 if {$synthonly eq ""} { set synthonly 0 }
 set defs [list SYNTHESIS]
