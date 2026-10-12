@@ -118,6 +118,20 @@ class Program(list):
         self.run_args = list(run_args)
 
 
+class Words(np.ndarray):
+    """A program's assembled words (uint32) with its run_args, as Program keeps them: the
+    words a compile worker process returns, tagged by the Engine with the run_args returned
+    beside them (opentpu.waits bounds the arguments with them on a WAITC device)."""
+
+    run_args: list = []
+
+    @staticmethod
+    def of(words, run_args=()) -> "Words":
+        w = np.asarray(words, np.uint32).view(Words)
+        w.run_args = list(run_args or ())
+        return w
+
+
 def arg_reg(k: int) -> int:
     """The register of a program's k-th run-time argument (Builder.run_args): from R15 down,
     as address registers are taken from R1 up."""

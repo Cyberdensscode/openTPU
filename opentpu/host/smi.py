@@ -148,8 +148,6 @@ def query_sim(interval_cycles: int = 0) -> dict:
     """The board model: the bring-up demo program (every unit) runs between the two samples,
     all in one simulation (SimTransport resets the machine per flush). interval_cycles > 0
     samples an idle window of that many cycles instead (the testbench's C command)."""
-    import numpy as np
-    from opentpu import isa as I
     from .board import SimTransport
     from .checks import PROG_AT, demo_image, demo_program
     t = SimTransport(ch_bytes=1 << 22)
@@ -169,7 +167,7 @@ def query_sim(interval_cycles: int = 0) -> dict:
     prog = demo_program()
     if not interval_cycles:
         b.write(0, demo_image())
-        b.load_program(PROG_AT, np.asarray(I.assemble(prog), np.uint32))   # queued, same flush
+        b.load(PROG_AT, prog)                               # queued, same flush
     snap = []
     if b.v2:
         t.reg_write(R.R_SNAP, 1)

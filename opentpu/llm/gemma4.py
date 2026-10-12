@@ -948,7 +948,7 @@ class Image:
                            "onehot": {f: b.alloc(4 * cfg.MCOLS * D * GA.onehot_blocks(
                                D, cfg.MCOLS, "int8" if f == "int8" else "fp4")) for f in fmts},
                            # the decode loop's area
-                           "gen": G.alloc(b, spec, cap, block, cfg.IMEM_WORDS)}
+                           "gen": G.alloc(b, spec, cap, block, cfg.IMEM_WORDS, cfg.SEQ_WC)}
             # the prompt runs' mask tiles, ends then starts (Additive); a MoE model's for its
             # tiled layer runs (OTPU_TILE as the image is built: tiled.compile_layer_tile)
             from .prefill import tile_flag

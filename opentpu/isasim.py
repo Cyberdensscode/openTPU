@@ -30,6 +30,10 @@ class Config:
     STREAM: bool = False     # the stream engine runs STREAM's hardware subset (docs/stream.md)
     ACT_ROWS: int = 0        # ACT RAM rows == max stationary rows of one MM (0: MCOLS); more
     #                          than MCOLS: the MXU replays each streamed chunk (docs/isa.md, MM)
+    SEQ_WC: bool = False     # EXPERIMENTAL: the sequencer takes each program's wait entries
+    #                          (WAITC, docs/isa.md "Wait counts"): the host writes them after
+    #                          every program (opentpu.waits), the chain slots hold them. The
+    #                          programs do not change; the ISA simulator ignores it
 
     @property
     def act_rows(self) -> int:
@@ -55,9 +59,10 @@ def board_config(**kw) -> Config:
     RAM rows (default MCOLS; more: the MXU replays each weight chunk for MCOLS rows at a time).
     The optional features stay off unless the environment turns them on, as before targets (the
     target states the hardware's truth: opentpu.target.config): OTPU_PAIR=1 column reuse (MM
-    PAIR / QACT DUP), OTPU_DSTEP=1 the DMA's DSTEP, OTPU_STREAM=1 the stream engine. They
-    configure the simulators and the board model; on the card,
-    opentpu.host.board.device_config takes them from the bitstream."""
+    PAIR / QACT DUP), OTPU_DSTEP=1 the DMA's DSTEP, OTPU_STREAM=1 the stream engine,
+    OTPU_SEQ_WC=1 the sequencer's wait entries (SEQ_WC, EXPERIMENTAL). They configure the
+    simulators and the board model; on the card, opentpu.host.board.device_config takes them
+    from the bitstream."""
     from .target import current
     a, env = current().arch, os.environ
     base = dict(S=a["S"], D=a["D"], MCOLS=int(env.get("OTPU_MCOLS", a["MCOLS"])),
@@ -67,7 +72,8 @@ def board_config(**kw) -> Config:
                 DRAM_BYTES=a["DRAM_BYTES"],
                 PAIR=bool(int(env.get("OTPU_PAIR", 0))),
                 DSTEP=bool(int(env.get("OTPU_DSTEP", 0))),
-                STREAM=bool(int(env.get("OTPU_STREAM", 0))))
+                STREAM=bool(int(env.get("OTPU_STREAM", 0))),
+                SEQ_WC=bool(int(env.get("OTPU_SEQ_WC", 0))))
     base.update(kw)
     return Config(**base)
 

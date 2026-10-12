@@ -24,7 +24,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-import numpy as np  # noqa: E402
 
 from opentpu import isa as I  # noqa: E402
 from opentpu.host import board as B  # noqa: E402
@@ -36,10 +35,10 @@ BUSY_AT, BUSY_OUT = 0x8000000, 0x9000000    # 128 / 144 MiB up: no other check's
 BUSY_PROG = 0xA000000
 
 
-def busy_program(n: int = 50_000_000) -> np.ndarray:
-    """n iterations of a 16 KiB LD and ST (minutes): DRAM reads and writes in flight always."""
-    return np.asarray(I.assemble([I.loop(2, n), I.ld(BUSY_AT, 0, 4096),
-                                  I.st(BUSY_OUT, 0, 4096), I.halt()]), np.uint32)
+def busy_program(n: int = 50_000_000) -> list:
+    """n iterations of a 16 KiB LD and ST (minutes): DRAM reads and writes in flight always
+    (Board.load's instructions)."""
+    return [I.loop(2, n), I.ld(BUSY_AT, 0, 4096), I.st(BUSY_OUT, 0, 4096), I.halt()]
 
 
 CHILD = """
@@ -49,7 +48,7 @@ from opentpu.host.board import Board, XdmaTransport
 sys.path.insert(0, {tools!r})
 from runend import BUSY_PROG, busy_program
 b = Board(XdmaTransport({dev!r}))
-b.load_program(BUSY_PROG, busy_program())
+b.load(BUSY_PROG, busy_program())
 b.start()
 print("running", flush=True)
 time.sleep(600)
@@ -68,7 +67,7 @@ def _child(dev: str):
 def cut_short(dev: str) -> tuple[bool, str]:
     with Board(XdmaTransport(dev)) as b:
         cfg = device_config(b.info())
-        b.load_program(BUSY_PROG, busy_program())
+        b.load(BUSY_PROG, busy_program())
         b.start()
         time.sleep(0.05)
         t0 = time.perf_counter()

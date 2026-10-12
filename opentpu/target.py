@@ -161,6 +161,9 @@ def load(name: str | None = None) -> Target:
     a = raw["arch"]
     if a["S"] < 1 or a["D"] % 32 or a["MCOLS"] < 1 or a["LANES"] & (a["LANES"] - 1):
         raise TargetError(f"{path}: bad arch (S >= 1, D a multiple of 32, LANES a power of two)")
+    if raw["arch"]["SEQ_WC"] and raw["uarch"]["WIN"] > 16:
+        raise TargetError(f"{path}: SEQ_WC (otpu_seq's wait entries) needs WIN <= 16: 4-bit "
+                          f"counts and a 15-bit VPU mask name a unit's last 15 instructions")
     if a["DRAM_BYTES"] > 1 << 32:
         raise TargetError(f"{path}: DRAM_BYTES over 4 GiB: DRAM addresses are 32 bits per slice "
                           f"(more slices, or the reserved window register: docs/targets.md)")
@@ -201,8 +204,13 @@ NUMERICS = "mx"
 
 def arch_hash(cfg) -> int:
     """A stable 32-bit hash of a Config's fields and the numerics (the CFG_HASH register;
-    programs compiled for one Config run on any device whose Config hashes the same)."""
+    programs compiled for one Config run on any device whose Config hashes the same). SEQ_WC
+    (EXPERIMENTAL, the sequencer's wait entries) is in it only when on: the hash of every
+    build without it stays, and a host that writes no entries refuses a build with it (its
+    hash leaves it out: opentpu/host/board.py check_hash)."""
     d = dict(dataclasses.asdict(cfg), NUMERICS=NUMERICS)
+    if not d.get("SEQ_WC"):
+        d.pop("SEQ_WC", None)
     s = json.dumps({k: (int(v) if isinstance(v, bool) else v) for k, v in sorted(d.items())},
                    separators=(",", ":"))
     return int.from_bytes(hashlib.sha256(s.encode()).digest()[:4], "big")
@@ -219,6 +227,8 @@ def sim_uarch(t: Target | str | None = None) -> dict:
         d["TMEM_IMPL"] = u["TMEM_IMPL"]
     if u.get("MXU_E"):
         d["MXU_E"] = u["MXU_E"]
+    if t.arch["SEQ_WC"]:
+        d["SEQ_WC"] = 1
     return d
 
 
@@ -237,7 +247,7 @@ def rtl_params(t: Target | str | None = None) -> dict:
         "VPU_CL": u["VPU_CL"], "ULANES": u["ULANES"], "TMEM_IMPL": u["TMEM_IMPL"],
         "RPB": u["RPB"] or NRP * a["LANES"], "WPB": u["WPB"], "WIN": u["WIN"],
         "FIFO_DEPTH": u["FIFO_DEPTH"], "TRACE_DEPTH": u["TRACE_DEPTH"], "PQ_WIN": u["PQ_WIN"],
-        "CHASH": int(u["CHASH"]),
+        "CHASH": int(u["CHASH"]), "SEQ_WC": int(a["SEQ_WC"]),
         "DDR_MTS": int(p.get("mem_mts", 0)),
         "NCH": p["channels_per_slice"],
         "CH_LOG2": (p["channel_bytes"] - 1).bit_length(),
@@ -261,7 +271,7 @@ def sources(t: Target | str | None = None, family: str | None = None) -> list[st
 
 def build_config(t: Target | str | None = None, **knobs):
     """The Config of an FPGA build of `t` with the board flow's knobs (run_vivado.sh MCOLS,
-    LANES, ACT_ROWS, DSTEP; the CFG_HASH it reports): ACT_ROWS equal to MCOLS is 0 (no
+    LANES, ACT_ROWS, DSTEP, SEQ_WC; the CFG_HASH it reports): ACT_ROWS equal to MCOLS is 0 (no
     replay), DSTEP 0 leaves out the stream engine too (STREAM)."""
     t = t if isinstance(t, Target) else load(t)
     a = dict(t.arch)
@@ -272,6 +282,8 @@ def build_config(t: Target | str | None = None, **knobs):
         a["ACT_ROWS"] = 0
     if knobs.get("DSTEP") is not None:
         a["DSTEP"] = a["STREAM"] = bool(int(knobs["DSTEP"]))
+    if knobs.get("SEQ_WC") is not None:
+        a["SEQ_WC"] = bool(int(knobs["SEQ_WC"]))
     return config(t, **a)
 
 
@@ -311,7 +323,7 @@ def main(argv: list[str]) -> int:
         print(" ".join(f"{k}={_fmt(v)}" for k, v in rtl_params(t).items()))
     elif cmd == "files":                        # files NAME [FAMILY]: rtl/ paths, one a line
         print("\n".join(f"rtl/{f}" for f in sources(t, argv[2] if len(argv) > 2 else None)))
-    elif cmd == "hash":                          # hash NAME [MCOLS=4 LANES=8 ACT_ROWS=4 DSTEP=1]
+    elif cmd == "hash":                  # hash NAME [MCOLS=4 LANES=8 ACT_ROWS=4 DSTEP=1 SEQ_WC=0]
         print(f"{arch_hash(build_config(t, **_knobs(argv[2:]))):08x}")
     elif cmd == "env":                           # shell assignments T_<PARAM>=<value>
         for k, v in rtl_params(t).items():

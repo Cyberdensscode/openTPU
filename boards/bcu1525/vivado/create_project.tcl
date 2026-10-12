@@ -78,7 +78,9 @@ source $here/bd.tcl
 make_wrapper -files [get_files otpu_bd.bd] -top
 add_files -norecurse [glob $out/otpu.gen/sources_1/bd/otpu_bd/hdl/otpu_bd_wrapper.v]
 set_property top otpu_fpga_top_bcu [current_fileset]
-set_property generic "S=$S MCOLS=$MCOLS ACT_ROWS=$ACT_ROWS VPU_CL=$VPU_CL LANES=$LANES CORE_KHZ=$CORE_KHZ BUILD_ID=32'h$BUILD_ID DDR_MTS=$DDR_MTS DSTEP=1'b$DSTEP PCIE_LANES=$PCIE_LANES PLATFORM=$PLATFORM ARCH_HASH=32'h$ARCH_HASH" [current_fileset]
+# otpu_seq WAITC (run_vivado.sh: the target's [arch] SEQ_WC, or SEQ_WC=1; CFG_UARCH bit24)
+set SEQ_WC [expr {[info exists ::env(OTPU_SEQ_WC_GEN)] && $::env(OTPU_SEQ_WC_GEN) eq "1" ? 1 : 0}]
+set_property generic "SEQ_WC=1'b$SEQ_WC S=$S MCOLS=$MCOLS ACT_ROWS=$ACT_ROWS VPU_CL=$VPU_CL LANES=$LANES CORE_KHZ=$CORE_KHZ BUILD_ID=32'h$BUILD_ID DDR_MTS=$DDR_MTS DSTEP=1'b$DSTEP PCIE_LANES=$PCIE_LANES PLATFORM=$PLATFORM ARCH_HASH=32'h$ARCH_HASH" [current_fileset]
 
 # ---- constraints: the pins (scripts/gen_pins.py), the top's clocks and crossings; each DDR4
 # core's own (LiteX's false paths, by names inside the core: scoped to otpu_ld4)

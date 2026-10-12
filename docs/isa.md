@@ -539,6 +539,20 @@ per instruction (the counts' word, then the mask's); the loader (RUN, `HALT CHAI
 into the sequencer's sidecar RAM after the instructions (`ld_n`, `R[rb]` count instructions,
 as before).
 
+**Host.** A WAITC build says so in CFG_UARCH bit24 (docs/observability.md), and its CFG_HASH
+holds `SEQ_WC` (`opentpu.target.arch_hash`: in the hash only when on, so every other build's
+hash stays and a host that writes no entries refuses the build). `device_config` sets the
+Config's `SEQ_WC` from the bit; the host then loads every program with its entries
+(`Board.load_program(addr, words, entries)`, `Board.load(addr, instructions)`;
+`waits.loadable`) and refuses a program without them (`ConfigMismatch`); on a build without
+the bit nothing changes. A Config with `SEQ_WC` gives each program its entries' room: the
+program area after the image and each chain slot's half are `waits.area` (5/4 of IMEM's bytes),
+and the chained programs are written with their entries (`generate.slot_words`). The entries
+are computed once per program (`waits.entries`: its words, its arguments' bounds, `D`, `S` and
+the compiler's source, which holds this pass) and kept beside the program cache's programs. The
+window must be 16 or less (a target with `SEQ_WC` and a larger `WIN` is an error; the host
+refuses such a bitstream).
+
 **Compiler.** `opentpu/waits.py` `wait_counts(program)` computes them from the program alone:
 an abstract execution with the registers as intervals (the run's arguments bounded by their
 variables where the program says so, every RLD value unknown), each instruction's footprint

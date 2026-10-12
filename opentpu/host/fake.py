@@ -18,7 +18,8 @@ and I2C_CTRL / I2C_IN drive and read those bus models. With `ddr_mts` CAPS bit3 
 DDR_MTS register; without it the register reads 0xDEADBEEF, as on older bitstreams. With
 `args` CAPS bit25 announces the ARG0..7 registers (kept, read back), with regmap=4 the CFG_*
 registers report `cfg` (regs.cfg's keys; default the current target's single-slice values with
-the CFG_HASH its build would report), with `mx` (default) CAPS bit29, the MX numerics every
+the CFG_HASH its build would report; `seq_wc`: CFG_UARCH bit24, a sequencer that takes wait
+entries, EXPERIMENTAL), with `mx` (default) CAPS bit29, the MX numerics every
 bitstream of this tree has (False: a bitstream before MX, which the host refuses), with `gen`
 CAPS bit30 the decode loop's instructions (it runs nothing either way), with `chash` CAPS bit7
 the hashed
@@ -46,7 +47,7 @@ RATES = {"RUNNING": 0.80, "MXU_BUSY": 0.60, "MXU_MAC": 0.50, "VPU_BUSY": 0.12,
 
 
 def _target_cfg(D: int, MCOLS: int, LANES: int, pair: bool, dstep: bool, stream: bool,
-                act_rows: int = 0) -> dict:
+                act_rows: int = 0, seq_wc: bool = False) -> dict:
     """The CFG_* registers of the current target's build with these VERSION / CAPS values."""
     from ..target import arch_hash, current
     t = current()
@@ -55,11 +56,11 @@ def _target_cfg(D: int, MCOLS: int, LANES: int, pair: bool, dstep: bool, stream:
                ACT_BLOCKS=a["ACT_BLOCKS"], DRAM_BYTES=a["DRAM_BYTES"],
                channels=p["channels_per_slice"], channel_bytes=p["channel_bytes"],
                MXU_IMPL=u["MXU_IMPL"], TMEM_IMPL=u["TMEM_IMPL"], VPU_CL=u["VPU_CL"],
-               ULANES=u["ULANES"], platform=t.platform_id)
+               ULANES=u["ULANES"], SEQ_WC=int(seq_wc), platform=t.platform_id)
     from ..isasim import Config
     full = Config(**{**a, "D": D, "MCOLS": MCOLS, "LANES": LANES,
                      "ACT_ROWS": act_rows if act_rows > MCOLS else 0, "PAIR": pair,
-                     "DSTEP": dstep, "STREAM": stream})
+                     "DSTEP": dstep, "STREAM": stream, "SEQ_WC": seq_wc})
     cfg["hash"] = arch_hash(full)
     return cfg
 
@@ -77,7 +78,8 @@ class FakeTransport:
                  w4: bool = True, pair: bool = False, dstep: bool = False,
                  args: bool = False, stream: bool = False, gen: bool = False,
                  chash: bool = False, calib: tuple = (True, True), ecc_ded: bool = False,
-                 cfg: dict | None = None, act_rows: int | None = None, mx: bool = True):
+                 cfg: dict | None = None, act_rows: int | None = None, mx: bool = True,
+                 seq_wc: bool = False):
         self.ch = [np.zeros(ch_bytes, np.uint8) for _ in range(2)]
         self.v, self.devname, self.dev = regmap, devname, devname and f"/dev/{devname}"
         self.run_s, self.cycles_per_run = run_s, cycles
@@ -96,7 +98,7 @@ class FakeTransport:
         self.version = D << 16 | MCOLS << 8 | LANES
         self.act_rows = act_rows        # > MCOLS: CAPS bit24 and the ACT_ROWS register
         self.cfg_words = R.cfg_words(cfg or _target_cfg(D, MCOLS, LANES, pair, dstep, stream,
-                                                        act_rows))
+                                                        act_rows, seq_wc))
         self.slices = R.cfg(self.cfg_words)["S"] if regmap >= R.CFG_SINCE else 1
         if self.slices > 1:             # two channels per slice (board.channel_map)
             self.ch = [np.zeros(ch_bytes, np.uint8) for _ in range(2 * self.slices)]

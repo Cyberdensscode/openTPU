@@ -31,7 +31,6 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from opentpu import isa as I  # noqa: E402
 from opentpu import language as ol  # noqa: E402
 from opentpu import quant as Q  # noqa: E402
 from opentpu.llm.qwen3 import _qdesc, _tdesc  # noqa: E402
@@ -114,13 +113,12 @@ def turnarounds(board, seconds: float = 30.0, mb: float = 32.0, runs: int | None
     img, a, prog = build(cfg, n_mm, n_dma)
     ref = Machine(cfg, [prog], [np.concatenate([img, np.zeros(size - len(img), np.uint8)])]).run()
     want = ref.slices[0].dram[a["dma"]:a["out"] + 4 * n_mm * R]
-    words = np.asarray(I.assemble(prog), np.uint32)
     e0 = ecc_counts(board.t)
     board.scrub()
     board.write(0, img)
     t0, n = time.time(), 0
     while (n < runs) if runs is not None else (n == 0 or time.time() - t0 < seconds):
-        board.load_program(a["prog"], words)                # the board model starts from reset
+        board.load(a["prog"], prog)                         # the board model starts from reset
         board.run()
         n += 1
     dt = time.time() - t0

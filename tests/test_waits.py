@@ -273,3 +273,208 @@ def test_mx_qst_scale_rows():
     ins = I.qst(0, 0x1000, 0x8000, 3, 5, 5 * D, 5 * D, 1)
     fp = W.footprint(ins, R)
     assert (W.SP_DRAM, 0x8000, (0x8000 + 4 * 3 * (1 + 2)) | 63) in fp.wr
+
+
+# ------------------------------------------------------------------------------ the host's loads
+# A bitstream whose sequencer takes wait entries (CFG_UARCH bit24, Config.SEQ_WC) loads every
+# program with them; the host refuses a program without them there, and changes nothing elsewhere.
+def _prog():
+    return [I.ld(0, 100, 8), vop(I.V_ADD, 200, 100, 100), vop(I.V_MUL, 300, 200, 100),
+            I.st(4096, 300, 8), I.halt()]
+
+
+def _board(seq_wc: bool):
+    from opentpu.host.board import Board
+    from opentpu.host.fake import FakeTransport
+    t = FakeTransport(regmap=4, devname=None, seq_wc=seq_wc)
+    return Board(t), t
+
+
+def test_a_waitc_bitstream_refuses_a_program_without_entries():
+    from opentpu.host import regs as RG
+    from opentpu.host.board import ConfigMismatch
+    b, t = _board(True)
+    assert b.waitc
+    words = np.asarray(I.assemble(_prog()), np.uint32)
+    with pytest.raises(ConfigMismatch, match="wait entries"):
+        b.load_program(0x10000, words)
+    with pytest.raises(ValueError, match="do not match"):
+        b.load_program(0x10000, words, np.zeros(2, np.uint64))
+    assert t.regs[RG.R_PROG_N] == 0                         # nothing was loaded
+
+
+def test_a_waitc_bitstream_loads_the_entries_after_the_program():
+    """Board.load: the words, zeros to the next chunk, the 64-bit entries (waits.loadable), at
+    the program's address; PROG_N counts the instructions alone."""
+    from opentpu.host import regs as RG
+    b, t = _board(True)
+    prog = _prog()
+    b.load(0x10000, prog)
+    words = np.asarray(I.assemble(prog), np.uint32)
+    ent = W.wait_counts(prog, D, 1)
+    got = b.read(0x10000, 2 * D + 8 * len(prog)).view("<u4")
+    assert np.array_equal(got[:len(words)], words)
+    assert not got[len(words):2 * D // 4].any()             # 160 bytes of program: to 256
+    assert np.array_equal(got[2 * D // 4:].view("<u8"), ent)
+    assert vm(ent, 2) == 0b1 and t.regs[RG.R_PROG_N] == len(prog)
+
+
+def test_a_bitstream_without_seq_wc_loads_the_words_alone():
+    """No CFG_UARCH bit24: load_program as before (entries, if given, unused), Board.load the
+    same words."""
+    b, t = _board(False)
+    assert not b.waitc
+    prog = _prog()
+    words = np.asarray(I.assemble(prog), np.uint32)
+    b.write(0x10000, np.full(512, 0xAB, np.uint8))
+    b.load_program(0x10000, words)
+    got = b.read(0x10000, 512)
+    assert np.array_equal(got[:4 * len(words)].view("<u4"), words)
+    assert (got[4 * len(words):] == 0xAB).all()             # nothing after the program
+    b.load(0x10000, prog)
+    assert np.array_equal(b.read(0x10000, 512), got)
+
+
+def test_the_window_guard_on_the_host(monkeypatch):
+    """A WAITC bitstream of a target whose window is over 16 is refused: the entries name a
+    unit's last 15 instructions."""
+    import dataclasses
+
+    from opentpu import target as T
+    from opentpu.host.board import ConfigMismatch
+    b, _ = _board(True)
+    t = T.current()
+    wide = dataclasses.replace(t, uarch={**t.uarch, "WIN": 32})
+    monkeypatch.setattr(T, "by_platform", lambda pid: wide)
+    with pytest.raises(ConfigMismatch, match="window of 32"):
+        b.load(0x10000, _prog())
+
+
+def test_device_config_takes_seq_wc_and_check_fits_needs_its_room():
+    """device_config's SEQ_WC is CFG_UARCH bit24 (the CFG_HASH has it: check_hash passes);
+    check_fits refuses a configuration without the entries' room on such a bitstream, and a
+    configuration with the room runs on a bitstream without them."""
+    import dataclasses
+
+    from opentpu.host.board import ConfigMismatch, check_fits, device_config
+    b, _ = _board(True)
+    cfg = device_config(b.info())
+    assert cfg.SEQ_WC
+    check_fits(cfg, b.info())
+    with pytest.raises(ConfigMismatch, match="no room for them"):
+        check_fits(dataclasses.replace(cfg, SEQ_WC=False), b.info())
+    b2, _ = _board(False)
+    assert not device_config(b2.info()).SEQ_WC
+    check_fits(cfg, b2.info())
+
+
+def test_a_host_without_seq_wc_refuses_a_waitc_bitstream():
+    """The CFG_HASH of a build with SEQ_WC has it (target.arch_hash), so a host that writes no
+    entries, whose hash leaves it out, refuses the bitstream (check_hash); without it the hash
+    is every earlier build's."""
+    import dataclasses
+
+    from opentpu import target as T
+    card = T.config("ypcb-00338")
+    assert not card.SEQ_WC and f"{T.arch_hash(card):08x}" == "89417856"
+    on = dataclasses.replace(card, SEQ_WC=True)
+    assert T.arch_hash(on) != T.arch_hash(card)
+    assert T.main(["hash", "ypcb-00338", "SEQ_WC=1"]) == 0          # (run_vivado.sh's CFG_HASH)
+    assert T.arch_hash(T.build_config("ypcb-00338", SEQ_WC="1")) == T.arch_hash(on)
+
+
+def test_board_backend_runs_with_the_entries_and_its_chain_slots_hold_them():
+    """BoardBackend on a WAITC bitstream: start() loads each program with its entries (those of
+    its run_args' bounds, for a worker's words too: compiler.Words), slot_words
+    (generate.slot_words) puts them after a chained program; on a bitstream without the bit
+    the words alone, as before. A configuration without their room is refused there."""
+    from opentpu.compiler import Program, RunVar, Words
+    from opentpu.host.board import BoardBackend, ConfigMismatch
+    from opentpu.host.fake import FakeTransport
+    from opentpu.isasim import board_config
+    from opentpu.llm import generate as G
+    pos = RunVar("pos", 64)
+    # the LD reads below 4 KiB with the bound, anywhere without: the QST's DRAM write waits
+    prog = Program([I.addi(1, 15, 0), I.ld(0, 100, 8, ra=1),
+                    I.qst(2000, 0x10000, 0x18000, 1, 1, D, D, 1), I.halt()], [(pos, 64)])
+    ent = W.wait_counts(prog, D, 1)
+    assert k(ent, 2)[W.U_DMA] == 0 and k(W.wait_counts(prog, D, 1, run_args=()), 2)[W.U_DMA] == 1
+    words = np.asarray(I.assemble(prog), np.uint32)
+    n = 4 * len(words)
+    for seq_wc in (True, False):
+        t = FakeTransport(regmap=4, devname=None, seq_wc=seq_wc)
+        cfg = board_config(DRAM_BYTES=1 << 21, SEQ_WC=True)
+        be = BoardBackend(cfg, [np.zeros(1 << 16, np.uint8)], transport=t, status=False)
+        assert be.waitc == seq_wc
+        for p in ([prog], Words.of(words, prog.run_args)):
+            be.board.write(be.prog_at, np.zeros(1024, np.uint8))
+            be.start(p)
+            be.wait()
+            got = be.board.read(be.prog_at, 1024)
+            assert np.array_equal(got[:n].view("<u4"), words)
+            if seq_wc:                                  # (from the next chunk)
+                off = -(-n // D) * D
+                assert np.array_equal(got[off:off + 8 * len(prog)].view("<u8"), ent)
+            else:
+                assert not got[n:].any()
+        assert np.array_equal(G.slot_words(be, prog),
+                              W.loadable(words, ent, D) if seq_wc else words)
+        be.close()
+    t = FakeTransport(regmap=4, devname=None, seq_wc=True)
+    with pytest.raises(ConfigMismatch, match="no room"):
+        BoardBackend(board_config(DRAM_BYTES=1 << 21), [np.zeros(4096, np.uint8)], transport=t,
+                     status=False)
+
+
+def test_the_entries_room():
+    """A program of IMEM's instructions with its entries is waits.area's 5 / 4 of its words (IMEM
+    fills whole chunks), a chain slot two of them (generate.prog_bytes)."""
+    from opentpu.llm import generate as G
+    n = 32768 // 8
+    words = np.zeros(32768, np.uint32)
+    assert 4 * len(W.loadable(words, np.zeros(n, np.uint64), D)) == W.area(32768, True) == 163840
+    assert W.area(32768) == 131072
+    assert G.prog_bytes(32768) == 1 << 18 and G.prog_bytes(32768, True) == 327680
+
+
+def test_the_caches_key_on_seq_wc_and_the_waits_pass(monkeypatch):
+    """The program and image caches' layouts hold the Config, SEQ_WC in it (its chain slots and
+    program area differ); waits.py is in the keyed source (progcache.keyed), so an entry and a
+    program compiled before a change to the pass miss; the entries' key holds the words, their
+    arguments' bounds, D, S and the source."""
+    import dataclasses
+
+    from opentpu import imgcache as IC
+    from opentpu import progcache as PC
+    from opentpu.compiler import RunVar
+    from opentpu.isasim import board_config
+    cfg = board_config()
+    on = dataclasses.replace(cfg, SEQ_WC=True)
+    assert PC.key((cfg,), ("decode", 1)) != PC.key((on,), ("decode", 1))
+    img = object()
+    assert IC.key(img, (cfg,), "ck") != IC.key(img, (on,), "ck")
+    assert "waits.py" in {p.name for p in PC.keyed()}
+    words = np.asarray(I.assemble(_prog()), np.uint32)
+    k0 = W.entries_key(words, D, 1)
+    assert W.entries_key(words, D, 1, [(RunVar("pos", 64), 1)]) != k0
+    assert W.entries_key(words, D, 2) != k0
+    monkeypatch.setattr(PC, "_SRC", "another tree")
+    assert W.entries_key(words, D, 1) != k0
+
+
+def test_entries_are_kept(monkeypatch, tmp_path):
+    """waits.entries computes once per program: then from this process, or the program cache's
+    disk (an entry beside its programs)."""
+    monkeypatch.setenv("OTPU_PROG_CACHE", str(tmp_path))
+    monkeypatch.setattr(W, "_mem", W.OrderedDict())
+    prog = _prog()
+    words = np.asarray(I.assemble(prog), np.uint32)
+    n0 = dict(W.stats)
+    e = W.entries(words, D, 1)
+    assert np.array_equal(e, W.wait_counts(prog, D, 1, run_args=()))
+    assert W.stats["computed"] == n0["computed"] + 1
+    assert np.array_equal(W.entries(words, D, 1, prog=prog), e)
+    assert W.stats["memory"] == n0["memory"] + 1
+    W._mem.clear()
+    assert np.array_equal(W.entries(words, D, 1), e)
+    assert W.stats["disk"] == n0["disk"] + 1 and len(list(tmp_path.glob("*/*.npz"))) == 1

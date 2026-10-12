@@ -539,6 +539,8 @@ class SimTransport:
              # the MXU's epilogue lanes as the target builds them (OTPU_MXU_E overrides)
              "MXU_E": rtlsim.UARCH.get("MXU_E", self.target.uarch.get("MXU_E", 0)),
              "MEM_NATIVE": 2 if native == "ld" else 1}
+        if rtlsim.UARCH.get("SEQ_WC"):              # (EXPERIMENTAL: WAITC, CFG_UARCH bit24)
+            p["SEQ_WC"] = 1
         p.update(self.params)
         # the configuration registers (register map 4) as the target's build of this
         # configuration reports them (run_vivado.sh: opentpu.target build_config / arch_hash)
@@ -547,7 +549,7 @@ class SimTransport:
         p.setdefault("PLATFORM", t.platform_id)
         p.setdefault("ARCH_HASH", "32'h%08x" % arch_hash(build_config(
             t, MCOLS=p["MCOLS"], LANES=p["LANES"], ACT_ROWS=p["ACT_ROWS"],
-            DSTEP=p.get("DSTEP", 1))))
+            DSTEP=p.get("DSTEP", 1), SEQ_WC=p.get("SEQ_WC", 0))))
         exe = rtlsim.build("tb_board", srcs, p)
         with simtmp.tempdir("otpu_board_") as d:
             for c in range(len(self.ch)):
@@ -784,6 +786,26 @@ class Board:
         return getattr(self.t, "bases", BASE)[ch]
 
     @property
+    def waitc(self) -> bool:
+        """The bitstream's sequencer takes wait entries (CFG_UARCH bit24, SEQ_WC, EXPERIMENTAL:
+        docs/seq_vpu.md): every program loads with its entries (load_program). Its window must
+        be 16 or less (the entries' counts and mask name a unit's last 15): a target of this
+        tree with more is refused (ConfigMismatch)."""
+        i = self._info or self.info()
+        c = i["cfg"]
+        if not (c and c.get("SEQ_WC")):
+            return False
+        if getattr(self, "_waitc_of", None) is not i:    # (once per info())
+            from opentpu.target import by_platform
+            t = by_platform(c["platform"])
+            if t is not None and t.uarch["WIN"] > 16:
+                raise ConfigMismatch(f"the bitstream takes wait entries (CFG_UARCH bit24) and its "
+                                     f"target {t.name} has a window of {t.uarch['WIN']}: the "
+                                     f"entries need 16 or less (docs/isa.md, Wait counts)")
+            self._waitc_of = i
+        return True
+
+    @property
     def chash(self) -> bool:
         """The bitstream hashes the channel interleave (CAPS bit7)."""
         c = (self._info or self.info())["caps"]
@@ -951,27 +973,52 @@ class Board:
         return flat if (a0, a1) == (addr, addr + n) else flat[addr - a0:addr - a0 + n].copy()
 
     # ------------------------------------------------------------------ programs
-    def load_program(self, addr: int, words) -> None:
+    def load_program(self, addr: int, words, entries=None) -> None:
         """Copy a program into DRAM at `addr` (chunk aligned) and into IMEM. A run started and
         not seen halted (a wait that raised) is stopped first: its reads in flight would land
         in IMEM as the new program's rows. On a multi-slice bitstream `words` may be a list,
         slice s's program at its index, each in its own DRAM at `addr` (the slices load the same
         PROG_ADDR and PROG_N: the shorter ones padded with NOPs); slices it names no program
-        for get a HALT."""
+        for get a HALT.
+
+        entries: the programs' wait entries (opentpu.waits.entries; a list like `words`), which
+        a bitstream whose sequencer takes them (waitc: CFG_UARCH bit24) needs: it loads them
+        after the program (waits.loadable), and a program without them is refused
+        (ConfigMismatch): its sequencer would run it with no waits. Other bitstreams load the
+        words alone (`entries` unused). load() computes them."""
         progs = [np.asarray(w, "<u4") for w in words] if isinstance(words, (list, tuple)) \
             else [np.asarray(words, "<u4")]
+        waitc = self.waitc
+        if waitc:
+            if entries is None:
+                raise ConfigMismatch("this bitstream's sequencer takes wait entries (CFG_UARCH "
+                                     "bit24, docs/seq_vpu.md): a program loads with them "
+                                     "(Board.load, opentpu.waits.entries)")
+            ents = [np.asarray(e, np.uint64) for e in entries] if \
+                isinstance(entries, (list, tuple)) else [np.asarray(entries, np.uint64)]
+            if len(ents) != len(progs) or any(len(e) != len(w) // 8
+                                              for e, w in zip(ents, progs)):
+                raise ValueError("the wait entries do not match the programs")
         S = self.slices
         if len(progs) > S:
             raise ValueError(f"{len(progs)} programs for a bitstream of {S} slices")
         if len(progs) < S:
             from opentpu import isa as I
             progs += [np.asarray(I.assemble([I.halt()]), "<u4")] * (S - len(progs))
+            if waitc:
+                from opentpu import waits as W
+                ents += [np.full(1, W.DEFAULT, np.uint64)] * (S - len(ents))
         n = max(len(w) for w in progs)
         if self.in_run:
             self.stop()
         for s, w in enumerate(progs):
             if len(w) < n:
                 w = np.concatenate([w, np.zeros(n - len(w), "<u4")])
+            if waitc:                               # its entries after it (the NOPs': none)
+                from opentpu import waits as W
+                e = ents[s]
+                w = W.loadable(w, np.concatenate([e, np.zeros(n // 8 - len(e), np.uint64)]),
+                               (self._info or self.info())["D"])
             self.write(addr, w.view(np.uint8), s)
         t = self.t
         t.reg_write(R_CTRL, 0)
@@ -979,6 +1026,22 @@ class Board:
         t.reg_write(R_PROG_N, n // 8)
         t.reg_write(R_CTRL, CTRL_LOAD)
         t.poll(R_STATUS, ST_LOADING, 0)
+
+    def load(self, addr: int, progs) -> None:
+        """load_program of programs as instructions (a list of Instr or compiler.Program; a list
+        of them, one per slice), assembled here, with their wait entries when the bitstream
+        takes them (waits.entries: kept per program)."""
+        from opentpu import isa as I
+        multi = bool(progs) and isinstance(progs[0], (list, tuple))
+        ps = list(progs) if multi else [progs]
+        words = [np.asarray(I.assemble(p), np.uint32) for p in ps]
+        entries = None
+        if self.waitc:
+            from opentpu import waits as W
+            D, S = (self._info or self.info())["D"], self.slices
+            entries = [W.entries(w, D, S, prog=p) for w, p in zip(words, ps)]
+        self.load_program(addr, words if multi else words[0],
+                          entries if multi or entries is None else entries[0])
 
     def set_args(self, words) -> None:
         """The next runs' arguments ARG0..7 (CAPS bit25; R8..R15 at the start): only the words
@@ -1170,6 +1233,7 @@ def device_config(info: dict, **kw):
     """The Config of the bitstream that `info` (Board.info()) describes: MCOLS and LANES come
     from its VERSION register, PAIR from CAPS bit5, DSTEP from bit6 and STREAM from bit26, and
     with register map 4 the slices, TMEM, IMEM, ACT RAM and DRAM sizes from its CFG_* registers
+    and SEQ_WC (the sequencer's wait entries, EXPERIMENTAL) from CFG_UARCH bit24
     (before map 4: the YPCB-00338's, the current target's), so the card needs no OTPU_MCOLS /
     OTPU_LANES / OTPU_PAIR / OTPU_DSTEP / OTPU_STREAM. When one is set in the environment it must
     name the bitstream's value (ConfigMismatch otherwise). Keyword arguments set other fields
@@ -1198,8 +1262,9 @@ def device_config(info: dict, **kw):
            "STREAM": stream, "ACT_ROWS": rows if rows > info["MCOLS"] else 0}
     c = info.get("cfg")
     if c:                                         # register map 4: the device says the rest
-        dev.update(D=info["D"], **{k: c[k] for k in ("S", "TMEM_WORDS", "IMEM_WORDS",
-                                                     "ACT_BLOCKS", "DRAM_BYTES")})
+        dev.update(D=info["D"], SEQ_WC=bool(c.get("SEQ_WC")),
+                   **{k: c[k] for k in ("S", "TMEM_WORDS", "IMEM_WORDS", "ACT_BLOCKS",
+                                        "DRAM_BYTES")})
     cfg = board_config(**dev)
     check_numerics(info)
     check_hash(info, cfg)
@@ -1260,7 +1325,7 @@ def check_hash(info: dict, cfg=None) -> None:
         sizes = {k: c[k] for k in ("S", "TMEM_WORDS", "IMEM_WORDS", "ACT_BLOCKS", "DRAM_BYTES")}
         cfg = board_config(D=info["D"], MCOLS=info["MCOLS"], LANES=info["LANES"],
                            PAIR=bool(caps.get("pair")), DSTEP=bool(caps.get("dstep")),
-                           STREAM=bool(caps.get("stream")),
+                           STREAM=bool(caps.get("stream")), SEQ_WC=bool(c.get("SEQ_WC")),
                            ACT_ROWS=rows if rows > info["MCOLS"] else 0, **sizes)
     if arch_hash(cfg) != c["hash"]:
         raise ConfigMismatch(f"the bitstream's CFG_HASH {c['hash']:08x} is not the hash of the "
@@ -1275,7 +1340,9 @@ def check_fits(cfg, info: dict) -> None:
     """Raise ConfigMismatch unless programs compiled for `cfg` run on the device `info`
     describes: the MX numerics (check_numerics), its CFG_HASH this host's (check_hash), the
     same MXU, lanes and ACT RAM rows, and (register map 4) no more slices, TMEM, IMEM, ACT RAM
-    blocks or DRAM than it has."""
+    blocks or DRAM than it has, and room for the wait entries if its sequencer takes them
+    (SEQ_WC: the programs' chain slots and area; a configuration with the room runs on a
+    bitstream without them too)."""
     check_numerics(info)
     check_hash(info)
     rows = info.get("act_rows") or info["MCOLS"]
@@ -1287,6 +1354,11 @@ def check_fits(cfg, info: dict) -> None:
     c = info.get("cfg")
     if not c:
         return
+    if c.get("SEQ_WC") and not getattr(cfg, "SEQ_WC", False):
+        raise ConfigMismatch("the bitstream's sequencer takes wait entries (CFG_UARCH bit24) "
+                             "and the configuration has no room for them (SEQ_WC off: the "
+                             "chain slots and the program area hold the words alone): use "
+                             "device_config")
     for k in ("S", "TMEM_WORDS", "IMEM_WORDS", "ACT_BLOCKS", "DRAM_BYTES"):
         if getattr(cfg, k) > c[k]:
             raise ConfigMismatch(f"the programs need {k}={getattr(cfg, k)} and the device has "
@@ -1324,7 +1396,8 @@ def dram_layout(cfg, image_bytes: int, prog_at: int, image=None, poss=None,
     free; with a model Image also the KV cache capacity (LFM2: with the convolution state;
     Qwen3.5: with the convolution and DeltaNet state, which do not grow with the position but
     are counted as if they did) and the part filled at positions `poss` (one per sequence)."""
-    prog = 4 * cfg.IMEM_WORDS
+    from opentpu import waits as W
+    prog = W.area(cfg.IMEM_WORDS, getattr(cfg, "SEQ_WC", False))     # (with its wait entries)
     d = {"total": cfg.DRAM_BYTES, "image": image_bytes, "weights": image_bytes - snapshots,
          "kv_capacity": 0, "kv_used": 0, "program": prog, "snapshots": snapshots,
          "free": max(0, cfg.DRAM_BYTES - prog_at - prog)}
@@ -1367,6 +1440,9 @@ class BoardBackend:
             if c and c["channels"] != 2:
                 raise ConfigMismatch(f"the bitstream's slices have {c['channels']} memory "
                                      "channels each: this driver interleaves two")
+            # its sequencer takes wait entries (EXPERIMENTAL): each program loads with its own
+            # (check_fits: the configuration has their room; Board.waitc: the window)
+            self.waitc = self.board.waitc
         except ConfigMismatch:
             self.board.close()
             raise
@@ -1375,13 +1451,15 @@ class BoardBackend:
         imgs = [np.asarray(images[s], np.uint8) for s in range(cfg.S)]
         self.image_bytes = max(len(m) for m in imgs)
         self.prog_at = -(-self.image_bytes // 4096) * 4096
-        if self.prog_at + 4 * cfg.IMEM_WORDS > cfg.DRAM_BYTES:
+        from opentpu import waits as W
+        self.W = W
+        if self.prog_at + W.area(cfg.IMEM_WORDS, cfg.SEQ_WC) > cfg.DRAM_BYTES:
             self.board.close()
             raise MemoryError("no room for the program area")
         self.engine = None
         self.trace: dict | None = None
         self.last = None
-        self._prep: dict = {}               # id(programs) -> (programs, words), from prepare()
+        self._prep: dict = {}               # id(programs) -> (programs, words, entries)
         self._running = None                # the started programs
         self._resident = None               # (programs, words) in IMEM (start() skips the load)
         self._expect = 0.0                  # the run's expected seconds (the poll's hint)
@@ -1470,11 +1548,37 @@ class BoardBackend:
             return np.asarray(self.I.assemble(programs[0]), np.uint32)
         return [np.asarray(self.I.assemble(p), np.uint32) for p in programs[:self.cfg.S]]
 
+    def _entries(self, words, programs=None):
+        """The wait entries of the programs' words (as _assemble gives them; a WAITC bitstream:
+        waits.entries, kept per program), or None on a bitstream without them. programs: the
+        instructions, when at hand (else the words are decoded; a compile worker's words,
+        compiler.Words, carry their run_args)."""
+        if not self.waitc:
+            return None
+        D, S = self.cfg.D, self.cfg.S
+        if isinstance(words, np.ndarray):
+            p = programs[0] if programs is not None and not isinstance(programs, np.ndarray) \
+                else None
+            return self.W.entries(words, D, S, prog=p)
+        ps = programs if programs is not None and not all(
+            isinstance(w, np.ndarray) for w in programs) else [None] * len(words)
+        return [self.W.entries(w, D, S, prog=p) for w, p in zip(words, ps)]
+
+    def slot_words(self, prog) -> np.ndarray:
+        """A chain slot's contents for `prog` (one slice's: generate.slot_words): its words,
+        and on a WAITC bitstream its entries after them (waits.loadable)."""
+        w = np.asarray(self.I.assemble(prog), np.uint32)
+        if not self.waitc:
+            return w
+        return self.W.loadable(w, self.W.entries(w, self.cfg.D, self.cfg.S, prog=prog),
+                               self.cfg.D)
+
     def prepare(self, programs: list) -> None:
-        """Assemble ahead of run(programs). Called from the Engine's compile thread while
-        run() of the previous token goes on: one dict entry per program list (dict operations
-        are atomic), dropped by run()."""
-        self._prep[id(programs)] = (programs, self._assemble(programs))
+        """Assemble ahead of run(programs), and on a WAITC bitstream compute the wait entries.
+        Called from the Engine's compile thread while run() of the previous token goes on: one
+        dict entry per program list (dict operations are atomic), dropped by run()."""
+        words = self._assemble(programs)
+        self._prep[id(programs)] = (programs, words, self._entries(words, programs))
 
     runs_words = True           # start() takes assembled words too (the Engine's worker process)
 
@@ -1522,14 +1626,19 @@ class BoardBackend:
                 self._prep.pop(next(iter(self._prep)), None)
             if isinstance(programs, np.ndarray) or \
                     (self.cfg.S > 1 and all(isinstance(w, np.ndarray) for w in programs)):
-                words = programs
+                words, ents = programs, self._entries(programs)
+            elif prep is not None and prep[0] is programs:
+                words, ents = prep[1], prep[2]
             else:
-                words = prep[1] if prep is not None and prep[0] is programs else \
-                    self._assemble(programs)
+                words = self._assemble(programs)
+                ents = self._entries(words, programs)
             if _nwords(words) > self.cfg.IMEM_WORDS:
                 raise ValueError("program does not fit IMEM")
             self._resident = None
-            self.board.load_program(self.prog_at, words)
+            if ents is None:
+                self.board.load_program(self.prog_at, words)
+            else:                                   # (WAITC: with the programs' entries)
+                self.board.load_program(self.prog_at, words, ents)
             self._resident = (programs, words)
         if args is not None:
             self.board.set_args(list(args) + [0] * (8 - len(args)))

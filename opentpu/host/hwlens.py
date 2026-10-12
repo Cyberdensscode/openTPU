@@ -238,7 +238,6 @@ def record_sim(a) -> list:
                      backend=lambda c, imgs: BoardBackend(c, imgs, transport=tr))
         ids = [int(t) for t in np.random.default_rng(1).integers(0, spec.vocab, pos0 + 1)]
         return _record_engine(eng, ids, pos0, a, "tiny Qwen3 (board model)")
-    from opentpu import isa as I
     from opentpu.runtime import compile_kernel
     wl = L._kernel_workloads()
     if a.workload not in wl:
@@ -250,7 +249,7 @@ def record_sim(a) -> list:
     b = Board(t)
     info = b.info()
     b.write(0, imgs[0])
-    b.load_program(cfg.DRAM_BYTES, np.asarray(I.assemble(comp.programs[0]), np.uint32))
+    b.load(cfg.DRAM_BYTES, comp.programs[0])
     traced = info["regmap"] >= 2 and info["caps"]["trace"]
     if not traced:
         print(f"note: the board model has no trace buffer (register map {info['regmap']}): "

@@ -64,23 +64,27 @@ def _vpad(spec) -> int:
     return -(-spec.vocab // BLK) * BLK
 
 
-def prog_bytes(imem_words: int) -> int:
+def prog_bytes(imem_words: int, waitc: bool = False) -> int:
     """A bucket program's slot in the chain area (bytes): two programs of IMEM's instructions
-    (32 bytes each), a split program's two parts (256 KiB at the card's 32K-word IMEM)."""
-    return 8 * imem_words
+    (32 bytes each), a split program's two parts (256 KiB at the card's 32K-word IMEM); on a
+    WAITC device (Config.SEQ_WC) each with its wait entries after it (opentpu.waits.area:
+    320 KiB)."""
+    from .. import waits as W
+    return 2 * W.area(imem_words, waitc)
 
 
-def alloc(b, spec, cap: int, block: int, imem_words: int = 1 << 15) -> dict:
+def alloc(b, spec, cap: int, block: int, imem_words: int = 1 << 15, waitc: bool = False) -> dict:
     """DRAM of the generate loop: the state block, out[] (one fp32 id per position), the
     bucket programs a run chains through (one slot per bucket and mode) and their tables
     ([address, instructions] per bucket, raw words, one table per mode); the sampler's
     logits (this slice's rows, -inf after them to a whole block), repetition penalty factors
     (pa, pb: 1 / R and R for the ids in the context, 1 for the others), uniforms (one per
     position, from the host) and constants (iota: 0 .. BLK - 1). A program slot holds two
-    programs that fit IMEM (`imem_words`: prog_bytes)."""
+    programs that fit IMEM (`imem_words`: prog_bytes), with their wait entries on a WAITC device
+    (`waitc`: Config.SEQ_WC)."""
     nb = buckets(cap, block)
     V = _vpad(spec)
-    slot = prog_bytes(imem_words)
+    slot = prog_bytes(imem_words, waitc)
     return {"state": b.alloc(4 * STATE_WORDS), "out": b.alloc(4 * (cap + 1)),
             "ptab": b.alloc(8 * (nb + 2) * MODES), "progs": b.alloc(slot * nb * MODES),
             "slot": slot,
@@ -93,6 +97,14 @@ def prog_slot(g: dict, blocks: int, mode: int = 0, part: int = 0) -> int:
     """The chain area's slot of bucket `blocks` (1, 2, ...) in chain area `mode`; a split
     program's second part in the slot's second half."""
     return g["progs"] + g["slot"] * (mode * g["nb"] + blocks - 1) + part * g["slot"] // 2
+
+
+def slot_words(backend, prog) -> np.ndarray:
+    """What a chain slot holds for `prog` (one slice's): its assembled words, and when the
+    backend's device loads wait entries (WAITC: backend.slot_words) its entries after them,
+    where HALT CHAIN's load reads them."""
+    f = getattr(backend, "slot_words", None)
+    return f(prog) if f is not None else np.asarray(I.assemble(prog), np.uint32)
 
 
 def ptab_addr(g: dict, mode: int = 0) -> int:

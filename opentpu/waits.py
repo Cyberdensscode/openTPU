@@ -32,9 +32,20 @@ iterations) run on widened registers to a fixed point, which covers every later 
 
 Checker checks entries against a concrete execution (the ISA simulator's): every conflict otpu_pkg
 conflict() finds with an older instruction that may still be running is waited for.
+
+On a WAITC device (Config.SEQ_WC; the bitstream's CFG_UARCH bit24) the host loads every program
+with its entries (opentpu/host/board.py Board.load_program refuses one without them): loadable()
+places them after the program's last chunk, where the slice's loader reads them, IMEM load and
+HALT CHAIN alike; area() is a program's room in DRAM; entries() computes them once per program
+(its words, its arguments' bounds) and keeps them beside the program cache's programs.
 """
 from __future__ import annotations
 
+import hashlib
+import os
+import shutil
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
 
 import numpy as np
@@ -507,6 +518,90 @@ def sync_file(words, path) -> None:
     with open(path, "w") as f:
         for pc, w in enumerate(words):
             f.write(f"{pc} " + " ".join(str(x) for x in counts(w)) + f" 0 {vmask(w)}\n")
+
+
+# ------------------------------------------------------------------------- loading (the host)
+def area(imem_words: int, waitc: bool = False) -> int:
+    """Bytes of DRAM a program of IMEM's instructions takes: its words (4 bytes each), and on a
+    WAITC device its entries after them (8 bytes an instruction; IMEM's words fill whole
+    chunks, so the entries need no padding before them)."""
+    return 4 * imem_words + (imem_words if waitc else 0)
+
+
+def loadable(words, entries, D: int) -> np.ndarray:
+    """A program as a WAITC device loads it from DRAM (uint32 words): its words, zeros to the
+    next chunk (D bytes), then its entries, 64 bits each (little-endian: the counts' word, then
+    the mask's), one per instruction (docs/isa.md "Wait counts")."""
+    w = np.asarray(words, "<u4")
+    e = np.asarray(entries, np.uint64)
+    if len(w) % 8 or len(e) != len(w) // 8:
+        raise ValueError(f"{len(e)} wait entries for {len(w) / 8:g} instructions")
+    pad = np.zeros(-len(w) % (D // 4), "<u4")
+    return np.concatenate([w, pad, e.astype("<u8").view("<u4")])
+
+
+MEM_N = 256                       # entries kept in this process (the most recently used)
+_mem: OrderedDict = OrderedDict()
+stats = {"memory": 0, "disk": 0, "computed": 0, "seconds": 0.0}
+
+
+def entries_key(words, D: int, S: int, run_args=None) -> str:
+    """The key of a program's entries: its words, the bounds its arguments take (run_args:
+    compiler.Program's), D, S, and the source of the compiler and of this pass
+    (progcache.source(): every module of opentpu that decides a program word, this one too)."""
+    from . import progcache as PC
+    b = sorted(arg_ranges(run_args).items())
+    h = hashlib.blake2b(repr(("waits", D, S, b, PC.source())).encode(), digest_size=20)
+    h.update(np.ascontiguousarray(words, "<u4").tobytes())
+    return h.hexdigest()
+
+
+def entries(words, D: int = 128, S: int = 1, run_args=None, prog=None) -> np.ndarray:
+    """wait_counts() of a program given as its assembled words (prog: its instructions, if at
+    hand; else the words decoded), its arguments bounded by run_args (default: prog's or the
+    words', compiler.Program / compiler.Words), kept: in this process (MEM_N) and, when the
+    program cache has a disk (progcache.cache_dir), as an entry of it (evicted with its
+    programs). `stats` counts the hits, the computes and their seconds."""
+    from . import progcache as PC
+    if run_args is None:
+        run_args = getattr(prog, "run_args", None) or getattr(words, "run_args", None)
+    k = entries_key(words, D, S, run_args)
+    if k in _mem:
+        _mem.move_to_end(k)
+        stats["memory"] += 1
+        return _mem[k]
+    d = PC.cache_dir()
+    f = None if d is None else d / k[:2] / f"{k}.npz"
+    e = None
+    if f is not None:
+        try:
+            with np.load(f) as z:
+                e = z["waits"]
+            os.utime(f)
+            stats["disk"] += 1
+        except FileNotFoundError:
+            pass
+        except Exception:                   # a damaged entry: compute again
+            f.unlink(missing_ok=True)
+    if e is None:
+        t0 = time.perf_counter()
+        if prog is None:
+            w = np.asarray(words, np.uint32)
+            prog = [I.Instr.decode(w[i:i + 8]) for i in range(0, len(w), 8)]
+        e = wait_counts(prog, D, S, run_args=run_args if run_args is not None else ())
+        stats["computed"] += 1
+        stats["seconds"] += time.perf_counter() - t0
+        if f is not None:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            if shutil.disk_usage(f.parent).free - e.nbytes >= PC.FREE_FLOOR:
+                tmp = f.with_name(f".{f.stem}.{os.getpid()}.npz")
+                np.savez(tmp, waits=e)
+                os.replace(tmp, f)
+                PC._evict(d)
+    _mem[k] = e
+    while len(_mem) > MEM_N:
+        _mem.popitem(last=False)
+    return e
 
 
 # ------------------------------------------------------------------------- checking

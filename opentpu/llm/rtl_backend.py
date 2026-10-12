@@ -25,6 +25,17 @@ class RtlBackend:
     generates = True            # the generate loop (RLD, ARGMAX: Engine.generate_card)
     chains = True               # and HALT CHAIN
 
+    def slot_words(self, prog) -> np.ndarray:
+        """A chain slot's contents for `prog` (generate.slot_words): its words, and with otpu_seq
+        WAITC (EXPERIMENTAL, OTPU_SEQ_WC=1: rtlsim.UARCH) its wait entries after them, which
+        HALT CHAIN's load reads (rtlsim.run places the first program's itself)."""
+        from .. import isa as I
+        from .. import waits as W
+        w = np.asarray(I.assemble(prog), np.uint32)
+        if not {**rtlsim.UARCH, **(self.uarch or {})}.get("SEQ_WC"):
+            return w
+        return W.loadable(w, W.entries(w, self.cfg.D, self.cfg.S, prog=prog), self.cfg.D)
+
     def run(self, programs: list, args=None) -> dict:
         drams, _, stats = rtlsim.run(self.cfg, programs, self.drams, self.dram_lat,
                                      max_cycles=1 << 40, uarch=self.uarch, axi=self.axi,

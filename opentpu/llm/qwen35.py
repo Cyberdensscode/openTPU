@@ -797,11 +797,13 @@ class Image(EmbedHost):
                                     M=cfg.MCOLS, embed_host=bool(embed_host),
                                     rows=self.grows,                # (layer 0's R rows)
                                     imem=cfg.IMEM_WORDS,            # OTPU_TILE as it is built)
-                                    masks=bool(self.prefill_rows) and tile_flag(None)) \
+                                    masks=bool(self.prefill_rows) and tile_flag(None),
+                                    waitc=cfg.SEQ_WC) \
             if lookup else {}
         if lookup and spec.mtp:     # the MTP loop's chain area (opentpu/llm/mtp.py)
             from .mtp import gen_alloc
-            self.lookup["mtpgen"] = gen_alloc(b, cap, spec, imem_words=cfg.IMEM_WORDS)
+            self.lookup["mtpgen"] = gen_alloc(b, cap, spec, imem_words=cfg.IMEM_WORDS,
+                                              waitc=cfg.SEQ_WC)
         self.choices = {"embed_host": self.embed_host,          # (the compile worker's
                         "formats": self.formats}                # image)
         self.offload = None

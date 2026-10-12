@@ -514,7 +514,7 @@ def run(a, t, dev: str, sim: bool) -> tuple[list[Row], list[str]]:
                         [link, f"DDR3 calibration channel {c}"], f"ch{c}")
 
     # ---- instruction set
-    img = diag_image()
+    img = diag_image(ctx["cfg"])
     if "isa" in want:
         print("isa", flush=True)
         caps = (ctx["info"] or {}).get("caps") or {}
@@ -635,8 +635,7 @@ def cycle_check(b, t, info, sim: bool) -> tuple:
     n = 20_000 if sim else 20_000_000
     cyc, walls, ups = [], [], []
     for k in (n, 2 * n):
-        b.load_program(PROG_AT, np.asarray(I.assemble([I.loop(1, k), I.nop(), I.halt()]),
-                                           np.uint32))
+        b.load(PROG_AT, [I.loop(1, k), I.nop(), I.halt()])
         s0 = b.snapshot() if not sim else None
         t0 = time.perf_counter()
         st = b.run(timeout=30)

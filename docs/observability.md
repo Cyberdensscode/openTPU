@@ -46,7 +46,7 @@ DDR3 speed as unknown.
 | 0x088 | CFG_IMEM | RO | IMEM words per slice (8 per instruction) |
 | 0x08C | CFG_ACT | RO | ACT RAM blocks |
 | 0x090 | CFG_DRAM | RO | [7:0] log2 DRAM bytes per slice, [15:8] memory channels per slice, [23:16] log2 bytes a slice addresses per channel |
-| 0x094 | CFG_UARCH | RO | [3:0] MXU_IMPL, [7:4] TMEM_IMPL, [15:8] VPU_CL, [23:16] ULANES |
+| 0x094 | CFG_UARCH | RO | [3:0] MXU_IMPL, [7:4] TMEM_IMPL, [15:8] VPU_CL, [23:16] ULANES, [24] SEQ_WC (EXPERIMENTAL: the sequencer takes each program's wait entries, which the host loads after it; docs/isa.md "Wait counts") |
 | 0x098 | CFG_PLATFORM | RO | the target's platform id (1 YPCB-00338, 2 BCU1525, 256 and up ASICs) |
 | 0x09C | CFG_HASH | RO | `opentpu.target.arch_hash` of the build's Config; the host checks it against the Config it builds from these registers (`device_config`) |
 | 0x0A0 + 4s | (reserved) | | slice s's DRAM window, for platforms with more memory per channel than a slice addresses (docs/targets.md) |

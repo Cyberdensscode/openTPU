@@ -266,6 +266,7 @@ def staging_area(eng) -> tuple[int, int] | None:
     at = getattr(be, "prog_at", None)
     if at is None:
         return None
-    base = -(-(at + 4 * cfg.IMEM_WORDS) // 4096) * 4096
+    from opentpu import waits as W
+    base = -(-(at + W.area(cfg.IMEM_WORDS, getattr(cfg, "SEQ_WC", False))) // 4096) * 4096
     n = min(STAGING_MAX, cfg.DRAM_BYTES - base)
     return (base, n) if n > 0 else None

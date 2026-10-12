@@ -487,7 +487,8 @@ class Image(EmbedHost):
             raise ValueError("embed_host needs the image's lookup tables (lookup=True)")
         self.lookup = _lookup_alloc(b, spec, cap, D=D, head=self.head if shared else None,
                                     M=cfg.MCOLS, embed_host=bool(embed_host),
-                                    rows=rows, imem=cfg.IMEM_WORDS) if lookup else {}
+                                    rows=rows, imem=cfg.IMEM_WORDS,
+                                    waitc=cfg.SEQ_WC) if lookup else {}
         self.choices = {"embed_host": self.embed_host,          # (the compile worker's
                         "formats": self.formats}                # image)
         self.offload = None

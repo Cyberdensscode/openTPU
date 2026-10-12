@@ -27,16 +27,20 @@ vpu_cl="${VPU_CL:-${T_VPU_CL:-2}}"
 lanes="${LANES:-${T_LANES:-8}}"
 act_rows="${ACT_ROWS:-$mcols}"
 dstep="${DSTEP:-${T_DSTEP:-1}}"
+# otpu_seq WAITC (EXPERIMENTAL, docs/seq_vpu.md; CFG_UARCH bit24, in CFG_HASH when on): the
+# target's [arch] SEQ_WC, or SEQ_WC=1. The host writes each program's wait entries
+seq_wc="${SEQ_WC:-${T_SEQ_WC:-0}}"
 core_mhz="${CORE_MHZ:-${T_CORE_MHZ:-100}}"
 platform="${T_PLATFORM:-2}"
 ddr_mts="${T_DDR_MTS:-1600}"
 arch_hash="$(PYTHONPATH="$root" python3 -m opentpu.target hash bcu1525 MCOLS="$mcols" \
-  LANES="$lanes" ACT_ROWS="$act_rows" DSTEP="$dstep" 2>/dev/null || echo 0)"
+  LANES="$lanes" ACT_ROWS="$act_rows" DSTEP="$dstep" SEQ_WC="$seq_wc" 2>/dev/null || echo 0)"
 build_id="${BUILD_ID:-$(git -C "$root" rev-parse HEAD 2>/dev/null | cut -c1-8)}"
 build_id="${build_id:-0}"
 mkdir -p "$out"
 export OTPU_IP_CACHE="${OTPU_IP_CACHE-$HOME/.cache/otpu-vivado-ip}"
 export OTPU_FAST="${FAST:-0}"
+export OTPU_SEQ_WC_GEN="$seq_wc"
 export PCIE_LANES="${PCIE_LANES:-16}"
 export TMEM_URAM="${TMEM_URAM:-0}"     # 1: the TMEM copies in UltraRAM (vivado/tmem_uram.xdc)
 run() { local script="$1"; shift
