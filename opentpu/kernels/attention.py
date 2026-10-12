@@ -71,6 +71,21 @@ class RowMasks:
                 out[r0:r1, k:n].set(float("-inf"))
 
 
+class RowTiles:
+    """RowMasks at run-time positions (a tiled prompt run): `tiles` [(r0, r1, add)], rows r0 ..
+    r1 - 1 of the score buffer take the Additive tile `add` (their own position's row of the
+    image's mask table, as each row's Bucket of a prompt run takes it). Each row group's rows
+    are loaded from its tile, then q.K^T is accumulated into the buffer with the row maxima:
+    every row's scores bit for bit those of its own Additive block."""
+
+    def __init__(self, tiles):
+        self.tiles = [(r0, r1, a) for r0, r1, a in tiles]
+
+    def fill(self, out, n: int) -> None:
+        for r0, r1, a in self.tiles:
+            ol.load(a.tile(r1 - r0, n), out=out[r0:r1, :])
+
+
 class TileSeq:
     """Blocks of a packed query tile (tiled prefill): `full` whole blocks every row sees (the
     hardware loop's, as a length's), then `items` [(t0, n, mask)] as Blocks' (a mask: RowMasks,
@@ -185,7 +200,7 @@ def _attend_heads(qhs, kv, hs, seq_len: int, block: int, scale: float | None = N
             ol.load(row.tile(st.G, n), out=out)
             ol.dot(st.qs, st.K[t0:t0 + n, :], acc=out, rowmax=True)
             return out
-        if isinstance(row, RowMasks):                   # built in place, then q.K^T added
+        if isinstance(row, (RowMasks, RowTiles)):       # built in place, then q.K^T added
             row.fill(out, n)
             ol.dot(st.qs, st.K[t0:t0 + n, :], acc=out, rowmax=True)
             return out

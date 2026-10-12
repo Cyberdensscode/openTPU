@@ -726,6 +726,8 @@ class Image(EmbedHost):
         self.io = {"x": b.alloc(4 * H * rows), "cos": b.alloc(2 * spec.rope_dim * rows),
                    "sin": b.alloc(2 * spec.rope_dim * rows), "gf": b.alloc(4 * H),
                    "logits": b.alloc(4 * spec.vocab * rows),
+                   # a tiled run's attention outputs, a part at a time (tiled.py: OSCR)
+                   "o": b.alloc(4 * cfg.act_rows * self.nq_loc * spec.head_dim),
                    "hs": b.alloc(4 * 2 * self.nl),     # per pair: decays of a, b; betas
                    "gr": b.alloc(4 * 2 * self.nl * self.grows),    # chunked prefill, per row:
                    "on": b.alloc(4 * 4 * spec.lin_dv * self.grows)}    # decays, betas; a head
@@ -790,10 +792,13 @@ class Image(EmbedHost):
                           and getattr(spec, "embed", "f32") == "int8" and spec.moe is not None)
         if embed_host and not lookup:
             raise ValueError("embed_host needs the image's lookup tables (lookup=True)")
+        from .prefill import tile_flag      # (a MoE model's mask tiles: its tiled layer runs,
         self.lookup = _lookup_alloc(b, spec, cap, D=D, head=self.head if shared else None,
                                     M=cfg.MCOLS, embed_host=bool(embed_host),
                                     rows=self.grows,                # (layer 0's R rows)
-                                    imem=cfg.IMEM_WORDS) if lookup else {}
+                                    imem=cfg.IMEM_WORDS,            # OTPU_TILE as it is built)
+                                    masks=bool(self.prefill_rows) and tile_flag(None)) \
+            if lookup else {}
         if lookup and spec.mtp:     # the MTP loop's chain area (opentpu/llm/mtp.py)
             from .mtp import gen_alloc
             self.lookup["mtpgen"] = gen_alloc(b, cap, spec, imem_words=cfg.IMEM_WORDS)
@@ -1348,6 +1353,7 @@ class Image(EmbedHost):
             cosr=_tdesc(self.io["cos"], (self.rows, spec.rope_dim // 2)),
             sinr=_tdesc(self.io["sin"], (self.rows, spec.rope_dim // 2)),
             logitsr=_tdesc(self.io["logits"], (self.rows, spec.vocab)),
+            oscr=_tdesc(self.io["o"], (self.cfg.act_rows, self.nq_loc * spec.head_dim)),
             hs=_tdesc(self.io["hs"], (nl // 2, 4)),
             gr=_tdesc(self.io["gr"], (self.grows, 2 * nl)),
             on=_tdesc(self.io["on"], (self.grows, self.og * dv)),
@@ -1837,7 +1843,7 @@ def qwen35_step(m, pos: int, block: int = ATTN_BLOCK, tok: int | None = None):
     _lm_head(x, m, spec)
 
 
-def _deltanet_rows(x, lw, p0: int, spec: Spec, gr, on, fork: bool = False):
+def _deltanet_rows(x, lw, p0: int, spec: Spec, gr, on, fork: bool = False, xs=None):
     """_deltanet for R consecutive positions p0 .. p0+R-1 at once. The projections stream once
     for the R rows, pair of heads by pair; the convolution runs over the pair's rows before
     it in the chunk and its ring; each head's state is loaded once, updated and read row after
@@ -1857,7 +1863,8 @@ def _deltanet_rows(x, lw, p0: int, spec: Spec, gr, on, fork: bool = False):
     fork (the speculative verify, docs/mtp.md 9): the last row's state and window go to the
     other slot (DeltaNetParts), so the committed slot keeps those after the row before it:
     the last row's step is a STREAM into the other slot (or, on the VPU path, the state is
-    stored after the row before it too)."""
+    stored after the row before it too). xs: x's normed rows already quantized (a tiled run's,
+    tiled._norm_quantize: the same operand, without the normed [R, H] tile in TMEM)."""
     eps, K, R = spec.eps, spec.conv_k, x.rows
     dk, dv = spec.lin_dk, spec.lin_dv
     dn = lw.dn
@@ -1867,7 +1874,8 @@ def _deltanet_rows(x, lw, p0: int, spec: Spec, gr, on, fork: bool = False):
     CP, RP = nb * bw, nb * bw + 2 * dv                  # its convolved channels, its rows
     NP, ng, gp = nl // 2, nl // og, og // 2             # pairs, head groups, pairs per group
     TP = K * CP                                         # taps words of a pair (then its ring)
-    xs = ol.quantize(rmsnorm(x, ol.load(lw.g_in), eps))
+    if xs is None:                                      # (a tiled run's: tiled.py)
+        xs = ol.quantize(rmsnorm(x, ol.load(lw.g_in), eps))
     ab = ol.dot(xs, lw.wab)                             # [R, 2nl]: a, then b, of each head
     alog, dtb = ol.load(lw.alog), ol.load(lw.dtb)
     for r in range(R):

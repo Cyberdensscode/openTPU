@@ -13,6 +13,9 @@ run; estimated means arithmetic on measured parts, named as such.
 
 ## 0. Short answer
 
+(Section 10 has the tile in the engine for every card model family, dense and MoE, and its
+measurements; this section is the prototype's.)
+
 - **Rows a weight pass are not what prefill lacks.** A pass needs about MCOLS rows (4-bit) or
   2 MCOLS (int8) to reach the MXU's multiply rate (section 2), and the card's prompt runs are
   already 96% MXU-busy at 4 rows. Today's kernel at 8, 16 and 32 rows with MM replay is within
@@ -622,3 +625,218 @@ Expert-major's -1.7 s (35B) / -1.9 s (26B) adds to the MoE rows once the pfB A/B
   used here) and any other branch's that did not carry the change.
 - **A user decision:** none needed for the software steps. An ACT_ROWS 16 bitstream and its card
   qualification, and the pfB A/B, take card time, which the lead schedules.
+
+## 10. In the engine (2026-10-12)
+
+The tile now serves every card model family's prefill, opt-in: `Engine(tile_runs=True)` or
+`OTPU_TILE=1` (prefill.tile_flag). Dense models take tiled prompt runs (prefill.py's tile mode:
+tiled.compile_tile_run at a run-time position, a program per bucket and kind as today's prompt
+runs); MoE models take tiled expert-major layer runs (Engine.layer_tile:
+tiled.compile_layer_tile). Branch tiled-prefill.
+
+### 10.1 What runs tiled
+
+| family | prompt runs (dense) | layer runs (MoE, expert-major) |
+|---|---|---|
+| Qwen3 and the Llama-likes (Phi-4-mini, SmolLM3) | qwen3_tile | |
+| Qwen3.5 | qwen35_tile: gated attention tiled, DeltaNet rows in runs of the rows that fit (their pair buffers grow with the rows) | qwen35_layer_tile (35B): the same; the route, need lines and shared expert a need line's rows at a time |
+| LFM2 / LFM2.5 | lfm2_tile: attention, convolutions by channel parts | |
+| Gemma 4 (E2B, E4B with PLE) | gemma4_tile: sliding / global spans, KV-shared layers, PLE | gemma4_layer_tile (26B): attention, then the route and need lines, then the dense MLP over the T rows |
+
+- **Forms** (compile_tile_run / compile_layer_tile try them until one fits TMEM, ACT RAM and
+  IMEM: `_first_fit`): as it is; x spilled to DRAM (the I/O input rows, or the expert-major
+  records' X) while the heads attend and loaded back into its own TMEM words (x is carried
+  across the layers' hardware loops); Qwen3.5's DeltaNet in runs of fewer rows; each at the
+  attention's pipeline depth 3, then, over IMEM, at depth 2 (SHALLOW).
+- **Query parts.** A KV head's query group runs in parts of at most MCOLS heads whose
+  [T, heads d] queries take at most TMEM / 8 words (QPART); each part's rows pack MCOLS query
+  rows to an MM, so K / V stream G / MCOLS times a row whatever the part. This is what fits
+  Gemma 4's 8-head groups, Qwen3.5-35B's G = 8 and Qwen3.5's 16-row tiles.
+- **The engine's rows.** With prompt runs and tiling on, the image's I/O rows grow to ACT_ROWS
+  (an L run of T rows writes row T - 1's logits). A MoE image built with OTPU_TILE=1 holds the
+  mask tiles its layer runs need (2 MiB at MCOLS 4; the probe that sizes the expert slots sees
+  them too). Layer 0's runs that gather their rows from the host's slot stay untiled.
+- **References.** tools/qual/refs.py's key holds OTPU_TILE (and OTPU_ACT_ROWS): a tiled qual's
+  references are its own.
+
+### 10.2 Correctness
+
+- **ISA: every family and form bit for bit against today's runs** (tests/test_tiled.py):
+  prompt runs of Qwen3 (MCOLS 2, 4, 8), SmolLM3, Phi-4-mini (G = 3), LFM2, Qwen3.5 (8 and 16
+  DeltaNet heads, query parts of 2 heads, x spilled, DeltaNet in runs of 4), Gemma 4 (1 and 2
+  KV heads, int8 and fp4, PLE from the host, query parts of 1 and 2 heads), the shallow
+  pipeline over 1,030 tokens; expert-major layer runs of the tiny Gemma 4 MoE and Qwen3.5-MoE
+  (8 and 6 rows against token by token in int8, and against today's expert-major runs of 4
+  rows in 4-bit): logits, KV caches, DeltaNet states and windows, and the decode steps after.
+- **PAIR, exactly.** A 4-bit MM of at most MCOLS / 2 rows pairs (two K blocks a cycle, summed
+  before the partial sums: a different rounding). A tile and today's run give the same bits
+  wherever both pair or neither does; they differ (last bits; max |diff| / max |y| < 1e-3 on
+  the logits) exactly where one of them pairs, e.g. today's 2-row or 1-row runs at a chunk's
+  end against a tile's 4 or more rows (test_tiled_prompt_runs_pair_rounding; a Qwen3.5-MoE
+  chunk of 13 rows by 4 left a 1-row run: 4 words of the layers' 8.4 MB differed, the logits
+  not). int8 never pairs. A DeltaNet split runs its rows as evenly as they go (6 by 4 is
+  3 + 3, not 4 + 2, whose 2 rows would pair).
+- **RTL = ISA** (DRAM and TMEM, the board's memory path), on the card's configuration (MCOLS
+  4, ACT_ROWS 4) and on ACT_ROWS 16 / MCOLS 8: prompt runs of Qwen3 (4 rows, ACT RAM of 4),
+  LFM2 (16), Qwen3.5 (16; and x spilled with the DeltaNet in runs), Gemma 4 (the sliding
+  window's start-masked block, 4 rows at position 600; MCOLS 8, 8 rows); expert-major layer
+  runs of the Gemma 4 MoE (a sliding layer's 4 rows on ACT_ROWS 4, a global layer's 8 on 16)
+  and of Qwen3.5-MoE (an attention layer's 4 rows on ACT_ROWS 4, the DeltaNet layer after it,
+  8 rows on 16). (With the LANES 16 design-point configuration a Qwen3.5-MoE DeltaNet layer
+  run, today's untiled one too, trips otpu_tmem.sv's copy check at the dump: a word written
+  to one TMEM copy only. The card's LANES 8 passes.)
+
+### 10.3 Rows a tile holds
+
+Compile only (tools/perf_prompt.py --compile-only, fp4 layers, int8 head, the card's 64K-word
+TMEM and 4K-instruction IMEM, bucket 2), against today's prompt runs:
+
+| model | today | MCOLS 4, ACT_ROWS 4 | MCOLS 4, ACT_ROWS 16 | MCOLS 8, ACT_ROWS 16 |
+|---|---|---|---|---|
+| Qwen3-0.6B | 8 | 4 | 16 | 16 |
+| Qwen3.5-0.8B | 4 | 4 | 16 | 16 |
+| Qwen3.5-2B | 4 | 4 | 12 | 12 |
+| Qwen3.5-4B | 3 | 4 | 8 | 8 |
+| LFM2-2.6B | 3 | 4 | 8 | 8 |
+| LFM2.5-230M | 8 | 4 | 12 | 16 |
+| Phi-4-mini | 3 | 4 | 8 | 12 |
+| SmolLM3-3B | 4 | 4 | 12 | 16 |
+| Gemma 4 E2B | 4 | 4 | 8 | 12 |
+| Gemma 4 E4B | 4 | 4 | 8 | 8 |
+| gemma-4-26B-A4B (expert-major layer runs) | 2 | 4 | 8 | |
+| Qwen3.5-35B-A3B (expert-major layer runs) | 2 | 4 | 8 | |
+
+(The survey's IMEM check is at the attention's depth 3; the engine retries an over-IMEM size
+at depth 2, which the survey did not: Qwen3.5-2B's 16 rows were 5,790 instructions at depth 3.)
+
+**Long prompts: IMEM, not TMEM, holds the tile past bucket ~3.** A packed tile's attention
+leaves up to ~3 x depth block bodies unrolled (the pipeline's prime, its hardware loop's body,
+the blocks after it), the most at bucket 8. Instructions at buckets 2 / 8 / 15 (MCOLS 4,
+ACT_ROWS 16, depth 3): Phi-4-mini T = 8 3,176 / 7,726 / 6,318; LFM2-2.6B T = 4 2,331 / 4,609 /
+3,905; E2B T = 8 2,994 / 4,355 / 4,003; SmolLM3 T = 8 2,211 / 4,489 / 3,785; Qwen3-0.6B T = 16
+3,066 / 7,616 / 6,208. At depth 2 (bucket 8): Phi-4-mini T = 4 2,604, LFM2-2.6B T = 4 3,201,
+E2B T = 8 3,651, SmolLM3 T = 8 3,081, Qwen3-0.6B T = 8 2,582, Qwen3.5-0.8B T = 12 3,576. The
+engine takes the largest T that fits each bucket (prefill._probe_tile, a program cache fact),
+at depth 2 where depth 3 is over IMEM (the depth costs 0.0-0.14% a row: 10.4). Bucket 2's
+tiles hold to about bucket 3; past that T drops to 4-8 on the larger models.
+
+The looped attention of docs/prefill.md 10 (A: an entry loop) is what lifts this: a KV head's
+packed tiles as a hardware loop (its queries', outputs' and mask tiles' addresses affine in
+the tile, K / V the same each iteration, the last, partial tile peeled), its body one packed
+tile's attention with its block loop inside; loop depth layers, entries, blocks (3 of the
+ISA's 4). The program is then about one packed tile's attention a KV head and part, so the
+tile's T is TMEM's at every bucket. It matters most at MCOLS 8 and on long prompts; its gates
+are docs/prefill.md 10's (an ISA count per layout and bucket, an RTL co-simulation of the
+looped run against the unrolled one, then bit for bit on the ISA and an RTL test).
+
+### 10.4 Measured (RTL co-simulation, the card's memory path)
+
+Prompt runs (tools/perf_prompt.py --phases: one P run at the start of a bucket, the model's
+first layers: 2 for Qwen3-0.6B and Phi-4-mini, 4 for Qwen3.5 and SmolLM3, 5 for Gemma 4, 6 for
+LFM2; fp4 layers, int8 head; cycles a row). Today's rows are the most that fit (3-4, 8 on the
+small ones) and, where that is 3, also 2, which the planner's PAIR rule takes for 4-bit
+(docs/prefill.md 7: 2 paired rows cost about one):
+
+Bucket 2 (position 256), MCOLS 4 (the card):
+
+| model | today (rows) | tile, T = 4 (ACT_ROWS 4: today's bitstream) | tile, larger T (ACT_ROWS 16) |
+|---|---|---|---|
+| Qwen3-0.6B | 88.8K (8) | 82.9K (-6.6%) | 81.1K (16: -8.7%) |
+| Qwen3.5-0.8B | 283.8K (4) | 282.7K (-0.4%) | 281.6K (12: -0.8%) |
+| Qwen3.5-4B | 1,120.6K (2; 3: 1,296.8K) | 1,004.7K (-10.3%) | 1,001.1K (8: -10.7%) |
+| LFM2-2.6B | 1,092.7K (2; 3: 1,313.8K) | 990.9K (-9.3%) | 987.2K (8: -9.7%) |
+| LFM2.5-230M | 168.6K (8) | 163.2K (-3.2%) | 159.7K (12: -5.3%) |
+| Phi-4-mini | 477.9K (2; 3: 564.9K) | 433.3K (-9.3%) | 430.6K (8: -9.9%) |
+| SmolLM3-3B | 658.9K (4) | 656.1K (-0.4%) | 652.9K (12: -0.9%) |
+| Gemma 4 E2B | 574.3K (4) | 574.9K (+0.1%) | 578.6K (8: +0.8%) |
+| Gemma 4 E4B | 1,126.3K (4) | 1,127.7K (+0.1%) | 1,133.7K (8: +0.7%) |
+
+Bucket 2, MCOLS 8 (today's runs on ACT_ROWS 8; 4-bit runs of up to 4 rows pair):
+
+| model | today (rows) | tile, T = 8 (ACT_ROWS 8) | tile, T = 16 (ACT_ROWS 16) |
+|---|---|---|---|
+| Qwen3-0.6B | 62.4K (8) | 50.7K (-18.7%) | 51.5K (-17.5%) |
+| Qwen3.5-0.8B | 235.3K (4) | 233.4K (-0.8%) | |
+| Qwen3.5-4B | 808.2K (3) | 650.7K (-19.5%) | |
+| LFM2-2.6B | 746.7K (3) | 511.5K (-31.5%) | |
+| LFM2.5-230M | 103.8K (8) | 92.0K (-11.4%) | 91.9K (-11.5%) |
+| Phi-4-mini | 331.3K (3) | 230.3K (-30.5%) | |
+| SmolLM3-3B | 385.6K (4) | 344.5K (-10.7%) | 344.6K (-10.7%) |
+| Gemma 4 E2B | 323.1K (4) | 309.2K (-4.3%) | |
+| Gemma 4 E4B | 711.7K (4) | 596.7K (-16.2%) | |
+
+(Qwen3.5-2B's image needs a 4 GiB DRAM, past what the simulator models: not run. 12 rows at
+MCOLS 8 lose: Phi-4-mini 301.8K, Qwen3.5-0.8B 254.8K, E2B 372.2K, the replay's second pass of
+4 rows costing a whole one; the engine takes whole passes of MCOLS above MCOLS rows and never
+picks 12 there.)
+
+Bucket 8 (position 1792: seven whole blocks and the masked one), MCOLS 4:
+
+| model (layers) | today (rows) | tile, T = 4 | tile, larger T | change |
+|---|---|---|---|---|
+| Qwen3-0.6B (2) | 140.3K (4) | | 112.1K (8; 112.1K at depth 2) | -20.1% |
+| Phi-4-mini (2) | 531.2K (2; 3: 619.4K) | 487.4K (488.1K at depth 2) | | -8.2% |
+| LFM2-2.6B (6) | 1,155.3K (2; 3: 1,377.4K) | 1,055.2K (depth 2) | | -8.7% |
+| Qwen3.5-4B (4) | 1,146.0K (2) | 1,030.7K | | -10.1% |
+| SmolLM3-3B (4) | 720.9K (4) | 720.2K | 716.4K (8, depth 2) | -0.6% |
+| Gemma 4 E2B (5) | 741.2K (4) | 742.3K | 745.4K (8, depth 2) | +0.2% / +0.6% |
+
+- **On today's bitstream (T = 4, ACT_ROWS 4)** the tile takes -9 to -10% a row off the models
+  whose prompt runs hold 3 rows today (Phi-4-mini, LFM2-2.6B, Qwen3.5-4B: 4 rows reach MCOLS
+  4's 4-bit knee, where today runs 2 paired rows), -6.6% off Qwen3-0.6B (G = 2: two rows a
+  K / V stream) and -3% off LFM2.5-230M; the rest are within +-0.4%. ACT_ROWS 16 adds 0.4-2.1
+  points at MCOLS 4 (Gemma 4 aside).
+- **G >= MCOLS** (SmolLM3 and Qwen3.5 G = 4, Gemma 4 E2B G = 8) packs nothing at MCOLS 4, and
+  4-bit layers are at their floor at 4 rows: no change there (as section 4.2's 4B shape);
+  Gemma 4 at 8 rows is +0.7-0.8% (replay), which a cost-aware choice of T would avoid (the
+  engine takes the largest T that fits).
+- **MCOLS 8 is where the tile is the prefill kernel**: -11% to -32% a row on every model with
+  G <= 4 (two or more rows a K / V stream, and 8 rows at the 4-bit knee that 3-4-row paired
+  runs miss), -4% on E2B (G = 8), ~-1% on Qwen3.5-0.8B (DeltaNet-bound).
+- **Long prompts** gain more where the attention is a larger share: Qwen3-0.6B -20% at bucket
+  8; the 3-row models keep their -8 to -10% there.
+
+Expert-major layer runs of gemma-4-26B-A4B (the mixer: the layer before's end, the attention,
+the route and need lines, the dense MLP; int8 dense weights, every need served; ms a row at
+133.33 MHz, on tools/moe_prefill_cosim.py's setup):
+
+| layer | position | today, R = 2 | tile, T = 4 (ACT_ROWS 4) | tile, T = 8 (ACT_ROWS 16) |
+|---|---|---|---|---|
+| sliding | 256 | 2.766 | 1.498 (-45.8%) | 1.411 (-49.0%) |
+| global | 256 | 2.850 | 1.812 (-36.4%) | 1.725 (-39.5%) |
+| sliding | 900 | 3.665 | 1.949 (-46.8%) | 1.866 (-49.1%) |
+| global | 900 | 3.387 | 2.346 (-30.7%) | 2.251 (-33.5%) |
+
+- **The 26B's mixer runs halve on today's bitstream.** Its int8 dense weights (the attention
+  projections and the 2,112-wide dense MLP) stream once for 4 rows instead of 2, and the
+  sliding layers' G = 2 packs two rows a K / V stream. Over its 30 layers (25 sliding, 5
+  global) that is about -37 ms a prompt row of the layer runs' device time at T = 4 (-40 ms at
+  T = 8) against ~83 ms today: for a 124-token pooled prompt about -4.6 s (-4.9 s) of device
+  time (estimated from the co-simulated layers; section 5.2's estimate from the weights alone
+  was -2.2 to -3.1 s). How much the card shows depends on the link: expert-major hides the
+  experts' streaming under these runs, so shorter runs can expose misses (docs/offload.md
+  13.11); a card A/B measures it.
+- **Its bits are today's.** The 26B's dense weights and router are int8 (no PAIR) and its
+  experts run in the layer's expert run as today: the tiled runs give today's expert-major
+  tokens, so chatmoe's references stand.
+
+### 10.5 ACT_ROWS 16
+
+tools/synth/ooc_rows.py (Vivado OOC of otpu_actram and otpu_mxu by ROWS on the card's part):
+today's MXU at ACT_ROWS 16 costs +259 LUT, +72 FF and no BRAM (the ACT RAM's 512-deep groups x
+blocks fit the same BRAM36s; 32 rows would double them), WNS +0.875 ns against +0.773 at 4;
+dsp-pump's MX column the same (+268 LUT, +72 FF). The MX build carries ACT_ROWS 16
+(dsp-pump's decision, 2026-10-12).
+
+### 10.6 Next
+
+- **Card, today's bitstream (the lead schedules it):** an OTPU_TILE=1 qual of the dense models
+  (prompt runs -9 to -10% a row on Phi-4-mini, LFM2-2.6B and Qwen3.5-4B, -6.6% on
+  Qwen3-0.6B, -3% on LFM2.5-230M in co-simulation; the rest within +-0.4%) and the 26B's
+  expert-major prefill with tiled layer runs of 4 rows (Engine layer_major=4; chatmoe
+  token-exact against today's; a TTFT A/B against expert-major at R = 2). New images: the
+  dense ones' I/O rows, the MoE ones' mask tiles (OTPU_TILE=1 as they are built). The dense
+  references move only where today's runs paired (4-bit runs of 1-2 rows).
+- **With the MX build (ACT_ROWS 16):** T = 8-16; references recomputed with OTPU_TILE=1 and
+  OTPU_ACT_ROWS=16 (MX changes them anyway).
+- **Looped attention** (10.3) for long prompts, with the MCOLS 8 / MX work.

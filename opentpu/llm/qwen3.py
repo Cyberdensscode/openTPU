@@ -365,7 +365,7 @@ def qk_gains(spec: Spec, W, p: str) -> tuple[np.ndarray, np.ndarray]:
 # =============================================================================== lookup tables
 def _lookup_alloc(b: "_Bump", spec, cap: int, block: int = None, D: int = 128,
                   head: tuple | None = None, M: int = 4, embed_host: bool = False,
-                  rows: int = 1, imem: int = 1 << 15) -> dict:
+                  rows: int = 1, imem: int = 1 << 15, masks: bool = False) -> dict:
     """DRAM for the device-side inputs of a run-time position (RunPos): every token's embedding
     row, the RoPE cos / sin rows of every position, and the attention mask table
     (attention.Bucket: cap entries +inf, then a block of -inf). The embedding rows are fp32
@@ -376,7 +376,8 @@ def _lookup_alloc(b: "_Bump", spec, cap: int, block: int = None, D: int = 128,
     of their own, or with `embed_host` a slot of `rows` of them that the host fills from the
     table it keeps (embed_record: each row's int8 data, then its gather scales) and a mailbox
     for the generate loop's requests (opentpu.host.offload.RowLayout). A dense model's image
-    also holds the prompt runs' additive mask tiles (amask_table)."""
+    also holds the prompt runs' additive mask tiles (amask_table); a MoE model's with `masks` (its
+    tiled layer runs: tiled.compile_layer_tile)."""
     block = block or ATTN_BLOCK
     half = len(rope_tables(spec, 0)[0])
     V, H = spec.vocab, spec.hidden
@@ -398,7 +399,7 @@ def _lookup_alloc(b: "_Bump", spec, cap: int, block: int = None, D: int = 128,
         emb.update(onehot=b.alloc(4 * M * onehot_blocks(D, M, "int8") * D), M=M)
     else:
         emb = {"embed": b.alloc(4 * V * H)}
-    if getattr(spec, "moe", None) is None and not getattr(spec, "experts", 0):
+    if masks or (getattr(spec, "moe", None) is None and not getattr(spec, "experts", 0)):
         emb.update(amask=b.alloc(amask_table(block, M).nbytes), amask_M=M)
     return {**emb, "cos_t": b.alloc(4 * cap * half), "sin_t": b.alloc(4 * cap * half),
             "zmask": b.alloc(4 * (cap + block)), "half": half, "block": block, "D": D,
@@ -905,7 +906,9 @@ class Image(EmbedHost):
         rd = spec.rope_dim
         self.io = {"x": b.alloc(4 * H * R), "cos": b.alloc(2 * rd * R),
                    "sin": b.alloc(2 * rd * R), "gf": b.alloc(4 * H),
-                   "logits": b.alloc(4 * spec.vocab * R)}
+                   "logits": b.alloc(4 * spec.vocab * R),
+                   # a tiled run's attention outputs, a part at a time (tiled.py: OSCR)
+                   "o": b.alloc(4 * cfg.act_rows * self.nq_loc * d)}
         self.layer0 = b.next
         self.mats = {"wq": (self.nq_loc * d, H), "wk": (self.nkv_loc * d, H),
                      "wv": (self.nkv_loc * d, H), "wo": (self.h_loc, spec.n_q * d),
@@ -1142,6 +1145,7 @@ class Image(EmbedHost):
             cosr=_tdesc(self.io["cos"], (self.rows, rh)),
             sinr=_tdesc(self.io["sin"], (self.rows, rh)),
             logitsr=_tdesc(self.io["logits"], (self.rows, spec.vocab)),
+            oscr=_tdesc(self.io["o"], (cfg.act_rows, self.nq_loc * d)),
             head=_qdesc(*self.head, self.v_loc, H, D, self.head_format), v_loc=self.v_loc,
             **_lookup_desc(self.lookup, spec, self.cap))
 
@@ -1896,13 +1900,17 @@ def _worker_decode(blocks: int, lo: int):
 
 def layer_programs(image, key, block: int, hint: bool = False, em: bool = False):
     """Engine.prefill_layers' run of `key`: (layer (-1: the embed run), blocks, rows,
-    embedded), (layer, None, rows, True, compile-time position), ("x", layer) (an expert run)
-    or "head" -> (programs, run_args); hint: a layer's run ends with the next MoE layer's hint
+    embedded), (layer, None, rows, True, compile-time position), (layer, blocks, rows, True,
+    "tile") (an expert-major run tiled: Engine.layer_tile), ("x", layer) (an expert run) or
+    "head" -> (programs, run_args); hint: a layer's run ends with the next MoE layer's hint
     (Engine's layer_ahead "hint"); em: expert-major (Engine's expert_major)."""
     if key == "head":
         return image.compile_prefill_head(**({"em": True} if em else {}))
     if key[0] == "x":
         return image.compile_expert_run(key[1])
+    if key[-1] == "tile":
+        from . import tiled as TL
+        return TL.compile_layer_tile(image, key[0], key[1], key[2], block)
     kw = {"hint": True} if hint and key[0] >= 0 else {}
     if em:
         kw["em"] = True
@@ -2110,7 +2118,10 @@ class Engine:
     run-time positions, its tokens from out[] (opentpu/llm/prefill.py): compiled once per
     bucket and kind, not per prompt. A dense model's resident image (prefill.supported). With
     the pipeline, bucket 1's are loaded or compiled on a thread as the engine starts
-    (prefill.warm).
+    (prefill.warm). tile_runs (docs/tiled_prefill.md; None: OTPU_TILE=1 turns them on): the
+    prompt runs tiled (opentpu/llm/tiled.py), up to ACT_ROWS rows a run, the image's I/O rows
+    at least ACT_ROWS; with expert_major a MoE model's layer runs of more than one row
+    (layer_tile: tiled.compile_layer_tile, on an image built with OTPU_TILE=1: its mask tiles).
 
     rollback(k) takes the context back to its first k tokens (a chat's next turn, whose
     template renders the last reply differently from what was fed: opentpu/llm/snapshot.py).
@@ -2130,10 +2141,12 @@ class Engine:
                  restore: str = "lazy", embed_runs: bool = False, release_weights: bool = True,
                  pool_map: bool = True, prog_cache: bool | None = None,
                  prompt_runs: bool = False, layer_ahead=None, expert_major: bool = False,
-                 snapshots: int = 0, batch_area: bool = False):
+                 snapshots: int = 0, batch_area: bool = False, tile_runs: bool | None = None):
+        from . import prefill as PF
         self.spec, self.cap, self.block = spec, cap, block
         self.prog_cache = PC.enabled() if prog_cache is None else bool(prog_cache)
         self.prompt_runs = prompt_runs
+        self.tile_runs = tile_runs          # (None: OTPU_TILE's choice, prefill.tile_flag)
         self.batch, self.rows = batch, max(rows, batch)
         wkw = dict(wformat=wformat, head_format=head_format)
         if experts is not None:             # a MoE model's expert slots per layer
@@ -2148,6 +2161,12 @@ class Engine:
         if lookup:
             wkw["lookup"] = True
         self.cfg = cfg or device_config(spec, cap, batch=batch, rows=self.rows, **wkw)
+        if prompt_runs and PF.tile_flag(tile_runs) and self.cfg.act_rows > self.rows:
+            # tiled prompt runs of up to ACT_ROWS rows (prefill.py): the image's I/O rows hold
+            # an L run's last row's logits (row T - 1)
+            self.rows = self.cfg.act_rows
+            if cfg is None:
+                self.cfg = device_config(spec, cap, batch=batch, rows=self.rows, **wkw)
         try:
             self.image = spec.image(self.cfg, cap, batch, self.rows, **wkw)
         except MemoryError as e:            # an int8 embedding table of its own that does not
@@ -2248,6 +2267,15 @@ class Engine:
                                       and not self.layer_hint):
             raise ValueError("expert-major MoE needs layer-major prefill, the expert server "
                              "with pooled slots, and no layer hints (its runs post needs)")
+        # expert-major runs of more than one row tiled (tile_runs, None: OTPU_TILE; tiled.py's
+        # compile_layer_tile: the layer's weights once for the run's rows, up to ACT_ROWS of
+        # them; the image's mask tiles, which OTPU_TILE gives a MoE image as it is built)
+        from . import tiled as TL
+        self.layer_tile = bool(self.expert_major and PF.tile_flag(tile_runs)
+                               and TL.layer_family(self.image))
+        if self.layer_tile and self.layer_major > self.cfg.act_rows:
+            raise ValueError(f"tiled layer runs of {self.layer_major} rows: one MM over them "
+                             f"needs ACT_ROWS >= {self.layer_major} ({self.cfg.act_rows})")
         self._gens: dict = {}               # the generate loop: (blocks, mode) -> programs
                                             # (a list, or split: (first parts, second parts))
         self.gen_split = None               # split generate programs: None when a bucket's
@@ -2732,6 +2760,7 @@ class Engine:
         chunk's records, moe.em_record a row), so the head runs before end_prefill hands them
         back. Bit-identical to step() token by token (the states, the KV cache, the logits):
         only the slots the experts sit in move. Returns the logits after the last token."""
+        from . import tiled as TL
         img, K, B, R = self.image, getattr(self.spec, "conv_k", 1), self.block, self.layer_major
         self._drain()
         tokens = [int(t) for t in tokens]
@@ -2776,8 +2805,12 @@ class Engine:
                     else:
                         n = min(R, len(part) - i, B - p % B)
                         gather = li == 0 and (R == 1 or host)   # (the run gathers its rows:
-                        runs.append(((li, p // B + 1, n, R > 1 and not gather),  # the host's)
-                                     dict(RunPos.values(part[i], p, K, B), row=i),
+                        if gather and self.layer_tile:          # the host's; untiled)
+                            n = min(n, TL.untiled_rows(img))
+                        key = (li, p // B + 1, n, R > 1 and not gather)
+                        if self.layer_tile and n > 1 and not gather:
+                            key += ("tile",)                    # (tiled.compile_layer_tile)
+                        runs.append((key, dict(RunPos.values(part[i], p, K, B), row=i),
                                      part[i:i + n] if gather else None))
                     i += n
                 if em and li >= mo.first:               # the layer's expert run
