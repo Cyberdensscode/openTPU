@@ -542,7 +542,12 @@ def test_bar_and_gather_across_slrs_on_board_model(have_verilator, nreg, seed):
     for s, (x, y) in enumerate(ins):
         b.write(_CDATA, x.view(np.uint8), s)
         b.write(_CACC, y.view(np.uint8), s)
-    b.load_program(_CPROG, [np.asarray(I.assemble(p), np.uint32) for p in progs])
+    words = [np.asarray(I.assemble(p), np.uint32) for p in progs]
+    if b.waitc:                                         # WAITC: each slice's program its entries
+        from opentpu import waits as W
+        b.load_program(_CPROG, words, [W.entries(w, cfg.D, cfg.S) for w in words])
+    else:
+        b.load_program(_CPROG, words)
     st = b.run()
     assert st["instructions"] == [sl.icount for sl in m.slices]
     for s in range(2):
@@ -577,6 +582,8 @@ def test_tiny_qwen3_generate_on_board_model(have_verilator):
     tr = SimTransport(ch_bytes=size // 2, stall=20, seed=5)
     brd = BoardBackend(cfg, [isa.machine.slices[0].dram[:n]], transport=tr)   # the prefill's
     assert brd.generates and brd.chains
+    if brd.waitc:       # WAITC: the ISA's chain slots as the board's loader writes them (the
+        isa.slot_words = brd.slot_words     # entries after the words), so the DRAMs compare whole
     want = eng.generate_card(t0, 12, stop_ids=[])
     eng.backend, eng.pos, eng._chained = brd, pos, {}
     seen = []
