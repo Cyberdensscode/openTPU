@@ -3662,7 +3662,8 @@ then not run, because the work wrapped up. When it runs, the plan is:
 Status (2026-10-12): session pfB ran this plan on the card (13.15). B was bit for bit with A in
 every run and cut the prefill by 1.91 s on the 35B and 1.78 s on the 26B, so it meets the rule
 above. Expert-major has been the default since (13.15, "The default"), for a prompt's calls
-of EM_ROWS new rows or more (13.16).
+of EM_ROWS new rows or more (13.16), and in production since 2026-10-12 (deploy_em_91a9c2d3,
+session emdef4, 13.16).
 
 ### 13.14 The need path on the host (offload-need)
 
@@ -4045,6 +4046,346 @@ swap, short:
   model of emdef3, and in both emdef2 turns that missed.
 - The summary: each run's TTFT and device time per turn, N - P per pair and of the means, and
   each run's layer-major host ms a miss.
+
+The lead ran emdef4 on 2026-10-12 at 7f815b57 in the balanced order (four pairs). It was
+token-exact, everything passed, and the chatmoe step and otpu-chat exited 0. N - P of the means,
+TTFT, s:
+
+| turn | 35B (N's call) | 35B | 26B (N's call) | 26B | 26B device |
+|:--|:--|--:|:--|--:|--:|
+| 1 | 20 L | -0.006 | 21 E | -0.083 | -0.37 |
+| 2 | 27 L | -0.058 | 27 E | -0.029 | -0.28 |
+| 3 | 45 E | -0.053 | 46 E | -0.883 | -1.31 |
+
+- The layer-major calls' host ms a miss came out even across the arms.
+- With emdef3's long turns (35B -0.89 and -2.33 s, 26B -1.36 and -2.46 s), the rule holds: no
+  turn is worse, and the long ones are much faster.
+- In production since 2026-10-12 16:26 local (15:26:30 by the opentpu clock): deploy_em_91a9c2d3,
+  host 7f815b57, promoted host-only by its promote.sh (scrub and selftest passed on build
+  91a9c2d3, link 5.0 GT/s x8). production-prev is deploy_mt4_91a9c2d3.
+
+### 13.17 The expert run in the co-sim (tools/moe_prefill_cosim.py em)
+
+`moe_prefill_cosim.py em MODEL_DIR --rows ...` co-simulates one MoE layer's expert run
+(compile_expert_run) on a chunk of rows. It uses the RTL with the card's LiteDRAM controllers,
+DDR3-1066, the core at 133.33 MHz and build B's configuration. The image is zeros (config.json
+only), and the DRAM holds the server's words as an expert-major prefill has them once every
+expert its chunk needs has landed:
+- each row's record in the scratch on the first slots, its tail holding the k global ids, the
+  weights and 1 / rms;
+- each expert the rows chose in a pooled slot of its own after the scratch, with its tag set and
+  its directory entry {slot, 1.0};
+- the layer's gbase.
+
+Routing:
+- By default each row takes k distinct experts, uniformly, from `used` of them: the prompts'
+  measured 144 of the 35B's 256 and 75 of the 26B's 128.
+- `--route` takes a router trace's layer-local ids instead.
+- With the defaults the passes match the router traces' windows (13.11): 565 against 564 on the
+  35B at 131 rows, and 515 against 517 on the 26B at 124.
+
+After the run:
+- every used expert's tag must be zero and every (row, rank) output written, or the tool raises;
+- the check fails on the DRAM before the run, and a missing entry stops the run.
+
+The record: passes, cycles, the DRAM bytes by kind (em_bytes, in whole lines), and layer-major's
+passes on the same ids.
+- Its lm2 passes overstate a prompt's, because the synthetic rows are independent.
+- `--isa` runs the ISA simulator: the check, no cycles.
+- `--set KEY=VALUE` overrides the configuration (MCOLS=16, or a branch's fields such as SEQ_WC).
+
+Measured on hwe-bench, 2026-10-12, at 7f815b57 with the harness of dc26103b; every check passed.
+The layer is the first; ms is a layer's expert run.
+
+| model | rows | experts | passes | cycles | ms | ms a row | ms a pass | MB a row (weights) | GB/s |
+|:--|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 35B | 16 | 80 | 89 | 1329816 | 9.97 | 0.623 | 0.1121 | 9.48 (9.30) | 15.2 |
+| 35B | 131 | 144 | 565 | 8425295 | 63.19 | 0.482 | 0.1118 | 7.35 (7.21) | 15.2 |
+| 35B | 512 | 144 | 2081 | 31025443 | 232.70 | 0.454 | 0.1118 | 6.93 (6.79) | 15.2 |
+| 26B | 16 | 64 | 81 | 2557432 | 19.18 | 1.199 | 0.2368 | 17.68 (17.45) | 14.8 |
+| 26B | 124 | 75 | 515 | 16236422 | 121.78 | 0.982 | 0.2365 | 14.50 (14.32) | 14.8 |
+| 26B | 512 | 75 | 2066 | 65124417 | 488.45 | 0.954 | 0.2364 | 14.09 (13.91) | 14.8 |
+
+- The expert run streams at 15.2 GB/s (35B) and 14.8 GB/s (26B): 89 % and 87 % of the two
+  DDR3-1066 channels' 17.06 GB/s.
+  - The experts' weights are 98-99 % of its bytes: an expert, 1.67 MB (35B) or 3.45 MB (26B),
+    each pass.
+  - The rows' inputs and outputs are 0.13-0.23 MB a row; the tables and words under 1 kB.
+- A pass costs the same at every chunk size: 0.112 ms (35B) and 0.236 ms (26B).
+  - That is c(2) (13.11: the expert's FFN alone, 0.100 / 0.210) plus 12 / 27 µs.
+  - The excess grows with the expert's size, so it is the stream's rate, not a fixed cost a pass.
+- Bytes a row against layer-major R = 2 on the traces' routing (840 passes on the 35B's 131-row
+  windows, 767 on the 26B's 124):
+  - 35B: 10.72 MB of expert weights a row, against expert-major's 7.21 (-33 %).
+  - 26B: 21.32 against 14.32 (-33 %).
+- At 16 rows nearly every expert has one or two entries (89 passes for 80 experts on the 35B), so
+  a row costs 1.2-1.3x what it does at 124-131.
+
+A pass's row capacity. A pass streams its expert's weights once for up to C of its entries, so a
+layer makes sum_e ceil(n_e / C) passes. C is 2 today: PAIR, and c(M) grows with each pair of rows
+(13.11). The expert weight bytes a row are those passes x the expert's bytes / rows.
+
+Method:
+- The router traces: ~/otpu-build/offload/traces on omarchy, four texts x 2048 tokens, every MoE
+  layer's top-k.
+- Every non-overlapping window of W prompt rows, every layer, means over them.
+- Computed with tools/offload/em_capacity.py; no RTL.
+
+| model | W | distinct | layer-major R = 2 | C = 2 (today) | C = 32 | C = 64 |
+|:--|--:|--:|--:|--:|--:|--:|
+| 35B | 131 | 138 | 845 passes, 10.77 MB | 564, 7.19 MB | 147, 1.87 MB | 140, 1.79 MB |
+| 35B | 512 | 194 | 3292, 10.75 | 2100, 6.85 | 262, 0.85 | 217, 0.71 |
+| 26B | 124 | 72 | 764, 21.25 | 516, 14.34 | 84, 2.32 | 75, 2.07 |
+| 26B | 512 | 91 | 3156, 21.25 | 2072, 13.95 | 185, 1.25 | 127, 0.86 |
+
+(MB: the expert weights a prompt row, a layer.)
+
+- Against today's C = 2:
+  - C = 32 cuts the dominant byte stream by 74 % (35B) and 84 % (26B) at 124-131 rows, and by
+    88 % and 91 % at 512.
+  - C = 64 cuts it by 75 % and 86 %, and by 90 % and 94 %.
+- At 124-131 rows C = 32 is already near the floor of one pass per distinct expert (138 and 72).
+  The extra gain of 64 shows at 512 rows, where the popular experts have more than 32 entries.
+- The traces reproduce the co-sims' C = 2 passes: 564 and 516 against the synthetic routing's
+  565 and 515.
+
+The ISA check:
+- The harness counts the ISA's passes (`isa_passes`: its WAITWs) and checks them against the
+  bucketing.
+- The prose trace's layer 0, first window (35B 131 rows, 210 experts; 26B 124 rows, 78) runs 580
+  and 516 passes.
+- With `--set MCOLS=16 --set ACT_ROWS=64` it runs the same passes, the same instruction count and
+  the same check.
+- So today's kernel pairs its entries whatever the configuration. C = 32 or 64 needs:
+  - the expert run's pass table to take up to C entries a pass (its bucketing closes a pass at C);
+  - a pass to load, quantize and store up to C rows;
+  - an MXU that takes them at the stream's rate (dsp-pump's MCOLS 16 with ACT_ROWS 64,
+    mx_mxu.md 10).
+
+The balance point (em_capacity.py, the same windows; no new RTL). The model:
+- A pass of m entries takes max(S, c(m)).
+  - S is its expert's stream: the co-sim's pass at C = 2, 0.112 ms (35B) and 0.237 ms (26B).
+  - c(m) = ceil(m / 2) x c(2) / x on an MXU x times today's, with c(2) = 0.100 and 0.210 ms
+    (13.11). The measured c(4) and c(8) are within 3 % and 7 % of this.
+- Each window's actual passes are counted, the part-filled last ones included.
+- At C = 2 it reproduces the co-sim: 0.481 / 0.984 ms a row.
+
+ms is a layer's expert run, per prompt row:
+
+| model | rows | C | MB a row | ms a row, today | ms a row, MXU 4x |
+|:--|--:|--:|--:|--:|--:|
+| 35B | 131 | 2 | 7.19 | 0.481 | 0.481 |
+| 35B | 131 | 4 | 4.16 | 0.438 | 0.278 |
+| 35B | 131 | 8 | 2.72 | 0.436 | 0.182 |
+| 35B | 131 | 32 | 1.87 | 0.435 | 0.163 |
+| 35B | 512 | 2 | 6.85 | 0.459 | 0.459 |
+| 35B | 512 | 4 | 3.61 | 0.413 | 0.241 |
+| 35B | 512 | 8 | 2.00 | 0.412 | 0.134 |
+| 35B | 512 | 32 | 0.85 | 0.411 | 0.115 |
+| 26B | 124 | 2 | 14.34 | 0.984 | 0.984 |
+| 26B | 124 | 4 | 7.76 | 0.883 | 0.532 |
+| 26B | 124 | 8 | 4.52 | 0.880 | 0.310 |
+| 26B | 124 | 32 | 2.32 | 0.878 | 0.265 |
+| 26B | 512 | 2 | 13.95 | 0.957 | 0.957 |
+| 26B | 512 | 4 | 7.15 | 0.853 | 0.490 |
+| 26B | 512 | 8 | 3.75 | 0.852 | 0.257 |
+| 26B | 512 | 32 | 1.25 | 0.851 | 0.223 |
+
+- Today the stream and the MXU meet at C = 2.2 (35B) and 2.3 (26B), so the expert run is nearly
+  balanced as it is.
+  - A C = 4 kernel still pays on the card: -9 to -11 % of the run's time, and the bytes nearly
+    halved (less contention with the link's H2C writes, 13.11).
+  - Beyond 4 the run is compute-bound: the time stays put while the bytes keep falling.
+- An MXU 4x faster (MCOLS 16) meets the stream at C = 8.9 and 9.0.
+  - C = 8 then cuts the run by 62-73 %, C = 32 by 66-77 %.
+  - At 124-131 rows little is left past C = 8. Most experts' one pass is stream-bound (140 x
+    0.112 ms, 0.12 ms a row on the 35B), and only the popular ones are compute-bound.
+- In general the stream and the MXU meet at C* = 2 S x / c(2). For passes of 32 or 64 rows to
+  stay stream-bound, the MXU must take an expert's 32 or 64 rows in its stream time: about 14x or
+  29x today's MXU against today's DRAM. That is the MXU-to-DRAM ratio MoE prefill wants from an
+  ASIC.
+
+### 13.18 Passes of C entries (moe.em_pass_rows)
+
+The expert run's bucketing closes a pass at C entries of one expert, not two. Each pass loads,
+norms and quantizes up to C rows, streams its expert once and stores the rows' outputs. C comes
+from the configuration alone; there are no per-model constants.
+
+The rule (moe.em_pass_order, em_pass_rows):
+- A pass of m entries costs max(EM_RHO, em_mxu_cost(m)) MXU cycles per chunk of the expert's
+  weights: the stream, or the MXU when that takes longer.
+  - EM_RHO = 1.12: the stream's cycles per chunk on the card (17.07 / 15.2 GB/s, 13.17).
+  - em_mxu_cost(m): 4-bit weights with PAIR and 2 m <= MCOLS take 1; other 4-bit passes take
+    2 ceil(m / MCOLS); int8 takes ceil(m / MCOLS).
+- C is the m <= ACT_ROWS with the least cost per entry, the fewest rows on a tie. Any EM_RHO in
+  (1, 2) gives the same order. This is 13.17's C* = 2 S x / c(2), rounded to what the MXU's
+  rows allow.
+  - The card (MCOLS 4, PAIR, ACT_ROWS 4): C = 4. Two rows cost the stream (1.12 / 2 = 0.56 an
+    entry); four cost twice the MXU's cycle (2 / 4 = 0.5).
+  - MCOLS 16 with ACT_ROWS >= 16, 4-bit: C = 16. int8 at MCOLS 4: C = 4. int8 at MCOLS 16,
+    ACT_ROWS 64: C = 32.
+
+Short passes (moe.em_short_rows):
+- An expert's last pass holds n mod C entries. On the card a pass of 1-2 rows costs half the MXU
+  time of 3-4 (PAIR).
+- S is the largest m below C with a lower MXU cost: 2 on the card; 0 when every size below C
+  costs as much as C (no PAIR, int8).
+- The bucketing marks an expert's last pass short when it holds 1 .. S entries. The pass loop
+  then runs the S-row body or the C-row body: two hardware loops whose counts (0 or 1) come
+  from the flag.
+- Without it, the 35B's 131-row layer would pay c(4) on its ~326 passes of 1-2 entries, about
+  C = 2's time (13.17's model).
+
+The kernel (moe.moe_expert_run(..., C, S)):
+- The pass table's rows hold C + 2 words: the expert, the short flag, then C entries.
+- Opening a pass fills all C entries with its first. A part-filled pass therefore loads and
+  stores its first row again: the same output to the same place.
+- Instructions: the 35B's run takes 189, the 26B's 234 (C = 2's kernel: 106 and 128).
+- TMEM: the rows are normed into one [C, H] tile a row at a time.
+  - Normed whole, the 26B's 4 x 2816 rows did not fit: 43,276 of 65,472 words in use.
+  - compile_expert_run tries the rule's order and takes the first (C, S) that fits. The 26B
+    fits (4, 2) but not (4, 0).
+
+Choosing C (an A/B, a co-sim):
+- Engine.em_pass; streamed.engine(em_pass=); chatmoe.py --em-pass; moe_prefill_cosim.py em
+  --em-pass.
+- The expert run's key is then ("x", layer, C).
+- There is no environment variable. OTPU_* variables key the program and image caches
+  (progcache.keyed_env), so an A/B on one would rebuild the image.
+
+Bit for bit:
+- Each row's math is unchanged; only the rows are grouped differently.
+- On the MX MXU (mx-column, docs/mx_mxu.md) each output is one exact integer sum before the
+  shared fp32 epilogue, and PAIR changes no bit. So the outputs equal C = 2's word for word.
+- On the MXU before MX they would not: a PAIR MM's fp32 sums rounded differently from a plain
+  one's. A pass of 4 runs without PAIR, a pass of 2 with it.
+- Checked on the ISA simulator with random rows, gains and expert weights
+  (`moe_prefill_cosim.py em --isa --random --compare 2`, the same DRAM through both programs).
+  Every case had 0 differing words, and the ISA's passes (its WAITWs) matched the bucketing.
+
+| model | rows | C, S | passes | output words |
+|:--|--:|:--|--:|--:|
+| tiny Qwen3.5-MoE | 7 | 4, 2 | 15 | 7,168 |
+| tiny Qwen3.5-MoE | 40 | 4, 2 | 46 | 40,960 |
+| tiny Qwen3.5-MoE, prefix 3, seed 5 | 40 | 4, 2 | 47 | 40,960 |
+| tiny Qwen3.5-MoE (--em-pass 3) | 40 | 3, 2 | 62 | 40,960 |
+| tiny Qwen3.5-MoE (--em-pass 1, against 4) | 9 | 1, 0 | 36 | 9,216 |
+| tiny Gemma 4 MoE | 3 | 4, 2 | 9 | 3,072 |
+| tiny Gemma 4 MoE | 33 | 4, 2 | 38 | 33,792 |
+| Qwen3.5-35B-A3B | 131 | 4, 2 | 320 | 2,146,304 |
+| gemma-4-26B-A4B-it | 124 | 4, 2 | 272 | 2,793,472 |
+| Qwen3.5-35B-A3B, prose trace | 131 | 4, 2 | 350 | - |
+| gemma-4-26B-A4B-it, prose trace | 124 | 4, 2 | 282 | - |
+
+The tests:
+- test_em_pass_rows_from_the_configuration: the rule on seven configurations.
+- test_expert_major_prefill_is_bit_exact (Qwen3.5-MoE) and
+  test_moe_expert_major_prefill_is_bit_exact (Gemma 4) compare against token-by-token decoding.
+  - They run at the configuration's C (4 with build B's MCOLS 4 and PAIR; 8 for int8 at the
+    tests' default MCOLS 8) and at C = 1, 2 and 3.
+  - They cover the logits, the states, the KV cache and the decode steps after.
+
+The co-sims (moe_prefill_cosim.py em on hwe-bench, 2026-10-12, emc e7c65617). They use the MX RTL
+with the card's LiteDRAM, DDR3-1066 and 133.33 MHz, 13.17's synthetic routing, and the first
+layer; every check passed. C = 2 runs the same tree with --em-pass 2.
+
+| model | rows | C, S | passes | ms | ms a pass | MB a row (weights) | instructions |
+|:--|--:|:--|--:|--:|--:|--:|--:|
+| 35B | 131 | 2, 0 | 565 | 69.41 | 0.1229 | 7.53 (7.38) | 117 |
+| 35B | 131 | 4, 2 | 320 | 65.87 | 0.2059 | 4.32 (4.18) | 189 |
+| 26B | 124 | 2, 0 | 515 | 127.02 | 0.2466 | 14.84 (14.65) | 139 |
+| 26B | 124 | 4, 2 | 272 | 117.30 | 0.4312 | 7.92 (7.74) | 234 |
+
+- C = 4 cuts the expert run by 5.1 % (35B) and 7.7 % (26B), and its bytes by 43 % and 47 %.
+- 13.17's model said -9 to -11 %.
+- The MX expert is a little larger than 13.17's (1.71 MB against 1.67 on the 35B), so C = 2 runs
+  69.41 / 127.02 ms here against 13.17's 63.19 / 121.78.
+
+Where the time goes. The 35B's runs with --profile (cycles by source line):
+
+| place | C = 2 | C = 4 |
+|:--|--:|--:|
+| swiglu_down (the expert: stream and MXU) | 7,367,290 | 7,035,829 |
+| the rows' norm, (x x 1 / rms) x g (VPU) | 735,082 | 795,123 |
+| the quantize (QACT) | 464,430 | 388,970 |
+| the outputs' stores | 344,078 | 345,445 |
+| the rows' loads | 218,549 | 110,272 |
+| the run | 9,254,664 | 8,782,803 |
+
+- swiglu_down meets the model exactly. The expert is 12,288 chunks: a full pass of 4 takes 2
+  cycles a chunk (MXU-bound), and a short pass or a pass of 2 takes the stream's ~1.12. At C = 4
+  that is 245 x 24,576 + 75 x 13,800 = 7.06 M cycles; 7.04 M was measured.
+- The rest, 1.6-1.8 M cycles (18-20 %), is each row's load, norm, quantize and store. It runs
+  in series with the expert's stream, and its total does not change with C: 1,130 rows are
+  loaded either way. 13.17's model folded it into a pass's fixed 12 µs, so it overstated C = 4's
+  gain.
+- Next lever: overlap a pass's rows (load, norm, quantize) with the previous pass's MM. That
+  needs a second [C, H] row tile (16K words on the 35B; the 26B's TMEM is tight) and the
+  sequencer letting VPU work run past an MM in flight.
+
+The card (session emc1, 2026-10-12, the lead's run of tools/offload/sessions/emc1.sh):
+- On MX production (deploy_mx_8b33206e, build 8b33206e), the host tree emc e7c65617.
+- A: --em-pass 2. B: the configuration's C = 4. L: every call layer-major (--em-rows 100000).
+- A warm-up, then A1 B1 B2 A2 L1 B3 A3 A4 B4 L2.
+- Every run's tokens equal the warm-up's and the ISA references' first two turns. fail 0.
+
+B - A, of the means over four pairs (TTFT; device time, the prompt's tokens over the device rate):
+
+| model | turn | prompt | calls | TTFT B - A (pairs) | TTFT | device |
+|:--|--:|--:|:--|:--|--:|--:|
+| 35B | 3 | 49 | 45E + 4L | +0.017 -0.076 -0.178 +0.241 | +0.001 s | -0.001 s |
+| 35B | 4 | 161 | 157E + 4L | +0.055 -0.478 -0.159 -0.272 | -0.213 s (-1.7 %) | -0.309 s (-2.6 %) |
+| 26B | 1 | 25 | 21E + 4L | +0.049 -0.011 -0.007 -0.591 | -0.140 s | -0.143 s (-2.9 %) |
+| 26B | 2 | 31 | 27E + 4L | -0.297 -0.145 -0.371 -0.526 | -0.335 s | -0.362 s (-6.9 %) |
+| 26B | 3 | 50 | 46E + 4L | -0.273 -0.106 -0.294 -0.442 | -0.279 s | -0.240 s (-3.4 %) |
+| 26B | 4 | 161 | 157E + 4L | -0.754 -0.755 -0.723 -0.647 | -0.720 s (-3.7 %) | -0.730 s (-3.9 %) |
+
+- The 35B's turns 1-2 (20 and 27 rows) run layer-major in both arms, so they show no change.
+- Decode is the same in A and B: the same tokens, hits and MB/token.
+- The swap is host-only: it keeps deploy_mx's bitstream.
+
+Expert-major against layer-major after the prompt (the A and B runs against L):
+
+| model | turn | em - L: TTFT | decode hit rate | MB/token |
+|:--|--:|--:|--:|--:|
+| 35B | 3 | -0.014 s | -0.0131 | +7.19 |
+| 35B | 4 | -2.566 s | -0.0346 | +18.94 (+9.4 %) |
+| 26B | 1 | -0.218 s | -0.0089 | +8.16 |
+| 26B | 2 | -0.449 s | +0.0308 | -28.19 |
+| 26B | 3 | -1.083 s | +0.0070 | -6.35 |
+| 26B | 4 | -3.014 s | +0.0147 | -13.46 |
+
+Next: the slots expert-major leaves (not built).
+- The 35B's long expert-major prompt leaves worse slots for the decode: -0.035 hits, +18.9
+  MB/token on its first 16 tokens.
+- The likely cause:
+  - The expert run takes its passes in the order of each expert's first entry in the chunk,
+    and the server loads the experts in that order. The slots therefore end holding the experts
+    first seen late in the prompt, often rare ones.
+  - Layer-major ends with the experts of the prompt's last rows, which the decode's first
+    tokens tend to reuse.
+- Proposal: order the last chunk's passes, and the server's loads for it, by each expert's last
+  row in the chunk.
+  - The kernel side: bucket the entries from the last row back, then run the pass table from
+    its end.
+  - The server side: it has every need line of the chunk before the expert run waits.
+  - Every expert is still loaded once, so it costs no bytes, and the slots end as layer-major's.
+- An offline check on the router traces supports it (tools/offload/em_slotsim.py: 41 slots a
+  layer on the 35B, 16 on the 26B; a 157-row prompt, its last 4 rows layer-major as the chat's; then the trace's next
+  rows as the decode, under LRU; all windows, layers and texts):
+  - 35B, first 16 decode rows: layer-major's end state 0.696 hits, 166.5 MB/token;
+    first-appearance order 0.677, 177.0 MB; last-row order 0.696, 166.7 MB.
+    - So the reorder saves ~10.5 MB/token, 6 %, the card's sign at about half its size.
+    - Over 64 decode rows the loss shrinks to 3.0 MB/token, as the decode refills the slots.
+    - The prompt's S most frequent experts do slightly better than either: 0.706, 161.1 MB.
+  - 26B: the four layer-major tail rows' 32 entries cover its 16 slots, so every order gives the
+    same 0.623. The card's em gain there (turns 2-4) is not modeled.
+- Bytes it would save: on the card, 18.9 MB/token over a reply's first tokens after a long
+  expert-major prompt on the 35B. That is ~0.3 GB of H2C a 16-token reply (~0.1 s at the link's
+  placed ~3 GB/s), and nothing on short prompts (layer-major already).
+- A post-prompt refill instead would cost what it loads: the 35B's 41 slots x 40 layers x 1.71
+  MB = 2.8 GB to refill every slot, about 150 tokens of the saving. Only a targeted refill of the
+  last rows' experts missing from the slots could pay, and the reorder makes it unnecessary.
 
 ## 14. Chatting with a streamed MoE (otpu-chat)
 

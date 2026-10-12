@@ -50,8 +50,8 @@ Expert-major (sections 13.11, 13.13) splits a layer-major MoE layer over a chunk
 run's `moe_prologue_rows` routes its rows, keeps their ids, weights and norm in the rows' records
 of a scratch (em_record; the server carves it from the first expert slots for the prefill), and
 posts the experts as a need line; then one `moe_expert_run` a layer runs each expert its rows
-chose once, in passes of two rows (ld-memch's bucketing), each pass waiting on its directory
-entry; the next layer's runs end the layer (`moe_combine_rows`). A row's arithmetic is
+chose once, in passes of up to C rows (em_pass_rows, docs/offload.md 13.18; ld-memch's
+bucketing), each pass waiting on its directory entry; the next layer's runs end the layer (`moe_combine_rows`). A row's arithmetic is
 moe_ffn_rows', bit for bit.
 
 `ExpertFormat` is one expert's slot: gate and up [F, H] and W_down's column parts, laid out as a
@@ -778,7 +778,8 @@ def moe_ffn_rows(x, lw, mo: MoESpec, dev: SimpleNamespace, eps: float, beside=No
 
 
 # ---------------------------------------------------------------------------- expert-major
-EM_PW = 4                   # an expert run's pass table: words a pass (its expert, entries A, B)
+EM_RHO = 1.12               # an expert's stream from DRAM, MXU cycles a chunk (the card: 17.07 / 15.2
+                            # GB/s); any value in (1, 2) orders the pass sizes alike (em_pass_order)
 _TWO23 = float(1 << 23)     # FILL's immediate plus a register: the float 2^23 + R (0 <= R < 2^23)
 
 
@@ -944,33 +945,79 @@ def moe_combine_rows(x, mo: MoESpec, dev: SimpleNamespace, row, residual: bool =
     return x + out
 
 
-def moe_expert_run(lw, mo: MoESpec, dev: SimpleNamespace, rows, entries) -> None:
-    """Expert-major's expert run of one MoE layer (docs/offload.md 13.11), after the layer's
-    mixer runs over a chunk's `rows` rows (run arguments: rows, and entries = rows x k): every
-    (row, rank) entry's expert once on its row, each expert in passes of two of its entries.
+def em_mxu_cost(cfg, wformat: str, m: int) -> int:
+    """An expert pass's MXU time on m rows, in cycles a chunk of its weights (docs/isa.md MM):
+    4-bit weights a chunk a cycle with PAIR (2 m <= MCOLS), half a chunk without; int8 a chunk a
+    cycle; the ACT RAM's rows past MCOLS replay each chunk, ceil(m / MCOLS) groups."""
+    g = -(-m // cfg.MCOLS)
+    if Q.mxu_wf(wformat) == 0:
+        return g
+    return 1 if cfg.PAIR and 2 * m <= cfg.MCOLS else 2 * g
+
+
+def em_pass_order(cfg, wformat: str) -> list:
+    """Every pass size m <= ACT_ROWS, the best first: the least time an entry,
+    max(EM_RHO, em_mxu_cost(m)) / m, the fewest rows on a tie (docs/offload.md 13.17). A pass
+    streams its expert's weights once, so it costs the stream until the MXU takes longer; the
+    stream is a little under a chunk a cycle (EM_RHO), and any value in (1, 2) orders them the
+    same."""
+    act = cfg.act_rows
+    return sorted(range(1, act + 1),
+                  key=lambda m: (max(EM_RHO, em_mxu_cost(cfg, wformat, m)) / m, m))
+
+
+def em_pass_rows(cfg, wformat: str) -> int:
+    """C, the entries of one expert an expert-major pass takes: em_pass_order's first. 4 on the
+    card (MCOLS 4, PAIR: 2 rows at the stream's rate, 4 at twice its MXU time), 16 at MCOLS 16
+    with ACT_ROWS >= 16, 4 for int8 at MCOLS 4 (a chunk a cycle for every row)."""
+    return em_pass_order(cfg, wformat)[0]
+
+
+def em_short_rows(cfg, wformat: str, c: int) -> int:
+    """The most rows a pass of C entries computes for less MXU time than C's (0: none): an
+    expert's last pass, if it holds no more entries, computes only that many (on the card 2 of
+    C = 4)."""
+    cost = em_mxu_cost(cfg, wformat, c)
+    return max([m for m in range(1, c) if em_mxu_cost(cfg, wformat, m) < cost], default=0)
+
+
+def moe_expert_run(lw, mo: MoESpec, dev: SimpleNamespace, rows, entries, C: int = 2,
+                   S: int = 0) -> None:
+    """Expert-major's expert run of one MoE layer (docs/offload.md 13.11, 13.17), after the
+    layer's mixer runs over a chunk's `rows` rows (run arguments: rows, and entries = rows x k):
+    every (row, rank) entry's expert once on its row, each expert in passes of up to C of its
+    entries, each pass streaming the expert's weights once (C: em_pass_rows).
 
     1. The tables: per row (a loop of `rows`) its k ids from its record tail, and for each of
        its entries its row and its output's place (the record's OUT row of its rank, in lines).
-    2. The bucketing (a loop of `entries`, ld-memch's): an entry closes its expert's open pass
-       (its B) or opens one (expert, A, and B = A until closed: an odd count's last pass
-       computes its row twice and stores the same output twice), the expert's parity toggled;
-       LOOPs counted by the parity and 1 - parity are the branches. Registers reach the tables
-       as FILL's 2^23 + R, made exact after the loop. The pass table holds entries / 2 + E
-       passes at most.
+    2. The bucketing (a loop of `entries`): an entry joins its expert's open pass while it has
+       room, else opens one (expert, a short flag 0, and the entry in all C places: a pass of
+       fewer entries computes its first row again and stores the same output again); the
+       expert's free places, next place and room flag (min(free, 1)) count it, and LOOPs
+       counted by the flag and 1 - flag are the branches. Registers reach the tables as
+       FILL's 2^23 + R, made exact after. The pass table holds entries / C + E passes at most.
+       With S (em_short_rows: a smaller pass's MXU costs less) a loop over the experts then
+       flags each one's last pass that holds at most S entries (free >= C - S); the others'
+       flags go to a sink row.
     3. The passes (a loop of the passes counted): WAITW on the expert's directory entry (its
        slot word != 0: the server writes an entry after its expert's data and tag, and keeps
        a needed expert's slot until this run has read it), its slot's tag zeroed (as slot_of),
-       the two rows normed again from their X and 1 / rms and quantized (moe_ffn_rows'
-       expression), swiglu_down at the slot, each output row to its place.
+       then the pass's C rows (S for a flagged pass, a LOOP of count flag and one of 1 - flag)
+       normed again from their X and 1 / rms and quantized (moe_ffn_rows' expression),
+       swiglu_down at the slot, each output row to its place. Each row's quantization and MM
+       outputs are its own (docs/isa.md: one exact integer an output), so the outputs are
+       C = 2's bit for bit.
 
     The entry wait stops at MB.TIMEOUT with an error the host sees: the prefill never runs on
     without an expert."""
     b = current()
     if ol.num_programs() != 1:
         raise CompileError("moe_expert_run runs on one slice")
+    if not 1 <= C or not 0 <= S < C:
+        raise CompileError(f"expert run passes of {C} entries, short ones of {S}")
     E, k, H = mo.E, mo.k, dev.fmt.H
-    N, REC, PW = dev.em_rows * k, dev.em_rec, EM_PW
-    PM = N // 2 + E
+    N, REC, PW = dev.em_rows * k, dev.em_rec, C + 2
+    PM = N // C + E
     tail = 4 * H * (k + 2)
     # 1. the tables: ids (global), each entry's row, each entry's place (lines from the base)
     L, QR, PL = ol.empty((N,)), ol.empty((N,)), ol.empty((N,))
@@ -996,31 +1043,43 @@ def moe_expert_run(lw, mo: MoESpec, dev: SimpleNamespace, rows, entries) -> None
     gb = ol.load(lw.gbase)
     L.set(L - gb)                                       # the layer's own indices
     # 2. the bucketing
-    PAR, OPEN = ol.zeros((E,)), ol.zeros((E,))
-    PT = ol.empty((PM, PW), dense=True)
+    FREE, ROOM, POS = ol.zeros((E,)), ol.zeros((E,)), ol.zeros((E,))
+    BASE = ol.full((E,), _TWO23 + PM * PW)              # (the sink row, for the unused)
+    PT = ol.empty((PM + 1, PW), dense=True)
     re = b.arg_reg(entries, 1)
     rp, rnp, r1, r2, r3, r4 = (b.scratch() for _ in range(6))
     lp = b.begin_loop(0, rcount=re)
     b.emit(I.rld(r1, L.base, ra=rp, comment="its expert"))
-    b.emit(I.rld(r2, PAR.base, ra=r1, comment="parity"))
-    b.emit(I.rld(r3, PAR.base, ra=r1, mul=-1, comment="-parity"))
-    close = b.begin_loop(0, rcount=r2)
-    b.emit(I.rld(r4, OPEN.base, ra=r1, comment="its open pass (2^23 + word)"))
-    b.emit(I.vop(I.V_FILL, PT.base + 2 - (1 << 23), 0, 0, 1, 1, 0, 0, 0, I.B_SCALAR,
-                 _TWO23, ra=r4, rd=rp, comment="close: B = entry"))
-    b.end_loop(close)
-    opn = b.begin_loop(1, rcount=r3)                    # 1 - parity
+    b.emit(I.rld(r2, ROOM.base, ra=r1, comment="room in its open pass"))
+    b.emit(I.rld(r3, ROOM.base, ra=r1, mul=-1, comment="-room"))
+    join = b.begin_loop(0, rcount=r2)
+    b.emit(I.rld(r4, POS.base, ra=r1, comment="its next place (2^23 + word)"))
+    b.emit(I.vop(I.V_FILL, PT.base - (1 << 23), 0, 0, 1, 1, 0, 0, 0, I.B_SCALAR, _TWO23,
+                 ra=r4, rd=rp, comment="join: the entry"))
+    b.emit(I.vop(I.V_ADD, POS.base, POS.base, 0, 1, 1, 0, 0, 0, I.B_SCALAR, 1.0, ra=r1, rb=r1,
+                 comment="next place"))
+    b.emit(I.vop(I.V_ADD, FREE.base, FREE.base, 0, 1, 1, 0, 0, 0, I.B_SCALAR, -1.0, ra=r1,
+                 rb=r1, comment="free - 1"))
+    b.emit(I.vop(I.V_MIN, ROOM.base, FREE.base, 0, 1, 1, 0, 0, 0, I.B_SCALAR, 1.0, ra=r1,
+                 rb=r1, comment="room = min(free, 1)"))
+    b.end_loop(join)
+    opn = b.begin_loop(1, rcount=r3)                    # 1 - room
     b.emit(I.vop(I.V_FILL, PT.base, 0, 0, 1, 1, 0, 0, 0, I.B_SCALAR, _TWO23, ra=rnp, rd=r1,
                  comment="open: its expert"))
-    for f in (1, 2):
-        b.emit(I.vop(I.V_FILL, PT.base + f, 0, 0, 1, 1, 0, 0, 0, I.B_SCALAR, _TWO23, ra=rnp,
-                     rd=rp, comment="open: A = B = entry"))
-    b.emit(I.vop(I.V_FILL, OPEN.base, 0, 0, 1, 1, 0, 0, 0, I.B_SCALAR, _TWO23, ra=r1, rd=rnp,
+    b.emit(I.vop(I.V_FILL, PT.base + 1, 0, 0, 1, 1, 0, 0, 0, I.B_SCALAR, _TWO23, ra=rnp,
+                 comment="open: not short"))
+    b.emit(I.vop(I.V_FILL, PT.base + 2, 0, 0, 1, C, 0, 0, 0, I.B_SCALAR, _TWO23, ra=rnp,
+                 rd=rp, comment="open: the entry in every place"))
+    b.emit(I.vop(I.V_FILL, BASE.base, 0, 0, 1, 1, 0, 0, 0, I.B_SCALAR, _TWO23, ra=r1, rd=rnp,
                  comment="its open pass"))
+    b.emit(I.vop(I.V_FILL, POS.base, 0, 0, 1, 1, 0, 0, 0, I.B_SCALAR, _TWO23 + 3, ra=r1,
+                 rd=rnp, comment="its next place"))
+    b.emit(I.vop(I.V_FILL, FREE.base, 0, 0, 1, 1, 0, 0, 0, I.B_SCALAR, float(C - 1), ra=r1,
+                 comment="free"))
+    b.emit(I.vop(I.V_FILL, ROOM.base, 0, 0, 1, 1, 0, 0, 0, I.B_SCALAR, float(min(C - 1, 1)),
+                 ra=r1, comment="room"))
     b.emit(I.addi(rnp, rnp, PW, comment="next pass"))
     b.end_loop(opn)
-    b.emit(I.vop(I.V_RSUB, PAR.base, PAR.base, 0, 1, 1, 0, 0, 0, I.B_SCALAR, 1.0, ra=r1, rb=r1,
-                 comment="parity = 1 - parity"))
     b.emit(I.addi(rp, rp, 1, comment="next entry"))
     b.end_loop(lp)
     NP = ol.full((1,), _TWO23)
@@ -1029,7 +1088,25 @@ def moe_expert_run(lw, mo: MoESpec, dev: SimpleNamespace, rows, entries) -> None
     for r in (rp, rnp, r1, r2, r3, r4):
         b.unscratch(r)
     b.release_arg(entries)
-    del L, PAR, OPEN
+    del L, ROOM, POS
+    if S:                                               # each expert's last pass: short?
+        SH = ol.empty((E,))
+        b.emit(I.vop(I.V_SUB, SH.base, FREE.base, 0, 1, E, 0, 0, 0, I.B_SCALAR,
+                     float(C - S - 1), comment="free - (C - S - 1)"))
+        b.emit(I.vop(I.V_MAX, SH.base, SH.base, 0, 1, E, 0, 0, 0, I.B_SCALAR, 0.0))
+        b.emit(I.vop(I.V_MIN, SH.base, SH.base, 0, 1, E, 0, 0, 0, I.B_SCALAR, 1.0,
+                     comment="short: free >= C - S"))
+        re, r4 = b.scratch(), b.scratch()
+        lp = b.begin_loop(E)
+        b.emit(I.rld(r4, BASE.base, ra=re, comment="its last pass (2^23 + word)"))
+        b.emit(I.vop(I.V_ADD, PT.base + 1 - (1 << 23), SH.base, 0, 1, 1, 0, 0, 0, I.B_SCALAR,
+                     _TWO23, ra=r4, rb=re, comment="its short flag"))
+        b.emit(I.addi(re, re, 1, comment="next expert"))
+        b.end_loop(lp)
+        b.unscratch(re)
+        b.unscratch(r4)
+        del SH
+    del FREE, BASE
     PT.set(PT - _TWO23)
     PT[:, 0:1].set(PT[:, 0:1] + gb)                     # global ids
     NP.set((NP - _TWO23) * (1.0 / PW))
@@ -1037,8 +1114,34 @@ def moe_expert_run(lw, mo: MoESpec, dev: SimpleNamespace, rows, entries) -> None
     # 3. the passes
     g = ol.load(lw.g_post)
     ge = ol.load(lw.g_exp) if getattr(lw, "g_exp", None) is not None else None
-    word, xr, ri = ol.empty((1,)), ol.empty((2, H), dense=True), ol.empty((2,))
+    word = ol.empty((1,))
     rq, rs, rn = b.scratch(), b.scratch(), b.scratch()
+
+    def rows_of_pass(M: int) -> None:
+        """The pass's first M places: their rows normed, quantized, through the expert, out."""
+        xr = ol.empty((M, H), dense=True)
+        rec = DevVar("record", rn, align=LINE)
+        for j in range(M):                              # (moe_ffn_rows' expressions, a row at a
+            b.emit(I.rld(rn, PT.base + 2 + j, ra=rq, comment="entry"))      # time: TMEM for C
+            b.emit(I.rld(rn, QR.base, ra=rn, mul=REC, comment="its row's record"))  # rows of
+            x = ol.load(Tensor(Affine(dev.em_base) + rec, (1, H), (H, 1)))       # the 26B's)
+            ri = ol.load(Tensor(Affine(dev.em_base + tail + 8 * k) + rec, (1,), (1,)))
+            xr[j:j + 1, :].set((x * ri[:, None]) * g[None, :])
+            del x, ri
+            if ge is not None:
+                xr[j:j + 1, :].set(xr[j:j + 1, :] * ge[None, :])
+        xe = ol.quantize(xr)
+        del xr
+        ex = dev.fmt.descs(DevVar("expert slot", rs, align=LINE))
+        o = swiglu_down(xe, ex.wg, ex.wu, ex.wd, act=ACTS[mo.act])
+        b.check_live(o)
+        for j in range(M):
+            b.emit(I.rld(rn, PT.base + 2 + j, ra=rq, comment="entry"))
+            b.emit(I.rld(rn, PL.base, ra=rn, mul=LINE, comment="its place"))
+            ol.store(Tensor(Affine(dev.em_base) + DevVar("place", rn, align=LINE), (1, H),
+                            (H, 1)), o[j:j + 1, :])
+        del o, xe
+
     b.rld(rs, NP, comment="passes")
     lp = b.begin_loop(0, rcount=rs)                     # (the count is read here: rs is free)
     b.emit(I.rld(rs, PT.base, ra=rq, mul=8, comment="its directory entry"))
@@ -1046,28 +1149,20 @@ def moe_expert_run(lw, mo: MoESpec, dev: SimpleNamespace, rows, entries) -> None
             comment="wait: its slot (the entry)")
     b.rld(rs, word, raw=True, comment="its slot")
     ol.store(Tensor(Affine(dev.tag) + DevVar("expert slot", rs), (1,), (1,)), ol.zeros((1,)))
-    rec = DevVar("record", rn, align=LINE)
-    for j in range(2):
-        b.emit(I.rld(rn, PT.base + 1 + j, ra=rq, comment="entry"))
-        b.emit(I.rld(rn, QR.base, ra=rn, mul=REC, comment="its row's record"))
-        ol.load(Tensor(Affine(dev.em_base) + rec, (1, H), (H, 1)), out=xr[j:j + 1, :])
-        ol.load(Tensor(Affine(dev.em_base + tail + 8 * k) + rec, (1,), (1,)),
-                out=ri[j:j + 1])
-    if ge is None:                                      # (moe_ffn_rows' expressions)
-        xe = ol.quantize((xr * ri[:, None]) * g[None, :])
+    if S:
+        rf, rg = b.scratch(), b.scratch()
+        b.emit(I.rld(rf, PT.base + 1, ra=rq, comment="short"))
+        b.emit(I.rld(rg, PT.base + 1, ra=rq, mul=-1, comment="-short"))
+        short = b.begin_loop(0, rcount=rf)
+        rows_of_pass(S)
+        b.end_loop(short)
+        full = b.begin_loop(1, rcount=rg)               # 1 - short
+        rows_of_pass(C)
+        b.end_loop(full)
+        b.unscratch(rf)
+        b.unscratch(rg)
     else:
-        xn = (xr * ri[:, None]) * g[None, :]
-        xe = ol.quantize(xn * ge[None, :])
-        del xn
-    ex = dev.fmt.descs(DevVar("expert slot", rs, align=LINE))
-    o = swiglu_down(xe, ex.wg, ex.wu, ex.wd, act=ACTS[mo.act])
-    b.check_live(o)
-    for j in range(2):
-        b.emit(I.rld(rn, PT.base + 1 + j, ra=rq, comment="entry"))
-        b.emit(I.rld(rn, PL.base, ra=rn, mul=LINE, comment="its place"))
-        ol.store(Tensor(Affine(dev.em_base) + DevVar("place", rn, align=LINE), (1, H), (H, 1)),
-                 o[j:j + 1, :])
-    del o, xe
+        rows_of_pass(C)
     b.emit(I.addi(rq, rq, PW, comment="next pass"))
     b.end_loop(lp)
     for r in (rq, rs, rn):

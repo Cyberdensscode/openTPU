@@ -125,7 +125,7 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
         turns=TURNS, max_new: int = 16, cap: int = 2048, pool: str | None = None,
         experts: int = 0, layer_major: int | None = None, sample: bool = False,
         seed: int = 0, create: bool = False, tok=None, em_rows: int | None = None,
-        trace: list | None = None) -> dict:
+        trace: list | None = None, em_pass: int | None = None) -> dict:
     from opentpu.host import chat as C
     from opentpu.host import streamed as ST
     from opentpu.isasim import board_config
@@ -146,7 +146,8 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
     eng = ST.engine(path, cfg or board_config(), be, cap, pool or ST.DEFAULT, experts=experts,
                     wformat=wformat, head_format=head, formats=formats, layer_major=layer_major,
                     create=create, snapshots=C.SNAPSHOTS,     # (otpu-chat's: its turns roll back)
-                    **({} if em_rows is None else {"em_rows": em_rows}))    # (13.16)
+                    **({} if em_rows is None else {"em_rows": em_rows}),    # (13.16)
+                    **({} if em_pass is None else {"em_pass": em_pass}))    # (13.18)
     load_s = time.time() - t
     calls: list = []
     if eng.layer_major:                         # (the prompt's calls, each turn's)
@@ -160,6 +161,7 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
                weights=C.weights_label(eng.image, wformat),
                experts=ST.describe(eng, eng.pool_path), layer_major=eng.layer_major,
                expert_major=eng.expert_major, em_rows=getattr(eng, "em_rows", 0),
+               em_pass=getattr(eng, "em_pass", None),
                on_card=chat.on_card, load_s=round(load_s, 1), turns=[])
     for text in turns:
         n0, c0 = len(chat.fed), len(calls)
@@ -211,6 +213,9 @@ def main(argv=None) -> int:
     ap.add_argument("--em-rows", type=int, metavar="N",
                     help="expert-major from N new rows a call on (default: the family's, "
                          "streamed.EM_ROWS; 0: every call)")
+    ap.add_argument("--em-pass", type=int, metavar="C",
+                    help="expert-major's entries a pass (default: the configuration's, "
+                         "moe.em_pass_rows)")
     ap.add_argument("--trace", help="each turn's calls' runs and the server's timeline, JSON")
     ap.add_argument("--sample", action="store_true", help="the model's sampling defaults")
     ap.add_argument("--seed", type=int, default=0)
@@ -220,7 +225,7 @@ def main(argv=None) -> int:
     tr = [] if a.trace else None
     r = run(a.model, a.backend, a.cfg, a.dev, a.turn or TURNS, a.max_new, a.cap, a.pool,
             a.experts, a.layer_major, a.sample, a.seed, a.pool_create, em_rows=a.em_rows,
-            trace=tr)
+            trace=tr, em_pass=a.em_pass)
     for i, t in enumerate(r["turns"]):
         print(f"turn {i + 1}: {t['reply']!r}\n  {t['line']}", flush=True)
         for c in t["calls"]:

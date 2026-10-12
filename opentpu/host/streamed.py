@@ -164,7 +164,7 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
            embed_host: bool | None = None, hints: bool | None = None,
            layer_major: int | None = None, pooled: bool = True, embed_runs: bool = False,
            layer_ahead=None, expert_major: bool | None = None, em_rows: int | None = None,
-           ahead_part: int | None = None,
+           em_pass: int | None = None, ahead_part: int | None = None,
            idle_parts: str = "v2", willneed: bool = True, pool_map: bool = True,
            release_weights: bool = True, create: bool = False, W=None, **kw):
     """The Engine of the MoE checkpoint at `model` on `backend` ("isa", or a backend factory
@@ -183,8 +183,9 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
     (expert_major None: on wherever the prompt is layer-major with pooled slots, no
     layer_ahead and room for its needs, expert_major_fits, docs/offload.md 13.15, for the
     prefill_layers calls of at least em_rows new rows (None: the family's EM_ROWS, 13.16;
-    gate_expert_major); True: on for every call unless em_rows says otherwise; ahead_part
-    None: NEED_PART with it, else Engine's);
+    gate_expert_major); True: on for every call unless em_rows says otherwise; em_pass: the
+    expert runs' entries a pass (Engine.em_pass; None: the configuration's, docs/offload.md
+    13.18); ahead_part None: NEED_PART with it, else Engine's);
     idle_parts: ExpertServer's read ahead and halt-aware parts (IDLE_PARTS); willneed: a
     request's disk reads queued at once (PoolFile.willneed); pool_map, release_weights:
     Engine's. create: a missing pool is made and each expert packed on its first use (else
@@ -227,6 +228,8 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
                  resident=True, experts=experts, pool_file=pool, backend=backend,
                  release_weights=release_weights, pool_map=pool_map, **ekw, **kw)
     eng.pool_path = pool
+    if em_pass:                                 # (the expert runs' passes: 13.18)
+        eng.em_pass = em_pass
     if eng.expert_major and em_rows:            # (a short call layer-major: 13.16)
         gate_expert_major(eng, em_rows)
     srv = eng.server

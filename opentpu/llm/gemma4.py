@@ -80,7 +80,7 @@ from .. import isa as I
 from .. import qcache as QC
 from .. import quant as Q
 from .. import language as ol
-from ..compiler import (Affine, DevVar, KVDesc, QTensor, Tensor, current, k_scale_bytes,
+from ..compiler import (Affine, CompileError, DevVar, KVDesc, QTensor, Tensor, current, k_scale_bytes,
                         trace_fit)
 from ..isasim import Config
 from ..kernels import gather as GA
@@ -1234,14 +1234,28 @@ class Image:
                                                     "em": em})
         return [b.finish()], list(b.run_args)
 
-    def compile_expert_run(self, li: int):
+    def compile_expert_run(self, li: int, C: int | None = None):
         """(programs, run_args): moe.moe_expert_run of layer li (expert-major, docs/offload.md
         13.11), the chunk's rows and entries (rows x k) run arguments ("rows", "entries")."""
         if self.offload is None or not self.prefill_rows or self.cfg.S != 1:
             raise ValueError("an expert run needs the expert server's words, the image's "
                              "prefill rows and one slice")
-        b = gemma4_expert_run.trace(self.cfg, 0, {"m": self.descriptors(0), "li": li})
-        return [b.finish()], list(b.run_args)
+        err, wf = None, self.fmt.wformat
+        if C is not None and not 1 <= C <= self.cfg.act_rows:
+            raise ValueError(f"passes of {C} entries: 1 .. ACT_ROWS ({self.cfg.act_rows})")
+        for C in [C] if C else MO.em_pass_order(self.cfg, wf):     # (the best that fits TMEM)
+            S = MO.em_short_rows(self.cfg, wf, C)
+            try:
+                b = gemma4_expert_run.trace(self.cfg, 0, {"m": self.descriptors(0), "li": li, "C": C,
+                                              "S": S})
+            except CompileError as e:
+                if "TMEM exhausted" not in str(e):
+                    raise
+                err = err or e
+                continue
+            self.em_pass = (C, S)
+            return [b.finish()], list(b.run_args)
+        raise err
 
     def compile_generate(self, blocks: int, lo: int, block: int = ATTN_BLOCK,
                          chain: bool = True, samp=None, debug: bool = False,
@@ -1977,11 +1991,12 @@ def gemma4_prefill_head(m, row, em: bool = False):
 
 
 @ol.jit
-def gemma4_expert_run(m, li: int):
+def gemma4_expert_run(m, li: int, C: int = 2, S: int = 0):
     """Expert-major's expert run of layer li (moe.moe_expert_run, docs/offload.md 13.11): after
-    the layer's runs over a prefill chunk, each expert its rows chose once, in passes of two
-    rows; the chunk's rows and their entries (rows x k) are run arguments."""
+    the layer's runs over a prefill chunk, each expert its rows chose once, in passes of up to C
+    rows (S: a short pass's, docs/offload.md 13.18); the chunk's rows and their entries (rows x
+    k) are run arguments."""
     from ..compiler import RunVar
-    C, k = m.moe_dev.em_rows, m.spec.top_k
-    MO.moe_expert_run(m.layer(li), m.spec.moe, m.moe_dev, RunVar("rows", C + 1),
-                      RunVar("entries", C * k + 1))
+    R, k = m.moe_dev.em_rows, m.spec.top_k
+    MO.moe_expert_run(m.layer(li), m.spec.moe, m.moe_dev, RunVar("rows", R + 1),
+                      RunVar("entries", R * k + 1), C, S)

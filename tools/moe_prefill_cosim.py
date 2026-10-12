@@ -5,6 +5,8 @@ on the data, so the images are zeros: no checkpoint is read (config.json only).
 
     python3 tools/moe_prefill_cosim.py rows MODEL_DIR --variant dense|moe --R 1,2,4 --prefix 0:0,1:0,5
     python3 tools/moe_prefill_cosim.py expert MODEL_DIR --M 1,2,3,4,8
+    python3 tools/moe_prefill_cosim.py em MODEL_DIR --rows 16,131,512 [--used N | --route IDS.npy]
+        [--set MCOLS=16] [--isa] [--profile]
 
 rows: the model cut to each prefix of layers (Gemma 4: checkpoint layers, ':' between
 prefixes; Qwen3.5: a count), R rows at positions pos.. (no logits); `dense`: the MoE block
@@ -12,7 +14,22 @@ removed (the attention / mixer and the dense MLP or shared expert alone), `moe`:
 the MoE block, every expert present (each entry names its layer's first slot) and `served`
 past every request (the timing hack: no fence or slot waits). A layer's cost is the difference
 of two prefixes. expert: one expert's FFN (kernels.mlp.swiglu_down from its slot) on M rows,
-less the same program without it. One JSON line per run.
+less the same program without it. em: expert-major's expert run of one MoE layer
+(compile_expert_run, docs/offload.md 13.11) after its mixer runs over a chunk of `rows` rows,
+with the server's words as the expert-major prefill has them once every expert the chunk needs
+has landed: the records (each row's k global ids, weights and 1 / rms in its tail) in the
+scratch on the first slots, each expert the rows chose in a slot of its own after the scratch,
+with its tag set and its directory entry {slot, 1.0}. The routing: each row k distinct experts,
+uniform, of `used` (the layer's distinct experts in a chunk; by default the prompts' measured 144
+of the 35B's 256, 75 of the 26B's 128), or a router trace's layer-local ids (--route, .npy
+[rows, k]). After the run every used expert's tag must be zero and every (row, rank) output
+place written (checked; --isa: the ISA simulator, no cycles, its passes counted by their WAITWs
+and checked against the bucketing's, isa_passes). Its record: passes (numpy's
+bucketing), cycles, ms, ms a pass, the experts' bytes streamed (each pass streams its expert),
+the run's DRAM bytes by kind and a row (em_bytes), and layer-major's passes on the same ids in
+runs of 2 rows (lm2: each run's union; the synthetic routing's adjacent rows are independent,
+so against a prompt's it overstates them).
+--set KEY=VALUE overrides the board configuration (MCOLS=16, ...). One JSON line per run.
 """
 from __future__ import annotations
 
@@ -29,6 +46,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from opentpu import isa as I  # noqa: E402
 from opentpu import language as ol  # noqa: E402
 from opentpu import rtlsim  # noqa: E402
 from opentpu.compiler import Affine, Tensor  # noqa: E402
@@ -42,18 +60,24 @@ MHZ = 133.33
 DRAM = 1 << 30                  # one simulator build for every run
 
 
-def cfg_of():
-    return board_config(PAIR=True, DSTEP=True, STREAM=True, DRAM_BYTES=DRAM)
+def cfg_of(**over):
+    return board_config(**{**dict(PAIR=True, DSTEP=True, STREAM=True, DRAM_BYTES=DRAM), **over})
+
+
+def _rtl(cfg, progs, dram, args=None, profile=False):
+    """(DRAM after the run, stats): the RTL with the card's LiteDRAM controllers."""
+    plus = rtlsim.ldc_plusargs(1066, MHZ) + ddr3_plusargs(3200 / 3, MHZ)[2:]
+    drams, _, st = rtlsim.run(cfg, progs, [dram], uarch=rtlsim.BOARD_UARCH, axi=True,
+                              boot=True, stall=0, bw=100, lat=round(0.3 * MHZ),
+                              max_cycles=1 << 40, ldc=1066, args=args, trace=profile,
+                              plusargs=["+axi_dram=1", "+axi_map=1"] + plus)
+    if profile:
+        print_profile(cfg, progs, st)
+    return drams[0], st
 
 
 def cosim(cfg, progs, dram, profile=False) -> int:
-    plus = rtlsim.ldc_plusargs(1066, MHZ) + ddr3_plusargs(3200 / 3, MHZ)[2:]
-    _, _, st = rtlsim.run(cfg, progs, [dram], uarch=rtlsim.BOARD_UARCH, axi=True, boot=True,
-                          stall=0, bw=100, lat=round(0.3 * MHZ), max_cycles=1 << 40, ldc=1066,
-                          trace=profile, plusargs=["+axi_dram=1", "+axi_map=1"] + plus)
-    if profile:
-        print_profile(cfg, progs, st)
-    return st["cycles"]
+    return _rtl(cfg, progs, dram, profile=profile)[1]["cycles"]
 
 
 def _where(ins):
@@ -81,7 +105,7 @@ def print_profile(cfg, progs, st):
 
 def load_model(d):
     mt = json.loads((Path(d) / "config.json").read_text()).get("model_type")
-    if mt == "gemma4":
+    if mt in ("gemma4", "gemma4_text"):
         from opentpu.llm import gemma4 as M
         return "gemma4", M, M.Spec.from_hf(d)
     if mt == "lfm2_moe":                    # (expert only)
@@ -92,20 +116,22 @@ def load_model(d):
 
 
 def model_image(kind, M, spec, prefix, variant, R, cfg, cap, **kw):
+    """The model cut to the prefix; `moe`: its experts in fp4, kw["experts"] slots a layer
+    (default top-k)."""
     if kind == "gemma4":
         s = spec.truncated([int(x) for x in prefix.split(",")])
         if variant == "dense":
             s = dataclasses.replace(s, experts=0, top_k=0, expert_ffn=0)
             return s, s.image(cfg, cap, rows=R, wformat="int8", head_format="fp4", formats="")
         return s, s.image(cfg, cap, rows=R, wformat="int8", head_format="fp4",
-                          formats="experts=fp4", experts=s.top_k, **kw)
+                          formats="experts=fp4", **{"experts": s.top_k, **kw})
     n = int(prefix)
     s = dataclasses.replace(spec, kinds=spec.kinds[:n])
     if variant == "dense":
         s = dataclasses.replace(s, moe=None)
         return s, s.image(cfg, cap, rows=R, wformat="fp4", head_format="int8")
-    return s, s.image(cfg, cap, rows=R, wformat="fp4", head_format="int8", experts=s.moe.k,
-                      **kw)
+    return s, s.image(cfg, cap, rows=R, wformat="fp4", head_format="int8",
+                      **{"experts": s.moe.k, **kw})
 
 
 def vpu_hack(progs, modes):
@@ -227,6 +253,205 @@ def cmd_expert(a):
         print(json.dumps(out), flush=True)
 
 
+EM_USED = {"qwen35": 144, "gemma4": 75}    # a layer's distinct experts in a prompt chunk
+EM_SENT = 7.0                               # an output place the run has not written
+
+
+def em_ids(rows: int, k: int, E: int, used: int, seed: int, route=None) -> np.ndarray:
+    """[rows, k] layer-local expert ids: the trace's first rows, or each row k distinct of
+    `used` experts (a random set), uniform."""
+    if route is not None:
+        ids = np.load(route).astype(np.int64)
+        if ids.ndim != 2 or ids.shape[1] != k or len(ids) < rows or ids.min() < 0 \
+                or ids.max() >= E:
+            raise ValueError(f"{route}: [rows >= {rows}, {k}] ids below {E}, has {ids.shape}")
+        return ids[:rows]
+    rng = np.random.default_rng(seed)
+    pool = rng.permutation(E)[:max(k, min(used, E))]
+    return np.stack([rng.choice(pool, k, replace=False) for _ in range(rows)])
+
+
+def em_passes(ids: np.ndarray, E: int, C: int = 2, S: int = 0) -> tuple:
+    """(passes, distinct experts, rows loaded): the bucketing's passes of up to C entries of one
+    expert. A pass loads and stores C rows (a part-filled one repeats its first entry), and an
+    expert's last pass S when it has 1 .. S entries (the short pass, moe.em_short_rows)."""
+    c = np.bincount(ids.reshape(-1), minlength=E)
+    p, r = -(-c // C), c % C
+    short = (r > 0) & (r <= S)
+    return int(p.sum()), int((c > 0).sum()), int((p * C - short * (C - S)).sum())
+
+
+def em_bytes(ids: np.ndarray, passes: int, loads: int, fb: int, H: int) -> dict:
+    """The expert run's DRAM traffic by kind, in bytes of whole 64-byte lines: each pass streams
+    its expert (fb), reads its rows' X and 1 / rms and writes their outputs (`loads` rows in
+    all: em_passes), reads its directory entry and zeroes its slot's tag; the tables read each
+    row's ids."""
+    def ln(b):
+        return -(-b // 64) * 64
+    rows, k = ids.shape
+    return dict(weights=passes * fb, rows_in=loads * (ln(4 * H) + 64),
+                rows_out=loads * ln(4 * H), tables=rows * ln(4 * k), words=passes * 2 * 64)
+
+
+def lm_passes(ids: np.ndarray, R: int = 2) -> int:
+    """Layer-major's expert passes on the same ids, runs of R rows: each run's union once."""
+    return sum(len(np.unique(ids[r:r + R])) for r in range(0, len(ids), R))
+
+
+def em_dram(img, li: int, ids: np.ndarray, seed=None):
+    """(DRAM, the experts' slots): the zero image with the words the expert run of layer li
+    reads once every expert its chunk needs has landed (the module docstring). seed: random
+    data instead of zeros (the rows' X and 1 / rms, the layer's gains, each used expert's
+    weights packed into its slot), for compare's bit-for-bit check."""
+    from opentpu.compiler import Affine as Af
+    dsc = img.descriptors(0)
+    dev, lw, Lo = dsc.moe_dev, dsc.layer(li), img.offload
+    E, H, (rows, k) = Lo.E, dev.fmt.H, ids.shape
+    dram = np.zeros(-(-img.nbytes // 4) * 4, np.uint8)
+
+    def put(addr, a):
+        a = np.ascontiguousarray(a)
+        dram[addr:addr + a.nbytes] = a.view(np.uint8).reshape(-1)
+
+    put(Af.of(lw.gbase.base).const, np.float32([li * E]))       # the layer's j * E
+    rng = None if seed is None else np.random.default_rng(seed)
+    if rng is not None:
+        for gn in ("g_post", "g_exp"):
+            if getattr(lw, gn, None) is not None:
+                put(Af.of(getattr(lw, gn).base).const,
+                    (0.5 + rng.random(H)).astype(np.float32))
+    tail = 4 * H * (k + 2)
+    for r in range(rows):
+        a = dev.em_base + r * dev.em_rec
+        if rng is not None:
+            put(a, rng.standard_normal(H).astype(np.float32))   # X
+        put(a + 4 * H, np.full(k * H, EM_SENT, np.float32))     # OUT: the run writes them
+        put(a + tail, (li * E + ids[r]).astype(np.float32))     # global ids
+        put(a + tail + 4 * k, np.full(k, 1.0 / k, np.float32))  # weights
+        put(a + tail + 8 * k, np.float32([1.0 if rng is None else 0.5 + rng.random()]))
+    scratch = len(MO.em_slots(Lo, rows * dev.em_rec))
+    used, slots = np.unique(ids), Lo.all_slots()
+    if scratch + len(used) > len(slots):
+        raise ValueError(f"{scratch} scratch slots and {len(used)} experts: the image has "
+                         f"{len(slots)} slots")
+    es = slots[scratch:scratch + len(used)]
+    f = dev.fmt
+    for e, a in zip(used, es):
+        if rng is not None:                                     # its weights
+            w = [0.05 * rng.standard_normal(sh).astype(np.float32)
+                 for sh in ((f.F0, H), (f.F0, H), (H, f.F0))]
+            put(a, f.pack(*w))
+        put(Lo.dir + 8 * (li * E + int(e)), np.array([a, 0x3F800000], np.uint32))  # {slot, 1.0}
+        put(a + Lo.tag, np.uint32([1]))                         # landed
+    return dram, es
+
+
+def em_outputs(after, img, rows: int, k: int) -> np.ndarray:
+    """The records' OUT rows [rows, k, H] (the expert run's outputs), as uint32 bits."""
+    dev = img.descriptors(0).moe_dev
+    H, w = dev.fmt.H, after.view(np.uint32)
+    return np.stack([w[(dev.em_base + r * dev.em_rec + 4 * H) // 4:][:k * H].reshape(k, H)
+                     for r in range(rows)])
+
+
+def em_check(after, img, li: int, ids: np.ndarray, es) -> None:
+    """Every used expert's tag zeroed, every (row, rank) output place written."""
+    dev, Lo = img.descriptors(0).moe_dev, img.offload
+    H, (rows, k) = dev.fmt.H, ids.shape
+    w = after.view(np.uint32)
+    bad = [a for a in es if w[(a + Lo.tag) // 4]]
+    if bad:
+        raise AssertionError(f"{len(bad)} of {len(es)} experts' tags not zeroed")
+    f = after.view(np.float32)
+    for r in range(rows):
+        o = (dev.em_base + r * dev.em_rec + 4 * H) // 4
+        left = [i for i in range(k) if (f[o + i * H:o + (i + 1) * H] == EM_SENT).any()]
+        if left:
+            raise AssertionError(f"row {r}: ranks {left} not written")
+
+
+def _sets(items) -> dict:
+    """--set KEY=VALUE pairs: the board configuration's overrides (ints; true / false)."""
+    out = {}
+    for it in items or []:
+        k, v = it.split("=", 1)
+        b = {"true": True, "false": False}.get(v.lower())
+        out[k] = int(v, 0) if b is None else b
+    return out
+
+
+def cmd_em(a):
+    """Expert-major's expert run (module docstring)."""
+    from opentpu.compiler import arg_words
+    from opentpu.isasim import Machine
+    kind, M, spec = load_model(a.model)
+    if kind not in ("qwen35", "gemma4"):
+        raise SystemExit("em: Qwen3.5-MoE or Gemma 4 MoE")
+    over = _sets(a.set)
+    cfg = cfg_of(**over)
+    prefix = a.prefix or ("1" if kind == "qwen35" else "0")
+    s, img = model_image(kind, M, spec, prefix, "moe", 1, cfg, a.cap)
+    mo, li = s.moe, s.layers - 1
+    used = a.used or EM_USED[kind]
+    for rows in [int(x) for x in a.rows.split(",")]:
+        ids = em_ids(rows, mo.k, mo.E, used, a.seed, a.route)
+        distinct = em_passes(ids, mo.E)[1]
+        L = img.offload
+        need = len(MO.em_slots(L, rows * MO.em_record(s.hidden, mo.k))) + distinct
+        n = max(mo.k, -(-need // len(L.slots)))     # slots a layer: the scratch and every expert
+        s, img = model_image(kind, M, spec, prefix, "moe", 1, cfg, a.cap, experts=n)
+        progs, ra = img.compile_expert_run(li, a.em_pass)
+        C, S = img.em_pass                          # (the pass's entries, a short pass's)
+        passes, _, loads = em_passes(ids, mo.E, C, S)
+        args = arg_words(ra, {"rows": rows, "entries": rows * mo.k})
+        dram, es = em_dram(img, li, ids, a.seed if a.random else None)
+        fb = img.fmt.nbytes
+        rec = dict(model=Path(a.model).name, layer=li, rows=rows, k=mo.k, E=mo.E,
+                   used=distinct, entries=rows * mo.k, C=C, S=S, passes=passes,
+                   instructions=len(progs[0]), slots=n, image_mib=round(img.nbytes / 2**20),
+                   cfg={**{k_: getattr(cfg, k_) for k_ in ("MCOLS", "LANES", "PAIR", "DSTEP",
+                                                            "STREAM")}, **over},
+                   expert_mib=round(passes * fb / 2**20, 1),
+                   dram_bound_ms=round(passes * (fb + 16 * s.hidden) / 14.1e9 * 1e3, 3))
+        mv = em_bytes(ids, passes, loads, fb, s.hidden)
+        lm = lm_passes(ids)
+        rec.update(bytes=mv, bytes_a_row=round(sum(mv.values()) / rows),
+                   weight_bytes_a_row=round(mv["weights"] / rows), lm2_passes=lm,
+                   lm2_weight_bytes_a_row=round(lm * fb / rows))
+        t = time.time()
+        if a.isa:
+            m = Machine(cfg, progs, [dram], args)
+            sl, waits = m.slices[0], [0]
+            step = sl.step
+
+            def counted():              # the passes the program ran: one WAITW each
+                waits[0] += sl.prog[sl.pc].op == I.WAITW
+                step()
+            sl.step = counted
+            m.run(max_steps=1 << 34)
+            after = sl.dram[:len(dram)]
+            rec.update(icount=sl.icount, isa_passes=waits[0])
+            if waits[0] != passes:
+                raise AssertionError(f"the ISA ran {waits[0]} passes, the bucketing {passes}")
+        else:
+            after, st = _rtl(cfg, progs, dram, args, a.profile)
+            rec.update(cycles=st["cycles"], ms=round(st["cycles"] / (MHZ * 1e3), 3),
+                       ms_a_pass=round(st["cycles"] / (MHZ * 1e3) / max(passes, 1), 4))
+        em_check(after, img, li, ids, es)
+        if a.compare:                   # the same DRAM through passes of a.compare entries
+            p2, _ = img.compile_expert_run(li, a.compare)
+            m2 = Machine(cfg, p2, [dram], args).run(max_steps=1 << 34)
+            o1 = em_outputs(after, img, rows, mo.k)
+            o2 = em_outputs(m2.slices[0].dram[:len(dram)], img, rows, mo.k)
+            rec.update(compare=a.compare, differing_words=int((o1 != o2).sum()),
+                       nonzero_words=int((o1 != 0).sum()))
+            if (o1 != o2).any():
+                raise AssertionError(f"{int((o1 != o2).sum())} output words differ from passes "
+                                     f"of {a.compare}")
+        rec.update(check="ok", sim_s=round(time.time() - t))
+        print(json.dumps(rec), flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -251,8 +476,27 @@ def main():
     e = sub.add_parser("expert")
     e.add_argument("model")
     e.add_argument("--M", default="1,2,3,4,8")
+    m = sub.add_parser("em")
+    m.add_argument("model")
+    m.add_argument("--rows", default="131", help="the chunk's rows (a list)")
+    m.add_argument("--prefix", default=None, help="layers (Qwen3.5 a count, default 1; Gemma 4 "
+                   "checkpoint layers, default 0): the last one's expert run")
+    m.add_argument("--used", type=int, default=0, help="distinct experts the chunk uses "
+                   "(default: Qwen3.5 144, Gemma 4 75)")
+    m.add_argument("--route", default=None, help="router trace: .npy [rows, k] layer-local ids")
+    m.add_argument("--seed", type=int, default=0)
+    m.add_argument("--cap", type=int, default=1024)
+    m.add_argument("--set", action="append", help="board configuration KEY=VALUE (repeat)")
+    m.add_argument("--isa", action="store_true", help="the ISA simulator (the check, no cycles)")
+    m.add_argument("--profile", action="store_true", help="per place: cycles (stderr)")
+    m.add_argument("--random", action="store_true", help="random rows, gains and experts "
+                   "(seeded by --seed) instead of zeros")
+    m.add_argument("--compare", type=int, default=0, help="with --isa: also run passes of this "
+                   "many entries on the same DRAM; the outputs must be equal")
+    m.add_argument("--em-pass", type=int, default=None, help="entries a pass (default: the "
+                   "configuration's, moe.em_pass_rows)")
     a = ap.parse_args()
-    {"rows": cmd_rows, "expert": cmd_expert, "layer": cmd_layer}[a.cmd](a)
+    {"rows": cmd_rows, "expert": cmd_expert, "layer": cmd_layer, "em": cmd_em}[a.cmd](a)
 
 
 if __name__ == "__main__":
