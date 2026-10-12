@@ -1350,6 +1350,37 @@ ACT_ROWS 16, 7.5 ns): E 2 12,311 LUT / 22,472 FF / 562 DSP (WNS +0.164), E 3 14,
 1.5 cycles a row) or lanes without ACC / ASCALE would cost less area but fix less (G 4 needs four
 results a cycle), and splitting a head's rows across MMs keeps G x T / E.
 
+**Attention decode at MCOLS 8: which E.** A K row of q.K^T costs the array KB = d / 128 cycles
+(no replay while G <= MCOLS), the drain ceil(G / E), and the KV cache (d + 4) bytes (int8 and the
+row's Sw) at about 120 bytes a cycle (94% of DDR3-1066's 128 bytes a 133.33 MHz cycle); P.V's
+rows (V^T, 256-token blocks: KB 2) cost the drain the same ceil(G / E) against 2. At MCOLS 8, E =
+MCOLS / 2 = 4 (from the shapes; no runs):
+
+| model | G (sliding / global) | d (sliding / global) | q.K^T a K row: drain / array / KV | bound at E 4 | cost at 4K |
+|---|---|---|---|---|---|
+| Qwen3-0.6B | 2 | 128 | 1 / 1 / 1.1 | KV | 0 |
+| Phi-4-mini | 3 | 128 | 1 / 1 / 1.1 | KV | 0 |
+| SmolLM3-3B | 4 | 128 | 1 / 1 / 1.1 | KV | 0 |
+| LFM2-2.6B, LFM2.5-8B-A1B (230M: G 2) | 4 | 64 | 1 / 1 / 0.6 | the array (a half block, any E) | 0 |
+| Qwen3.5-0.8B / 2B / 4B | 4 | 256 | 1 / 2 / 2.2 | KV | 0 |
+| Qwen3.5-35B-A3B | 8 | 256 | 2 / 2 / 2.2 | KV (the drain level with the array) | 0 |
+| Gemma 4 E2B | 8 / 8 | 256 / 512 | 2 / 2 / 2.2, 2 / 4 / 4.3 | KV | 0 |
+| Gemma 4 E4B | 4 / 4 | 256 / 512 | 1 / 2 / 2.2, 1 / 4 / 4.3 | KV | 0 |
+| gemma-4-26B-A4B | 2 / 8 | 256 / 512 | 1 / 2 / 2.2, 2 / 4 / 4.3 | KV | 0 |
+| G 5 to 8 at d 128 (the test's G 6; Llama-3-70B and Qwen2.5-72B shapes: G 8) | 5-8 | 128 | 2 / 1 / 1.1 | the drain, at every context | +0.9 T Hkv cycles a layer |
+
+No card model's attention decode is drain-bound at MCOLS 8 / E 4, at any context: the drain and
+the KV cache both grow with T, so the bound is the shape's, not the position's. The shapes that
+are, G 5 to 8 at d 128, run q.K^T at 2 cycles a K row against the cache's 1.1: at 4K that is
++3,700 x Hkv cycles a layer, about +40% on the attention's cache time (q.K^T and P.V 2.2 cycles
+a K row become 3.1); `tests/test_perf.py` keeps the design point's G 6 case at E = MCOLS / 2 as a
+strict xfail. E 4 also costs prefill at d 128: an 8-row q.K^T drains in 2 cycles a K row against
+the array's 1 (section 10's table at 16 rows: 4x at E 4). The MCOLS 8 integration tree should
+build E = MCOLS (8): every G up to the column count and every prefill q.K^T at full rate, as the
+card at MCOLS 4 does, for 4 lanes more (about 7.7K LUTs, 5.3K FFs, 24 DSPs; this section's
+1,930 / 1,320 / 6 a lane). E = 4 is the area fallback, at no card model's decode cost but at 2x
+on prefill q.K^T at d 128 and on decode of G 5 to 8 at d 128.
+
 ## 10. MCOLS 16 on the YPCB, out of context
 
 Sixteen rows a pass on eight pumped DSP48E1 columns: section 5's experiment (`rtl/exp/mx_mxu`
