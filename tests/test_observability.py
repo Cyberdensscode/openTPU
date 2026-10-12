@@ -229,7 +229,9 @@ def test_mxu_starve_counter(have_verilator):
     wait, while DRAM_WAIT stays near 0 (the adapter takes nearly every request). Where the wait
     lands depends on the MXU: the systolic array starts a row only once all of its chunks are in
     (a row never stalls in the pipeline; docs/mxu_systolic.md), so it waits on a partial row,
-    blocked, about as long as on an empty FIFO, and MXU_STARVE sees about half of its wait. A short latency (20) removes nearly all of the wait."""
+    blocked, about as long as on an empty FIFO, and MXU_STARVE sees about half of its wait (a
+    quarter with the MX kernels' MLP: 12 MMs of whole QACT ranges, longer rows, against 24). A
+    short latency (20) removes nearly all of the wait."""
     cfg, img, prog = _kernel("mlp")
     c, cyc, q = {}, {}, {}
     for lat in (400, 20):
@@ -245,7 +247,7 @@ def test_mxu_starve_counter(have_verilator):
     wait = {lat: q[lat]["ms"] + q[lat]["mb"] for lat in q}
     assert wait[400] > 0.9 * (c[400]["MXU_BUSY"] - c[400]["MXU_MAC"]), (c[400], q[400])
     assert c[400]["DRAM_WAIT"] < wait[400] // 100 and c[20]["DRAM_WAIT"] == 0, (c[400], c[20])
-    assert min(q[400]["ms"], q[400]["mb"]) > wait[400] // 3, q[400]
+    assert min(q[400]["ms"], q[400]["mb"]) > wait[400] // 5, q[400]
     assert wait[20] < wait[400] // 20, (q[400], q[20])
     assert cyc[20] < 0.3 * cyc[400], cyc
 

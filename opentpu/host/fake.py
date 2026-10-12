@@ -18,8 +18,10 @@ and I2C_CTRL / I2C_IN drive and read those bus models. With `ddr_mts` CAPS bit3 
 DDR_MTS register; without it the register reads 0xDEADBEEF, as on older bitstreams. With
 `args` CAPS bit25 announces the ARG0..7 registers (kept, read back), with regmap=4 the CFG_*
 registers report `cfg` (regs.cfg's keys; default the current target's single-slice values with
-the CFG_HASH its build would report), with `gen` CAPS bit30
-the decode loop's instructions (it runs nothing either way), with `chash` CAPS bit7 the hashed
+the CFG_HASH its build would report), with `mx` (default) CAPS bit29, the MX numerics every
+bitstream of this tree has (False: a bitstream before MX, which the host refuses), with `gen`
+CAPS bit30 the decode loop's instructions (it runs nothing either way), with `chash` CAPS bit7
+the hashed
 channel interleave (the run's logits pieces land by that map). `calib` (STATUS CALIB0,
 CALIB1): CTRL takes RUN only while both are set, as the RTL; `ecc_ded`: STATUS ECC_DED (set
 by hand: sticky on the card). Its identity (VERSION: D,
@@ -75,7 +77,7 @@ class FakeTransport:
                  w4: bool = True, pair: bool = False, dstep: bool = False,
                  args: bool = False, stream: bool = False, gen: bool = False,
                  chash: bool = False, calib: tuple = (True, True), ecc_ded: bool = False,
-                 cfg: dict | None = None, act_rows: int | None = None):
+                 cfg: dict | None = None, act_rows: int | None = None, mx: bool = True):
         self.ch = [np.zeros(ch_bytes, np.uint8) for _ in range(2)]
         self.v, self.devname, self.dev = regmap, devname, devname and f"/dev/{devname}"
         self.run_s, self.cycles_per_run = run_s, cycles
@@ -107,6 +109,7 @@ class FakeTransport:
         self.stream = stream            # CAPS bit26: the stream engine
         self.gen = gen                  # CAPS bit30: the decode loop (RLD, ARGMAX, HALT CHAIN)
         self.chash = chash              # CAPS bit7: the hashed channel interleave
+        self.mx = mx                    # CAPS bit29: the MX numerics (every bitstream of this tree)
         self.calib = list(calib)        # STATUS CALIB0 / CALIB1
         self.ecc_ded = ecc_ded          # STATUS ECC_DED
         self.regs = {R.R_CTRL: 0, R.R_PROG_ADDR: 0, R.R_PROG_N: 0, R.R_SCRATCH: 0,
@@ -229,7 +232,7 @@ class FakeTransport:
                     | (R.CAP_PAIR if self.pair else 0)
                     | (R.CAP_DSTEP if self.dstep else 0) | (R.CAP_ARGS if self.args else 0)
                     | (R.CAP_STREAM if self.stream else 0) | (R.CAP_GEN if self.gen else 0)
-                    | (R.CAP_CHASH if self.chash else 0)
+                    | (R.CAP_CHASH if self.chash else 0) | (R.CAP_MX if self.mx else 0)
                     | (R.CAP_ACT if self.act_rows > self.version >> 8 & 0xFF else 0)
                     | self.trace_log2 << 8 | 6 << 16)
         if off == R.R_ACT_ROWS and self.act_rows > self.version >> 8 & 0xFF:

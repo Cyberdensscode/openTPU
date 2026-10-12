@@ -207,6 +207,33 @@ def test_the_engine_backend_checks_the_hash(no_env):
         BoardBackend(small, [np.zeros(4096, np.uint8)], transport=bad, status=False)
 
 
+@pytest.mark.parametrize("regmap", [3, 4])
+def test_a_bitstream_before_mx_is_refused(no_env, regmap):
+    """A bitstream without CAPS bit29 (the MX numerics: an MXU before MX, whatever its hash) is
+    refused with ConfigMismatch by device_config (otpu-chat, selftest, diag, hwlens, the quals)
+    and by BoardBackend (check_fits: the Engine's, otpu-serve's); one without CAPS at all
+    (register map 1) too."""
+    import numpy as np
+
+    from opentpu.host.board import BoardBackend
+    kw = dict(devname=None, regmap=regmap, pair=True, dstep=True, stream=True)
+    good = Board(FakeTransport(**kw)).info()
+    assert good["caps"]["mx"]
+    cfg = dataclasses.replace(device_config(good), DRAM_BYTES=1 << 22)
+    old = FakeTransport(mx=False, **kw)
+    info = Board(old).info()
+    assert not info["caps"]["mx"]
+    for refuse in (lambda: device_config(info), lambda: check_fits(cfg, info),
+                   lambda: BoardBackend(cfg, [np.zeros(4096, np.uint8)], transport=old,
+                                        status=False)):
+        with pytest.raises(ConfigMismatch, match="lacks the MX numerics \\(CAPS bit29\\)"):
+            refuse()
+    v1 = Board(FakeTransport(devname=None, regmap=1)).info()
+    assert v1["caps"] is None
+    with pytest.raises(ConfigMismatch, match="MX numerics"):
+        device_config(v1)
+
+
 def test_device_config_before_map_4_is_the_card(no_env):
     info = Board(FakeTransport(devname=None, regmap=3, pair=True, dstep=True,
                                stream=True)).info()

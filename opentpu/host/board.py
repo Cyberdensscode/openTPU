@@ -1171,7 +1171,8 @@ def device_config(info: dict, **kw):
     (before map 4: the YPCB-00338's, the current target's), so the card needs no OTPU_MCOLS /
     OTPU_LANES / OTPU_PAIR / OTPU_DSTEP / OTPU_STREAM. When one is set in the environment it must
     name the bitstream's value (ConfigMismatch otherwise). Keyword arguments set other fields
-    (DRAM_BYTES)."""
+    (DRAM_BYTES). A bitstream without the MX numerics (CAPS bit29) or whose CFG_HASH is not
+    this host's hash of what its registers report is refused (check_numerics, check_hash)."""
     from opentpu.isasim import board_config
     for k in ("MCOLS", "LANES"):
         env = os.environ.get(f"OTPU_{k}")
@@ -1198,6 +1199,7 @@ def device_config(info: dict, **kw):
         dev.update(D=info["D"], **{k: c[k] for k in ("S", "TMEM_WORDS", "IMEM_WORDS",
                                                      "ACT_BLOCKS", "DRAM_BYTES")})
     cfg = board_config(**dev)
+    check_numerics(info)
     check_hash(info, cfg)
     if info["D"] != cfg.D:
         raise ConfigMismatch(f"the bitstream has D={info['D']}, the board configuration "
@@ -1223,6 +1225,19 @@ def config_summary(info: dict) -> str:
     if i["build_id"] is not None:
         msg += f", build {i['build_id']:08x}"
     return msg
+
+
+def check_numerics(info: dict) -> None:
+    """Raise ConfigMismatch unless the bitstream has the MX numerics (CAPS bit29: MM's exact
+    accumulation under power-of-two block scales, QACT / QST's row scale and offsets;
+    docs/isa.md, docs/mx_mxu.md), which every program and image of this host assumes. A
+    bitstream without the bit (or without CAPS: register map 1) is of the MXU before MX: this
+    host's programs would compute something else there."""
+    if not (info.get("caps") or {}).get("mx"):
+        raise ConfigMismatch("the bitstream lacks the MX numerics (CAPS bit29): its MXU and "
+                             "quantizer are the ones before MX (docs/mx_mxu.md), and this host's "
+                             "programs and images would compute something else there; load an "
+                             "MX bitstream (this tree's) or run the bitstream's own host")
 
 
 def check_hash(info: dict, cfg=None) -> None:
@@ -1256,8 +1271,10 @@ def check_hash(info: dict, cfg=None) -> None:
 
 def check_fits(cfg, info: dict) -> None:
     """Raise ConfigMismatch unless programs compiled for `cfg` run on the device `info`
-    describes: its CFG_HASH this host's (check_hash), the same MXU, lanes and ACT RAM rows,
-    and (register map 4) no more slices, TMEM, IMEM, ACT RAM blocks or DRAM than it has."""
+    describes: the MX numerics (check_numerics), its CFG_HASH this host's (check_hash), the
+    same MXU, lanes and ACT RAM rows, and (register map 4) no more slices, TMEM, IMEM, ACT RAM
+    blocks or DRAM than it has."""
+    check_numerics(info)
     check_hash(info)
     rows = info.get("act_rows") or info["MCOLS"]
     if (info["D"], info["MCOLS"], info["LANES"], rows) != \
