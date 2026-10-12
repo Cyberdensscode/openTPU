@@ -25,7 +25,7 @@ module tb_board;
   parameter int IMEM_WORDS = 1 << 15;
   parameter int LANES      = 8;
   parameter int VPU_CL     = (LANES >= 8) ? LANES / 4 : 1;
-  parameter int MXU_IMPL   = 2;      // MXU dot product: 2 systolic (docs/mxu_systolic.md), 0 adder tree
+  parameter int MXU_IMPL   = 2;      // MXU dot product: 2 systolic (docs/mxu_systolic.md), the only one
   parameter int ULANES     = LANES;
   parameter int WIN        = 16;
   parameter int LAT        = 20;

@@ -38,7 +38,7 @@ fi
 mcols="${MCOLS:-${T_MCOLS:-4}}"     # MXU columns (the host reads them from the VERSION register)
 vpu_cl="${VPU_CL:-${T_VPU_CL:-2}}"  # VPU lanes with the composite functions (timing only)
 lanes="${LANES:-${T_LANES:-8}}"     # VPU lanes / TMEM banks (likewise in VERSION)
-act_rows="${ACT_ROWS:-$mcols}"      # ACT RAM rows (> MCOLS: MM replay; the ACT_ROWS register)
+act_rows="${ACT_ROWS:-${T_ACT_ROWS:-$mcols}}"  # ACT RAM rows (> MCOLS: MM replay; the ACT_ROWS register)
 dstep="${DSTEP:-${T_DSTEP:-1}}"     # 0: no DSTEP datapath in the DMA (CAPS bit6 = 0)
 mxu="$([[ "${T_MXU_IMPL:-2}" == 0 ]] && echo tree || echo systolic)"   # the MXU's dot product
 core_mhz="${CORE_MHZ:-$([[ "${FAST:-0}" == 1 ]] && echo 100 || echo "${T_CORE_MHZ:-133.33}")}"  # accelerator clock (FAST=1: 100)

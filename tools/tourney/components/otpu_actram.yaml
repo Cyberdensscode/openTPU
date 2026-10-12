@@ -1,6 +1,6 @@
 name: otpu_actram
-description: 'ACT RAM: MCOLS rows x BLOCKS blocks of D int8 plus block scales; written by the quantizer,
-  read one block per cycle by the MXU.'
+description: 'ACT RAM: MCOLS rows x BLOCKS blocks of D int8 plus a 64-bit record a block (the row''s scale,
+  four offsets); written by the quantizer, read one block per cycle by the MXU.'
 allowed:
 - rtl/mem/otpu_actram.sv
 synth:

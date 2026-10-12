@@ -362,12 +362,69 @@ One lane: 1,167 LUTs, 100 SRLs, 546 flip-flops, 6 DSPs.
 - The ACT RAM's read width doubles with 8 rows either way (64 -> ~128 BRAM36, docs/dsp_pumping.md
   4.3).
 
-**Vivado out of context** (`run_ooc.sh`: synthesis, placement, routing at 133.33 MHz, the pumped
-columns at 266.67 MHz; the pairs k7-base4 / k7-mx2e2, k7-base8 / k7-mx4e4 on xc7k480tffg1156-2,
-the same on xcku5p): not run yet. The first pair has been queued on omarchy since 2026-10-11
-23:24 (-03) behind a full build; the timing of the column end's shift into the B port, the
-accumulating DSP, the lane's i2f48 and the pumped domain are what it will tell. The pumped
-column alone closed at 266.67 MHz with +0.163 ns (docs/dsp_pumping.md section 5).
+**Vivado out of context** (`run_ooc.sh`: Vivado 2026.1 synthesis, opt, place, phys_opt and
+route. clk_s is 133.33 MHz. On the 7-series the pumped columns run at 266.67 MHz from the same
+MMCM, with their DSPs' operand pins as two-fast-cycle multicycle paths. Inputs and outputs are
+registered. omarchy, 2026-10-12, 3 to 8 minutes a run):
+
+| part | design | rows | LUT | LUT RAM | SRL | FF | DSP | slices | WNS clk_s | clk_f | clk_s -> clk_f | clk_f -> clk_s | WHS |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| xc7k480t-2 | today, MCOLS 4 | 4 | 14,141 | 576 | 3,091 | 24,654 | 552 | 6,983 | +0.265 | | | | +0.020 |
+| | **MX, 2 pumped columns, E 2** | 4 | **11,041** | 960 | 2,888 | **18,038** | **288** | **4,929** | +1.287 | +0.162 | +0.446 | +0.333 | +0.054 |
+| | today, MCOLS 8 | 8 | 25,400 | 1,092 | 5,978 | 45,773 | 1,104 | 13,292 | +0.079 | | | | +0.050 |
+| | **MX, 4 pumped columns, E 4** | 8 | **17,922** | 1,728 | 5,053 | **35,794** | **576** | **8,854** | +0.329 | +0.135 | +0.359 | +0.103 | +0.050 |
+| | MX, 4 pumped columns, E 2 | 8 | 16,139 | 1,728 | 5,017 | 34,136 | 564 | 8,310 | +1.183 | +0.171 | +0.315 | +0.158 | +0.052 |
+| | MX, 4 pumped columns, E 1 | 8 | 15,241 | 1,728 | 5,001 | 33,257 | 558 | 7,868 | +1.008 | +0.155 | +0.634 | +0.087 | +0.053 |
+| xcku5p-2 | today, MCOLS 4 | 4 | 15,951 | 504 | 4,985 | 22,729 | 552 | 3,998 | +2.154 | | | | +0.010 |
+| | **MX, 2 packed columns, E 2** | 4 | **12,722** | 828 | 4,897 | **17,324** | **288** | **2,890** | +2.997 | | | | +0.010 |
+| | today, MCOLS 8 | 8 | 28,752 | 936 | 9,355 | 47,711 | 1,104 | 8,145 | +1.373 | | | | +0.010 |
+| | **MX, 4 packed columns, E 4** | 8 | **22,084** | 1,488 | 9,317 | **32,686** | **576** | **5,225** | +1.517 | | | | +0.010 |
+| | MX, 4 packed columns, E 2 | 8 | 20,506 | 1,488 | 9,218 | 32,900 | 564 | 4,985 | +1.400 | | | | +0.010 |
+
+Slices are CLBs on the xcku5p. FF counts include the registered inputs (1,024 per row plus the
+chunk) in both designs, so compare differences, not totals.
+
+- **Every run meets timing, hold included, with 0 critical warnings.**
+  - On the 7-series the pumped domain is again the tightest. Two paths set it, the same ones and
+    the same margins as the single column of docs/dsp_pumping.md section 5:
+    - the fast-cycle INMODE replicas, +0.135 to +0.171 ns;
+    - the one-fast-period return from the chain ends into the column end's A / D registers,
+      +0.087 to +0.333 ns.
+  - The MX slow-clock paths have at least +0.33 ns. At 8 rows with 4 lanes the worst is the
+    result FIFO's write enable fanning out to its three LUT RAM copies, which a replica fixes;
+    the other MX runs have at least +1.0 ns. Today's MCOLS 8 has +0.079 ns (hi0 to the PEs'
+    INMODE).
+  - The new slow paths have room (`paths.tcl` on the routed checkpoints, 2 / 4 columns, ns):
+
+    | path | 7-series | xcku5p |
+    |---|---:|---:|
+    | the column end's shift into the B port (6 levels) | +2.351 / +2.143 | +3.814 / +3.413 |
+    | the accumulating DSP's OPMODE | +5.852 / +5.181 | +6.451 / +6.161 |
+    | its P to the row registers | +6.012 / +5.374 | +6.360 / +6.382 |
+    | the lane's i2f48 (13 levels on the 7-series) | +2.551 / +2.390 | +3.777 / +3.624 |
+    | PAIR's 48-bit add | +4.802 / +3.373 | +6.139 / +5.601 |
+    | the result FIFO's write | +2.168 / +0.329 | +4.695 / +3.593 |
+    | the chain ends into the column end (7-series: one fast period; xcku5p: the packed split) | +0.334 / +0.103 | +4.592 / +4.190 |
+  - On the xcku5p every path has at least +1.37 ns.
+- **Against today, on the 7-series:**
+  - 4 rows: -22% LUTs, -27% flip-flops, -48% DSPs, -29% slices.
+  - 8 rows, 4 lanes: -29%, -22%, -48%, -33%.
+  - 8 rows, 2 lanes: -36% LUTs and -37% slices.
+  - On the xcku5p: -20%, -24%, -48%, -28% CLBs at 4 rows; -23%, -31%, -48%, -36% at 8 rows with 4
+    lanes.
+- **What goes:**
+  - today's per-column epilogue (the two fmuls, PAIR's fadd, the loop fadd, the combine fadds and
+    their delays): 5,879 LUTs, 3,432 flip-flops and 16 DSPs at 4 rows; 11,800, 6,734 and 32 at 8;
+  - its MCOLS read-modify-write lanes: 1,730, 1,330 and 8 at 4 rows; 3,441, 2,646 and 16 at 8.
+- **What comes:**
+  - E lanes of ~920 LUTs, ~720 flip-flops and 6 DSPs each;
+  - a fifth DSP in each row's column end. The shift adds no visible LUTs: the xcku5p's column end
+    has 64 to 68 LUTs against today's 73, and the 7-series flattens it into the column.
+- **Going from 4 to 8 rows on the 7-series:** MX with 4 lanes adds +6.9K LUTs, +3.9K slices and
+  +288 DSPs; today's design adds +11.3K, +6.3K and +552.
+- **Against the Yosys estimate above:** Vivado's LUT savings are smaller (-22% and -29% against
+  -31% and -35%), its DSP savings the same, and its flip-flop totals higher on both sides (it
+  keeps the input registers).
 
 ## 6. Workloads
 
@@ -454,7 +511,8 @@ rows, E = MCOLS/4 costs the experts +26% / +30% (+9% / +11% with chunks of 1024,
 
 ## 7. Recommendation and decisions
 
-**Recommendation** (pending Vivado's timing, section 5):
+**Recommendation** (Vivado out of context closes the datapath at 133.33 MHz and the pumped
+columns at 266.67 MHz, section 5):
 
 1. **Make the MX column the MXU's next datapath**, with `int8x` and `fp4x6` weights and `a8x32`
    activations, exact accumulation in the column end, and E = MCOLS/2 shared epilogue lanes. It is

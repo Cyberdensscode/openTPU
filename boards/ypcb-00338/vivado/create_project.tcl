@@ -20,9 +20,10 @@ set LANES [expr {[llength $argv] > 6 ? [lindex $argv 6] : 8}]
 set ACT_ROWS [expr {[llength $argv] > 7 ? [lindex $argv 7] : $MCOLS}]
 # DSTEP 0: the DMA's DeltaNet head step left out (CAPS bit6 = 0; the compiler emits VOPs)
 set DSTEP [expr {[llength $argv] > 8 ? [lindex $argv 8] : 1}]
-# MXU: the MXU's dot product (docs/mxu_systolic.md): systolic (MXU_IMPL 2, the default) or tree (0)
+# MXU: the MXU's dot product (docs/mxu_systolic.md): systolic (MXU_IMPL 2), the only one
 set MXU [expr {[llength $argv] > 9 ? [lindex $argv 9] : "systolic"}]
-set MXU_IMPL [expr {$MXU eq "tree" ? 0 : 2}]
+if {$MXU ne "systolic"} { error "MXU $MXU: the systolic MXU is the only one" }
+set MXU_IMPL 2
 # PLATFORM, ARCH_HASH: the CFG_PLATFORM / CFG_HASH registers (run_vivado.sh: the target file,
 # targets/ypcb-00338.toml, through opentpu/target.py; ARCH_HASH 8 hex digits)
 set PLATFORM [expr {[llength $argv] > 10 ? [lindex $argv 10] : 1}]
