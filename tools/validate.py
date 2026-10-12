@@ -23,13 +23,15 @@ the cache holds it (a scale per token and head; past d = D an offset per D-block
 and token, and P V as V's int8 values against the numerators 2^(s - max) times V's per-token
 scales, quantized per attention block of keys. Those products are taken in float64 and
 rounded to fp32 after, as the MXU sums exactly and rounds each output once (fp32 sums of
-operands whose offsets spread lose bits). The MXU's window drops (a product's two offsets more
-than W octaves apart: docs/mx_mxu.md) are in the golden's attention (q K, P V: attention_drops),
-not in its projections. --weights-only quantizes the weights only ("W"); the fp32 golden (the
-checkpoint, Hugging Face's eager attention) is there for context unless --no-fp32. Gemma 4
-(E2B, E4B): the formats are the device image's (they follow the card's fit: the PLE table
-and, for an int8 image that
-does not fit, some layers in 4-bit), the embedding rows the LM head's in the head's format (the
+operands whose offsets spread lose bits). The MXU's window drops (a group whose two offsets
+add up to more than the format's W: docs/mx_mxu.md) are the golden's too: in its projections
+(the weight groups' dw, the input groups' da: drop_groups, quant.mx_matmul's rule; fp4's W 11
+drops whole groups of a row with a large activation outlier, a KL of 0.33 at such a position of
+Qwen3-0.6B) and in its attention (q K, P V: attention_drops). --weights-only quantizes the
+weights only ("W"); the fp32 golden (the checkpoint, Hugging Face's eager attention) is there
+for context unless --no-fp32. Gemma 4 (E2B, E4B): the formats are the device image's (they
+follow the card's fit: the PLE table and, for an int8 image that does not fit, some layers in
+4-bit), the embedding rows the LM head's in the head's format (the
 device gathers them from the head), the per-layer embeddings the device's PLE records, and the
 logits compared after the soft cap (the device's are before it). Hugging Face loads the language
 model alone without its PLE table (E2B's is 9.4 GB in fp32), and the golden keeps a bf16
@@ -202,12 +204,14 @@ def act_ranges(spec, name: str, fmt: str, K: int, D: int = 128, S: int = 1):
     return None
 
 
-def device_weight(w, fmt: str, D: int = 128) -> np.ndarray:
-    """The values the MXU multiplies for a weight matrix w [N, K] in `fmt` (int8, int4, fp4):
-    the image's quantize_mxu (opentpu.qcache, as the images' builds), dequantized as the MXU
-    reads it, rounded to fp32 [N, K]. Quantization is per row (the column parts the images
-    place are slices of their whole rows' quantization: quant.column_parts), so a whole
-    checkpoint matrix gives the values of the row and column parts the images place."""
+def device_weight(w, fmt: str, D: int = 128, offsets: bool = False):
+    """The values the MXU multiplies for a weight matrix w [N, K] in `fmt` (int8, int4, fp4,
+    nvfp4): the image's quantize_mxu (opentpu.qcache, as the images' builds), dequantized as
+    the MXU reads it, rounded to fp32 [N, K]. Quantization is per row (the column parts the
+    images place are slices of their whole rows' quantization: quant.column_parts), so a whole
+    checkpoint matrix gives the values of the row and column parts the images place. offsets:
+    also each D/8 group's dw [N, ceil(K / (D/8))] (int8; quant.group_offsets), for MM's
+    window."""
     from opentpu import qcache as QC
     from opentpu import quant as Q
     w = np.asarray(w, np.float32)
@@ -217,10 +221,39 @@ def device_weight(w, fmt: str, D: int = 128) -> np.ndarray:
     Kp = w.shape[1]
     q, s = QC.quantize_mxu(w, fmt, D)
     out = np.empty((N, Kp), np.float32)
+    dw = np.empty((N, Kp // (D // Q.NVG)), np.int8) if offsets else None
     for r in range(0, N, Q.QUANT_ROWS):
         e = min(N, r + Q.QUANT_ROWS)
         out[r:e] = Q.dequantize_mxu(q[r:e], s[r:e], fmt, Kp, D)
-    return out[:, :K]
+        if offsets:
+            dw[r:e] = Q.group_offsets(s[r:e], fmt, Kp, D)
+    if not offsets:
+        return out[:, :K]
+    return out[:, :K], dw[:, :-(-K // (D // Q.NVG))]
+
+
+def drop_groups(y, x, dx, w, dw, W: int, D: int = 128):
+    """y = x @ w.T (float64, [..., N]) less the groups MM's window leaves out (quant.mx_matmul's
+    rule): a group of D/8 columns whose input offset da (dx, each element's, as mx_quant gives
+    them) and weight offset dw ([N, K / (D/8)], device_weight's) add up to more than the
+    format's window W counts for nothing. In place; returns y."""
+    import torch
+    G = D // 8
+    K = x.shape[-1]
+    ng = K // G
+    if ng == 0:
+        return y
+    xf, yf = x.reshape(-1, K), y.reshape(-1, y.shape[-1])
+    da = dx.reshape(-1, K)[:, ::G][:, :ng].to(torch.int32)
+    dwi = dw[:, :ng].to(torch.int32)
+    dwmax = dwi.max(0).values
+    for gi in torch.nonzero(da.max(0).values + dwmax > W).flatten().tolist():
+        rows = torch.nonzero(da[:, gi] + dwmax[gi] > W).flatten()
+        m = (da[rows, gi][:, None] + dwi[None, :, gi]) > W              # [rows, N]
+        if bool(m.any()):
+            sl = slice(G * gi, G * (gi + 1))
+            yf[rows] -= (xf[rows, sl] @ w[:, sl].double().T) * m
+    return y
 
 
 def embed_rows(table, spec, D: int = 128) -> np.ndarray:
@@ -337,7 +370,9 @@ class Golden:
         self._lin = []                      # (module, the checkpoint's weight, the device's)
         self._wide = {}                     # module -> its kept weight, during an fp32 call
         self._ranges = {}                   # module -> its input's QACT ranges (act_ranges)
+        self._dw = {}                       # module -> (its groups' dw, its format's W)
         S = (image or {}).get("S", 1)
+        from opentpu.isa import MX_W, WFORMATS
         dev = {}
         for n, m in model.named_modules():
             if not isinstance(m, torch.nn.Linear):
@@ -349,7 +384,9 @@ class Golden:
             w = m.weight.detach().float().numpy()
             if name == "model.per_layer_model_projection.weight":   # (the image folds the
                 w = w * np.float32(spec.hidden ** -0.5)              # 1 / sqrt(H) in: set())
-            dev[name] = torch.nn.Parameter(torch.from_numpy(device_weight(w, f, D)), False)
+            vals, dw = device_weight(w, f, D, offsets=True)
+            dev[name] = torch.nn.Parameter(torch.from_numpy(vals), False)
+            self._dw[m] = (torch.from_numpy(dw), MX_W[WFORMATS[f]])
             w32 = ck[id(m.weight)] if id(m.weight) in ck else _compact(m.weight)
             self._lin.append((m, w32, dev[name]))
             m.weight = dev[name]
@@ -438,14 +475,19 @@ class Golden:
         """A Linear with the activations quantized: its input quantized (one QACT a range) and
         the product taken in float64 (a few hundred MB of the weight at a time), rounded to
         fp32 after: the MXU sums exactly and rounds each output once (docs/isa.md MM), where
-        fp32 sums of operands whose offsets spread lose bits."""
+        fp32 sums of operands whose offsets spread lose bits; the groups MM's window drops left
+        out (drop_groups)."""
         import torch
-        x = mx_quant(x, self.D, self._ranges.get(mod)).double()
+        x, dx = mx_quant(x, self.D, self._ranges.get(mod), offsets=True)
+        x = x.double()
         w, b = mod.weight, mod.bias
+        dw, Wn = self._dw.get(mod, (None, 0))
         out = torch.empty(*x.shape[:-1], w.shape[0], dtype=torch.float32)
         step = max(1, (1 << 26) // max(1, w.shape[1]))
         for r in range(0, w.shape[0], step):
             y = x @ w[r:r + step].double().T
+            if dw is not None:
+                drop_groups(y, x, dx, w[r:r + step], dw[r:r + step], Wn, self.D)
             if b is not None:
                 y = y + b[r:r + step].double()
             out[..., r:r + step] = y.float()
