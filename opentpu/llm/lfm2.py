@@ -448,7 +448,9 @@ class Image(EmbedHost):
         b = _Bump()
         R = rows
         self.io = {"x": b.alloc(4 * H * R), "cos": b.alloc(2 * d * R), "sin": b.alloc(2 * d * R),
-                   "gf": b.alloc(4 * H), "logits": b.alloc(4 * spec.vocab * R)}
+                   "gf": b.alloc(4 * H), "logits": b.alloc(4 * spec.vocab * R),
+                   # a tiled run's attention outputs, a part at a time (tiled.py: OSCR)
+                   "o": b.alloc(4 * cfg.act_rows * self.nq_loc * d)}
         self.layer0 = b.next
         mlp = {"wg": (self.f_loc, H), "wu": (self.f_loc, H)}
         self.mats = {CONV: {"win": (3 * self.h_loc, H), "wout": (self.h_loc, H)},
@@ -796,6 +798,7 @@ class Image(EmbedHost):
             cosr=_tdesc(self.io["cos"], (self.rows, d // 2)),
             sinr=_tdesc(self.io["sin"], (self.rows, d // 2)),
             logitsr=_tdesc(self.io["logits"], (self.rows, spec.vocab)),
+            oscr=_tdesc(self.io["o"], (self.cfg.act_rows, self.nq_loc * d)),
             head=_qdesc(*self.head, self.v_loc, H, D, self.head_format), v_loc=self.v_loc,
             **_lookup_desc(self.lookup, spec, self.cap))
 

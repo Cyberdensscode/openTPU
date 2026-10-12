@@ -726,6 +726,8 @@ class Image(EmbedHost):
         self.io = {"x": b.alloc(4 * H * rows), "cos": b.alloc(2 * spec.rope_dim * rows),
                    "sin": b.alloc(2 * spec.rope_dim * rows), "gf": b.alloc(4 * H),
                    "logits": b.alloc(4 * spec.vocab * rows),
+                   # a tiled run's attention outputs, a part at a time (tiled.py: OSCR)
+                   "o": b.alloc(4 * cfg.act_rows * self.nq_loc * spec.head_dim),
                    "hs": b.alloc(4 * 2 * self.nl),     # per pair: decays of a, b; betas
                    "gr": b.alloc(4 * 2 * self.nl * self.grows),    # chunked prefill, per row:
                    "on": b.alloc(4 * 4 * spec.lin_dv * self.grows)}    # decays, betas; a head
@@ -1351,6 +1353,7 @@ class Image(EmbedHost):
             cosr=_tdesc(self.io["cos"], (self.rows, spec.rope_dim // 2)),
             sinr=_tdesc(self.io["sin"], (self.rows, spec.rope_dim // 2)),
             logitsr=_tdesc(self.io["logits"], (self.rows, spec.vocab)),
+            oscr=_tdesc(self.io["o"], (self.cfg.act_rows, self.nq_loc * spec.head_dim)),
             hs=_tdesc(self.io["hs"], (nl // 2, 4)),
             gr=_tdesc(self.io["gr"], (self.grows, 2 * nl)),
             on=_tdesc(self.io["on"], (self.grows, self.og * dv)),
