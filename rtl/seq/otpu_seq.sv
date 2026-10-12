@@ -1114,7 +1114,7 @@ module otpu_seq
   int  hist_n [NUNITS];
   int  scls [WIN];
   // statistics
-  longint st_cyc, st_wfull, st_rlw, st_disp, st_nodep;
+  longint st_cyc, st_wfull, st_rlw, st_disp, st_nodep, st_vhold;
   longint st_u [NUNITS][6];                // busy, empty, start, unit not ready, blocked, (spare)
   longint st_by [NUNITS][NUNITS];          // blocked cycles of unit u by producer unit p
   longint st_bcls [NCLS][NCLS];            // blocked cycles by (waiting class, producer class)
@@ -1191,7 +1191,7 @@ module otpu_seq
     end
     if ($value$plusargs("hz_kout=%s", fn)) hz_kfd = $fopen(fn, "w");
     if ($value$plusargs("hz_log=%s", fn)) hz_fd = $fopen(fn, "w");
-    st_cyc = 0; st_wfull = 0; st_rlw = 0; st_disp = 0; st_nodep = 0; st_wcmiss = 0;
+    st_cyc = 0; st_wfull = 0; st_rlw = 0; st_disp = 0; st_nodep = 0; st_wcmiss = 0; st_vhold = 0;
     for (int u = 0; u < NUNITS; u++) begin
       for (int j = 0; j < 6; j++) st_u[u][j] = 0;
       for (int p = 0; p < NUNITS; p++) begin
@@ -1291,6 +1291,7 @@ module otpu_seq
       if (!halted && hz_fd != 0) begin
         st_cyc++;
         if (c_v && !have_free) st_wfull++;
+        if (c_v && have_free && wc_hold) st_vhold++;   // WAITC: a VOP held for the one 15 back
         if (rl_wait) st_rlw++;
         for (int u = 0; u < NUNITS; u++) begin
           logic [WIN-1:0] pend;
@@ -1339,8 +1340,8 @@ module otpu_seq
       $fclose(hz_kfd);
     end
     if (hz_fd != 0) begin
-      $fdisplay(hz_fd, "HZ cycles %0d dispatched %0d nodep %0d wfull %0d rlwait %0d wcmiss %0d",
-                st_cyc, st_disp, st_nodep, st_wfull, st_rlw, st_wcmiss);
+      $fdisplay(hz_fd, "HZ cycles %0d dispatched %0d nodep %0d wfull %0d rlwait %0d wcmiss %0d vhold %0d",
+                st_cyc, st_disp, st_nodep, st_wfull, st_rlw, st_wcmiss, st_vhold);
       $fdisplay(hz_fd, "HZ knobs tg %0d dg %0d rh %0d dh %0d win %0d ino %0d rob %0d wc %0d uq %0d,%0d,%0d,%0d,%0d",
                 hz_tg, hz_dg, hz_rh, hz_dh, hz_win, hz_ino, hz_rob, hz_wc, hz_uq[0], hz_uq[1],
                 hz_uq[2], hz_uq[3], hz_uq[4]);
