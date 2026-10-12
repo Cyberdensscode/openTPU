@@ -1,0 +1,20 @@
+# MoE (tools/moe_prefill_cosim.py, zero images from config.json, every expert present at its
+# layer's first slot, the routing's bookkeeping VOPs kept exact: vpu_hack.moe_keep).
+# rows --variant moe: one decode row with the MoE block; a layer's cost is a prefix difference
+m_g26 moe: rows models/gemma-4-26B-A4B-it --variant moe --R 1 --prefix 0:0,1:0,5
+m_g26_novop moe: rows models/gemma-4-26B-A4B-it --variant moe --R 1 --prefix 0:0,1:0,5 --hack novop
+m_g26_half moe: rows models/gemma-4-26B-A4B-it --variant moe --R 1 --prefix 0:0,1:0,5 --hack half
+m_g26_comp1 moe: rows models/gemma-4-26B-A4B-it --variant moe --R 1 --prefix 0:0,1:0,5 --hack comp1
+m_q35m moe: rows models/Qwen3.5-35B-A3B --variant moe --R 1 --prefix 1:3:4
+m_q35m_novop moe: rows models/Qwen3.5-35B-A3B --variant moe --R 1 --prefix 1:3:4 --hack novop
+m_q35m_half moe: rows models/Qwen3.5-35B-A3B --variant moe --R 1 --prefix 1:3:4 --hack half
+m_q35m_nose moe: rows models/Qwen3.5-35B-A3B --variant moe --R 1 --prefix 1:3:4 --hack nose
+# layer: the layer-major prefill's program of one layer (compile_layer_run), 2 rows (R k <= 16 ids: R_max 2 at k = 8)
+l_g26 moe: layer models/gemma-4-26B-A4B-it --R 2 --prefix 0,1:0,5
+l_g26_novop moe: layer models/gemma-4-26B-A4B-it --R 2 --prefix 0,1:0,5 --hack novop
+l_g26_half moe: layer models/gemma-4-26B-A4B-it --R 2 --prefix 0,1:0,5 --hack half
+l_q35m moe: layer models/Qwen3.5-35B-A3B --R 2 --prefix 1:4
+l_q35m_novop moe: layer models/Qwen3.5-35B-A3B --R 2 --prefix 1:4 --hack novop
+l_q35m_half moe: layer models/Qwen3.5-35B-A3B --R 2 --prefix 1:4 --hack half
+l_q35m_nose moe: layer models/Qwen3.5-35B-A3B --R 2 --prefix 1:4 --hack nose
+l_q35m_halfse moe: layer models/Qwen3.5-35B-A3B --R 2 --prefix 1:4 --hack halfse

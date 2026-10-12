@@ -1,0 +1,2623 @@
+{
+ "LFM2-2.6B": {
+  "embed": 134217728,
+  "family": "lfm2",
+  "head": 134217728,
+  "hidden": 2048,
+  "model_type": "lfm2",
+  "n_layers": 30,
+  "name": "LFM2-2.6B",
+  "runs": [
+   [
+    2,
+    {
+     "groups": {
+      "conv": 16777216,
+      "down": 22020096,
+      "gateup": 44040192
+     },
+     "kind": "conv"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 10485760,
+      "down": 22020096,
+      "gateup": 44040192
+     },
+     "head_dim": 64,
+     "kind": "attn",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "q_heads": 32,
+     "window": 0
+    }
+   ],
+   [
+    2,
+    {
+     "groups": {
+      "conv": 16777216,
+      "down": 22020096,
+      "gateup": 44040192
+     },
+     "kind": "conv"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 10485760,
+      "down": 22020096,
+      "gateup": 44040192
+     },
+     "head_dim": 64,
+     "kind": "attn",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "q_heads": 32,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "groups": {
+      "conv": 16777216,
+      "down": 22020096,
+      "gateup": 44040192
+     },
+     "kind": "conv"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 10485760,
+      "down": 22020096,
+      "gateup": 44040192
+     },
+     "head_dim": 64,
+     "kind": "attn",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "q_heads": 32,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "groups": {
+      "conv": 16777216,
+      "down": 22020096,
+      "gateup": 44040192
+     },
+     "kind": "conv"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 10485760,
+      "down": 22020096,
+      "gateup": 44040192
+     },
+     "head_dim": 64,
+     "kind": "attn",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "q_heads": 32,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "groups": {
+      "conv": 16777216,
+      "down": 22020096,
+      "gateup": 44040192
+     },
+     "kind": "conv"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 10485760,
+      "down": 22020096,
+      "gateup": 44040192
+     },
+     "head_dim": 64,
+     "kind": "attn",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "q_heads": 32,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "groups": {
+      "conv": 16777216,
+      "down": 22020096,
+      "gateup": 44040192
+     },
+     "kind": "conv"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 10485760,
+      "down": 22020096,
+      "gateup": 44040192
+     },
+     "head_dim": 64,
+     "kind": "attn",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "q_heads": 32,
+     "window": 0
+    }
+   ],
+   [
+    2,
+    {
+     "groups": {
+      "conv": 16777216,
+      "down": 22020096,
+      "gateup": 44040192
+     },
+     "kind": "conv"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 10485760,
+      "down": 22020096,
+      "gateup": 44040192
+     },
+     "head_dim": 64,
+     "kind": "attn",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "q_heads": 32,
+     "window": 0
+    }
+   ],
+   [
+    2,
+    {
+     "groups": {
+      "conv": 16777216,
+      "down": 22020096,
+      "gateup": 44040192
+     },
+     "kind": "conv"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 10485760,
+      "down": 22020096,
+      "gateup": 44040192
+     },
+     "head_dim": 64,
+     "kind": "attn",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "q_heads": 32,
+     "window": 0
+    }
+   ],
+   [
+    2,
+    {
+     "groups": {
+      "conv": 16777216,
+      "down": 22020096,
+      "gateup": 44040192
+     },
+     "kind": "conv"
+    }
+   ]
+  ],
+  "vocab": 65536
+ },
+ "LFM2.5-230M": {
+  "embed": 67108864,
+  "family": "lfm2",
+  "head": 67108864,
+  "hidden": 1024,
+  "model_type": "lfm2",
+  "n_layers": 14,
+  "name": "LFM2.5-230M",
+  "runs": [
+   [
+    2,
+    {
+     "groups": {
+      "conv": 4194304,
+      "down": 2621440,
+      "gateup": 5242880
+     },
+     "kind": "conv"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 3145728,
+      "down": 2621440,
+      "gateup": 5242880
+     },
+     "head_dim": 64,
+     "kind": "attn",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "conv": 4194304,
+      "down": 2621440,
+      "gateup": 5242880
+     },
+     "kind": "conv"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 3145728,
+      "down": 2621440,
+      "gateup": 5242880
+     },
+     "head_dim": 64,
+     "kind": "attn",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "conv": 4194304,
+      "down": 2621440,
+      "gateup": 5242880
+     },
+     "kind": "conv"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 3145728,
+      "down": 2621440,
+      "gateup": 5242880
+     },
+     "head_dim": 64,
+     "kind": "attn",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "conv": 4194304,
+      "down": 2621440,
+      "gateup": 5242880
+     },
+     "kind": "conv"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 3145728,
+      "down": 2621440,
+      "gateup": 5242880
+     },
+     "head_dim": 64,
+     "kind": "attn",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "conv": 4194304,
+      "down": 2621440,
+      "gateup": 5242880
+     },
+     "kind": "conv"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 3145728,
+      "down": 2621440,
+      "gateup": 5242880
+     },
+     "head_dim": 64,
+     "kind": "attn",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "conv": 4194304,
+      "down": 2621440,
+      "gateup": 5242880
+     },
+     "kind": "conv"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 3145728,
+      "down": 2621440,
+      "gateup": 5242880
+     },
+     "head_dim": 64,
+     "kind": "attn",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "conv": 4194304,
+      "down": 2621440,
+      "gateup": 5242880
+     },
+     "kind": "conv"
+    }
+   ]
+  ],
+  "vocab": 65536
+ },
+ "LFM2.5-8B-A1B": {
+  "embed": 262144000,
+  "family": "lfm2",
+  "head": 262144000,
+  "hidden": 2048,
+  "model_type": "lfm2_moe",
+  "n_layers": 24,
+  "name": "LFM2.5-8B-A1B",
+  "runs": [
+   [
+    2,
+    {
+     "groups": {
+      "conv": 16777216,
+      "down": 14680064,
+      "gateup": 29360128
+     },
+     "kind": "conv"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 10485760,
+      "router": 262144
+     },
+     "head_dim": 64,
+     "kind": "attn",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 11010048,
+      "experts": 32,
+      "top_k": 4
+     },
+     "q_heads": 32,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "groups": {
+      "conv": 16777216,
+      "router": 262144
+     },
+     "kind": "conv",
+     "moe": {
+      "expert_params": 11010048,
+      "experts": 32,
+      "top_k": 4
+     }
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 10485760,
+      "router": 262144
+     },
+     "head_dim": 64,
+     "kind": "attn",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 11010048,
+      "experts": 32,
+      "top_k": 4
+     },
+     "q_heads": 32,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "groups": {
+      "conv": 16777216,
+      "router": 262144
+     },
+     "kind": "conv",
+     "moe": {
+      "expert_params": 11010048,
+      "experts": 32,
+      "top_k": 4
+     }
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 10485760,
+      "router": 262144
+     },
+     "head_dim": 64,
+     "kind": "attn",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 11010048,
+      "experts": 32,
+      "top_k": 4
+     },
+     "q_heads": 32,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "groups": {
+      "conv": 16777216,
+      "router": 262144
+     },
+     "kind": "conv",
+     "moe": {
+      "expert_params": 11010048,
+      "experts": 32,
+      "top_k": 4
+     }
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 10485760,
+      "router": 262144
+     },
+     "head_dim": 64,
+     "kind": "attn",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 11010048,
+      "experts": 32,
+      "top_k": 4
+     },
+     "q_heads": 32,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "groups": {
+      "conv": 16777216,
+      "router": 262144
+     },
+     "kind": "conv",
+     "moe": {
+      "expert_params": 11010048,
+      "experts": 32,
+      "top_k": 4
+     }
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 10485760,
+      "router": 262144
+     },
+     "head_dim": 64,
+     "kind": "attn",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 11010048,
+      "experts": 32,
+      "top_k": 4
+     },
+     "q_heads": 32,
+     "window": 0
+    }
+   ],
+   [
+    2,
+    {
+     "groups": {
+      "conv": 16777216,
+      "router": 262144
+     },
+     "kind": "conv",
+     "moe": {
+      "expert_params": 11010048,
+      "experts": 32,
+      "top_k": 4
+     }
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 10485760,
+      "router": 262144
+     },
+     "head_dim": 64,
+     "kind": "attn",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 11010048,
+      "experts": 32,
+      "top_k": 4
+     },
+     "q_heads": 32,
+     "window": 0
+    }
+   ],
+   [
+    2,
+    {
+     "groups": {
+      "conv": 16777216,
+      "router": 262144
+     },
+     "kind": "conv",
+     "moe": {
+      "expert_params": 11010048,
+      "experts": 32,
+      "top_k": 4
+     }
+    }
+   ]
+  ],
+  "vocab": 128000
+ },
+ "Phi-4-mini-instruct": {
+  "embed": 614596608,
+  "family": "llama",
+  "head": 614596608,
+  "hidden": 3072,
+  "model_type": "phi3",
+  "n_layers": 32,
+  "name": "Phi-4-mini-instruct",
+  "runs": [
+   [
+    32,
+    {
+     "groups": {
+      "attn": 25165824,
+      "down": 25165824,
+      "gateup": 50331648
+     },
+     "head_dim": 128,
+     "kind": "attn",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "q_heads": 24,
+     "window": 0
+    }
+   ]
+  ],
+  "vocab": 200064
+ },
+ "Qwen3-0.6B": {
+  "embed": 155582464,
+  "family": "qwen3",
+  "head": 155582464,
+  "hidden": 1024,
+  "model_type": "qwen3",
+  "n_layers": 28,
+  "name": "Qwen3-0.6B",
+  "runs": [
+   [
+    28,
+    {
+     "groups": {
+      "attn": 6291456,
+      "down": 3145728,
+      "gateup": 6291456
+     },
+     "head_dim": 128,
+     "kind": "attn",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "q_heads": 16,
+     "window": 0
+    }
+   ]
+  ],
+  "vocab": 151936
+ },
+ "Qwen3.5-0.8B": {
+  "embed": 254279680,
+  "family": "qwen35",
+  "head": 254279680,
+  "hidden": 1024,
+  "model_type": "qwen3_5_text",
+  "n_layers": 24,
+  "name": "Qwen3.5-0.8B",
+  "runs": [
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 16
+     },
+     "groups": {
+      "delta": 10747904,
+      "down": 3670016,
+      "gateup": 7340032
+     },
+     "kind": "delta"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 7340032,
+      "down": 3670016,
+      "gateup": 7340032
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 16
+     },
+     "groups": {
+      "delta": 10747904,
+      "down": 3670016,
+      "gateup": 7340032
+     },
+     "kind": "delta"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 7340032,
+      "down": 3670016,
+      "gateup": 7340032
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 16
+     },
+     "groups": {
+      "delta": 10747904,
+      "down": 3670016,
+      "gateup": 7340032
+     },
+     "kind": "delta"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 7340032,
+      "down": 3670016,
+      "gateup": 7340032
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 16
+     },
+     "groups": {
+      "delta": 10747904,
+      "down": 3670016,
+      "gateup": 7340032
+     },
+     "kind": "delta"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 7340032,
+      "down": 3670016,
+      "gateup": 7340032
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 16
+     },
+     "groups": {
+      "delta": 10747904,
+      "down": 3670016,
+      "gateup": 7340032
+     },
+     "kind": "delta"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 7340032,
+      "down": 3670016,
+      "gateup": 7340032
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 16
+     },
+     "groups": {
+      "delta": 10747904,
+      "down": 3670016,
+      "gateup": 7340032
+     },
+     "kind": "delta"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 7340032,
+      "down": 3670016,
+      "gateup": 7340032
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 0
+    }
+   ]
+  ],
+  "vocab": 248320
+ },
+ "Qwen3.5-2B": {
+  "embed": 508559360,
+  "family": "qwen35",
+  "head": 508559360,
+  "hidden": 2048,
+  "model_type": "qwen3_5_text",
+  "n_layers": 24,
+  "name": "Qwen3.5-2B",
+  "runs": [
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 16
+     },
+     "groups": {
+      "delta": 21495808,
+      "down": 12582912,
+      "gateup": 25165824
+     },
+     "kind": "delta"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 14680064,
+      "down": 12582912,
+      "gateup": 25165824
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 16
+     },
+     "groups": {
+      "delta": 21495808,
+      "down": 12582912,
+      "gateup": 25165824
+     },
+     "kind": "delta"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 14680064,
+      "down": 12582912,
+      "gateup": 25165824
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 16
+     },
+     "groups": {
+      "delta": 21495808,
+      "down": 12582912,
+      "gateup": 25165824
+     },
+     "kind": "delta"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 14680064,
+      "down": 12582912,
+      "gateup": 25165824
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 16
+     },
+     "groups": {
+      "delta": 21495808,
+      "down": 12582912,
+      "gateup": 25165824
+     },
+     "kind": "delta"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 14680064,
+      "down": 12582912,
+      "gateup": 25165824
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 16
+     },
+     "groups": {
+      "delta": 21495808,
+      "down": 12582912,
+      "gateup": 25165824
+     },
+     "kind": "delta"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 14680064,
+      "down": 12582912,
+      "gateup": 25165824
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 16
+     },
+     "groups": {
+      "delta": 21495808,
+      "down": 12582912,
+      "gateup": 25165824
+     },
+     "kind": "delta"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 14680064,
+      "down": 12582912,
+      "gateup": 25165824
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 0
+    }
+   ]
+  ],
+  "vocab": 248320
+ },
+ "Qwen3.5-35B-A3B": {
+  "embed": 508559360,
+  "family": "qwen35",
+  "head": 508559360,
+  "hidden": 2048,
+  "model_type": "qwen3_5_moe_text",
+  "n_layers": 40,
+  "name": "Qwen3.5-35B-A3B",
+  "runs": [
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 32
+     },
+     "groups": {
+      "delta": 34078720,
+      "router": 524288,
+      "shared": 3407872
+     },
+     "kind": "delta",
+     "moe": {
+      "expert_params": 3145728,
+      "experts": 256,
+      "top_k": 8
+     }
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 27262976,
+      "router": 524288,
+      "shared": 3407872
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 3145728,
+      "experts": 256,
+      "top_k": 8
+     },
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 32
+     },
+     "groups": {
+      "delta": 34078720,
+      "router": 524288,
+      "shared": 3407872
+     },
+     "kind": "delta",
+     "moe": {
+      "expert_params": 3145728,
+      "experts": 256,
+      "top_k": 8
+     }
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 27262976,
+      "router": 524288,
+      "shared": 3407872
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 3145728,
+      "experts": 256,
+      "top_k": 8
+     },
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 32
+     },
+     "groups": {
+      "delta": 34078720,
+      "router": 524288,
+      "shared": 3407872
+     },
+     "kind": "delta",
+     "moe": {
+      "expert_params": 3145728,
+      "experts": 256,
+      "top_k": 8
+     }
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 27262976,
+      "router": 524288,
+      "shared": 3407872
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 3145728,
+      "experts": 256,
+      "top_k": 8
+     },
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 32
+     },
+     "groups": {
+      "delta": 34078720,
+      "router": 524288,
+      "shared": 3407872
+     },
+     "kind": "delta",
+     "moe": {
+      "expert_params": 3145728,
+      "experts": 256,
+      "top_k": 8
+     }
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 27262976,
+      "router": 524288,
+      "shared": 3407872
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 3145728,
+      "experts": 256,
+      "top_k": 8
+     },
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 32
+     },
+     "groups": {
+      "delta": 34078720,
+      "router": 524288,
+      "shared": 3407872
+     },
+     "kind": "delta",
+     "moe": {
+      "expert_params": 3145728,
+      "experts": 256,
+      "top_k": 8
+     }
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 27262976,
+      "router": 524288,
+      "shared": 3407872
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 3145728,
+      "experts": 256,
+      "top_k": 8
+     },
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 32
+     },
+     "groups": {
+      "delta": 34078720,
+      "router": 524288,
+      "shared": 3407872
+     },
+     "kind": "delta",
+     "moe": {
+      "expert_params": 3145728,
+      "experts": 256,
+      "top_k": 8
+     }
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 27262976,
+      "router": 524288,
+      "shared": 3407872
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 3145728,
+      "experts": 256,
+      "top_k": 8
+     },
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 32
+     },
+     "groups": {
+      "delta": 34078720,
+      "router": 524288,
+      "shared": 3407872
+     },
+     "kind": "delta",
+     "moe": {
+      "expert_params": 3145728,
+      "experts": 256,
+      "top_k": 8
+     }
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 27262976,
+      "router": 524288,
+      "shared": 3407872
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 3145728,
+      "experts": 256,
+      "top_k": 8
+     },
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 32
+     },
+     "groups": {
+      "delta": 34078720,
+      "router": 524288,
+      "shared": 3407872
+     },
+     "kind": "delta",
+     "moe": {
+      "expert_params": 3145728,
+      "experts": 256,
+      "top_k": 8
+     }
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 27262976,
+      "router": 524288,
+      "shared": 3407872
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 3145728,
+      "experts": 256,
+      "top_k": 8
+     },
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 32
+     },
+     "groups": {
+      "delta": 34078720,
+      "router": 524288,
+      "shared": 3407872
+     },
+     "kind": "delta",
+     "moe": {
+      "expert_params": 3145728,
+      "experts": 256,
+      "top_k": 8
+     }
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 27262976,
+      "router": 524288,
+      "shared": 3407872
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 3145728,
+      "experts": 256,
+      "top_k": 8
+     },
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 32
+     },
+     "groups": {
+      "delta": 34078720,
+      "router": 524288,
+      "shared": 3407872
+     },
+     "kind": "delta",
+     "moe": {
+      "expert_params": 3145728,
+      "experts": 256,
+      "top_k": 8
+     }
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 27262976,
+      "router": 524288,
+      "shared": 3407872
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 3145728,
+      "experts": 256,
+      "top_k": 8
+     },
+     "q_heads": 16,
+     "window": 0
+    }
+   ]
+  ],
+  "vocab": 248320
+ },
+ "Qwen3.5-4B": {
+  "embed": 635699200,
+  "family": "qwen35",
+  "head": 635699200,
+  "hidden": 2560,
+  "model_type": "qwen3_5_text",
+  "n_layers": 32,
+  "name": "Qwen3.5-4B",
+  "runs": [
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 32
+     },
+     "groups": {
+      "delta": 42598400,
+      "down": 23592960,
+      "gateup": 47185920
+     },
+     "kind": "delta"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 36700160,
+      "down": 23592960,
+      "gateup": 47185920
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 4,
+     "kv_shared": false,
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 32
+     },
+     "groups": {
+      "delta": 42598400,
+      "down": 23592960,
+      "gateup": 47185920
+     },
+     "kind": "delta"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 36700160,
+      "down": 23592960,
+      "gateup": 47185920
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 4,
+     "kv_shared": false,
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 32
+     },
+     "groups": {
+      "delta": 42598400,
+      "down": 23592960,
+      "gateup": 47185920
+     },
+     "kind": "delta"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 36700160,
+      "down": 23592960,
+      "gateup": 47185920
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 4,
+     "kv_shared": false,
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 32
+     },
+     "groups": {
+      "delta": 42598400,
+      "down": 23592960,
+      "gateup": 47185920
+     },
+     "kind": "delta"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 36700160,
+      "down": 23592960,
+      "gateup": 47185920
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 4,
+     "kv_shared": false,
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 32
+     },
+     "groups": {
+      "delta": 42598400,
+      "down": 23592960,
+      "gateup": 47185920
+     },
+     "kind": "delta"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 36700160,
+      "down": 23592960,
+      "gateup": 47185920
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 4,
+     "kv_shared": false,
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 32
+     },
+     "groups": {
+      "delta": 42598400,
+      "down": 23592960,
+      "gateup": 47185920
+     },
+     "kind": "delta"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 36700160,
+      "down": 23592960,
+      "gateup": 47185920
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 4,
+     "kv_shared": false,
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 32
+     },
+     "groups": {
+      "delta": 42598400,
+      "down": 23592960,
+      "gateup": 47185920
+     },
+     "kind": "delta"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 36700160,
+      "down": 23592960,
+      "gateup": 47185920
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 4,
+     "kv_shared": false,
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    3,
+    {
+     "deltanet": {
+      "dk": 128,
+      "dv": 128,
+      "k_heads": 16,
+      "v_heads": 32
+     },
+     "groups": {
+      "delta": 42598400,
+      "down": 23592960,
+      "gateup": 47185920
+     },
+     "kind": "delta"
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 36700160,
+      "down": 23592960,
+      "gateup": 47185920
+     },
+     "head_dim": 256,
+     "kind": "attn",
+     "kv_heads": 4,
+     "kv_shared": false,
+     "q_heads": 16,
+     "window": 0
+    }
+   ]
+  ],
+  "vocab": 248320
+ },
+ "SmolLM3-3B": {
+  "embed": 262668288,
+  "family": "llama",
+  "head": 262668288,
+  "hidden": 2048,
+  "model_type": "smollm3",
+  "n_layers": 36,
+  "name": "SmolLM3-3B",
+  "runs": [
+   [
+    36,
+    {
+     "groups": {
+      "attn": 10485760,
+      "down": 22544384,
+      "gateup": 45088768
+     },
+     "head_dim": 128,
+     "kind": "attn",
+     "kv_heads": 4,
+     "kv_shared": false,
+     "q_heads": 16,
+     "window": 0
+    }
+   ]
+  ],
+  "vocab": 128256
+ },
+ "gemma-4-26B-A4B-it": {
+  "embed": 738197504,
+  "family": "gemma4",
+  "head": 738197504,
+  "hidden": 2816,
+  "model_type": "gemma4_text",
+  "n_layers": 30,
+  "name": "gemma-4-26B-A4B-it",
+  "runs": [
+   [
+    5,
+    {
+     "groups": {
+      "attn": 34603008,
+      "down": 6488064,
+      "gateup": 12976128,
+      "router": 360448
+     },
+     "head_dim": 256,
+     "kind": "sliding",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 6488064,
+      "experts": 128,
+      "top_k": 8
+     },
+     "q_heads": 16,
+     "window": 1024
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 49020928,
+      "down": 6488064,
+      "gateup": 12976128,
+      "router": 360448
+     },
+     "head_dim": 512,
+     "kind": "global",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 6488064,
+      "experts": 128,
+      "top_k": 8
+     },
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    5,
+    {
+     "groups": {
+      "attn": 34603008,
+      "down": 6488064,
+      "gateup": 12976128,
+      "router": 360448
+     },
+     "head_dim": 256,
+     "kind": "sliding",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 6488064,
+      "experts": 128,
+      "top_k": 8
+     },
+     "q_heads": 16,
+     "window": 1024
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 49020928,
+      "down": 6488064,
+      "gateup": 12976128,
+      "router": 360448
+     },
+     "head_dim": 512,
+     "kind": "global",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 6488064,
+      "experts": 128,
+      "top_k": 8
+     },
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    5,
+    {
+     "groups": {
+      "attn": 34603008,
+      "down": 6488064,
+      "gateup": 12976128,
+      "router": 360448
+     },
+     "head_dim": 256,
+     "kind": "sliding",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 6488064,
+      "experts": 128,
+      "top_k": 8
+     },
+     "q_heads": 16,
+     "window": 1024
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 49020928,
+      "down": 6488064,
+      "gateup": 12976128,
+      "router": 360448
+     },
+     "head_dim": 512,
+     "kind": "global",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 6488064,
+      "experts": 128,
+      "top_k": 8
+     },
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    5,
+    {
+     "groups": {
+      "attn": 34603008,
+      "down": 6488064,
+      "gateup": 12976128,
+      "router": 360448
+     },
+     "head_dim": 256,
+     "kind": "sliding",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 6488064,
+      "experts": 128,
+      "top_k": 8
+     },
+     "q_heads": 16,
+     "window": 1024
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 49020928,
+      "down": 6488064,
+      "gateup": 12976128,
+      "router": 360448
+     },
+     "head_dim": 512,
+     "kind": "global",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 6488064,
+      "experts": 128,
+      "top_k": 8
+     },
+     "q_heads": 16,
+     "window": 0
+    }
+   ],
+   [
+    5,
+    {
+     "groups": {
+      "attn": 34603008,
+      "down": 6488064,
+      "gateup": 12976128,
+      "router": 360448
+     },
+     "head_dim": 256,
+     "kind": "sliding",
+     "kv_heads": 8,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 6488064,
+      "experts": 128,
+      "top_k": 8
+     },
+     "q_heads": 16,
+     "window": 1024
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 49020928,
+      "down": 6488064,
+      "gateup": 12976128,
+      "router": 360448
+     },
+     "head_dim": 512,
+     "kind": "global",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "moe": {
+      "expert_params": 6488064,
+      "experts": 128,
+      "top_k": 8
+     },
+     "q_heads": 16,
+     "window": 0
+    }
+   ]
+  ],
+  "vocab": 262144
+ },
+ "gemma-4-E2B-it": {
+  "embed": 402653184,
+  "family": "gemma4",
+  "head": 402653184,
+  "hidden": 1536,
+  "model_type": "gemma4_text",
+  "n_layers": 35,
+  "name": "gemma-4-E2B-it",
+  "ple": {
+   "proj": 13762560,
+   "row": 8960,
+   "table": 2348810240
+  },
+  "runs": [
+   [
+    4,
+    {
+     "groups": {
+      "attn": 7077888,
+      "down": 9437184,
+      "gateup": 18874368,
+      "ple": 786432
+     },
+     "head_dim": 256,
+     "kind": "sliding",
+     "kv_heads": 1,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 512
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 14155776,
+      "down": 9437184,
+      "gateup": 18874368,
+      "ple": 786432
+     },
+     "head_dim": 512,
+     "kind": "global",
+     "kv_heads": 1,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 0
+    }
+   ],
+   [
+    4,
+    {
+     "groups": {
+      "attn": 7077888,
+      "down": 9437184,
+      "gateup": 18874368,
+      "ple": 786432
+     },
+     "head_dim": 256,
+     "kind": "sliding",
+     "kv_heads": 1,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 512
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 14155776,
+      "down": 9437184,
+      "gateup": 18874368,
+      "ple": 786432
+     },
+     "head_dim": 512,
+     "kind": "global",
+     "kv_heads": 1,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 0
+    }
+   ],
+   [
+    4,
+    {
+     "groups": {
+      "attn": 7077888,
+      "down": 9437184,
+      "gateup": 18874368,
+      "ple": 786432
+     },
+     "head_dim": 256,
+     "kind": "sliding",
+     "kv_heads": 1,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 512
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 14155776,
+      "down": 9437184,
+      "gateup": 18874368,
+      "ple": 786432
+     },
+     "head_dim": 512,
+     "kind": "global",
+     "kv_heads": 1,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 0
+    }
+   ],
+   [
+    4,
+    {
+     "groups": {
+      "attn": 6291456,
+      "down": 18874368,
+      "gateup": 37748736,
+      "ple": 786432
+     },
+     "head_dim": 256,
+     "kind": "sliding",
+     "kv_heads": 1,
+     "kv_shared": true,
+     "q_heads": 8,
+     "window": 512
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 12582912,
+      "down": 18874368,
+      "gateup": 37748736,
+      "ple": 786432
+     },
+     "head_dim": 512,
+     "kind": "global",
+     "kv_heads": 1,
+     "kv_shared": true,
+     "q_heads": 8,
+     "window": 0
+    }
+   ],
+   [
+    4,
+    {
+     "groups": {
+      "attn": 6291456,
+      "down": 18874368,
+      "gateup": 37748736,
+      "ple": 786432
+     },
+     "head_dim": 256,
+     "kind": "sliding",
+     "kv_heads": 1,
+     "kv_shared": true,
+     "q_heads": 8,
+     "window": 512
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 12582912,
+      "down": 18874368,
+      "gateup": 37748736,
+      "ple": 786432
+     },
+     "head_dim": 512,
+     "kind": "global",
+     "kv_heads": 1,
+     "kv_shared": true,
+     "q_heads": 8,
+     "window": 0
+    }
+   ],
+   [
+    4,
+    {
+     "groups": {
+      "attn": 6291456,
+      "down": 18874368,
+      "gateup": 37748736,
+      "ple": 786432
+     },
+     "head_dim": 256,
+     "kind": "sliding",
+     "kv_heads": 1,
+     "kv_shared": true,
+     "q_heads": 8,
+     "window": 512
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 12582912,
+      "down": 18874368,
+      "gateup": 37748736,
+      "ple": 786432
+     },
+     "head_dim": 512,
+     "kind": "global",
+     "kv_heads": 1,
+     "kv_shared": true,
+     "q_heads": 8,
+     "window": 0
+    }
+   ],
+   [
+    4,
+    {
+     "groups": {
+      "attn": 6291456,
+      "down": 18874368,
+      "gateup": 37748736,
+      "ple": 786432
+     },
+     "head_dim": 256,
+     "kind": "sliding",
+     "kv_heads": 1,
+     "kv_shared": true,
+     "q_heads": 8,
+     "window": 512
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 12582912,
+      "down": 18874368,
+      "gateup": 37748736,
+      "ple": 786432
+     },
+     "head_dim": 512,
+     "kind": "global",
+     "kv_heads": 1,
+     "kv_shared": true,
+     "q_heads": 8,
+     "window": 0
+    }
+   ]
+  ],
+  "vocab": 262144
+ },
+ "gemma-4-E4B-it": {
+  "embed": 671088640,
+  "family": "gemma4",
+  "head": 671088640,
+  "hidden": 2560,
+  "model_type": "gemma4_text",
+  "n_layers": 42,
+  "name": "gemma-4-E4B-it",
+  "ple": {
+   "proj": 27525120,
+   "row": 10752,
+   "table": 2818572288
+  },
+  "runs": [
+   [
+    5,
+    {
+     "groups": {
+      "attn": 13107200,
+      "down": 26214400,
+      "gateup": 52428800,
+      "ple": 1310720
+     },
+     "head_dim": 256,
+     "kind": "sliding",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 512
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 26214400,
+      "down": 26214400,
+      "gateup": 52428800,
+      "ple": 1310720
+     },
+     "head_dim": 512,
+     "kind": "global",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 0
+    }
+   ],
+   [
+    5,
+    {
+     "groups": {
+      "attn": 13107200,
+      "down": 26214400,
+      "gateup": 52428800,
+      "ple": 1310720
+     },
+     "head_dim": 256,
+     "kind": "sliding",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 512
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 26214400,
+      "down": 26214400,
+      "gateup": 52428800,
+      "ple": 1310720
+     },
+     "head_dim": 512,
+     "kind": "global",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 0
+    }
+   ],
+   [
+    5,
+    {
+     "groups": {
+      "attn": 13107200,
+      "down": 26214400,
+      "gateup": 52428800,
+      "ple": 1310720
+     },
+     "head_dim": 256,
+     "kind": "sliding",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 512
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 26214400,
+      "down": 26214400,
+      "gateup": 52428800,
+      "ple": 1310720
+     },
+     "head_dim": 512,
+     "kind": "global",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 0
+    }
+   ],
+   [
+    5,
+    {
+     "groups": {
+      "attn": 13107200,
+      "down": 26214400,
+      "gateup": 52428800,
+      "ple": 1310720
+     },
+     "head_dim": 256,
+     "kind": "sliding",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 512
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 26214400,
+      "down": 26214400,
+      "gateup": 52428800,
+      "ple": 1310720
+     },
+     "head_dim": 512,
+     "kind": "global",
+     "kv_heads": 2,
+     "kv_shared": false,
+     "q_heads": 8,
+     "window": 0
+    }
+   ],
+   [
+    5,
+    {
+     "groups": {
+      "attn": 10485760,
+      "down": 26214400,
+      "gateup": 52428800,
+      "ple": 1310720
+     },
+     "head_dim": 256,
+     "kind": "sliding",
+     "kv_heads": 2,
+     "kv_shared": true,
+     "q_heads": 8,
+     "window": 512
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 20971520,
+      "down": 26214400,
+      "gateup": 52428800,
+      "ple": 1310720
+     },
+     "head_dim": 512,
+     "kind": "global",
+     "kv_heads": 2,
+     "kv_shared": true,
+     "q_heads": 8,
+     "window": 0
+    }
+   ],
+   [
+    5,
+    {
+     "groups": {
+      "attn": 10485760,
+      "down": 26214400,
+      "gateup": 52428800,
+      "ple": 1310720
+     },
+     "head_dim": 256,
+     "kind": "sliding",
+     "kv_heads": 2,
+     "kv_shared": true,
+     "q_heads": 8,
+     "window": 512
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 20971520,
+      "down": 26214400,
+      "gateup": 52428800,
+      "ple": 1310720
+     },
+     "head_dim": 512,
+     "kind": "global",
+     "kv_heads": 2,
+     "kv_shared": true,
+     "q_heads": 8,
+     "window": 0
+    }
+   ],
+   [
+    5,
+    {
+     "groups": {
+      "attn": 10485760,
+      "down": 26214400,
+      "gateup": 52428800,
+      "ple": 1310720
+     },
+     "head_dim": 256,
+     "kind": "sliding",
+     "kv_heads": 2,
+     "kv_shared": true,
+     "q_heads": 8,
+     "window": 512
+    }
+   ],
+   [
+    1,
+    {
+     "groups": {
+      "attn": 20971520,
+      "down": 26214400,
+      "gateup": 52428800,
+      "ple": 1310720
+     },
+     "head_dim": 512,
+     "kind": "global",
+     "kv_heads": 2,
+     "kv_shared": true,
+     "q_heads": 8,
+     "window": 0
+    }
+   ]
+  ],
+  "vocab": 262144
+ }
+}

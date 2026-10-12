@@ -145,7 +145,8 @@ module otpu_slice
   logic        sq_halted, sq_ch, sq_err, rl_v;
   logic        dma_err;           // a WAITW timed out: the slice stops with an error (to_err)
   logic [31:0] sq_icount, sq_cha, sq_chn, rl_val;
-  otpu_seq #(.IMEM_WORDS(IMEM_WORDS), .SID(SID), .S(S), .D(D), .WIN(WIN), .STREAMS(HAS_SS)) u_seq (
+  otpu_seq #(.IMEM_WORDS(IMEM_WORDS), .TMEM_WORDS(TMEM_WORDS), .SID(SID), .S(S), .D(D),
+             .WIN(WIN), .STREAMS(HAS_SS)) u_seq (
     .clk, .rst(srst), .ucmd, .ustart, .urel, .urdy, .udone, .halted(sq_halted), .error(sq_err),
     .icount(sq_icount), .ev(sq_ev), .rinit, .rl_v, .rl_val, .ch_req(sq_ch), .ch_addr(sq_cha),
     .ch_n(sq_chn), .im_we, .im_row, .im_data(b_rdata));
