@@ -61,6 +61,14 @@ wcv OTPU_SEQ_WC=1 OTPU_WAITS=1 HZLOG=1
 # they cover every conflict on the window
 wcm OTPU_SEQ_WC=1 OTPU_WAITS=1 HZLOG=1
 wcma OTPU_SEQ_WC=1 OTPU_WAITS=args
+# v2's cost split (simulation): the VPU producers from today's range check instead of the
+# mask, the hold at 15 (wcmx: the mask's own cost is wcm - wcmx), at none (wcmx0: the hold's
+# cost is wcmx - wcmx0) or 24 back (wcmx24: what a 24-bit mask would give); the mask with the
+# hold at 8 (wcm8)
+wcmx OTPU_SEQ_WC=1 OTPU_WAITS=1 HZLOG=1 OTPU_SIM_PLUSARGS=+wc_vx=1
+wcmx0 OTPU_SEQ_WC=1 OTPU_WAITS=1 HZLOG=1 OTPU_SIM_PLUSARGS=+wc_vx=1,+wc_vgate=0
+wcmx24 OTPU_SEQ_WC=1 OTPU_WAITS=1 HZLOG=1 OTPU_SIM_PLUSARGS=+wc_vx=1,+wc_vgate=24
+wcm8 OTPU_SEQ_WC=1 OTPU_WAITS=1 HZLOG=1 OTPU_SIM_PLUSARGS=+wc_vgate=8
 # where WAITC's cost is: the oracle's counts with the DMA and the quantizer in order and the VPU
 # out of order (wc5), a VPU producer's dependencies exact instead of its count for every consumer
 # (wcvx1), for a VPU consumer only (wcvx2), for the other units' consumers only (wcvx3)

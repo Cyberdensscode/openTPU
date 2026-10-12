@@ -580,6 +580,23 @@ module otpu_seq
   logic [CW-1:0]    wt [WIN][NWT];
   logic [NWT-1:0]   wv [WIN];
   logic [WIN-1:0]   w_all, w_dram;            // the slot's waits (all / the stream's) are met
+`ifndef SYNTHESIS
+  // EXPERIMENTAL, simulation only (docs/seq_vpu.md): +wc_vx=1 takes a slot's VPU producers from
+  // today's range check (fp_seg, conf_s: vxd) instead of its mask; +wc_vgate=G holds a VOP
+  // until the one G back has completed instead of 15 (G = 0: never; G > 15 or 0 only with
+  // +wc_vx, the mask names 15)
+  bit             wc_vx = 1'b0;
+  int             wc_vg = 15;
+  logic [WIN-1:0] vxd [WIN];
+  fps_t           sfpx [WIN];
+  logic [CW-1:0]  vxi [WIN];
+  initial begin
+    wc_vx = $test$plusargs("wc_vx=1");
+    void'($value$plusargs("wc_vgate=%d", wc_vg));
+    if ((wc_vg == 0 || wc_vg > 15) && !wc_vx)
+      $fatal(1, "otpu_seq: +wc_vgate=%0d needs +wc_vx=1", wc_vg);
+  end
+`endif
   function automatic int wunit(input int j);
     return (j < NUNITS) ? j : (j == NUNITS) ? U_DMA : U_Q;
   endfunction
@@ -587,6 +604,14 @@ module otpu_seq
     v_fin = '0;
     if (udone[U_VPU]) v_fin[vix[uq[U_VPU][uq_h[U_VPU][SW-1:0]]]] = 1'b1;
     wc_hold = WAITC && c_unit == U_VPU && vout[4'(wd_n[U_VPU] + 1'b1)];
+`ifndef SYNTHESIS
+    if (wc_vg != 15) begin
+      wc_hold = 1'b0;
+      if (WAITC && c_unit == U_VPU && wc_vg > 0)
+        for (int j = 0; j < WIN; j++)
+          if (sv[j] && soh[j][U_VPU] && CW'(wd_n[U_VPU] - vxi[j]) >= CW'(wc_vg)) wc_hold = 1'b1;
+    end
+`endif
   end
   always_comb
     for (int i = 0; i < WIN; i++) begin
@@ -597,6 +622,9 @@ module otpu_seq
         ok[j] = !wv[i][j] || !df[CW-1];
       end
       w_all[i] = &ok[NUNITS-1:0] && vpend[i] == '0;
+`ifndef SYNTHESIS
+      if (wc_vx) w_all[i] = &ok[NUNITS-1:0] && vxd[i] == '0;
+`endif
       w_dram[i] = ok[NUNITS] && ok[NUNITS+1];
     end
 
@@ -882,10 +910,10 @@ module otpu_seq
             int ui;
             ui = 0;
             for (int u = 0; u < NUNITS; u++) if (soh[i][u]) ui = u;
-            if (ui == U_VPU) begin
+            if (ui == U_VPU && wc_vg > 0 && wc_vg <= 15) begin
               logic [CW-1:0] rk;
               rk = wd_n[U_VPU] - sidx[i];
-              if (rk == 0 || rk > 15)
+              if (rk == 0 || rk > CW'(wc_vg))
                 $fatal(1, "otpu_seq: WAITC: pc %0d: VPU slot %0d (pc %0d) %0d back", c_pc, i,
                        spc[i], rk);
               if (conflict(c_ref, sfp_ref[i]) && !c_sync[28 + int'(rk) - 1])
@@ -933,6 +961,9 @@ module otpu_seq
         end
 `endif
       for (int u = 0; u < NUNITS; u++) if (udone[u]) uq_h[u] <= uq_h[u] + 1;
+`ifndef SYNTHESIS
+      for (int i = 0; i < WIN; i++) vxd[i] <= vxd[i] & ~fin;
+`endif
       if (WAITC) begin
         for (int u = 0; u < NUNITS; u++) if (udone[u] && u != U_VPU) wc_n[u] <= wc_n[u] + 1'b1;
         vout <= (vout & ~v_fin) | ((c_go && c_unit == U_VPU) ? 16'(1) << wd_n[U_VPU][3:0] : '0);
@@ -989,6 +1020,13 @@ module otpu_seq
         end
 `ifndef SYNTHESIS
         sdone[free_slot] <= 1'b0;
+        sfpx[free_slot] <= c_fpx;
+        vxi[free_slot] <= wd_n[c_unit];
+        for (int j = 0; j < WIN; j++) begin
+          logic [1:0] cf;
+          cf = conf_s(c_fpx, sfpx[j]);
+          vxd[free_slot][j] <= sv[j] && !fin[j] && soh[j][U_VPU] && cf[1];
+        end
 `endif
 `ifndef SYNTHESIS
         sfp_ref[free_slot] <= c_ref;
