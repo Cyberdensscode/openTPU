@@ -58,7 +58,7 @@ module otpu_tmem #(
   parameter int SID   = 0,
   parameter int IMPL  = 0,                // 0: a copy per read port (block RAM); 1: banked (see top)
   parameter int NCP   = 1,                // IMPL 1: copies
-  parameter logic [NRP-1:0][1:0] CPY = '0, // IMPL 1: each read port's copy (< NCP)
+  parameter logic [NRP-1:0][2:0] CPY = '0, // IMPL 1: each read port's copy (< NCP)
   parameter bit   RQ    = 1'b0,           // IMPL 1: bank addresses from the requests (see top)
   parameter logic [NRP-1:0][2:0] PRANK = '0 // RQ: each read port's priority (0 first)
 ) (

@@ -10,7 +10,7 @@ module tb_tmem #(parameter int IMPL = 0);
   localparam int WORDS = 256, LANES = 4, NRP = 3, NWP = 2, WPB = 1, CYCLES = 20000;
   localparam int BW = $clog2(LANES);
   localparam int NCP = 2;
-  localparam logic [NRP-1:0][1:0] CPY = {2'd1, 2'd0, 2'd0};
+  localparam logic [NRP-1:0][2:0] CPY = {3'd1, 3'd0, 3'd0};
 
   logic clk = 0;
   logic [NRP-1:0][LANES-1:0]       r_en, r_req;

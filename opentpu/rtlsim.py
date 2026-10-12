@@ -179,7 +179,7 @@ if os.environ.get("OTPU_VPU_CL"):
 # TMEM_IMPL 1 target (OTPU_TARGET=nangate45): OTPU_TMEM_RQ=1 (docs/tmem_pump.md)
 if os.environ.get("OTPU_TMEM_RQ"):
     UARCH["TMEM_RQ"] = BOARD_UARCH["TMEM_RQ"] = int(os.environ["OTPU_TMEM_RQ"])
-# ... and OTPU_TMEM_NCP=4: four read slots (two pumped copies' ports; the core is the same)
+# ... and OTPU_TMEM_NCP=2, 4, 5, 7: the read slots of pumped copies (otpu_slice TMEM_NCP)
 if os.environ.get("OTPU_TMEM_NCP"):
     UARCH["TMEM_NCP"] = int(os.environ["OTPU_TMEM_NCP"])
 # TMEM lanes of the MXU and the quantizer when fewer than LANES (timing only): OTPU_ULANES=8
@@ -339,6 +339,9 @@ def _run(cfg, programs: list, images: list, dram_lat: int = 8, max_cycles: int =
     r = run_sim(args, timeout=3600)
     out = r.stdout + r.stderr
     import re
+    if os.environ.get("OTPU_TMEMSTAT_LOG"):   # the TMEM's read demand (docs/tmem_pump.md)
+        with open(os.environ["OTPU_TMEMSTAT_LOG"], "a") as f:
+            f.writelines(m + "\n" for m in re.findall(r"TMEMSTAT .*", out))
     m = re.search(r"RESULT cycles=(\d+) halted=(\d+) error=(\d+)", out)
     if not m:
         raise RuntimeError(f"RTL simulation failed:\n{out[-3000:]}")

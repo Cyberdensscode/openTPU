@@ -49,8 +49,8 @@ module otpu_slice
                                       //   (three copies of 1R1W RAMs: an ASIC; otpu_tmem)
   parameter bit TMEM_RQ    = 1'b0,    // TMEM_IMPL 1: the banks' addresses from the requests by
                                       //   priority, and the arbiter grants by them (gnt_q)
-  parameter int TMEM_NCP   = 3        // TMEM_IMPL 1: copies (3, or 4: two pumped copies' read
-                                      //   slots, docs/tmem_pump.md)
+  parameter int TMEM_NCP   = 3        // TMEM_IMPL 1: copies (3; 2, 4, 5, 7: the read slots of
+                                      //   pumped copies, docs/tmem_pump.md)
 ) (
   input  logic          clk,
   input  logic          sys_rst,
@@ -126,17 +126,27 @@ module otpu_slice
   // counts one read per port and bank (its lanes there read one word) per copy (gnt_k).
   // TMEM_NCP 4 (two pumped copies' four read slots): MXU and VPU A, VPU B and QUANT 3, DMA and
   // QUANT 2, QUANT and COLL
-  localparam int NCP = TMEM_NCP;
-  localparam logic [NRP-1:0][1:0] CPY = (TMEM_NCP == 4) ?
-    {2'd3, 2'd2, 2'd1, 2'd1, 2'd0, 2'd3, 2'd2, 2'd0} :
-    {2'd2, 2'd1, 2'd2, 2'd1, 2'd0, 2'd0, 2'd2, 2'd0};
-  //                                    COLL  Q2    Q3    VB    VA    Q     DMA   MXU
+  // TMEM_NCP 2 (one pumped copy's two read slots, P1): MXU, VPU A, QUANT 2 and COLL share one,
+  // DMA, VPU B and QUANT the other; QUANT 3 (the row factor, one word) has a third of its own, a
+  // model of the row factor kept in a register by the quantizer (two slots cannot hold the
+  // quantizer's three reads)
+  // TMEM_NCP 5 / 7 (one copy pumped at 3x / 4x: 2K - 1 read slots, their count only, at today's
+  // read latency): 5: MXU; DMA, QUANT 3 and COLL; QUANT; VPU A; VPU B and QUANT 2. 7: a slot per
+  // port, COLL on the DMA's
+  localparam int NCP = (TMEM_NCP == 2) ? 3 : TMEM_NCP;
+  localparam logic [NRP-1:0][2:0] CPY =
+    (TMEM_NCP == 2) ? {3'd0, 3'd0, 3'd2, 3'd1, 3'd0, 3'd1, 3'd1, 3'd0} :
+    (TMEM_NCP == 4) ? {3'd3, 3'd2, 3'd1, 3'd1, 3'd0, 3'd3, 3'd2, 3'd0} :
+    (TMEM_NCP == 5) ? {3'd1, 3'd4, 3'd1, 3'd4, 3'd3, 3'd2, 3'd1, 3'd0} :
+    (TMEM_NCP == 7) ? {3'd1, 3'd6, 3'd5, 3'd4, 3'd3, 3'd2, 3'd1, 3'd0} :
+                      {3'd2, 3'd1, 3'd2, 3'd1, 3'd0, 3'd0, 3'd2, 3'd0};
+  //                    COLL  Q2    Q3    VB    VA    Q     DMA   MXU
   // TMEM_RQ: each read port's rank in the arbiter's priority order (its group's: DMA, COLL, VPU,
   // MXU, QUANT), for the copies' request-priority bank addresses (otpu_tmem RQ)
   localparam logic [NRP-1:0][2:0] PRANK = {3'd1, 3'd4, 3'd4, 3'd2, 3'd2, 3'd4, 3'd0, 3'd3};
   //                                       COLL  Q2    Q3    VB    VA    Q     DMA   MXU
-  initial if (TMEM_IMPL == 1 && TMEM_NCP != 3 && TMEM_NCP != 4)
-    $fatal(1, "otpu_slice: TMEM_NCP %0d (3 or 4)", TMEM_NCP);
+  initial if (TMEM_IMPL == 1 && !(TMEM_NCP inside {2, 3, 4, 5, 7}))
+    $fatal(1, "otpu_slice: TMEM_NCP %0d (2, 3, 4, 5 or 7)", TMEM_NCP);
   initial if (TMEM_IMPL == 1 && (RPB != 1 || WPB != 1))
     $fatal(1, "otpu_slice: TMEM_IMPL 1 needs RPB = 1 and WPB = 1 (RPB %0d WPB %0d)", RPB, WPB);
   localparam int W_DMA = 0, W_MXU = 1, W_COLL = 2, W_VPU = 3, NWP = 4;
@@ -666,6 +676,61 @@ module otpu_slice
   wire lose_q   = !gnt[G_Q] && ((|rq_en[P_Q]) || (|rq_en[P_Q2]) || q3_en);
   wire lose_vpu = !gnt[G_VPU] && ((|rq_en[P_VA]) || (|rq_en[P_VB]) || (|wq_en[W_VPU]));
   wire lose_col = !gnt[G_COLL] && ((|rq_en[P_COLL]) || (|wq_en[W_COLL]));
+
+`ifndef SYNTHESIS
+  // TMEM read demand (docs/tmem_pump.md; simulation only, a TMEMSTAT line at the end): each cycle
+  // out of reset and before the halt, how many read streams ask (MXU; the DMA's copy: DMA,
+  // QUANT 3, COLL; QUANT; VPU A; VPU B; QUANT 2: 0..6), the most read ports asking for one bank
+  // (0..8), the same with a write asking for that bank (0..9), and the cycles the MXU, QUANT, the
+  // VPU and the collective lost to the arbitration
+  longint ts_cyc, ts_lose [4], ts_n [7], ts_d [NRP + 1], ts_dw [NRP + 2];
+  initial begin
+    ts_cyc = 0;
+    for (int i = 0; i < 4; i++) ts_lose[i] = 0;
+    for (int i = 0; i < 7; i++) ts_n[i] = 0;
+    for (int i = 0; i <= NRP; i++) ts_d[i] = 0;
+    for (int i = 0; i <= NRP + 1; i++) ts_dw[i] = 0;
+  end
+  always @(posedge clk)
+    if (!srst && !halted) begin
+      int n, dm, dwm, c;
+      logic [LANES-1:0] wb;
+      logic hit;
+      n = int'(|rq_en[P_MXU]) + int'((|rq_en[P_DMA]) || (|rq_en[P_Q3]) || (|rq_en[P_COLL])) +
+          int'(|rq_en[P_Q]) + int'(|rq_en[P_VA]) + int'(|rq_en[P_VB]) + int'(|rq_en[P_Q2]);
+      wb = '0;
+      for (int p = 0; p < NWP; p++)
+        for (int l = 0; l < LANES; l++) if (wq_en[p][l]) wb[w_addr[p][l][BW-1:0]] = 1'b1;
+      dm = 0; dwm = 0;
+      for (int b = 0; b < LANES; b++) begin
+        c = 0;
+        for (int p = 0; p < NRP; p++) begin
+          hit = 1'b0;
+          for (int l = 0; l < LANES; l++)
+            if (rq_en[p][l] && r_addr[p][l][BW-1:0] == BW'(b)) hit = 1'b1;
+          c += int'(hit);
+        end
+        if (c > dm) dm = c;
+        if (c + int'(wb[b]) > dwm) dwm = c + int'(wb[b]);
+      end
+      ts_cyc++; ts_n[n]++; ts_d[dm]++; ts_dw[dwm]++;
+      if (lose_mxu) ts_lose[0]++;
+      if (lose_q)   ts_lose[1]++;
+      if (lose_vpu) ts_lose[2]++;
+      if (lose_col) ts_lose[3]++;
+    end
+  final begin
+    string s;
+    s = $sformatf("TMEMSTAT sid=%0d cyc=%0d lose=%0d,%0d,%0d,%0d n=", SID, ts_cyc, ts_lose[0],
+                  ts_lose[1], ts_lose[2], ts_lose[3]);
+    for (int i = 0; i < 7; i++) s = {s, $sformatf("%s%0d", (i > 0) ? "," : "", ts_n[i])};
+    s = {s, " d="};
+    for (int i = 0; i <= NRP; i++) s = {s, $sformatf("%s%0d", (i > 0) ? "," : "", ts_d[i])};
+    s = {s, " dw="};
+    for (int i = 0; i <= NRP + 1; i++) s = {s, $sformatf("%s%0d", (i > 0) ? "," : "", ts_dw[i])};
+    $display("%s", s);
+  end
+`endif
 
   logic [31:0] win;                  // cycles per window
 `ifdef SYNTHESIS
