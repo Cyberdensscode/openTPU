@@ -260,12 +260,50 @@ def test_tiled_prompt_runs_pair_rounding(tmp_path_factory, pair, P1, P2, same):
         assert all(np.abs(x - y).max() < 1e-3 * np.abs(y).max() for x, y in zip(got, want))
 
 
+def test_tiled_shallow_pipeline(tmp_path_factory, monkeypatch):
+    """A tiled run over IMEM at the attention's depth (ATTN_DEPTH: a head's entries leave up to
+    ~3 x depth blocks unrolled) takes the same form at tiled.SHALLOW (over at both: the first,
+    for the caller's IMEM check: bucket 8's, 4 blocks' code a packed tile at depth 2 against 8
+    at 3); its runs are today's bit for bit (a 1030-token prompt: buckets 1-5, the heads' whole
+    blocks looped from bucket 4 at depth 2, none at 3)."""
+    W, spec, cfg, kw = _family("qwen3-board", tmp_path_factory)
+    cfg = dataclasses.replace(cfg, MCOLS=4, ACT_ROWS=16)
+    a, b = (Engine(spec, W, cap=2048, cfg=cfg, rows=16, resident=True, prompt_runs=True, **kw)
+            for _ in range(2))
+    img, imem = a.image, a.image.cfg
+    size = lambda: max(map(len, tiled.compile_tile_run(img, 8, 16, "P")[0]))   # noqa: E731
+    forms = tiled.variants
+    shallow = lambda *x: [dict(v, depth=tiled.SHALLOW) for v in forms(*x)]   # noqa: E731
+    n3 = size()
+    monkeypatch.setattr(tiled, "variants", shallow)
+    n2 = size()
+    monkeypatch.setattr(tiled, "variants", forms)
+    assert n2 < n3
+    monkeypatch.setattr(img, "cfg", dataclasses.replace(imem, IMEM_WORDS=8 * n2))
+    assert size() == n2
+    monkeypatch.setattr(img, "cfg", dataclasses.replace(imem, IMEM_WORDS=8 * (n2 - 1)))
+    assert size() == n3
+    monkeypatch.setattr(img, "cfg", imem)
+    monkeypatch.setattr(tiled, "variants", shallow)
+    a.tile_runs, b.tile_runs = True, False
+    b._prompt_rmax = {k: (8, True) for k in range(6)}
+    r = np.random.default_rng(5)
+    p1, p2 = ([int(t) for t in r.integers(0, 1000, n)] for n in (1030, 20))
+    got = [a.prefill(p1), a.prefill(p2)]
+    assert set(a._prompt_tile.values()) == {16}
+    want = [b.prefill(p1), b.prefill(p2)]
+    for x, y in zip(got, want):
+        assert np.array_equal(x.view(np.uint32), y.view(np.uint32))
+    assert all(np.array_equal(x, y) for x, y in zip(_dram_but_scratch(a, 1050),
+                                                    _dram_but_scratch(b, 1050)))
+
+
 @pytest.mark.parametrize("case, mcols, act, p0, T, form", [
     ("qwen3", 4, 4, 300, 4, None),      # the card's ACT RAM (4 rows): a whole block, then the
     ("lfm2", 4, 16, 200, 16, None),     # masked one; 16 rows: replayed MMs, the convolution's
     ("kh8", 4, 16, 300, 12, None),      # channel parts; Qwen3.5: DeltaNet rows (DSTEP), gated
-    ("gemma4-1", 4, 16, 600, 8, None),  # Gemma 4: the sliding window's start-masked block
-    ("gemma4-2", 8, 16, 300, 8, None),  # E4B's groups of 4, two rows a tile (RowTiles)
+    ("gemma4-1", 4, 16, 600, 4, None),  # Gemma 4: the sliding window's start-masked block (IMEM:
+    ("gemma4-2", 8, 16, 300, 8, None),  # 4 rows in bucket 3); E4B's groups of 4, two rows a tile
     ("kh8", 4, 16, 300, 12, {"spill": True, "drows": 5}),  # x stored and loaded back in place,
 ])                                                          # DeltaNet in runs of 5, 5, 2
 def test_tiled_prompt_run_on_rtl(tmp_path_factory, monkeypatch, have_verilator, case, mcols,

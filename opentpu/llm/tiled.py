@@ -143,7 +143,7 @@ def _alloc_at(base: int, shape, rs: int):
 
 
 def _attention_tile(res: Res, lw, c, s_, pos, T: int, spec, block: int, parts: int,
-                    gated: bool = False):
+                    gated: bool = False, depth: int = ATTN_DEPTH):
     """x += W_o . attention(x) for T rows of sequence 0 at positions pos .. pos + T - 1 (pos an
     int, or a prompt run's RunRows: run-time positions), their K / V appended first, each row
     attending causally over the cache: _attention_rows' arithmetic, one KV head's projections
@@ -234,7 +234,7 @@ def _attention_tile(res: Res, lw, c, s_, pos, T: int, spec, block: int, parts: i
             ol.quantize_into(ost, o, j * G * d)
             del o
 
-    _attend_heads(qhs, kvc, kvh, seqs, block, scale, depth=ATTN_DEPTH, emit=emit)
+    _attend_heads(qhs, kvc, kvh, seqs, block, scale, depth=depth, emit=emit)
     xs = None
     _add_parts(res.back(), [ost], [lw.wo], parts)              # x += W_o o, by output parts
 
@@ -401,30 +401,32 @@ def _rows_of(pos, T: int):
 
 
 @ol.jit
-def qwen3_tile(m, p0, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool = False):
+def qwen3_tile(m, p0, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool = False,
+               depth: int = ATTN_DEPTH):
     """T rows at positions p0 .. p0 + T - 1 of sequence 0 (p0 an int: their embedding and RoPE
     rows in the I/O area, as qwen3_rows'; a RunRows: a prompt run's tokens and positions), the
     logits of `logit_rows` (empty: none). spill: x in the I/O area's rows while each layer's
-    heads attend (Res)."""
+    heads attend (Res). depth: the attention's pipeline (_attend_heads: blocks in flight a
+    head; fewer, a smaller program: compile_tile_run's forms)."""
     spec = m.spec
     x, c, s_ = _inputs_rows(m, _rows_of(p0, T))
     res = Res(x, m.xr[0:T, :] if spill else None)
     del x
     parts, sub = _widths(m, T)
     for lw in _layers(m):
-        _attention_tile(res, lw, c, s_, p0, T, spec, block, parts)
+        _attention_tile(res, lw, c, s_, p0, T, spec, block, parts, depth=depth)
         _mlp_tile(res.x, lw, spec, parts, sub(lw))
     _lm_head_rows(res.x, m, spec, logit_rows)
 
 
 @ol.jit
 def qwen35_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, hidden: bool = False,
-                spill: bool = False, drows: int = 0):
+                spill: bool = False, drows: int = 0, depth: int = ATTN_DEPTH):
     """qwen35_rows tiled: T rows of a prompt run (pos a RunRows), its attention layers and
     MLPs tiled, its DeltaNet layers today's rows (_deltanet_rows over the T rows, or in runs
     of `drows` rows one after another: their pair buffers grow with the rows; each weight
     streamed once a run, pair of heads by pair). hidden: MTP's rows (each row's final-normed
-    hidden to m.hid, as qwen35_rows'). spill: as qwen3_tile's."""
+    hidden to m.hid, as qwen35_rows'). spill, depth: as qwen3_tile's."""
     from ..kernels.lib import rmsnorm
     from .qwen35 import LIN, _deltanet_rows, run_layers
     spec = m.spec
@@ -449,7 +451,8 @@ def qwen35_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, hidden: boo
             del x
         else:
             del x
-            _attention_tile(res, lw, c, s_, pos, T, spec, block, parts, gated=True)
+            _attention_tile(res, lw, c, s_, pos, T, spec, block, parts, gated=True,
+                            depth=depth)
         _mlp_tile(res.x, lw, spec, parts, sub(lw))
 
     run_layers(m.plan, layer)
@@ -463,9 +466,10 @@ def qwen35_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, hidden: boo
 
 
 @ol.jit
-def lfm2_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool = False):
+def lfm2_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool = False,
+              depth: int = ATTN_DEPTH):
     """lfm2_rows tiled: T rows of a prompt run (pos a RunRows), its attention layers, its
-    convolution blocks and its MLPs tiled. spill: as qwen3_tile's."""
+    convolution blocks and its MLPs tiled. spill, depth: as qwen3_tile's."""
     from .lfm2 import CONV, run_layers
     spec = m.spec
     if not isinstance(pos, RunRows):
@@ -482,7 +486,7 @@ def lfm2_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool =
             n = lw.taps.shape[1]
             _conv_tile(res.x, lw, pos, spec, parts, conv_parts(n, spec.conv_k, D, T, W))
         else:
-            _attention_tile(res, lw, c, s_, pos, T, spec, block, parts)
+            _attention_tile(res, lw, c, s_, pos, T, spec, block, parts, depth=depth)
         _mlp_tile(res.x, lw, spec, parts, sub(lw))
 
     run_layers(m.plan, layer)
@@ -536,10 +540,11 @@ def _rope_rows_g(x, c, s, out):
 
 
 QPART = 8       # Gemma 4: a query part's [T, heads d] at most TMEM / QPART words
+SHALLOW = 2     # the attention pipeline's depth of a run over IMEM at ATTN_DEPTH
 
 
 def _gemma_attention_tile(res: Res, lw, m, pos: RunRows, ropes, T: int, block: int,
-                          parts: int):
+                          parts: int, depth: int = ATTN_DEPTH):
     """gemma4._attention tiled for T rows of a prompt run: x += norm(W_o attention(norm(x))).
     Per KV head its K / V (own layers: projected for the T rows, normed, K RoPE'd, appended a
     row at a time to its slot: the sliding ring's or the cache's), then its query group in
@@ -619,7 +624,7 @@ def _gemma_attention_tile(res: Res, lw, m, pos: RunRows, ropes, T: int, block: i
             ol.quantize_into(ost, made.pop((j, g0)), (j * G + g0) * d)
         del o
 
-    _attend_heads(qhs, kv, kvh, seqs, block, ol.LOG2E, depth=ATTN_DEPTH, emit=emit)
+    _attend_heads(qhs, kv, kvh, seqs, block, ol.LOG2E, depth=depth, emit=emit)
     xs = None
     x = res.back()
     y = ol.empty([T, spec.hidden])
@@ -629,12 +634,13 @@ def _gemma_attention_tile(res: Res, lw, m, pos: RunRows, ropes, T: int, block: i
 
 
 @ol.jit
-def gemma4_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool = False):
+def gemma4_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool = False,
+                depth: int = ATTN_DEPTH):
     """gemma4_step's rows tiled: T rows of a prompt run (pos a RunRows with the image's mask
     tiles), their tokens gathered from out[] and per-layer inputs as gemma4_step's; per layer
     the tiled attention, the dense MLP (GeGLU) tiled into [T, H] for its post-norm, the
     per-layer input block as gemma4._ple. spill: x in the I/O area's input rows while each
-    layer's heads attend and W_o runs (Res)."""
+    layer's heads attend and W_o runs (Res). depth: as qwen3_tile's."""
     from ..kernels.lib import gelu_tanh
     from .gemma4 import _add_norm, _gathered_out, _ple, _ple_inputs, _pos_rows
     from .qwen3 import fill_logits
@@ -653,7 +659,7 @@ def gemma4_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool
 
     def layer(li, it=None, jt=None):
         lw = m.layer(li, it, jt)
-        _gemma_attention_tile(res, lw, m, pos, ropes, T, block, parts)
+        _gemma_attention_tile(res, lw, m, pos, ropes, T, block, parts, depth)
         x = res.x
         y = ol.empty([T, spec.hidden])
         _mlp_tile(x, lw, spec, parts, sub(lw), act=gelu_tanh, g=lw.g_pre, out=y)
@@ -726,7 +732,11 @@ def compile_tile(img, p0: int, T: int, block: int = ATTN_BLOCK, logit_rows=()) -
 def compile_tile_run(img, blocks: int, T: int, kind: str, block: int = ATTN_BLOCK,
                      hidden: bool = False, slot: int = 0):
     """tile_run's (programs, run_args): T rows of a prompt at a run-time position of bucket
-    `blocks` (from conv_k - 1), as the image's compile_prompt_run's P and L runs."""
+    `blocks` (from conv_k - 1), as the image's compile_prompt_run's P and L runs. The first
+    of the run's forms (variants) that fits TMEM and ACT RAM, at the attention's pipeline depth
+    (ATTN_DEPTH), or where that is over IMEM at SHALLOW (its program grows with the blocks a
+    head's entries leave unrolled, up to ~3 x depth a packed tile: past bucket ~3 the
+    bigger tiles); over IMEM at both, the first (the caller's IMEM check)."""
     fam = family(img)
     if fam is None:
         raise ValueError(f"no tiled prompt run for {type(img).__module__}")
@@ -750,19 +760,28 @@ def compile_tile_run(img, blocks: int, T: int, kind: str, block: int = ATTN_BLOC
     else:
         pos = RunRows(blocks, block, lo, img.lookup["zmask"], img.cap, T, 0, _amask(img.lookup))
     desc = (lambda s: img.descriptors(s, slot)) if fam == "qwen35" else img.descriptors
-    err = None
-    for v in variants(fam, T, img.cfg.MCOLS):       # the first that fits TMEM and ACT RAM
-        kw = dict(v, hidden=True) if hidden else v
-        try:
-            bs = [trace_fit(tile_run, img.cfg, s, lambda s=s: {
-                "m": desc(s), "kernel": KERNELS[fam], "pos": pos, "T": T, "kind": kind,
-                "block": block, "kw": kw}) for s in range(img.cfg.S)]
-        except CompileError as e:
-            if not any(w in str(e) for w in ("TMEM", "ACT RAM")):
-                raise
-            err = e
-            continue
-        return [b.finish() for b in bs], list(bs[0].run_args)
+    err = over = None
+    imem = img.cfg.IMEM_WORDS // 8
+    for v in variants(fam, T, img.cfg.MCOLS):       # the first that fits TMEM, ACT RAM, IMEM
+        # (over IMEM: the same form with a shallower attention pipeline, then the next form)
+        for f in [v] + ([dict(v, depth=SHALLOW)] if "depth" not in v else []):
+            kw = dict(f, hidden=True) if hidden else f
+            try:
+                bs = [trace_fit(tile_run, img.cfg, s, lambda s=s: {
+                    "m": desc(s), "kernel": KERNELS[fam], "pos": pos, "T": T, "kind": kind,
+                    "block": block, "kw": kw}) for s in range(img.cfg.S)]
+            except CompileError as e:
+                if not any(w in str(e) for w in ("TMEM", "ACT RAM")):
+                    raise
+                err = e
+                break
+            progs = [b.finish() for b in bs]
+            if max(map(len, progs)) <= imem:
+                return progs, list(bs[0].run_args)
+            if over is None:
+                over = progs, list(bs[0].run_args)
+    if over is not None:                # (the caller's IMEM check: prefill.programs)
+        return over
     raise err
 
 
