@@ -7,6 +7,7 @@ target refuses earlier: the one-hot gathers in parts, a decode step placed best-
 heads several D wide. On the ISA simulator; nothing here is tied to the card's sizes.
 
 Where a model does not map onto an architecture its image refuses it naming the limit."""
+import inspect
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -193,7 +194,8 @@ def test_model(models, model, name):
     assert a.can_generate and a.generate_card(t0, 8, stop_ids=[]) == ref
     c = Engine(spec, W, cap=_cap(spec), cfg=cfg)
     dev = np.array([c.step(t) for t in toks[:6]], np.float64)
-    emu = mod.emulated_logits(spec, W, toks[:6], D=cfg.D)
+    sk = {"S": cfg.S} if "S" in inspect.signature(mod.emulated_logits).parameters else {}
+    emu = mod.emulated_logits(spec, W, toks[:6], D=cfg.D, **sk)   # (S: the slices' QACTs)
     if model == "gemma4":
         dev, emu = G4.softcap(spec, dev), G4.softcap(spec, emu)
     assert _cos(dev, emu).min() > (0.99 if model == "gemma4" else 0.999)

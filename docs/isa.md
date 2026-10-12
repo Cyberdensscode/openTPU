@@ -17,8 +17,10 @@ every bit written to TMEM or DRAM.
 - **DRAM**: byte addressed, little endian, accessed as 32-bit words. All word accesses and all
   MXU chunk reads must be 4-byte aligned. Only `QST` writes single bytes.
 - **TMEM**: 32-bit word addressed. Holds fp32 values (raw IEEE bits).
-- **ACT RAM**: `ACT_ROWS` rows x `ACT_BLOCKS` blocks x `D` int8, plus one fp32 scale per
-  (row, block). Written only by `QACT`, read only by `MM`.
+- **ACT RAM**: `ACT_ROWS` rows x `ACT_BLOCKS` blocks x `D` int8, plus a scale record per
+  (row, block): the row's fp32 scale `Sa[r][k]` and four 8-bit offsets `da[r][k][b]`, one per
+  sub-block `b` of `D/4` elements (the sub-block's scale is `Sa * 2^-da`). Written only by
+  `QACT`, read only by `MM`.
 
 Execution is in order. Every instruction completes (all its writes are visible) before the
 next one starts. The MXU prefetches its streamed operand from DRAM internally.
@@ -76,7 +78,7 @@ compares order raw sign-magnitude bits (a NaN with the sign set is below `-inf`)
 `log2(NaN)` the canonical NaN, `q8(NaN) = 0`. Composite functions are defined as fixed sequences of
 `add`/`mul` so that every implementation is bit exact:
 
-- `i2f(i)`: int32 to fp32, RNE.
+- `i2f(i)`: a signed integer to fp32, RNE (MM's accumulators have at most 48 bits).
 - `exp2(x)`: if `x < -126` return `+0`; if `x >= 128` return `+inf`. `i = floor(x)`,
   `f = x - i2f(i)`, `p = C7`, then `p = p*f + Ck` for k = 6, 5, ..., 0 (each a rounded `mul`
   then a rounded `add`), result = `p` with `i` added to its exponent field. `C0..C7` are a
@@ -120,21 +122,32 @@ compares order raw sign-magnitude bits (a NaN with the sign set is below `-inf`)
 - `a > b` compares flushed values in a total order: `-inf < ... < -0 < +0 < ... < +inf < NaN`
   (sign-magnitude bits). `max(a, b)` = `a if a > b else b`; `min(a, b)` = `a if b > a else b`.
   Because the order is total, a max/min reduction gives the same bits in any order.
-- **Sums** (MM accumulation and the VOP row sums) are defined so that a pipelined adder can
-  compute them at full rate. `isum_P(x[0..n-1])` with P a power of two: partial
+- **Sums** (the VOP row sums) are defined so that a pipelined adder can compute them at full
+  rate. `isum_P(x[0..n-1])` with P a power of two: partial
   `p[q] = +0 + x[q] + x[q+P] + x[q+2P] + ...` (left to right, each `+` an fp32 add), then a
   folding tree over the partials: `n = P/2, P/4, ..., 1: p[i] = p[i] + p[i+n]` for `i < n`.
-  (For MM that is `(p0 + p2) + (p1 + p3)`.)
-  MM uses P = 4 over the K blocks; RSUM, RSSQ and RDOT use P = 64 over the columns. RSUM, RSSQ
-  and RDOT pad a row with +0 terms to a multiple of 64 columns (each added: a -0 partial, from a
-  sum that flushed, becomes +0). MM has no pad terms: a partial is the chain of its own blocks
-  only (one with no block is the +0 it starts from).
+  RSUM, RSSQ and RDOT use P = 64 over the columns and pad a row with +0 terms to a multiple
+  of 64 columns (each added: a -0 partial, from a sum that flushed, becomes +0). MM sums
+  exactly: an integer ("MM").
 - `q8(x)`: round half to even to an integer, saturate to `[-127, 127]`; NaN gives 0 (a zero
   times an infinite `inv`, below).
 
-Quantization of a group `x[0..n)` (a block of `D`, or a whole row in row mode):
-`amax = max |x|`; if `amax == 0`: `s = 0`, `inv = 0`; else `s = amax * f32(1/127)`,
-`inv = 127 * recip(amax)`; `q[i] = q8(x[i] * inv)`.
+Quantization of a row `x[0..n)` (QACT and QST: the `KB*D` elements of one row) with its groups
+(QACT: the sub-blocks of `D/4` elements; QST: the D-blocks; `ROW` mode: every `d = 0`):
+
+```
+amax = max |x| over the row            (flushed bits, as RMAX)
+S    = amax == 0 ? 0 : amax * f32(1/127)                  the row's scale
+inv  = amax == 0 ? 0 : 127 * recip(amax)
+a_g  = max |x| over group g
+d_g  = (a_g == 0 or ROW) ? 0 : min(31, e(amax) - e(a_g) - (f(a_g) > f(amax) ? 1 : 0))
+q[i] = q8(x[i] * (inv * f32(2^d_g)))                      i in group g; two rounded mul
+```
+
+`e` is the exponent field and `f` the fraction bits: `d_g` is the largest `d <= 31` with
+`a_g * 2^d <= amax`, so group `g` is quantized with the scale `S * 2^-d_g`, within a factor
+of 2 of its own `a_g / 127`. (Before the MX MXU, docs/mx_mxu.md, every D-block had its own
+fp32 `s = amax_block / 127`.)
 
 ## Encoding
 
@@ -165,106 +178,123 @@ and ST's `n`, QACT's `w2` and `w3`, GATHER's `w3`).
 
 ### MM
 
-Fields: `sa = R[ra]+w1` (streamed int8 rows, bytes), `ssa = R[rb]+w2` (streamed scales, bytes),
-`out = R[rc]+w3` (TMEM words), `N = w4[15:0]`, `KB = w4[31:16]`, `rs = w5` (row stride,
-bytes), `ors = w6[15:0]` (output row stride, words), `M = w6[23:16]`, `ab = w6[31:24]` (first
-ACT RAM block), `srs = w7` (scale row stride, bytes). Flags: bit0 `UNIT` (streamed scales are
-1.0 and not read), bit1 `ACC` (accumulate into `out`), bit2 `RMAX` (also write each output
-row's maximum: `T[out + M*ors + j] = fold(max, y[j][0..N-1])`, folded from `n = 0` like the
-`RMAX` VOP; the softmax row max comes for free from the MXU epilogue), bit3 `ASCALE` (needs
-`UNIT` and `ACC`; `ssa` is then the TMEM address of M per-row factors and the old accumulator
-is rescaled first: `y = T[out + j*ors + n] * T[ssa + j] + acc[j]` -- the flash-attention
-correction step, done in the MXU epilogue), bits 5:4 `WF`, the streamed weights' format (below;
-0 = int8), bit6 `PAIR` (4-bit weights at full rate, "Column reuse"). The streamed rows are
-D-byte aligned (`sa` and `rs` are multiples of D): the MXU streams whole D-byte DRAM chunks.
-`N >= 1`, `KB >= 1` and `0 < M <= ACT_ROWS`; RMAX, ASCALE and PAIR need `M <= MCOLS` (PAIR:
-`2*M <= MCOLS`), and an MM with `M > MCOLS` needs its streamed row to fit the MXU's chunk FIFO
-(`KB` chunks for int8, `ceil(KB/2)` for 4-bit; the board: 1024; a replayed row stays in the FIFO
-until its last group).
+Fields: `sa = R[ra]+w1` (streamed rows, bytes), `ssa = R[rb]+w2` (the weights' scale rows,
+bytes), `out = R[rc]+w3` (TMEM words), `N = w4[15:0]`, `KB = w4[23:16]`, `k0 = w4[31:24]` (the
+first block of the MM within the scale rows), `rs = w5` (row stride, bytes), `ors = w6[15:0]`
+(output row stride, words), `M = w6[23:16]`, `ab = w6[31:24]` (first ACT RAM block),
+`srs = w7` (scale row stride, bytes). Flags: bit0 `UNIT` (no scale rows: `Sw = 1.0`, every
+`dw = 0` and `m = 1`; nothing is read at `ssa`), bit1 `ACC` (accumulate into `out`), bit2 `RMAX`
+(also write each output row's maximum: `T[out + M*ors + j] = fold(max, y[j][0..N-1])`, folded
+from `n = 0` like the `RMAX` VOP; the softmax row max comes for free from the MXU epilogue), bit3
+`ASCALE` (needs `UNIT` and `ACC`; `ssa` is then the TMEM address of M per-row factors and the old
+accumulator is rescaled first: `y = T[out + j*ors + n] * T[ssa + j] + y` -- the
+flash-attention correction step, done in the MXU epilogue), bits 5:4 `WF`, the streamed
+weights' format ("Weight formats"), bit6 `PAIR` (4-bit weights at full rate, "Column reuse"),
+bit7 `RSC` (row scales only: each scale row is the one word `Sw[n]`, every `dw = 0` and `m = 1`;
+not with `WF = 3`). The streamed rows are D-byte aligned (`sa` and `rs` are multiples of D):
+the MXU streams whole D-byte DRAM chunks. `N >= 1`, `KB >= 1` and `0 < M <= ACT_ROWS`; RMAX,
+ASCALE and PAIR need `M <= MCOLS` (PAIR: `2*M <= MCOLS`), and an MM with `M > MCOLS` needs its
+streamed row to fit the MXU's chunk FIFO (`KB` chunks for int8, `ceil(KB/2)` for 4-bit; the
+board: 1024; a replayed row stays in the FIFO until its last group).
+
+Each output is one exact integer: every product of a block's group (a sub-block of `D/4`
+elements; NVFP4's weights: of `D/8`) is scaled by a power of two, `B`, that the weights' and
+the activations' offsets give, and the fp32 epilogue runs once per output:
 
 ```
+W = 16 (WF 0, int8), 11 (WF 1, 2: int4, fp4), 13 (WF 3, nvfp4)       the shift window
 for n in 0..N-1:
-  for k in 0..KB-1:
-    w  = M8[sa + n*rs + k*D + i], i < D          (int8)
-    ws = UNIT ? 1.0 : M32[ssa + n*srs + 4k]
-    for j < M:
-      isum      = sum_i ACT[j][(ab+k)*D + i] * w[i]  (exact integer)
-      t[j][k]   = (i2f(isum) * ws) * ASCALE[j][ab+k]
   for j < M:
-    acc[j] = isum_4(t[j][0..KB-1])              (see "Sums")
-    y = acc[j];  if ACC: y = T[out + j*ors + n] + acc[j]
+    acc = 0                                              an exact integer (|acc| < 2^47)
+    for k in 0..KB-1:
+      r = PAIR and k odd ? j + M : j                     the ACT row of block k
+      for each group g of block k, b its sub-block (WF 3: g in 0..7, b = g/2; else g = b in 0..3):
+        c   = sum_{i in g} ACT[r][(ab+k)*D + i] * w[i]   (exact; w: the elements of block k of row n)
+        sh  = W - dw(n, k, g) - da[r][ab+k][b]
+        acc = acc + (sh >= 0 ? m(n, k, g) << sh : 0) * c
+    y = (i2f(acc) * Sw[n]) * (Sa[j][ab] * f32(2^-W))      three rounded mul (FTZ)
+    if ASCALE: y = T[out + j*ors + n] * T[ssa + j] + y    (a rounded mul, then add)
+    elif ACC:  y = T[out + j*ors + n] + y
     T[out + j*ors + n] = y
 ```
 
+A group whose two offsets add up to more than `W` (`sh < 0`) does not count: its scale is under
+`2^-W` of the row's largest weight scale times the row's largest activation scale (the formats'
+scans measured at most 7e-5 of the groups, docs/mx_mxu.md 3.3). The bounds keep `acc` exact:
+a group's `|c| < 2^19` (int8; 4-bit `< 2^16`), `B < 2^17`, at most `4 * 255` groups for int8.
+An MM's rows `j` read `Sa[j][ab]` only: its blocks `ab .. ab+KB-1` (and, with PAIR, row `j + M`'s)
+must hold the same `Sa`, as one QACT writes them (the ISA simulator raises otherwise).
+
 #### Weight formats
 
-`WF = 0` (int8) is the loop above. `WF = 1` (int4) and `WF = 2` (FP4, E2M1) stream 4-bit
-elements, two per byte: block `k` of row `n` is the `D/2` bytes at `sa + n*rs + k*D/2`
-(two blocks per D-byte chunk; a row's last chunk is half used when KB is odd), element `i` in
-the low nibble of byte `i/2` for even `i`, the high nibble for odd `i`. A nibble `c` is the
-integer `w = c - 16*c[3]` (int4, -8..7) or, for E2M1, twice its value: `c[2:0]` in
-{0, 1, 2, 3, 4, 6, 8, 12} with `c[3]` the sign (so a stored E2M1 matrix carries half its
-scale). Each block has one scale word `sw = M32[ssa + n*srs + 4k]`, two-level: `ws = bf16(sw[15:0])`
-(the fp32 with bits `sw[15:0] << 16`) and four unsigned multipliers `m_b = sw[16+4b +: 4]`, one
-per sub-block `b` of `D/4` elements. The block's integer is the exact
+`WF = 0` (int8) streams int8 elements, block `k` of row `n` the `D` bytes at `sa + n*rs + k*D`.
+`WF = 1` (int4), `WF = 2` (FP4, E2M1) and `WF = 3` (NVFP4: E2M1 elements) stream 4-bit elements,
+two per byte: block `k` of row `n` is the `D/2` bytes at `sa + n*rs + k*D/2` (two blocks per
+D-byte chunk; a row's last chunk is half used when KB is odd), element `i` in the low nibble of
+byte `i/2` for even `i`, the high nibble for odd `i`. A nibble `c` is the integer
+`w = c - 16*c[3]` (int4, -8..7) or, for E2M1, twice its value: `c[2:0]` in
+{0, 1, 2, 3, 4, 6, 8, 12} with `c[3]` the sign (so a stored E2M1 matrix carries half its scale).
 
-```
-isum = sum_b m_b * sum_{i in b} ACT[j][(ab+k)*D + i] * w[i]      (|isum| < 2^22 at D = 128)
-```
+The scale row of weight row `n` starts at `ssa + n*srs` with the row's fp32 scale `Sw[n]` (a
+word), followed by the blocks' offsets and multipliers (little endian; the MM's block `k` is
+the row's block `k0 + k`):
 
-and everything after it (`i2f`, `* ws`, `* ASCALE`, the sums, ACC, RMAX, ASCALE) is as for int8.
-With `UNIT`, `ws = 1.0` and every `m_b = 1`. opentpu/quant.py makes these matrices
-(`quantize_w4`: `ws` a bf16 block scale, `m_b` in 1..15 chosen to minimize the squared error) and
-docs/quant.md compares the formats. The stationary operand (ACT RAM), the KV cache and QST stay
-int8.
+| WF | scale row | block `k`'s `dw` and `m` |
+|---|---|---|
+| 0 int8 | `Sw`, then one byte per block | `dw` = byte `4 + k0 + k`; `m = 1` |
+| 1 int4, 2 fp4 | `Sw`, a reserved word, then a word per block | word at byte `8 + 4*(k0+k)`: `dw` = bits 7:0, `m` of sub-block `b` = bits `8+6b +: 6` (0..63) |
+| 3 nvfp4 | `Sw`, three reserved words, then two words per block | byte `16 + 8*(k0+k) + g`, g < 8: an E4M3 scale `s` (s[7] = 0) of the group of `D/8` elements `g`: `E = s[6:3]`, `M = s[2:0]`, `m = E ? 8 + M : M`, `dw = 15 - max(E, 1)` |
+
+So a weight's value is `w * m * 2^-dw * Sw[n]` (NVFP4: the E4M3 value `m * 2^(max(E,1) - 10)`
+times `2^-5 Sw[n]`): a per-row fp32 scale and power-of-two offsets under it, MX style
+(docs/mx_mxu.md). With `RSC` the scale row is `Sw[n]` alone (the K cache, one scale per token).
+`ssa` and `srs` are multiples of 4 (int8, RSC), 8 (int4, fp4) or 16 (nvfp4). opentpu/quant.py
+makes these rows (`quantize_mxu`): `int8` (Sw = the row's amax / 127, `dw` per block as the
+quantizer's `d_g`), `fp4` / `int4` (the `m` that minimize the squared error), `nvfp4` (E4M3 per
+16 under a per-row Sw); docs/quant.md and docs/mx_mxu.md compare them. OCP MXFP4 (E8M0 per 32)
+is `fp4` with `m = 2^(e_b - e_min)` where a block's four exponents span at most 5, else `nvfp4`.
 
 #### Column reuse
 
 A 4-bit MM takes one block per cycle, half a streamed chunk. Flag bit6 `PAIR` (4-bit `WF` only,
 `2*M <= MCOLS`) lets it take a whole chunk per cycle when the operand has at most MCOLS/2 rows:
 the idle columns `M..2M-1` take the odd blocks. Output row `j` gets its even blocks from ACT
-row `j` and its odd blocks from ACT row `j + M` (which `QACT DUP` fills with the same row), and
-the two terms of a chunk are added before the sums:
-
-```
-t[r][k]  as above, for ACT rows r < 2M
-p[j][c]  = t[j][2c] + (2c+1 < KB ? t[j+M][2c+1] : +0)       c < ceil(KB/2)
-acc[j]   = isum_4(p[j][0..ceil(KB/2)-1])
-```
-
-The streamed rows and scales are the same as without `PAIR`: chunk `c` holds blocks `2c` and
-`2c+1`, whose scale words are adjacent (`ssa + n*srs + 8c`) and are read as one 8-byte pair, so
-without `UNIT` both `ssa` and `srs` are multiples of 8 (with KB odd the scale rows are padded; the
-last chunk's second word is read and ignored). ACC, RMAX and ASCALE are unchanged and write M
-rows. The results differ from a `PAIR`-less MM only in fp32 rounding (the sum order).
+row `j` and its odd blocks from ACT row `j + M` (which `QACT DUP` fills with the same row), as
+the loop above says: the result is the same integer, so PAIR changes no bit of the output.
+Chunk `c` holds blocks `2c` and `2c+1`, whose scale words (WF 1, 2: 8 bytes; WF 3: 16) are read
+together: `k0` is even and `ssa` and `srs` are multiples of 8 (WF 3: 16); with KB odd the last
+chunk's second block word is read and ignored. ACC, RMAX and ASCALE are unchanged and write M
+rows.
 
 ### QACT
 
 `src = R[ra]+w1` (TMEM words), `rows = w2[7:0]` (at most ACT_ROWS), `ab = w2[15:8]`,
-`KB = w2[31:16]`, `srs = w3` (source row stride, words). Flag bit0 `ROW`: one scale per row instead of per block.
-Flag bit1 `CSCALE`: every element is first multiplied by a per-column scale,
-`x = T[src + r*srs + c] * T[w4 + c]` (this folds V's per-token scale into P for free).
-Flag bit2 `RSCALE`: every element is first multiplied by a per-row factor `T[w5 + r]`. With
-both, `x = (T[src + r*srs + c] * T[w5 + r]) * T[w4 + c]` (RMSNorm's `x * r * gamma`).
-For each row `r < rows` and block `k < KB`: quantize `T[src + r*srs + k*D + i]`, write
-`ACT[r][(ab+k)*D + i] = q[i]`, `ASCALE[r][ab+k] = s`.
-Flag bit3 `DUP` (`2*rows <= MCOLS`): row `r + rows` receives the same bytes and scales as row `r`
-in the same cycles, the operand layout of `MM PAIR` ("Column reuse").
+`KB = w2[31:16]`, `srs = w3` (source row stride, words). Flag bit1 `CSCALE`: every element is
+first multiplied by a per-column scale, `x = T[src + r*srs + c] * T[w4 + c]` (this folds V's
+per-token scale into P for free). Flag bit2 `RSCALE`: every element is first multiplied by a
+per-row factor `T[w5 + r]`. With both, `x = (T[src + r*srs + c] * T[w5 + r]) * T[w4 + c]`
+(RMSNorm's `x * r * gamma`). Each row `r < rows` of `KB` blocks is quantized as one row
+("Quantization", its groups the sub-blocks of `D/4`): `ACT[r][(ab+k)*D + i] = q[k*D + i]`,
+`Sa[r][ab+k] = S`, `da[r][ab+k][b] = d` of sub-block `b` of block `k`. Flag bit0 `ROW`: every
+`d = 0` (the row's one scale). Flag bit3 `DUP` (`2*rows <= MCOLS`): row `r + rows` receives the
+same bytes and scale records as row `r` in the same cycles, the operand layout of `MM PAIR`
+("Column reuse").
 
 ### QST
 
 `src = R[ra]+w1` (TMEM), `dst = R[rb]+w2` (DRAM bytes), `sdst = R[rc]+w3` (DRAM bytes),
 `rows = w4[15:0]`, `KB = w4[31:16]`, `srs = w5` (words), `drs = w6` (bytes), `es = w7`
-(element stride, bytes). Flag bit0 `ROW`.
-Element `c` of row `r` goes to byte `dst + r*drs + c*es`. Scales: per block to
-`sdst + (r*KB + k)*4`; in `ROW` mode one scale per row to `sdst + r*4`. The data and scale ranges of
-one QST must not overlap. On the board a 64-byte DRAM beat a QST writes only part of is read,
-merged and written whole (`otpu_native_dram`): the scoreboard counts every word of the QST's
-beats as written by it, and the host must not write the other bytes of those beats while it
-runs. Flag bit1 `HALF` (`ROW` mode only): the scale is still the whole row's, but only elements
-`c < KB*D/2` are written (a V^T append of a head half as wide as its padded row, LFM2's 64 of
-128, then writes its 64 real rows instead of 128 byte-strided ones; a quantizer without `HALF`
-writes the zero padding too, which nothing reads).
+(element stride, bytes). Flag bit0 `ROW`. Each row is quantized as one row ("Quantization",
+its groups the D-blocks). Element `c` of row `r` goes to byte `dst + r*drs + c*es`. Scales: in
+`ROW` mode the word `S` to `sdst + r*4` (an `RSC` scale row); otherwise row `r`'s int8 scale row
+(WF 0, `k0 = 0`) to `sdst + r*(4 + 4*ceil(KB/4))`: the word `S`, then the bytes `d_k` (`k < KB`;
+the pad bytes 0). The data and scale ranges of one QST must not overlap. On the board a 64-byte
+DRAM beat a QST writes only part of is read, merged and written whole (`otpu_native_dram`): the
+scoreboard counts every word of the QST's beats as written by it, and the host must not write
+the other bytes of those beats while it runs. Flag bit1 `HALF` (`ROW` mode only): the scale is
+still the whole row's, but only elements `c < KB*D/2` are written (a V^T append of a head half
+as wide as its padded row, LFM2's 64 of 128, then writes its 64 real rows instead of 128
+byte-strided ones; a quantizer without `HALF` writes the zero padding too, which nothing reads).
 
 ### VOP
 

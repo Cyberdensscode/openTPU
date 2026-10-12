@@ -125,7 +125,7 @@ def _describe(ins: I.Instr, cfg) -> tuple[str, str, int, int, int]:
         return ("STREAM", f"{rows}x{cols}{' zero' if zero else ''}",
                 -(-rows * cols // I.DSTEP_LANES), n if zero else 2 * n, 0)
     if op == I.MM:
-        N, KB, M = w[3] & 0xFFFF, w[3] >> 16, (w[5] >> 16) & 0xFF
+        N, KB, M = w[3] & 0xFFFF, (w[3] >> 16) & 0xFF, (w[5] >> 16) & 0xFF
         acc = " +acc" if ins.flags & I.F_ACC else ""
         scales = 0 if ins.flags & I.F_UNIT else N * KB
         wf = (ins.flags >> I.WF_SHIFT) & 3
@@ -229,7 +229,7 @@ class Profile:
         for r in self.recs:
             if r.op == I.MM:
                 ins = self.programs[r.slice][r.pc]
-                N, KB, M = ins.w[3] & 0xFFFF, ins.w[3] >> 16, (ins.w[5] >> 16) & 0xFF
+                N, KB, M = ins.w[3] & 0xFFFF, (ins.w[3] >> 16) & 0xFF, (ins.w[5] >> 16) & 0xFF
                 tot += M * N * KB * self.cfg.D
         return tot
 

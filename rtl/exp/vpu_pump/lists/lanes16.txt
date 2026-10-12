@@ -1,0 +1,6 @@
+# the real 16-lane VPU (otpu_vpu LANES 16 on 16 TMEM banks, the MXU and quantizer on 8: ULANES 8;
+# CL 4 long lanes for the composites; no stream engine, which needs 8 lanes): Qwen3 only (no
+# DSTEP / STREAM), bit-exact against the ISA (--check); against the same runs at 8 lanes
+x16_p_q3 env: OTPU_LANES=16 OTPU_ULANES=8 OTPU_DSTEP=0 OTPU_STREAM=0 -- --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none --check
+x16_b4_q3 env: OTPU_LANES=16 OTPU_ULANES=8 OTPU_DSTEP=0 OTPU_STREAM=0 -- --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 544 --batch 4 --check
+x16_d4k_q3 env: OTPU_LANES=16 OTPU_ULANES=8 OTPU_DSTEP=0 OTPU_STREAM=0 -- --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 4000

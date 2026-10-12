@@ -8,11 +8,12 @@ import numpy as np
 import pytest
 
 from opentpu import language as ol
-from opentpu.isasim import board_config
-from opentpu.kernels.gather import gather_row, onehot
+from opentpu import quant as Q
+from opentpu.compiler import Affine, Tensor
+from opentpu.isasim import Machine, board_config
+from opentpu.kernels.gather import gather_row, onehot, table
 from opentpu.llm import load_spec
 from opentpu.llm.qwen3 import Engine, emulated_logits, gathered_rows, load_weights, reference_logits
-from opentpu.runtime import Input, Output, Weight, launch
 
 torch = pytest.importorskip("torch")
 transformers = pytest.importorskip("transformers")
@@ -61,26 +62,41 @@ def tiny(request, tmp_path_factory):
     return request.param, m, load_spec(path), load_weights(path)
 
 
-@ol.jit
-def _gather(table, oh, out, row):
-    ol.store(out, gather_row(ol.quantize(ol.load(oh)), table, row, "int8").reshape(1, out.shape[1]))
-
-
 @pytest.mark.parametrize("K", [256, 768])
 def test_embedding_rows_are_the_gathers(K):
     """qwen3.gathered_rows (the host's reference of an int8 embedding) is what the device's
-    gather (kernels.gather.gather_row) reads from an int8 table, bit for bit (rows with a zero
-    block), within an ulp of q * s."""
+    gather (kernels.gather.gather_row) reads from an int8 table (quant.quantize_mxu's element
+    rows and their gather scales, as an image keeps the embedding), bit for bit (rows with a
+    zero block), within half a step of the row's scale."""
     rng = np.random.default_rng(K)
     W = rng.normal(0, 0.05, (40, K)).astype(np.float32)
     W[7, :128] = 0
-    oh = onehot(128, 4, "int8")
-    for r in (0, 7, 39):
-        got = launch(_gather, board_config(DRAM_BYTES=1 << 22), table=Weight(W, 0),
-                     oh=Input(oh), out=Output((1, K)), row=r).outputs["out"]
-        want = gathered_rows(W[r], 128)
-        assert np.array_equal(got.view(np.uint32), want.view(np.uint32)), r
-        assert np.abs(got - W[r]).max() <= np.abs(W[r]).reshape(-1, 128).max(1).max() / 254
+    cfg = board_config(DRAM_BYTES=1 << 22)
+    D, M = cfg.D, cfg.MCOLS
+    oh = onehot(D, M, "int8")
+    q, s = Q.quantize_mxu(W, "int8", D)
+    g = np.ascontiguousarray(Q.gather_scales(s, "int8", K, D)).view(np.uint8).reshape(-1)
+    OH, TAB, GS, OUT = 0, 1 << 18, 1 << 20, 1 << 21
+    img = np.zeros(cfg.DRAM_BYTES, np.uint8)
+    img[OH:OH + oh.nbytes] = oh.view(np.uint8).reshape(-1)
+    img[TAB:TAB + q.size] = q.reshape(-1)
+    img[GS:GS + g.size] = g
+    tab, rows = table(TAB, GS, 40, K, "int8", D), (0, 7, 39)
+
+    @ol.jit
+    def k(ohd, out):
+        op = ol.quantize(ol.load(ohd))
+        for i, r in enumerate(rows):
+            ol.store(out[i:i + 1, :], gather_row(op, tab, r, "int8").reshape(1, K))
+
+    prog = k.trace(cfg, 0, {"ohd": Tensor(Affine(OH), oh.shape, (oh.shape[1], 1)),
+                            "out": Tensor(Affine(OUT), (len(rows), K), (K, 1))}).finish()
+    dram = Machine(cfg, [prog], [img]).run().slices[0].dram
+    got = dram[OUT:OUT + 4 * len(rows) * K].view(np.float32).reshape(len(rows), K)
+    for i, r in enumerate(rows):
+        want = gathered_rows(W[r:r + 1], D)[0]
+        assert np.array_equal(got[i].view(np.uint32), want.view(np.uint32)), r
+        assert np.abs(got[i] - W[r]).max() <= np.abs(W[r]).max() / 254 * 1.0001
 
 
 def test_specs(tiny):

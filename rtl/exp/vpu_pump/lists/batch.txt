@@ -1,0 +1,15 @@
+# multi-user: a batched decode step (opentpu/llm/batch.py: Qwen3 and the Llama-likes; LFM2,
+# Qwen3.5 and Gemma 4 images hold one sequence), B slots at position 544 each, the picks on the
+# device (greedy ARGMAX), fp4 + int8 head, whole model
+b4_q3 --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 544 --batch 4
+b4_q3_novop --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 544 --batch 4 --hack novop
+b4_q3_half --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 544 --batch 4 --hack half
+b4_q3_comp1 --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 544 --batch 4 --hack comp1
+# 8 users in one run at the pumped / MCOLS 8 MXU's rate (the card's MCOLS 4 runs them as two of b4)
+b8_q3 --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 544 --batch 8 --mcols 8
+b8_q3_novop --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 544 --batch 8 --mcols 8 --hack novop
+b8_q3_half --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 544 --batch 8 --mcols 8 --hack half
+# a long context: 4 users at position 4000
+b4k_q3 --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 4000 --batch 4
+b4k_q3_novop --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 4000 --batch 4 --hack novop
+b4k_q3_half --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 4000 --batch 4 --hack half

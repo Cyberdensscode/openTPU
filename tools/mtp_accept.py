@@ -194,7 +194,7 @@ def heads(model) -> dict:
     from opentpu import quant as Q
     E = model.get_input_embeddings().weight.detach().float().numpy()
     t = time.time()
-    _, _, deq = Q.quantize_w4(E, "fp4")
+    deq = np.asarray(Q.fake_w(E, "fp4", 128)).view(np.ndarray)      # the MXU's fp4x6 values
     print(f"fp4 head quantized in {time.time() - t:.0f} s", flush=True)
     deq = deq.astype(np.float32, copy=False)
     out = {"full": (None, E, False), "fp4": (None, deq, True)}
@@ -204,11 +204,11 @@ def heads(model) -> dict:
 
 
 def act_int8(x: np.ndarray) -> np.ndarray:
-    """x as the card's QACT gives it to the MXU (int8 per row and 128-block), dequantized."""
-    from opentpu.runtime import quantize_rows
-    q, s = quantize_rows(np.ascontiguousarray(x, np.float32), 128)
-    N, K = x.shape
-    return (q.reshape(N, K // 128, 128).astype(np.float32) * s[..., None]).reshape(N, K)
+    """x as the card's QACT gives it to the MXU (int8 under a row scale and an offset per 32),
+    dequantized (the MXU's window drops aside)."""
+    from opentpu import quant as Q
+    return np.asarray(Q.fake_act(np.asarray(x, np.float32), 128)).view(np.ndarray).astype(
+        np.float32)
 
 
 def run(a) -> None:

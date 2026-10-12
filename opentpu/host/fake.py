@@ -18,13 +18,17 @@ and I2C_CTRL / I2C_IN drive and read those bus models. With `ddr_mts` CAPS bit3 
 DDR_MTS register; without it the register reads 0xDEADBEEF, as on older bitstreams. With
 `args` CAPS bit25 announces the ARG0..7 registers (kept, read back), with regmap=4 the CFG_*
 registers report `cfg` (regs.cfg's keys; default the current target's single-slice values with
-the CFG_HASH its build would report), with `gen` CAPS bit30
-the decode loop's instructions (it runs nothing either way), with `chash` CAPS bit7 the hashed
+the CFG_HASH its build would report), with `mx` (default) CAPS bit29, the MX numerics every
+bitstream of this tree has (False: a bitstream before MX, which the host refuses), with `gen`
+CAPS bit30 the decode loop's instructions (it runs nothing either way), with `chash` CAPS bit7
+the hashed
 channel interleave (the run's logits pieces land by that map). `calib` (STATUS CALIB0,
 CALIB1): CTRL takes RUN only while both are set, as the RTL; `ecc_ded`: STATUS ECC_DED (set
 by hand: sticky on the card). Its identity (VERSION: D,
 MCOLS, LANES) is by default the configuration the environment asks for (board_config:
-OTPU_MCOLS, OTPU_LANES), as a card built for it would report.
+OTPU_MCOLS, OTPU_LANES), as a card built for it would report; so are its ACT RAM rows
+(`act_rows`, the target's: 16 on the card; MCOLS when MCOLS is given): above MCOLS, CAPS bit24
+announces the ACT_ROWS register and the CFG_HASH is that Config's.
 """
 from __future__ import annotations
 
@@ -41,7 +45,8 @@ RATES = {"RUNNING": 0.80, "MXU_BUSY": 0.60, "MXU_MAC": 0.50, "VPU_BUSY": 0.12,
          "DRAM_WR": 0.02, "DRAM_WAIT": 0.20, "INSTR": 0.005, "MXU_STARVE": 0.08}
 
 
-def _target_cfg(D: int, MCOLS: int, LANES: int, pair: bool, dstep: bool, stream: bool) -> dict:
+def _target_cfg(D: int, MCOLS: int, LANES: int, pair: bool, dstep: bool, stream: bool,
+                act_rows: int = 0) -> dict:
     """The CFG_* registers of the current target's build with these VERSION / CAPS values."""
     from ..target import arch_hash, current
     t = current()
@@ -52,7 +57,8 @@ def _target_cfg(D: int, MCOLS: int, LANES: int, pair: bool, dstep: bool, stream:
                MXU_IMPL=u["MXU_IMPL"], TMEM_IMPL=u["TMEM_IMPL"], VPU_CL=u["VPU_CL"],
                ULANES=u["ULANES"], platform=t.platform_id)
     from ..isasim import Config
-    full = Config(**{**a, "D": D, "MCOLS": MCOLS, "LANES": LANES, "ACT_ROWS": 0, "PAIR": pair,
+    full = Config(**{**a, "D": D, "MCOLS": MCOLS, "LANES": LANES,
+                     "ACT_ROWS": act_rows if act_rows > MCOLS else 0, "PAIR": pair,
                      "DSTEP": dstep, "STREAM": stream})
     cfg["hash"] = arch_hash(full)
     return cfg
@@ -71,20 +77,26 @@ class FakeTransport:
                  w4: bool = True, pair: bool = False, dstep: bool = False,
                  args: bool = False, stream: bool = False, gen: bool = False,
                  chash: bool = False, calib: tuple = (True, True), ecc_ded: bool = False,
-                 cfg: dict | None = None):
+                 cfg: dict | None = None, act_rows: int | None = None, mx: bool = True):
         self.ch = [np.zeros(ch_bytes, np.uint8) for _ in range(2)]
         self.v, self.devname, self.dev = regmap, devname, devname and f"/dev/{devname}"
         self.run_s, self.cycles_per_run = run_s, cycles
         self.core_khz, self.build_id, self.temp_code = core_khz, build_id, temp_code
         self.trace_log2, self.step = trace_log2, step
         self.trace, self.trace_extra, self.trace_drop = list(trace or []), trace_extra, trace_drop
+        if act_rows is None:            # the target's rows, unless MCOLS is the caller's
+            act_rows = MCOLS
         if None in (D, MCOLS, LANES):
             from ..isasim import board_config
             c = board_config()
+            if act_rows is None:
+                act_rows = c.act_rows
             D, MCOLS, LANES = (c.D if D is None else D, c.MCOLS if MCOLS is None else MCOLS,
                                c.LANES if LANES is None else LANES)
         self.version = D << 16 | MCOLS << 8 | LANES
-        self.cfg_words = R.cfg_words(cfg or _target_cfg(D, MCOLS, LANES, pair, dstep, stream))
+        self.act_rows = act_rows        # > MCOLS: CAPS bit24 and the ACT_ROWS register
+        self.cfg_words = R.cfg_words(cfg or _target_cfg(D, MCOLS, LANES, pair, dstep, stream,
+                                                        act_rows))
         self.slices = R.cfg(self.cfg_words)["S"] if regmap >= R.CFG_SINCE else 1
         if self.slices > 1:             # two channels per slice (board.channel_map)
             self.ch = [np.zeros(ch_bytes, np.uint8) for _ in range(2 * self.slices)]
@@ -97,6 +109,7 @@ class FakeTransport:
         self.stream = stream            # CAPS bit26: the stream engine
         self.gen = gen                  # CAPS bit30: the decode loop (RLD, ARGMAX, HALT CHAIN)
         self.chash = chash              # CAPS bit7: the hashed channel interleave
+        self.mx = mx                    # CAPS bit29: the MX numerics (every bitstream of this tree)
         self.calib = list(calib)        # STATUS CALIB0 / CALIB1
         self.ecc_ded = ecc_ded          # STATUS ECC_DED
         self.regs = {R.R_CTRL: 0, R.R_PROG_ADDR: 0, R.R_PROG_N: 0, R.R_SCRATCH: 0,
@@ -219,8 +232,11 @@ class FakeTransport:
                     | (R.CAP_PAIR if self.pair else 0)
                     | (R.CAP_DSTEP if self.dstep else 0) | (R.CAP_ARGS if self.args else 0)
                     | (R.CAP_STREAM if self.stream else 0) | (R.CAP_GEN if self.gen else 0)
-                    | (R.CAP_CHASH if self.chash else 0)
+                    | (R.CAP_CHASH if self.chash else 0) | (R.CAP_MX if self.mx else 0)
+                    | (R.CAP_ACT if self.act_rows > self.version >> 8 & 0xFF else 0)
                     | self.trace_log2 << 8 | 6 << 16)
+        if off == R.R_ACT_ROWS and self.act_rows > self.version >> 8 & 0xFF:
+            return self.act_rows
         if off == R.R_CORE_KHZ:
             return self.core_khz
         if off == R.R_BUILD_ID:

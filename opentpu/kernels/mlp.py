@@ -7,14 +7,27 @@ from .lib import rmsnorm, silu
 
 def _chunk(f_loc: int, D: int, q: int | None = None) -> int:
     """F-chunk size: about 8 chunks per slice, a multiple of q (default D; 2D for 4-bit W_down,
-    whose column slices must start on whole D-byte chunks)."""
+    whose column slices must start on whole D-byte chunks), and at least 2D where F allows:
+    each chunk's down MM is a QACT of its own (one Sa per MM row), and an MM of 2 blocks or
+    more keeps the MX MXU at full rate with MCOLS/2 epilogue lanes (rows / E <= KB; PAIR's
+    rows are MCOLS/2: KB/2), docs/mx_mxu.md 4. The activations' quantization follows the
+    chunks: emulations take them from down_chunk."""
     q = q or D
     if f_loc % q:
         raise ValueError(f"F per slice {f_loc} is not a multiple of {q}")
-    c = max(q, (f_loc // 8) // q * q)
-    while f_loc % c:
+    lo = min(f_loc, -(-2 * D // q) * q)
+    c = max(lo, (f_loc // 8) // q * q)
+    while f_loc % c and c > lo:
         c -= q
+    while f_loc % c:
+        c += q
     return c
+
+
+def down_chunk(f_loc: int, D: int, fmt: str) -> int:
+    """The F-chunk of a W_down in format fmt (_chunk): the columns each down MM's activations
+    are quantized over (one QACT)."""
+    return _chunk(f_loc, D, D if fmt == "int8" else 2 * D)
 
 
 def swiglu_down(xs, w_gate, w_up, w_down, chunk=None, act=silu, loop=False):
@@ -29,7 +42,8 @@ def swiglu_down(xs, w_gate, w_up, w_down, chunk=None, act=silu, loop=False):
     S = ol.num_programs()
     f_loc = w_gate.shape[0]
     D = ol.block_size()
-    C = chunk or _chunk(f_loc, D, D if w_down.wf == 0 else 2 * D)
+    C = chunk or (w_down.pw if w_down.parts is not None else
+                  _chunk(f_loc, D, D if w_down.wf == 0 else 2 * D))
     if loop and f_loc // C >= 6:                # two iterations at least
         return _swiglu_down_loop(xs, w_gate, w_up, w_down, C, act)
     starts = list(range(0, f_loc, C))

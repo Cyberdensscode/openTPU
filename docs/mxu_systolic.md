@@ -6,6 +6,16 @@ broadcast fan-outs and the fabric adder tree that make MCOLS = 4 fail timing tod
 slices, worst paths route-dominated). Results must stay bit-identical to the ISA simulator, and
 decode must not lose cycles.
 
+**Since the MX column** ([mx_mxu.md](mx_mxu.md) section 9, branch `mx-rtl-prod`): the systolic
+array is the only MXU (`IMPL` 0 and 1 are gone; `MXU_IMPL` must be 2), and everything after the
+chain ends is new. The four `otpu_colend` DSPs and the per-column fp32 epilogue (i2f, the two
+scale multiplies, the isum_4 loop) are replaced by `otpu_mxce` (rtl/tech: eight DSPs that take
+each chain end times m << sh and a ninth that accumulates the whole row exactly in 48 bits), the
+result FIFO holds the rows' integers, and E = MCOLS/2 lanes the columns share do the epilogue
+once per output. The array below (hops, skews, the PAIR select in `otpu_pe`, row-gated pops,
+command overlap) is unchanged; the column-end and epilogue lines of this page describe the
+previous design.
+
 ## What changes, what stays
 
 The MXU is a D x MCOLS dot-product engine: each advance, one D = 128-byte weight chunk (one K-block

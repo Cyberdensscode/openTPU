@@ -136,7 +136,7 @@ def poison_past_cap(eng) -> int:
     """Fill the guards after every KV head's regions (K rows, K scales, V^T, V scales: cap
     tokens each) of a `guarded` image with 0xFF bytes (fp32 -NaN words, int8 -1): a program
     that reads past the cache's capacity reads them. Returns the regions poisoned."""
-    from opentpu.compiler import Affine
+    from opentpu.compiler import Affine, k_scale_bytes
     img = eng.image
     cap, D = img.cap, img.cfg.D
     bad = np.full(GUARD, 0xFF, np.uint8)
@@ -146,7 +146,7 @@ def poison_past_cap(eng) -> int:
         for li in range(img.spec.layers):
             for kv in getattr(m.layer(li), "kvs", ()):
                 for r in kv.heads.values():
-                    for name, size in (("k", cap * kv.d), ("ks", 4 * cap * (kv.d // D)),
+                    for name, size in (("k", cap * kv.d), ("ks", cap * k_scale_bytes(kv.d, D)),
                                        ("vt", kv.d * cap), ("vs", 4 * cap)):
                         eng.backend.write(s, Affine.of(r[name]).static() + size, bad)
                         n += 1

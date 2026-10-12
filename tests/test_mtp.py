@@ -214,7 +214,10 @@ def test_mtp_loop_on_the_device_is_plain_greedy(P, drafter, fmt, N, stop):
     the last fed one by one. kh16: the 0.8B's and 2B's 16 DeltaNet heads, whose addresses
     take an argument register of the verify's, so its last arguments move into the released
     registers of the row tokens', each at its own release (Builder._move_arg)."""
-    _, W, spec = _tiny_model(16, 16) if fmt == "kh16" else _tiny_model(8)
+    # (the stop case: tokens that vary, init 0.2; at 0.02 the MX numerics' tokens are one
+    # token repeated)
+    _, W, spec = _tiny_model(16, 16) if fmt == "kh16" else _tiny_model(8, init=0.2 if stop
+                                                                         else 0.02)
     cfg = board_config(DRAM_BYTES=1 << 26, DSTEP=True, STREAM=True, PAIR=True) \
         if fmt == "kh16" else CFG
     if fmt == "emb8":
@@ -224,8 +227,9 @@ def test_mtp_loop_on_the_device_is_plain_greedy(P, drafter, fmt, N, stop):
     prompt = [int(t) for t in np.random.default_rng(P).integers(0, 1000, P)]
     want = _plain(spec, W, prompt, N, kw, cfg)
     ids = None
-    if stop:                                # the first token of a second kind stops it
-        k = next((i for i, t in enumerate(want) if t != want[0]), len(want) - 1)
+    if stop:                                # the second of the first accepted pair stops it
+        k = 2
+        assert want[k] not in want[:k]
         ids = [want[k]]
         want = want[:k + 1]
     right = np.zeros(514, np.float32)
@@ -299,8 +303,9 @@ def test_mtp_sampled_loop_is_plain_sampling(P, drafter, how, N, stop):
     prompt = [int(t) for t in np.random.default_rng(P).integers(0, 1000, P)]
     want, ref, hits = _plain_sampled(spec, W, prompt, N, samp, 5, cfg)
     ids = []
-    if stop:                                # the first token of a second kind stops it
-        k = next((i for i, t in enumerate(want) if t != want[0]), len(want) - 1)
+    if stop:                                # the second of the first accepted pair stops it
+        k = 2
+        assert want[k] not in want[:k]
         ids = [want[k]]
         want, ref, _ = _plain_sampled(spec, W, prompt, N, samp, 5, cfg, ids)
         assert len(want) == k + 1

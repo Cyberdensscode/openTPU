@@ -10,9 +10,9 @@ is its layout, and changing layout is an instruction.
 | Layout | Where | Created by | Consumed by |
 |---|---|---|---|
 | `Tensor` | DRAM fp32, row-major with a row stride | runtime `Input`/`Output` | `ol.load`, `ol.store` |
-| `QTensor` | DRAM int8 rows plus fp32 block scales (or 4-bit rows plus scale words, `wf`; docs/quant.md) | runtime `Weight`, KV cache views | the streamed operand of `ol.dot` |
+| `QTensor` | DRAM rows in an MXU format (`wf`: int8, int4, fp4, nvfp4) plus a scale row per row: its fp32 Sw, then its blocks' offsets (docs/quant.md "The MX formats"); `k0` the first block a column slice reads, `rsc` Sw alone (the K cache at d = D) | runtime `Weight`, KV cache views | the streamed operand of `ol.dot` |
 | `Tile` | TMEM fp32, base + shape + row stride | load, VPU ops, dot | VPU ops, quantize, store |
-| `Stationary` | ACT RAM int8 rows plus scales | `ol.quantize` | the stationary operand of `ol.dot` |
+| `Stationary` | ACT RAM int8 rows plus a scale per row and QACT range and offsets per D/4 (`qranges`) | `ol.quantize` | the stationary operand of `ol.dot` |
 | `Bcast` | a view of a 1-D tile as a column or row | `v[:, None]`, `v[None, :]` | VPU B-operand modes |
 
 Layout transitions are the data movement:
@@ -28,7 +28,8 @@ Layout transitions are the data movement:
 | `ol.all_reduce(x)` | `GATHER` + `VOP` adds | every slice gets the sum of all slices' `x` |
 | `ol.kv_append(kv, h, pos, k, v)` | two `QST` | TMEM fp32 to DRAM int8 in the cache layouts |
 
-The KV cache (`compiler.KVDesc`): K token-major `[cap, d]` with block scales; V transposed,
+The KV cache (`compiler.KVDesc`): K token-major `[cap, d]` with a scale row per token
+(`k_scale_bytes`: its fp32 scale at d = D, read by MM RSC; else an int8 scale row); V transposed,
 `[d, cap]`, stored in tiles of 256 tokens (`VT_TILE`, the attention block) when the capacity is
 a multiple of 256: tile *i* holds tokens 256*i .. 256*i + 255 of every row, `[d, 256]`
 contiguous. P.V of one attention block then streams one contiguous 32 KB tile in full bursts
@@ -48,6 +49,12 @@ byte is read from DRAM exactly once per `dot`. The optional arguments map to MM 
 | `acc=t, acc_scale=alpha` | `ACC` + `ASCALE` | `t[i, j] = t[i, j] * alpha[i] + (a @ w.T)[i, j]` in the drain |
 
 `ol.max(dot(...), axis=1)` on an unnamed result is rewritten to `rowmax` automatically.
+
+An MM's rows read one activation scale (docs/isa.md "MM"), so `dot` runs one MM per QACT range
+of the stationary operand (`Stationary.qranges`: one range unless parts were quantized on
+their own), the first as asked and the rest `ACC`, `RMAX` on the last. A column slice of a
+scaled weight moves the MM's `k0` (an immediate): at a run-time or loop-dependent column the
+weight must be stored in column parts (`QTensor.parts`, each with its own scale rows).
 
 ## Broadcasting
 

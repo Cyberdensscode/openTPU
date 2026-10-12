@@ -970,12 +970,13 @@ def main(argv=None):
     ap.add_argument("--repetition-penalty", type=float)
     ap.add_argument("--seed", type=int)
     ap.add_argument("--max-new", type=int, default=1024, help="tokens per reply at most")
-    ap.add_argument("--wformat", default=FM.AUTO, choices=[FM.AUTO, "int8", "fp4", "int4", FM.MIX],
+    ap.add_argument("--wformat", default=FM.AUTO,
+                    choices=[FM.AUTO, "int8", "fp4", "int4", "nvfp4", FM.MIX],
                     help="weight format of the layers (docs/quant.md; fp4 needs a bitstream "
                          "with 4-bit MM support): auto (default) is the model's recommended "
                          "mix of int8 and fp4 where it has one (mix, docs/formats.md), else "
                          "int8")
-    ap.add_argument("--head-format", default=None, choices=["int8", "fp4", "int4"],
+    ap.add_argument("--head-format", default=None, choices=["int8", "fp4", "int4", "nvfp4"],
                     help="weight format of the LM head (default: --wformat)")
     ap.add_argument("--no-prog-cache", action="store_true",
                     help="compile the decode loop's bucket programs in every process (by "

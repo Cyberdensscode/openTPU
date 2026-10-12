@@ -35,7 +35,85 @@ Vivado) while the format was built. 4-bit weights have run on the card since: th
 results table has the card's speeds, and tools/validate.py's card runs give the ISA simulator's
 tokens and logits bit for bit (README, "Validating against Hugging Face").
 
-## Formats
+The MX MXU ([mx_mxu.md](mx_mxu.md)) replaced these formats' scales: the next section is what
+the code does now; the sections after it are the survey and the 4-bit MXU before MX.
+
+## The MX formats
+
+Every MM output is one exact integer and every scale under a row's fp32 scale is a power-of-two
+shift (docs/isa.md "MM", "Weight formats", "Quantization"). `opentpu/quant.py` has the formats,
+their quantizers (`quantize_mxu`, through the image cache `opentpu/qcache.py`) and the float64
+emulation the models' `emulated_logits`, `tools/formats_scan.py` and `tools/validate.py` use.
+The names are the old ones; the formats are those of docs/mx_mxu.md 3.3:
+
+| name (WF) | elements | scale row of a weight row (bytes) | quantizer |
+|---|---|---|---|
+| `int8` (0): int8x | int8 | Sw, a dw byte per block (4 + 4 ceil(KB/4)) | QST's own (`fp32.quantize_mx`, groups of D): Sw = amax / 127, dw the block's offset |
+| `int4` (1): int4x | int4 | Sw, a reserved word, a word per block: dw and four 6-bit m (8 + 8 ceil(KB/2)) | as fp4 |
+| `fp4` (2): fp4x6 | E2M1 (codes 2x) | as int4 | Sw = the row's largest sub-block scale / 63, dw per block, m in 1..63 per D/4 by a 13-point squared-error search |
+| `nvfp4` (3) | E2M1 (codes 2x) | Sw (16 x the row's fp32 scale), 3 reserved words, an E4M3 byte per D/8 (16 + 16 ceil(KB/2)) | amax / (448 x 6) per row, each E4M3 by the same search |
+
+Any kind may take any format (`opentpu/llm/formats.py`); `wformat`, `head_format` and the
+CLIs' `--wformat` take `nvfp4` too. `tools/quant_eval.py` (Hugging Face in fp32) has them as
+`mx-int8`, `mx-int4`, `mx-fp4` and `mx-nvfp4`, with QACT's MX activations by default
+(`--a8 mx`; `--a8 block` the survey's per-128 scales).
+
+- **Activations (a8x32).** QACT quantizes each row over its range with one fp32 scale and a
+  power-of-two offset per D/4. An MM's rows must read one scale, so the compiler runs one MM per
+  QACT range of the operand (`Stationary.qranges`; the rest ACC): the down projection's F chunks
+  (`kernels.mlp.down_chunk`), Qwen3.5's out_proj per head group, attention's P per 256-token
+  block. The emulations quantize over the same ranges (`quant.fake_act`, `MXAct`), with the
+  window's drops (`mx_matmul`: a group whose two offsets add up to more than W is left out).
+- **Column parts.** A matrix read in K-parts (W_down's F chunks, the routed experts', Gemma 4's
+  MLP, Qwen3.5's out_proj per head group) is quantized as whole rows, then stored in column parts
+  whose scale rows each repeat the row's Sw (`quant.column_parts`): every MM runs at k0 = 0, so
+  a part's scales never start mid-row (port A fetches 32-byte lines; an Sw outside the line of
+  the first block's scales costs a line). The only steady k0 > 0 left is Qwen3.5's last head
+  group's second pair (k0 = 2, 18 MMs of a Qwen3.5-0.8B token, in a 8- or 24-byte scale row),
+  which costs no line either: each row's Sw shares the line of its first block's scales or of
+  the previous row's last.
+- **KV cache.** K rows: one fp32 scale a row at d = D (QST ROW, read by MM RSC), else an int8
+  scale row (an offset per D-block, read as int8 weights: `compiler.k_scale_bytes`). V: int8
+  per token, its scales folded into P by QACT CSCALE (V^T streams UNIT).
+- **Tables.** Embedding rows, Gemma 4's head-as-embedding and PLE records are gathered by
+  one-hot MMs whose scale rows hold each block's Sw 2^-dw (int8: MM RSC) or the chunk's scale
+  row (4-bit): the MM's own scale arithmetic dequantizes, bit for bit what
+  `kernels.gather.dequant_gathered` / `dequant_records` give the host. No VPU dequantization.
+  These gather scales are a table of their own beside the element rows: a tied int8 LM head
+  that is also the resident decode's int8 embedding (`head_gsc`) writes them with the head
+  (`qwen3.put_head`), and Gemma 4's head-as-embedding holds vocab x `quant.gather_scale_bytes`
+  more (a 4-bit head: a 16-byte scale row per 256 elements, E4B 40 MiB; int8: an fp32 per
+  block, as before MX). A 4-bit PLE record carries the same 16 bytes a chunk (E4B: 6272 bytes,
+  5888 before). Against ee8f118d, at otpu-chat's defaults: E4B-it's image is 15.5 MiB smaller
+  (its int8 layers' scale rows shrink more than the head grows; its longest context at those
+  choices 5376 tokens, 4352 before), E2B-it's 34 MiB larger (62464 tokens, 66048 before);
+  E4B-it in fp4 (`--wformat fp4`) keeps its PLE table on the card up to 2304 tokens (11008
+  before), past that on the host (the image's own choice).
+- **Caches.** The qcache, imgcache, progcache and refcache keys hash the quantizer's sources
+  (qcache also `quant.MX_NUMERICS`): no entry of the MXU before MX is read. Expert pools carry
+  key 2 with `numerics` (`moe.pool_key`); a key 1 pool or one without a key is refused with how
+  to repack it (`tools/offload/pack_pool.py`), never misread.
+
+### Checkpoint imports
+
+`quant.import_mxfp4(codes, e8m0)` and `quant.import_nvfp4(codes, e4m3, tensor_scale)` take a
+checkpoint's 4-bit weights as they are, exactly (no requantization):
+
+- **OCP MXFP4** (E2M1, an E8M0 per 32): `fp4` when every K-block's four sub-block exponents
+  span at most 5 (m = 2^(e - the block's smallest), dw the block's below the row's top, Sw a
+  power of two); else `nvfp4` with mantissa-0 E4M3 bytes (subnormals 4, 2, 1 at the bottom) when
+  each row's exponents span at most 17; else `NotExact` (and on an E8M0 NaN). All-zero
+  sub-blocks take any exponent.
+- **NVFP4** (E2M1, an E4M3 per 16, an fp32 per tensor): every valid checkpoint comes in. Each
+  row's scales are re-based so that its largest has dw 0 (exponent field 15; the MXU reads 0x7F
+  as 15 x 2^0, so a largest of mantissa 7 needs no shift), subnormal scales renormalize, and the
+  ones more than 14 octaves below the row's largest become MXU subnormals, exact because E4M3's
+  own range spans at most 17 octaves with the low bits zero where they fall off. Sw = ts
+  2^(top - 1). `NotExact` on a negative or NaN scale, or a row scale outside fp32's normal range.
+- In both, the representation is exact; the MM's window (fp4 11, nvfp4 13 octaves with the
+  activations' offsets) still drops the products far below a row's top, as for any weight.
+
+## Formats (the survey, before MX)
 
 All formats quantize blocks of consecutive elements of a weight row (the K dimension the MXU
 reduces over). "bits" counts element bits plus the block scales; a per-tensor scale is ignored.
@@ -337,18 +415,18 @@ Why not the other scale formats in hardware:
   MXU can fetch in one cycle) and a per-tensor fp32 scale the MM has no field for.
 - The two-level scale uses the existing stream unchanged and keeps the integer tree exact.
 
-## ISA and DRAM layout
+## ISA and DRAM layout (before MX)
 
 `MM` flags bits 5:4 are the weight format `WF`: 0 int8, 1 int4, 2 E2M1 (docs/isa.md, "Weight
-formats"). A 4-bit row stores block k at `sa + n*rs + k*64` bytes (two blocks per 128-byte
-chunk, the element 2i in the low nibble); the scale word of block k is where the fp32 scale of an
-int8 row would be, `ssa + n*srs + 4k`: bits 15:0 the bf16 scale, bits 16+4b the multiplier of
-sub-block b. Rows are chunk aligned, so a column slice of a 4-bit matrix must start at an even
-block (the compiler checks this; W_down is chunked in multiples of 256 columns). Activations
-(`QACT`), the KV cache and `QST` stay int8: this is W4A8. `MM` flag bit6 `PAIR` and `QACT` flag
-bit3 `DUP` are column reuse (docs/isa.md, "Column reuse"); `PAIR` reads a chunk's two scale words
-as one 8-byte pair, so `ssa` and `srs` are multiples of 8 (the compiler falls back to half rate
-otherwise, e.g. a matrix with an odd block count and dense scale rows).
+formats"; today's layout: "The MX formats" above). A 4-bit row stores block k at `sa + n*rs + k*64`
+bytes (two blocks per 128-byte chunk, the element 2i in the low nibble); the scale word of block k
+is where the fp32 scale of an int8 row would be, `ssa + n*srs + 4k`: bits 15:0 the bf16 scale, bits
+16+4b the multiplier of sub-block b. Rows are chunk aligned, so a column slice of a 4-bit matrix
+must start at an even block (the compiler checks this; W_down is chunked in multiples of 256
+columns). Activations (`QACT`), the KV cache and `QST` stay int8: this is W4A8. `MM` flag bit6
+`PAIR` and `QACT` flag bit3 `DUP` are column reuse (docs/isa.md, "Column reuse"); `PAIR` reads a
+chunk's two scale words as one 8-byte pair, so `ssa` and `srs` are multiples of 8 (the compiler
+falls back to half rate otherwise, e.g. a matrix with an odd block count and dense scale rows).
 
 ## Using it
 
@@ -358,10 +436,10 @@ eng = Engine(spec, W, wformat="fp4")                       # every weight 4-bit
 eng = Engine(spec, W, wformat="fp4", head_format="int8")   # LM head int8
 ```
 
-`wformat` is `"int8"` (default), `"fp4"` or `"int4"`; the Qwen3, LFM2 and Qwen3.5 images all
-take it. `Config.PAIR` (a bitstream with CAPS bit5; `OTPU_PAIR=1` for the simulators) makes
+`wformat` is `"int8"` (default), `"fp4"`, `"int4"` or `"nvfp4"`; every family's image takes
+it. `Config.PAIR` (a bitstream with CAPS bit5; `OTPU_PAIR=1` for the simulators) makes
 the compiler use column reuse for every 4-bit MM of at most MCOLS/2 rows. For kernels, `runtime.Weight(w, shard, fmt="fp4")`. `opentpu/quant.py` has the
-quantizers (`quantize_w4`, `quantize_mxu`) and the reference formats of the survey.
+quantizers (`quantize_mxu`), the checkpoint imports and the reference formats of the survey.
 `tools/bench_llm.py` and `tools/perf_qwen.py` take `--wformat` and `--head-format`.
 
 ## Measured speed (simulated)
@@ -387,9 +465,13 @@ decoding) Qwen3-0.6B decodes 21.6 tokens/s in int8 and 31.3 with 4-bit layers an
 
 ## Tests
 
-- `tests/test_quant.py`: the rounding rules, bits per weight, pack/unpack round trips, the 4-bit
-  `MM` on the ISA simulator against float64 math on the dequantized weights (int4 and FP4, odd
-  and even block counts, UNIT and ACC), the MLP kernel at 4 bits.
+- `tests/test_quant.py`: the survey's rounding rules and bits per weight; the MX quantizers
+  against docs/mx_mxu.md's study (`tools/exp/mx_formats.py`) bit for bit, the scale rows and
+  their column parts; MM on the ISA simulator against the emulation for every format (with the
+  window's drops, a k0 column slice, an operand of two QACT ranges run as two MMs); the gathers'
+  one-hot MMs against the host's dequantization; the MXFP4 / NVFP4 imports, exact (and their
+  MMs). `tests/test_mx.py` holds the ISA simulator to the definition; `tests/test_pair.py`
+  PAIR's row choice and epilogues.
 - `tests/test_rtl.py`: the random-program fuzzers and the scoreboard stress tests now draw
   int4 and FP4 MMs too (also on the AXI memory path with random stalls), and a 4-bit MLP at
   D = 32 and D = 128. RTL and ISA simulator agree bit for bit.
@@ -408,5 +490,5 @@ decoding) Qwen3-0.6B decodes 21.6 tokens/s in int8 and 31.3 with 4-bit layers an
   weights; the simulation stops if it meets one.
 - Column reuse needs a free column: MMs of more than MCOLS/2 rows (prefill chunks, batched
   decode) run at half rate.
-- Calibration-based quantization (GPTQ, AWQ) and importing MXFP4 / NVFP4 checkpoints. An MXFP4
-  block converts exactly only when its four scales span at most 2^3, and NVFP4 not in general.
+- Calibration-based quantization (GPTQ, AWQ). (MXFP4 / NVFP4 checkpoints import exactly on the
+  MX MXU: "Checkpoint imports" above.)

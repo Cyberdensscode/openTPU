@@ -781,10 +781,10 @@ def test_pool_key_refuses_another_images_pool(tiny, tmp_path, monkeypatch, capsy
     the layout, the checkpoint's config.json), written with a new pool (pack_pool init, or the
     Engine's), is checked whenever the pool is opened: a pool of the same size packed in
     another format (int4 against fp4), by another quantizer or from another checkpoint is
-    refused with how to repack it. A pool without a key (packed before keys) serves with a
-    one-line warning until pack_pool stamp writes its key; info tells int8 from 4-bit by the
-    key, or without one by the slot size. send puts the key first in its stream, and recv
-    refuses a stream packed for another image."""
+    refused with how to repack it, and so is a pool of the MXU before MX (a key 1, or no key
+    at all: packed before keys) until pack_pool stamp writes its key (after `sums`); info tells
+    int8 from 4-bit by the key, or without one by the slot size. send puts the key first in its
+    stream, and recv refuses a stream packed for another image."""
     import json
     import runpy
     import sys
@@ -842,17 +842,20 @@ def test_pool_key_refuses_another_images_pool(tiny, tmp_path, monkeypatch, capsy
     with pytest.raises(ValueError, match="checkpoint differ"):
         engine(a)
     cj.write_text(conf)
+    old = {k: v for k, v in key.items() if k != "numerics"}     # a key 1 pool: before MX
+    kf.write_text(json.dumps(dict(old, key=1)))
+    with pytest.raises(ValueError, match="key, numerics differ.*Repack it"):
+        engine(a)
     kf.unlink()                                         # a pool packed before keys
-    assert np.array_equal(engine(a).view(np.uint32), want.view(np.uint32))
-    err = capsys.readouterr().err.strip().splitlines()
-    assert len(err) == 1 and "has no key file" in err[0] and "stamp" in err[0]
+    with pytest.raises(ValueError, match="has no key file.*before MX.*stamp"):
+        engine(a)
     run(m, a, "info")
     assert out_line(capsys) == "4-bit (fp4 or int4: the same size)"
     run(m, a, "stamp")
     assert json.loads(kf.read_text()) == key
     with pytest.raises(SystemExit, match="has a key already: this one"):
         run(m, a, "stamp")
-    engine(a)
+    assert np.array_equal(engine(a).view(np.uint32), want.view(np.uint32))
     assert "warning" not in capsys.readouterr().err
     with pytest.raises(SystemExit, match="not this model's pool in this format"):
         run(m, a, "stamp", "--wformat", "int8")

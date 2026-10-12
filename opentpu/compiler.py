@@ -215,14 +215,19 @@ class Tensor:
 
 @dataclass
 class QTensor:
-    """int8 matrix [rows, cols] with fp32 scales per (row, D-block) -- the MXU streamed operand.
+    """A weight matrix [rows, cols] in an MXU format -- the MXU's streamed operand: element rows
+    rs bytes apart and a scale row per row, srs bytes apart (docs/isa.md "Weight formats": the
+    row's fp32 Sw, then its blocks' power-of-two offsets and multipliers).
 
     `scale is None` means unit scales (e.g. V^T, whose per-token scale is folded into P).
+    `k0`: the matrix's first block within its scale rows (a column slice keeps the rows' scale
+    address and moves k0: MM's k0). `rsc`: the scale rows are Sw alone (MM RSC: the K cache of
+    one block a token, quantized by QST ROW).
     `parts`: the matrix is stored as separate column slices of width `pw` (each with its own
-    contiguous rows and scales, so a column-slice MM streams contiguous scales); it can then
-    only be sliced into whole parts.
-    `wf`: the element format (isa.W8; or W4I / W4F: 4-bit elements, D/2 bytes per D-block, and
-    a two-level scale word per D-block, docs/isa.md "Weight formats").
+    contiguous rows and scale rows, so a column-slice MM streams contiguous scales and a part
+    at a loop-dependent column is an address); it can then only be sliced into whole parts.
+    `wf`: the element format (isa.W8 int8; W4I / W4F / WNV: 4-bit elements, D/2 bytes per
+    D-block, docs/isa.md "Weight formats").
     `tiles`: (tb, tstride): the columns are stored in tiles of tb (each tile rows x tb, row
     stride rs = tb, tiles tstride bytes apart; int8, unscaled: the V^T cache). A column slice
     must stay within one tile.
@@ -237,6 +242,17 @@ class QTensor:
     pw: int = 0
     wf: int = 0
     tiles: tuple | None = None
+    k0: int = 0
+    rsc: bool = False
+
+    @staticmethod
+    def weight(data, scale, n: int, k: int, fmt: str, D: int, **kw) -> "QTensor":
+        """The descriptor of an [n, k] matrix in MXU format `fmt` ("int8", "int4", "fp4",
+        "nvfp4", opentpu/quant.py quantize_mxu's rows): element rows row_bytes apart, scale rows
+        scale_bytes apart."""
+        from . import quant as Q
+        return QTensor(Affine.of(data), Affine.of(scale), (n, k), Q.row_bytes(k, fmt, D),
+                       Q.scale_bytes(k, fmt, D), D, wf=Q.mxu_wf(fmt), **kw)
 
     def padded_cols(self, r0, nr: int, c0, nc: int, valid: int) -> "QTensor":
         """Rows [r0, r0+nr), columns [c0, c0+nc) of which the first `valid` are real (the rest
@@ -279,13 +295,24 @@ class QTensor:
             data = self.data + r0 * self.rs + c0
         else:                     # 4-bit rows stream whole D-byte chunks of two D-blocks
             data = self.data + r0 * self.rs + c0.div_exact(2 * self.D) * self.D
-        scale = None
+        scale, k0 = None, self.k0
         if self.scale is not None:
-            scale = self.scale + r0 * self.srs + c0.div_exact(self.D) * 4
-        return QTensor(data, scale, (nr, nc), self.rs, self.srs, self.D, wf=self.wf)
+            # the rows' scale rows stay where they are (each starts with its Sw): a column
+            # slice starts at block k0 of them, an immediate of the MM
+            if not c0.is_static and not self.rsc:
+                raise CompileError(f"a column slice of a scaled matrix at a run-time or "
+                                   f"loop-dependent column ({c0}): its first block is MM's k0, "
+                                   f"an immediate; store the matrix in column parts")
+            scale = self.scale + r0 * self.srs
+            if not self.rsc:
+                k0 += c0.div_exact(self.D).static()
+        return QTensor(data, scale, (nr, nc), self.rs, self.srs, self.D, wf=self.wf, k0=k0,
+                       rsc=self.rsc)
 
 
 VT_TILE = 256          # V^T cache tile (tokens): the attention block (qwen3.ATTN_BLOCK)
+QACT_KB_MAX = 255      # QACT's blocks (the RTL's field)
+QST_KB_MAX = 1024      # QST's blocks without ROW (the RTL's limit)
 
 
 def vt_tile(cap: int) -> int:
@@ -326,10 +353,18 @@ def vt_untiled(flat: np.ndarray, d: int, cap: int) -> np.ndarray:
     return flat.reshape(cap // tb, d, tb).transpose(1, 0, 2).reshape(d, cap)
 
 
+def k_scale_bytes(d: int, D: int) -> int:
+    """Bytes of a K cache token's scale row (KVDesc.k): 4 (its fp32 scale) for a head of one
+    block, else an int8 scale row of d / D blocks."""
+    from . import quant as Q
+    return Q.scale_bytes(d, "int8", D, rsc=d == D)
+
+
 class KVDesc:
     """Per-slice view of a KV cache whose heads are dealt round-robin over slices.
 
-    Layout per head: K token-major int8 [cap, d] + scales [cap, d/D]; V^T dim-major int8
+    Layout per head: K token-major int8 [cap, d] + a scale row per token (k_scale_bytes: its
+    fp32 scale at d = D, else an int8 scale row); V^T dim-major int8
     [d, cap] in tiles of tb = vt_tile(cap) tokens: tile i holds tokens [i*tb, (i+1)*tb) of every
     row, [d, tb] contiguous (so P.V of an attention block streams one contiguous tile, and a
     token's column stays within a few DRAM rows at any capacity); one V scale per token [cap]
@@ -351,9 +386,12 @@ class KVDesc:
         return self.heads[h]
 
     def k(self, h: int) -> QTensor:
+        """K [cap, d]: int8 rows, a token's scale row per row (k_scale_bytes): at d = D its
+        fp32 scale alone (QST ROW, MM RSC), else an int8 scale row (QST: the token's S and an
+        offset per block)."""
         e = self._h(h)
         return QTensor(Affine.of(e["k"]), Affine.of(e["ks"]), (self.cap, self.d), self.d,
-                       4 * (self.d // self.D), self.D)
+                       k_scale_bytes(self.d, self.D), self.D, rsc=self.d == self.D)
 
     def vt(self, h: int) -> QTensor:
         e = self._h(h)
@@ -594,11 +632,35 @@ class _Parts:
 class Stationary:
     """A tile quantized into ACT RAM blocks [ab, ab+KB), in chunks of up to ACT_ROWS rows.
     `pair`: its rows are also in ACT rows M..2M-1 (QACT DUP), so 4-bit MMs run at full rate
-    (MM PAIR)."""
+    (MM PAIR). `qranges`: the block ranges [k0, k1) each QACT wrote (None: one, all KB blocks):
+    every row has one Sa per QACT, and an MM reads the blocks of one Sa only (docs/isa.md
+    "MM"), so dot() runs an MM per range and adds them up (MM ACC)."""
 
-    def __init__(self, src: Tile, chunks: list, KB: int, owners: list, pair: bool = False):
+    def __init__(self, src: Tile, chunks: list, KB: int, owners: list, pair: bool = False,
+                 qranges: list | None = None):
         self.src, self.chunks, self.KB, self.owners = src, chunks, KB, owners
         self.pair = pair
+        self.qranges = qranges
+
+    def add_qrange(self, k0: int, k1: int) -> None:
+        """Blocks [k0, k1) were written by one QACT (a part filled by quantize_into): they
+        replace what other ranges they overlap."""
+        rs = [(a, b) for a, b in (self.qranges or []) if b <= k0 or a >= k1]
+        self.qranges = sorted(rs + [(k0, k1)])
+
+    def ranges(self) -> list:
+        """The QACT ranges [(k0, k1)] covering its KB blocks, in order (CompileError on a block
+        no QACT wrote)."""
+        rs = self.qranges if self.qranges is not None else [(0, self.KB)]
+        k = 0
+        for a, b in rs:
+            if a != k:
+                break
+            k = b
+        if k != self.KB:
+            raise CompileError(f"a stationary operand's blocks {k}.. were not quantized "
+                               f"(QACT ranges {rs} of {self.KB} blocks)")
+        return list(rs)
 
     def blocks(self, k: int, kb: int = 1) -> "Stationary":
         """Its ACT RAM blocks [k, k + kb) as a stationary operand of their own (the same rows,
@@ -612,7 +674,11 @@ class Stationary:
         D = self.src.b.cfg.D
         src = self.src[:, k * D:(k + kb) * D] if len(self.src.shape) == 2 else \
             self.src[k * D:(k + kb) * D]
-        v = Stationary(src, [(ab + k, mc)], kb, list(self.owners))
+        qr = None
+        if self.qranges is not None:
+            qr = [(max(a, k) - k, min(b, k + kb) - k) for a, b in self.qranges
+                  if a < k + kb and b > k]
+        v = Stationary(src, [(ab + k, mc)], kb, list(self.owners), qranges=qr)
         v.loop, v.parent = getattr(self, "loop", None), self
         return v
 
@@ -1335,6 +1401,9 @@ class Builder:
         if x.cols % D:
             raise CompileError(f"reduction dim {x.cols} must be a multiple of D={D}")
         KB = x.cols // D
+        if KB > QACT_KB_MAX:
+            raise CompileError(f"QACT of {KB} blocks: at most {QACT_KB_MAX} (its field); quantize "
+                               f"the operand in ranges")
         src, rs, cs, rsc = x.base, (x.rs if len(x.shape) == 2 else x.cols), None, None
         fused = self.fuse_cscale(x) if temp and rscale is None and cscale is None else None
         if fused is not None:
@@ -1373,8 +1442,9 @@ class Builder:
     def stationary(self, rows: int, cols: int) -> Stationary:
         """ACT RAM blocks for a stationary operand of `rows` rows (at most ACT_ROWS) and `cols`
         columns, filled in parts of whole blocks by quantize_into (a tiled prefill's attention
-        output: a KV head's columns at a time). Each part's QACT quantizes its blocks as a
-        quantize of the whole tile would (per row and block), so the operand is the same."""
+        output: a KV head's columns at a time). Each part's QACT gives its blocks a row scale of
+        their own (docs/isa.md "QACT"), so a dot over the operand runs an MM per part
+        (Stationary.qranges) and adds them up (MM ACC)."""
         D = self.cfg.D
         if cols % D:
             raise CompileError(f"reduction dim {cols} must be a multiple of D={D}")
@@ -1382,7 +1452,7 @@ class Builder:
             raise CompileError(f"a stationary of {rows} rows: ACT RAM holds {self.cfg.act_rows}")
         KB = cols // D
         pair = self.cfg.PAIR and 2 * rows <= self.cfg.MCOLS
-        st = Stationary(_Parts(self, rows, cols), [], KB, [], pair)
+        st = Stationary(_Parts(self, rows, cols), [], KB, [], pair, qranges=[])
         ab, owner = self.act_alloc(KB)
         for k in builtins.range(ab, ab + KB):
             self.act_live[k] = weakref.ref(st)
@@ -1408,6 +1478,7 @@ class Builder:
         rs = x.rs if len(x.shape) == 2 else x.cols
         self.emit(I.qact(x.base, mc, ab + col // D, x.cols // D, rs, dup=st.pair,
                          comment="quantize -> ACT (part)" + (" dup" if st.pair else "")))
+        st.add_qrange(col // D, (col + x.cols) // D)
 
     def fuse_cscale(self, x: Tile):
         """quantize(a * v[None, :]) with the product an unnamed temp just computed: drop the
@@ -1681,22 +1752,40 @@ class Builder:
                        or getattr(out, "spare", 0) < M or out.rs < N):
             raise CompileError("dot(rowmax=True) needs M <= MCOLS and an output tile from "
                                "ol.empty/zeros/full (they reserve the row-max area)")
-        # PAIR reads a chunk's two scale words as one 8-byte-aligned pair
-        pair = st.pair and w.wf != I.W8 and (w.scale is None or (
-            w.srs % 8 == 0 and Affine.of(w.scale).const % 8 == 0
-            and all(c * getattr(v, "align", 1) % 8 == 0
+        unit = w.scale is None
+        # PAIR reads a chunk's two blocks' scales at once: 8-byte (nvfp4: 16-byte) aligned rows
+        # and an even first block
+        al = 16 if w.wf == I.WNV else 8
+        pair = st.pair and w.wf != I.W8 and (unit or w.rsc or (
+            w.k0 % 2 == 0 and w.srs % al == 0 and Affine.of(w.scale).const % al == 0
+            and all(c * getattr(v, "align", 1) % al == 0
                     for v, c in Affine.of(w.scale).terms.items())))
-        m0 = 0
-        for ab, mc in st.chunks:
-            ins = I.mm(sa, ssa, out.base + m0 * ors, N, st.KB, w.rs, ors, mc, ab, w.srs,
-                       unit=w.scale is None, acc=acc is not None, rmax=rowmax, wf=w.wf,
-                       pair=pair,
-                       ascale=acc_scale.base if acc_scale is not None else None, ra=ra, rb=rb,
-                       comment=f"mm {M}x{K} . {N}x{K}^T" + (" pair" if pair else "")
-                       + (" +rowmax" if rowmax else "")
-                       + (" acc*=scale" if acc_scale is not None else ""))
-            self.emit(ins)
-            m0 += mc
+        # one MM per QACT range of the operand (an MM's rows read one Sa: docs/isa.md "MM"),
+        # added up in the output: the first as asked (overwrite, ACC or ASCALE), the rest ACC;
+        # RMAX on the last, whose written values are the sums
+        bpb = self.cfg.D if w.wf == I.W8 else self.cfg.D // 2   # streamed bytes per block
+        parts = st.ranges()
+        for i, (k0, k1) in enumerate(parts):
+            if (k0 * bpb) % self.cfg.D:
+                raise CompileError(f"dot: a QACT range starting at block {k0} of 4-bit weights "
+                                   f"(their D-byte chunks hold two blocks): split the operand "
+                                   f"at even blocks")
+            first, last = i == 0, i == len(parts) - 1
+            kp = 0 if unit or w.rsc else w.k0 + k0
+            ppair = pair and kp % 2 == 0
+            m0 = 0
+            for ab, mc in st.chunks:
+                ins = I.mm(sa + k0 * bpb, ssa, out.base + m0 * ors, N, k1 - k0, w.rs, ors, mc,
+                           ab + k0, w.srs, unit=unit, acc=acc is not None or not first,
+                           rmax=rowmax and last, wf=w.wf, pair=ppair, k0=kp, rsc=w.rsc,
+                           ascale=acc_scale.base if acc_scale is not None and first else None,
+                           ra=ra, rb=rb,
+                           comment=f"mm {M}x{K} . {N}x{K}^T"
+                           + (f" part {k0}:{k1}" if len(parts) > 1 else "")
+                           + (" pair" if ppair else "") + (" +rowmax" if rowmax and last else "")
+                           + (" acc*=scale" if acc_scale is not None and first else ""))
+                self.emit(ins)
+                m0 += mc
         self.bump_version(out.buf)
         if (acc is None and len(st.chunks) == 1 and M <= self.cfg.MCOLS and len(out.shape) == 2
                 and getattr(out, "spare", 0) >= M and out.rs >= N):
@@ -1712,6 +1801,8 @@ class Builder:
         rb, dimm = self.addr(dst)
         rc, simm = self.addr(sdst)
         rs = x.rs if len(x.shape) == 2 else x.cols
+        if not row_scale and x.cols // D > QST_KB_MAX:
+            raise CompileError(f"QST of {x.cols // D} blocks without ROW: at most {QST_KB_MAX}")
         self.emit(I.qst(x.base, dimm, simm, x.rows, x.cols // D, rs, drs, es, row=row_scale,
                         half=half, rb=rb, rc=rc, comment="quantized store"))
 
@@ -1821,7 +1912,8 @@ _TRACE_CODE = Kernel.trace.__code__
 def trace_fit(kernel: Kernel, cfg: Config, sid: int, bound) -> Builder:
     """kernel.trace(cfg, sid, bound()), and when its tiles do not fit TMEM placed next-fit (the
     free words split into gaps too small: a small TMEM), the trace again with best-fit
-    placement. For the programs that have no smaller form to fall back to (a decode step):
+    placement. For the programs that have no smaller form to fall back to (a decode step, a
+    generate bucket's split form):
     the compiles that probe (a prefill run's rows, a prompt run's, a generate bucket's single
     program) keep next-fit's answer, so a program that fits next-fit is placed as before.
     `bound` makes the arguments (fresh descriptors for the second trace)."""

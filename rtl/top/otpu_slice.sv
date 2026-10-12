@@ -39,8 +39,10 @@ module otpu_slice
   parameter int WIN        = 32,
   parameter int RPB        = 4,       // TMEM reads per bank per cycle
   parameter int WPB        = 2,       // TMEM writes per bank per cycle
-  parameter int MXU_IMPL   = 0,       // MXU dot product: 0 adder tree, 1 DSP cascade chains, 2 systolic
+  parameter int MXU_IMPL   = 2,       // MXU dot product: 2 systolic, the only one (docs/mxu_systolic.md)
   parameter int MXU_CL     = 16,      // cascade chain length
+  parameter int MXU_E      = 0,       // MXU epilogue lanes (0: MCOLS / 2; otpu_mxu E)
+  parameter int QUANT_XD   = 1024,    // quantizer row buffer chunks (0: two passes over TMEM; otpu_quant XD)
   parameter int VPU_CL     = (LANES >= 8) ? LANES / 4 : 1,  // VPU lanes with the composite functions
   parameter int ULANES     = LANES,   // TMEM lanes of the MXU and the quantizer (<= LANES)
   parameter int PQ_WIN     = 64,      // cycles per P/Q counter window (+bucket= in simulation)
@@ -73,8 +75,7 @@ module otpu_slice
   output logic [31:0]   sw_wdata,
   output logic [3:0]    sw_be,
   input  logic          a_rvalid,
-  input  logic [31:0]   a_rdata,
-  input  logic [31:0]   a_rdata2,   // the other word of a_rdata's 8-byte pair (MM PAIR scales)
+  input  logic [255:0]  a_rdata,    // the aligned 32 bytes holding the word read (MM scale lines)
   output logic          b_req,
   output logic          b_tag,
   output logic          b_we,
@@ -245,14 +246,15 @@ module otpu_slice
   logic                   asc_we;
   logic [7:0]             act_row, asc_row, act_off;
   logic                   act_dup;
-  logic [31:0]            act_idx, asc_data;
+  logic [31:0]            act_idx;
+  logic [63:0]            asc_data;     // {da3, da2, da1, da0, Sa}
   logic [15:0]            asc_blk, act_rblk, act_rblk2;
   logic [MCOLS-1:0]       act_rhi;
   logic [7:0]             act_rgrp;
   logic                   act_ren;
   logic                   mxu_pop;       // the MXU consumes a block this cycle (its ACT read)
   logic [MCOLS*D*8-1:0]   act_rdata;
-  logic [MCOLS*32-1:0]    act_rscale;
+  logic [MCOLS*64-1:0]    act_rscale;
   otpu_actram #(.D(D), .MCOLS(MCOLS), .ROWS(ACT_ROWS), .BLOCKS(ACT_BLOCKS), .LANES(ULANES)) u_act (
     .clk, .we(act_we), .w_row(act_row), .w_idx(act_idx), .w_data(act_data), .w_dup(act_dup),
     .w_off(act_off), .swe(asc_we),
@@ -319,18 +321,23 @@ module otpu_slice
     .ss_y_v, .ss_y_d, .ss_o_v, .ss_o_d);
 
   otpu_mxu #(.D(D), .MCOLS(MCOLS), .ROWS(ACT_ROWS), .DEPTH(FIFO_DEPTH), .LANES(ULANES), .IMPL(MXU_IMPL),
-             .CL(MXU_CL), .SID(SID)) u_mxu (
+             .CL(MXU_CL), .E(MXU_E), .SID(SID)) u_mxu (
     .clk, .rst(rst_mxu), .start(ustart[U_MXU]), .go(urel), .cmd(ucmd[U_MXU]), .rdy(r_mxu), .done(d_mxu),
     .computing(mxu_pop), .pf_level(mxu_level), .pf_starve(mxu_starve), .pf_block(mxu_block),
     .pf_u(mxu_u), .pf_uv(mxu_uv),
     .act_blk(act_rblk), .act_blk2(act_rblk2), .act_hi(act_rhi), .act_grp(act_rgrp), .act_ren, .act_data(act_rdata), .act_scale(act_rscale),
-    .a_req(mxu_areq), .a_addr(mxu_aaddr), .a_gnt(mxu_agnt), .a_rvalid, .a_rdata, .a_rdata2,
+    .a_req(mxu_areq), .a_addr(mxu_aaddr), .a_gnt(mxu_agnt), .a_rvalid, .a_rdata,
     .b_req(mxu_breq), .b_addr(mxu_baddr), .b_gnt(mxu_bgnt), .b_rvalid(b_rvalid && !b_rtag),
     .b_rdata,
     .t_ren(mxu_ren), .t_raddr(mxu_raddr), .t_rdata(r_data[P_MXU][ULANES-1:0]),
     .t_wen(mxu_wen), .t_waddr(mxu_waddr), .t_wdata(mxu_wdata), .t_gnt(gnt[G_MXU]));
 
-  otpu_quant #(.D(D), .LANES(ULANES), .SID(SID)) u_quant (
+  // the quantizer's group maxes of a row (MX offsets; not ROW mode): a QACT's 4 KB (KB <=
+  // ACT_BLOCKS: the ACT RAM's bound) and a QST's KB (its row in TMEM: KB <= TMEM_WORDS / D), so
+  // every QACT and QST the ISA's bounds allow fits (the card: 512)
+  localparam int QG = (4 * ACT_BLOCKS > TMEM_WORDS / D) ? 4 * ACT_BLOCKS : TMEM_WORDS / D;
+  localparam int Q_GR = (QG <= 8) ? 8 : (1 << $clog2(QG));
+  otpu_quant #(.D(D), .LANES(ULANES), .GR(Q_GR), .XD(QUANT_XD), .SID(SID)) u_quant (
     .clk, .rst(rst_q), .start(ustart[U_Q]), .cmd(ucmd[U_Q]), .rdy(r_q), .done(d_q), .gnt(gnt[G_Q]),
     .t_ren(q_ren), .t_raddr(q_raddr), .t_rdata(r_data[P_Q][ULANES-1:0]),
     .t_ren2(q_ren2), .t_raddr2(q_raddr2), .t_rdata2(r_data[P_Q2][ULANES-1:0]),
@@ -691,6 +698,10 @@ module otpu_slice
   // board's trace buffer records (otpu_trace.sv, opentpu/hwtrace.py)
   bit trace;
   initial trace = $test$plusargs("trace");
+  // the MXU's scale reads (otpu_mxu xs_*; rtlsim stats["mxu_scale"]): port A line requests, and
+  // those that fetched a row's Sw alone
+  always @(posedge clk)
+    if (dump) $display("MXSCALE s%0d areq=%0d sw=%0d", SID, u_mxu.xs_a, u_mxu.xs_sw);
   always_ff @(posedge clk)
     if (trace) begin
       if (pf.sq.g) $display("T%0d G c=%0d s=%0d", SID, pf.sq.cyc, pf.sq.g_slot);

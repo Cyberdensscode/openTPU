@@ -10,7 +10,8 @@ build different layouts (lookup tables, rows, KV capacity) from the same matrice
 quantization jobs' matrices go through quantize_mxu in its worker processes).
 
 The key is the matrix's content: a hash of its fp32 bytes and shape, the format, D, the
-quantizer's parameters (the scale search), the source of quant.py and the numpy version. Any
+quantizer's parameters (the scale search), the MXU's numerics (quant.MX_NUMERICS: no entry of
+the MXU before MX is read), the source of quant.py and fp32.py and the numpy version. Any
 change to the quantizer or the weights misses; the layout and the configuration do not matter.
 int8 is not cached (it quantizes about as fast as the matrix hashes), nor matrices under
 MIN_ELEMS elements (the tests' tiny models).
@@ -42,7 +43,7 @@ import numpy as np
 
 from . import quant as Q
 
-FORMATS = ("fp4", "int4")       # cached formats (int8 quantizes as fast as it hashes)
+FORMATS = Q.FOUR                # cached formats (int8 quantizes as fast as it hashes)
 MIN_ELEMS = 1 << 20             # smaller matrices are quantized in line
 CAP_BYTES = 30 << 30            # the cache's size (OTPU_IMAGE_CACHE_GB overrides)
 FREE_FLOOR = 20 << 30           # free disk a write must leave
@@ -69,10 +70,13 @@ def cache_dir() -> Path | None:
 
 
 def _source() -> str:
-    """What decides the quantizer's output besides its arguments: quant.py and numpy."""
+    """What decides the quantizer's output besides its arguments: the MXU's numerics
+    (quant.MX_NUMERICS: no entry of the MXU before MX is read), quant.py, fp32.py and numpy."""
+    from . import fp32 as F
     global _SRC
     if _SRC is None:
-        _SRC = hashlib.blake2b(Path(Q.__file__).read_bytes() + np.__version__.encode(),
+        _SRC = hashlib.blake2b(Q.MX_NUMERICS.encode() + Path(Q.__file__).read_bytes() +
+                               Path(F.__file__).read_bytes() + np.__version__.encode(),
                                digest_size=16).hexdigest()
     return _SRC
 

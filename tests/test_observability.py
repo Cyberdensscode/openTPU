@@ -12,7 +12,7 @@ from opentpu.host.board import (CTRL_CLEAR, CTRL_RUN, R_B_RD, R_B_WR, R_CTRL, R_
                         R_ICOUNT, R_SCRATCH, R_STATUS, R_VERSION, ST_HALTED, Board, SimTransport)
 from opentpu.host import regs as R
 from opentpu.host.checks import PROG_AT, demo_image, demo_program
-from opentpu import isa as I, rtlsim
+from opentpu import isa as I
 from opentpu.hwtrace import (R_TRACE_ADDR, R_TRACE_COUNT, R_TRACE_CTRL, R_TRACE_DROP,
                              R_TRACE_HI, R_TRACE_LO, TRACE_BUSY, TRACE_CLEAR, TRACE_ENABLE,
                              TRACE_STOP_WHEN_FULL, records_to_trace, ring_order)
@@ -85,9 +85,10 @@ def test_register_map(have_verilator):
     assert ident == 0x4F545055
     assert ver == (CFG.D << 16) | (CFG.MCOLS << 8) | CFG.LANES
     assert regmap == 4
-    # log2 256, log2 1024; WAITW, GEN, STREAM (with DSTEP), run arguments, ACT_ROWS, chash, DSTEP,
-    # PAIR, 4-bit, ddr, i2c, temp, trace
-    assert caps == (0xC7 << 24) | (8 << 16) | (10 << 8) | 0x80 | 0b1111111
+    # log2 256, log2 1024; WAITW, GEN, MX, STREAM (with DSTEP), run arguments, ACT_ROWS, chash,
+    # DSTEP, PAIR, 4-bit, ddr, i2c, temp, trace
+    assert caps == (0xE7 << 24) | (8 << 16) | (10 << 8) | 0x80 | 0b1111111
+    assert R.caps(caps)["mx"]
     assert a3 == 0xCAFE_F00D and a4 == 0                      # ARG3 kept, ARG4 reset
     assert khz == 75294 and bid == TB_BUILD_ID and mts == 1066
     assert temp == (1 << 31) | TB_TEMP
@@ -120,9 +121,9 @@ def test_cfg_registers(have_verilator):
 def test_register_map_board_defaults(have_verilator):
     t = SimTransport(ch_bytes=1 << 20)
     caps, khz, mts = t.reg_read_many([R_CAPS, R_CORE_KHZ, R_DDR_MTS])
-    # 1024-cycle windows, 16384 records; WAITW, GEN, STREAM (with DSTEP), run arguments, ACT_ROWS,
-    # chash, DSTEP, PAIR, 4-bit, temp, trace
-    assert caps == (0xC7 << 24) | (10 << 16) | (14 << 8) | 0x80 | 0b1110111
+    # 1024-cycle windows, 16384 records; WAITW, GEN, MX, STREAM (with DSTEP), run arguments,
+    # ACT_ROWS, chash, DSTEP, PAIR, 4-bit, temp, trace
+    assert caps == (0xE7 << 24) | (10 << 16) | (14 << 8) | 0x80 | 0b1110111
     assert khz == 100000 and mts == 0                     # no DDR_MTS given: CAPS bit3 clear
 
 
@@ -226,11 +227,11 @@ def test_mxu_starve_counter(have_verilator):
     (+axi_lat 400: the read credits run out, the data comes late) the MXU does little but wait for
     chunks (starved, ms, or blocked on the chunks it holds, mb): its busy time is its MACs and the
     wait, while DRAM_WAIT stays near 0 (the adapter takes nearly every request). Where the wait
-    lands depends on the MXU: the adder tree and the cascade (MXU_IMPL 0 / 1) consume a row chunk
-    by chunk, as the chunks arrive, so the wait is all starved; the systolic array (2) starts a row
-    only once all of its chunks are in (a row never stalls in the pipeline; docs/mxu_systolic.md),
-    so it waits on a partial row, blocked, about as long as on an empty FIFO, and MXU_STARVE sees
-    about half of its wait. A short latency (20) removes nearly all of the wait."""
+    lands depends on the MXU: the systolic array starts a row only once all of its chunks are in
+    (a row never stalls in the pipeline; docs/mxu_systolic.md), so it waits on a partial row,
+    blocked, about as long as on an empty FIFO, and MXU_STARVE sees about half of its wait (a
+    quarter with the MX kernels' MLP: 12 MMs of whole QACT ranges, longer rows, against 24). A
+    short latency (20) removes nearly all of the wait."""
     cfg, img, prog = _kernel("mlp")
     c, cyc, q = {}, {}, {}
     for lat in (400, 20):
@@ -246,10 +247,7 @@ def test_mxu_starve_counter(have_verilator):
     wait = {lat: q[lat]["ms"] + q[lat]["mb"] for lat in q}
     assert wait[400] > 0.9 * (c[400]["MXU_BUSY"] - c[400]["MXU_MAC"]), (c[400], q[400])
     assert c[400]["DRAM_WAIT"] < wait[400] // 100 and c[20]["DRAM_WAIT"] == 0, (c[400], c[20])
-    if rtlsim.UARCH.get("MXU_IMPL", 0) == 2:
-        assert min(q[400]["ms"], q[400]["mb"]) > wait[400] // 3, q[400]
-    else:
-        assert q[400]["mb"] < wait[400] // 50, q[400]
+    assert min(q[400]["ms"], q[400]["mb"]) > wait[400] // 5, q[400]
     assert wait[20] < wait[400] // 20, (q[400], q[20])
     assert cyc[20] < 0.3 * cyc[400], cyc
 

@@ -35,7 +35,7 @@ MB = 1 << 20
 
 
 def layout(n_mm: int, n_dma: int) -> dict:
-    rb, sb = Q.row_bytes(H, "fp4", 128), 4 * (H // 128)
+    rb, sb = Q.row_bytes(H, "fp4", 128), Q.scale_bytes(H, "fp4", 128)
     a = {"w": 0, "ws": n_mm * R * rb}
     a["x"] = a["ws"] + n_mm * R * sb
     a["st"] = (a["x"] + 4 * H + MB - 1) // MB * MB
@@ -138,7 +138,8 @@ def main(argv=None) -> int:
                                       lat=round(0.3 * a.mhz), max_cycles=1 << 40,
                                       plusargs=a.plus + ddr3_plusargs(mts, a.mhz))
                 cyc = st["cycles"]
-            mmb = (n_mm * R * (Q.row_bytes(H, "fp4", 128) + 4 * (H // 128))) if "mm" in mode else 0
+            mmb = (n_mm * R * (Q.row_bytes(H, "fp4", 128) + Q.scale_bytes(H, "fp4", 128))
+                   if "mm" in mode else 0)
             dmab = nd * 4 * NS * NS * (2 if mode.endswith("dstep") else 1)
             r = {"mode": mode, "cycles": int(cyc), "mm_bytes": mmb, "dma_bytes": dmab,
                  "bpc": (mmb + dmab) / cyc}

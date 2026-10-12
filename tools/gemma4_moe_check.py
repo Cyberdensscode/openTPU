@@ -68,7 +68,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("model_dir")
     ap.add_argument("ref")
-    ap.add_argument("experts", choices=["int8", "fp4", "int4"])
+    ap.add_argument("experts", choices=["int8", "fp4", "int4", "nvfp4"])
     ap.add_argument("--layers", default="10,20,29", help="checkpoint layers, comma-separated")
     ap.add_argument("--tokens", type=int, default=64)
     ap.add_argument("--slots", type=int, default=64, help="expert slots per layer")
@@ -93,8 +93,12 @@ def main(argv=None) -> int:
     print(f"engine {time.time() - t0:.0f} s: experts {eng.image.efmt}, {a.slots} slots per layer, "
           f"programs {[len(p) for p in progs]} instructions", flush=True)
 
-    def fw(w, f):
-        w = np.pad(np.asarray(w, np.float32), ((0, 0), (0, -w.shape[1] % 128)))
+    from opentpu.llm import moe as MO
+    xf = MO.ExpertFormat(H, F, 128, EF)     # the slot's width and down chunks
+
+    def fw(w, f, cols=None):
+        cols = cols or -(-w.shape[1] // 128) * 128
+        w = np.pad(np.asarray(w, np.float32), ((0, 0), (0, cols - w.shape[1])))
         return w.astype(np.float64) if f == "none" else _fake_w(w, 128, f)
 
     def blocks(p, x, cases):
@@ -105,8 +109,8 @@ def main(argv=None) -> int:
         xe = G._norm(x, None, eps) * g2
         prep, outs = [], []
         for sets, lg, wf, act in cases:
-            fq = (lambda v: _fake_q(np.asarray(v, np.float64), 128)) if act else \
-                (lambda v: np.asarray(v, np.float64))
+            fq = (lambda v, n=None: _fake_q(np.asarray(v, np.float64), 128, n)) if act else \
+                (lambda v, n=None: np.asarray(v, np.float64))
             wts = {}
             for t, st in enumerate(sets):
                 z = lg[t, st]
@@ -123,12 +127,13 @@ def main(argv=None) -> int:
                 if e not in wts:
                     continue
                 if wf not in mats:
-                    mats[wf] = (fw(gu[:F], wf), fw(gu[F:], wf), fw(dn, wf))
+                    mats[wf] = (fw(gu[:F], wf), fw(gu[F:], wf), fw(dn, wf, xf.F))
                 gq, uq, dq = mats[wf]
                 t = np.array([i for i, _ in wts[e]])
                 we = np.array([w for _, w in wts[e]])
-                u = G._gelu(xq[t] @ gq.T) * (xq[t] @ uq.T)
-                u = fq(np.pad(u, ((0, 0), (0, dq.shape[1] - u.shape[1]))))
+                xt = xq.rows(t) if hasattr(xq, "rows") else xq[t]       # (with its offsets)
+                u = G._gelu(xt @ gq.T) * (xt @ uq.T)
+                u = fq(np.pad(u, ((0, 0), (0, dq.shape[1] - u.shape[1]))), xf.C)
                 out[t] += we[:, None] * (u @ dq.T)
         return outs
 

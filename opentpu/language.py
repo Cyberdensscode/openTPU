@@ -356,15 +356,17 @@ def kv_append(kv: KVDesc, h: int, pos, k: Tile | None, v: Tile | None) -> None:
     """Quantize and append rows of k, v ([n, d]) at token position `pos` of KV head `h` (either
     may be None: only the other is appended).
 
-    K rows are written token-major with per-block scales; V is written transposed (one byte per
-    dimension, stride = the V^T tile, see KVDesc) with one scale per token.
+    K rows are written token-major with a scale row per token (QST ROW's fp32 scale for a head
+    of one block, MM RSC; else QST's int8 scale row, read as int8 weights); V is written
+    transposed (one byte per dimension, stride = the V^T tile, see KVDesc) with one scale per
+    token.
     """
     b = current()
     pos = Affine.of(pos)
     if k is not None:
         kd = kv.k(h)
         b.store_quantized(k, kd.data + pos * kd.rs, kd.scale + pos * kd.srs, kd.rs, 1,
-                          row_scale=False)
+                          row_scale=kd.rsc)
     if v is None:
         return
     vt = kv.vt(h)

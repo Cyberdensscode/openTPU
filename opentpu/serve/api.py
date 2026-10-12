@@ -703,8 +703,8 @@ def main(argv=None):
     ap.add_argument("--served-model-name", help="the model's name in the API (default: the "
                                                 "checkpoint directory's)")
     ap.add_argument("--wformat", default=FM.AUTO,
-                    choices=[FM.AUTO, "int8", "fp4", "int4", FM.MIX])
-    ap.add_argument("--head-format", default=None, choices=["int8", "fp4", "int4"])
+                    choices=[FM.AUTO, "int8", "fp4", "int4", "nvfp4", FM.MIX])
+    ap.add_argument("--head-format", default=None, choices=["int8", "fp4", "int4", "nvfp4"])
     ap.add_argument("--slots", type=int, default=8,
                     help="KV slots on the card: requests decoded together, batched (Qwen3 and "
                          "the Llama-likes; other models run one sequence, requests in turns)")

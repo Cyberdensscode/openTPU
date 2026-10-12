@@ -31,11 +31,13 @@ from dataclasses import replace
 
 import numpy as np
 
+from opentpu import isa as I
 from opentpu import qcache as QC
 from opentpu import quant as Q
 from opentpu.kernels import gather as GA
 from opentpu.llm import gemma4 as G
-from opentpu.llm.qwen3 import _fake_q, _fake_w, _v_parts
+from opentpu.llm import moe as MO
+from opentpu.llm.qwen3 import ATTN_BLOCK, _fake_k, _fake_q, _qk, _v_parts
 
 THREADS = 4     # experts quantized at once (numpy's 4-bit search releases the GIL: 2.8x on 4)
 
@@ -50,9 +52,10 @@ def emulate(spec, W, tokens, D=128, wformat="int8", hf=None, ple_format="int8", 
     float weights (the PLE table then float too); wmap: per-kind layer formats {"attn", "mlp"
     (or "down" / "gateup" of it), "ple": format}, a key "kind@a-b" for layers a..b only
     (checkpoint layers; it wins over "kind"). quant: the activation quantization points
-    applied, a subset of {"act" (the matmul inputs), "kv" (K / V), "p" (P)}; default all, none
-    with wformat "none". ckpt: a file the residual is saved to after each layer and resumed
-    from (the same tokens and formats; a model without KV-shared layers): a run killed at the
+    applied, a subset of {"act" (the matmul inputs: the QACT ranges of gemma4.emulated_logits),
+    "kv" (K / V), "p" (P, per attention block of absolute positions)}; default all, none with
+    wformat "none". ckpt: a file the residual is saved to after each layer and resumed from
+    (the same tokens and formats; a model without KV-shared layers): a run killed at the
     memory floor loses at most a layer.
 
     A MoE block (26B-A4B; docs/offload.md section 11): the weightless RMSNorm of x quantized
@@ -64,9 +67,8 @@ def emulate(spec, W, tokens, D=128, wformat="int8", hf=None, ple_format="int8", 
     hf = hf or wformat
     none = wformat == "none"
     quant = (set() if none else {"act", "kv", "p"}) if quant is None else set(quant)
-    ident = lambda v, d=D: np.asarray(v, np.float64)
+    ident = lambda v, d=D, n=None: np.asarray(v, np.float64)              # noqa: E731
     fq = _fake_q if "act" in quant else ident
-    fk = _fake_q if "kv" in quant else ident
     fp = _fake_q if "p" in quant else ident
 
     wmap = wmap or {}                   # per-kind layer formats: attn, mlp, ple (else wformat)
@@ -90,24 +92,32 @@ def emulate(spec, W, tokens, D=128, wformat="int8", hf=None, ple_format="int8", 
             return get("down" if ".down_proj" in n else "gateup", li, get("mlp", li, wformat))
         return get("ple", li, wformat)
 
-    def wq(n, fmt=wformat, a=None):
+    def wq(n, fmt=wformat, a=None, cols=None):
         if n is not None and fmt == wformat and n.startswith("model.layers."):
             fmt = fmt_of(n)
         a = np.asarray(W[n] if a is None else a, np.float32)
-        a = np.pad(a, ((0, 0), (0, -a.shape[1] % D)))       # whole D-blocks (MLP widths)
-        if fmt in QC.FORMATS:   # 4-bit through opentpu.qcache: the runs of a study share it
-            q, sc = QC.quantize_mxu(a, fmt, D)      # (rows padded to whole D-byte chunks)
-            return Q.dequantize_w4(q[:, :a.shape[1] // 2], sc, fmt, D)        # (= _fake_w's)
-        return a.astype(np.float64) if fmt == "none" else _fake_w(a, D, fmt)
+        cols = cols or -(-a.shape[1] // D) * D               # whole D-blocks (MLP widths)
+        a = np.pad(a, ((0, 0), (0, cols - a.shape[1])))
+        if fmt == "none":
+            return a.astype(np.float64)
+        # an MXW (the 4-bit quantization through opentpu.qcache: the runs of a study share it)
+        return Q.fake_w(a, fmt, D, QC.quantize_mxu(a, fmt, D) if fmt in QC.FORMATS else None)
 
-    def padq(v, n):             # an activation [T, f] padded with zeros to n columns, quantized
-        return fq(np.pad(v, ((0, 0), (0, n - v.shape[1]))))
+    def padq(v, n, C):          # an activation [T, f] padded with zeros to n columns, quantized
+        return fq(np.pad(v, ((0, 0), (0, n - v.shape[1]))), D, C)      # in ranges of C
+
+    def mlp_width(f, fd):       # (the layer block's width, its down projection's chunks)
+        if fd == "none":
+            return -(-f // D) * D, None
+        fp_ = G._ffn_pad(f, fd, D)
+        return fp_, G._mlp_chunk(fp_, D, D if fd == "int8" else 2 * D)
 
     T, H, P, L = len(tokens), spec.hidden, spec.ple_dim, spec.layers
     n_q, eps = spec.n_q, spec.eps
     uniq, inv = np.unique(np.asarray(tokens), return_inverse=True)
     head = "model.embed_tokens.weight" if spec.tied else "lm_head.weight"
-    x = wq(head, hf, G._rows(W, head, uniq.tolist()))[inv] * math.sqrt(H)
+    er = np.asarray(G._rows(W, head, uniq.tolist()), np.float32)     # the device's gathers
+    x = (er if hf == "none" else GA.gathered(er, hf, D)).astype(np.float64)[inv] * math.sqrt(H)
     pli = None
     if P:
         cols = np.concatenate([np.arange(spec.src(i) * P, (spec.src(i) + 1) * P)
@@ -121,7 +131,8 @@ def emulate(spec, W, tokens, D=128, wformat="int8", hf=None, ple_format="int8", 
         pe = np.asarray(pe, np.float64)[inv]
         wp = W["model.per_layer_model_projection.weight"].reshape(-1, P, H)[
             [spec.src(i) for i in range(L)]].reshape(-1, H)
-        wpq = wq(None, wmap.get("ple", wformat), a=wp) * H ** -0.5
+        wpq = wq(None, wmap.get("ple", wformat), a=np.asarray(wp, np.float32) *
+                 np.float32(H ** -0.5))                       # (folded, as the image's)
         gpl = np.asarray(W["model.per_layer_projection_norm.weight"], np.float64) * 2 ** -0.5
         pli = G._norm((fq(x) @ wpq.T).reshape(T, L, P), gpl, eps) + pe.reshape(T, L, P)
         del wp, wpq, pe
@@ -147,45 +158,43 @@ def emulate(spec, W, tokens, D=128, wformat="int8", hf=None, ple_format="int8", 
         s_ = np.stack([t[1] for t in tab])[:, None, :]
         h = fq(G._norm(x, W[p + "input_layernorm.weight"], eps))
         q = (h @ wq(a + "q_proj.weight").T).reshape(T, n_q, d)
-        q = fq(G._rot(G._norm(q, W[a + "q_norm.weight"], eps), c, s_, d // 2))
+        q = G._rot(G._norm(q, W[a + "q_norm.weight"], eps), c, s_, d // 2)
         if spec.kv_src[i] == i:
             k = (h @ wq(a + "k_proj.weight").T).reshape(T, n_kv, d)
             v = k if spec.kv_same(i) else (h @ wq(a + "v_proj.weight").T).reshape(T, n_kv, d)
-            K[i] = fk(G._rot(G._norm(k, W[a + "k_norm.weight"], eps), c, s_, d // 2))
+            k = G._rot(G._norm(k, W[a + "k_norm.weight"], eps), c, s_, d // 2)
+            K[i] = _fake_k(k, D) if "kv" in quant else (ident(k), None)    # as the cache holds
             v = G._norm(v, None, eps)       # int8 values, per-token scales (folded into P)
             V[i] = _v_parts(v) if "kv" in quant else (ident(v), np.ones((T, n_kv)))
-        Kh, (Vq, Vs) = K[spec.kv_src[i]], V[spec.kv_src[i]]
+        (Kh, dK), (Vq, Vs) = K[spec.kv_src[i]], V[spec.kv_src[i]]
+        ok = np.arange(T)[None, :] <= ii                        # causal, and the window
+        if kind == G.SLIDE:
+            ok &= np.arange(T)[None, :] >= ii + 1 - spec.window
+        Tb = -(-T // ATTN_BLOCK) * ATTN_BLOCK                  # P's attention blocks
         o = np.zeros((T, n_q, d))
         for hq in range(n_q):
-            sc = q[:, hq] @ Kh[:, hq // Gq].T                       # [T, T]
-            vs = Vs[:, hq // Gq]
-            if kind == G.SLIDE:                                      # P's blocks from the window start
-                Wn = -(-spec.window // D) * D
-                idx = np.maximum(0, ii[:, 0] + 1 - spec.window)[:, None] + np.arange(Wn)[None, :]
-                ok = idx <= ii
-                scp = np.concatenate([sc, np.full((T, Wn), -np.inf)], 1)
-                sb = np.where(ok, np.take_along_axis(scp, idx, 1), -np.inf)
-                pp = np.exp(sb - sb.max(1, keepdims=True))
-                pf = np.zeros((T, T + Wn))
-                np.put_along_axis(pf, idx, fp(pp * np.pad(vs, (0, Wn))[idx]), 1)
-                pf = pf[:, :T]
-            else:
-                Tp = -(-T // D) * D
-                sb = np.full((T, Tp), -np.inf)
-                sb[:, :T] = np.where(np.arange(T)[None, :] <= ii, sc, -np.inf)
-                pp = np.exp(sb - sb.max(1, keepdims=True))
-                pf = fp(pp * np.pad(vs, (0, Tp - T)))[:, :T]
-            o[:, hq] = (pf @ Vq[:, hq // Gq]) / pp.sum(1, keepdims=True)
+            g = hq // Gq
+            qq = fq(q[:, hq])
+            sc = np.where(ok, _qk(qq, Kh[:, g], None if dK is None else dK[:, g], D), -np.inf)
+            pp = np.exp(sc - sc.max(1, keepdims=True))                  # [T, T]
+            pf = np.zeros((T, Tb))
+            pf[:, :T] = pp * Vs[:, g][None, :]
+            vt = np.zeros((Tb, d))
+            vt[:T] = Vq[:, g]
+            o[:, hq] = Q.mx_matmul(fp(pf, D, ATTN_BLOCK), vt.T, None, I.MX_W[I.W8], D) / \
+                pp.sum(1, keepdims=True)
         att = fq(o.reshape(T, -1)) @ wq(a + "o_proj.weight").T
         x = x + G._norm(att, W[p + "post_attention_layernorm.weight"], eps)
         h = fq(G._norm(x, W[p + "pre_feedforward_layernorm.weight"], eps))
-        wd = wq(p + "mlp.down_proj.weight")
+        dn = p + "mlp.down_proj.weight"
+        fw, C = mlp_width(spec.ffn[i], fmt_of(dn) if wformat != "none" else "none")
+        wd = wq(dn, cols=fw)
         m = padq(G._gelu(h @ wq(p + "mlp.gate_proj.weight").T) *
-                 (h @ wq(p + "mlp.up_proj.weight").T), wd.shape[1]) @ wd.T
+                 (h @ wq(p + "mlp.up_proj.weight").T), fw, C) @ wd.T
         del wd
         if spec.experts:
             m = G._norm(m, W[p + "post_feedforward_layernorm_1.weight"], eps) + \
-                G._norm(_moe(spec, W, p, x, wq, fq, padq, none), W[
+                G._norm(_moe(spec, W, p, x, wq, fq, padq, none, fmt_of, D), W[
                     p + "post_feedforward_layernorm_2.weight"], eps)
         x = x + G._norm(m, W[p + "post_feedforward_layernorm.weight"], eps)
         if pli is not None:
@@ -210,13 +219,14 @@ def emulate(spec, W, tokens, D=128, wformat="int8", hf=None, ple_format="int8", 
     starts = range(0, spec.vocab, 16384)
     if on_rows is None:
         return np.concatenate([xl @ wq(None, hf, head_rows(r0)).T for r0 in starts], 1)
-    # the quantized head held in float32 (E4B's in float64 would be 5.4 GB)
-    Eq = [wq(None, hf, head_rows(r0)).T.astype(np.float32) for r0 in starts]
+    # the quantized head held in float32 (E4B's in float64 would be 5.4 GB), its offsets kept
+    Eq = [wq(None, hf, head_rows(r0)).astype(np.float32).T for r0 in starts]
     for i0 in range(0, len(rows), 64):      # on_rows(first row, logits [<= 64, vocab])
-        on_rows(i0, np.concatenate([xl[i0:i0 + 64] @ e for e in Eq], 1))
+        xr = xl.rows(slice(i0, i0 + 64)) if isinstance(xl, Q.MXAct) else xl[i0:i0 + 64]
+        on_rows(i0, np.concatenate([xr @ e for e in Eq], 1))
 
 
-def _moe(spec, W, p, x, wq, fq, padq, none):
+def _moe(spec, W, p, x, wq, fq, padq, none, fmt_of, D=128):
     """The MoE block of layer prefix p on rows x [T, H] (emulate's docstring), float64: the
     router reads the unit RMSNorm of x quantized; the experts read it times
     pre_feedforward_layernorm_2's gain g2, quantized (g2 is ~0 on the residual's outlier
@@ -238,8 +248,11 @@ def _moe(spec, W, p, x, wq, fq, padq, none):
     n = p + "experts.down_proj"                 # (its name: the experts' format, wmap)
     es = [int(e) for e in np.unique(top)]
 
+    xf = None if none else MO.ExpertFormat(spec.hidden, F, D, fmt_of(n))   # the slot's width
+    Fp, C = (-(-F // D) * D, None) if none else (xf.F, xf.C)              # and down chunks
+
     def fake(gu, dn, e):        # expert e's gate, up, down [H, F padded] as the device holds them
-        return wq(n, a=gu[:F]), wq(n, a=gu[F:]), wq(n, a=dn * pes[e])
+        return wq(n, a=gu[:F]), wq(n, a=gu[F:]), wq(n, a=dn * pes[e], cols=Fp)
 
     out = np.zeros_like(xs)
     with ThreadPoolExecutor(THREADS) as ex:    # THREADS experts at a time (their fp64 copies)
@@ -251,7 +264,7 @@ def _moe(spec, W, p, x, wq, fq, padq, none):
                 gq, uq, dq = job.result()
                 t, j = np.nonzero(top == e)
                 u = G._gelu(xe[t] @ gq.T) * (xe[t] @ uq.T)
-                out[t] += w[t, j][:, None] * (padq(u, dq.shape[1]) @ dq.T)
+                out[t] += w[t, j][:, None] * (padq(u, dq.shape[1], C) @ dq.T)
     return out
 
 

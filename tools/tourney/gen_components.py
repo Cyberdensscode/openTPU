@@ -36,18 +36,21 @@ C = {
     "otpu_mxu": dict(
         files=["rtl/mxu/otpu_mxu.sv", "rtl/tech/xilinx7/otpu_tech_dsp.sv"], top="otpu_mxu",
         params=dict(D=128, MCOLS=4, DEPTH=1024, LANES=8, IMPL=2, SID=0),
-        desc="MXU: streams int8 weight chunks (D bytes/cycle) through a prefetch FIFO against up to "
-             "MCOLS stationary int8 rows in ACT RAM; products in the systolic array (IMPL 2: a "
-             "DSP48E1 per position, weights hopping column to column), i2f, scale multiplies, "
-             "isum_4 partial loop, result FIFO, drain with ACC/ASCALE read-modify-write, RMAX.",
+        desc="MXU, the MX column: streams weight chunks (D bytes/cycle) and their scale lines "
+             "through prefetch FIFOs against up to MCOLS stationary int8 rows in ACT RAM; products "
+             "in the systolic array (a DSP48E1 per position, weights hopping column to column), "
+             "the column end (otpu_mxce: each chain end times m << sh, the row accumulated exactly "
+             "in 48 bits), PAIR's integer add, result FIFO, E shared lanes (i2f48, x Sw, x Sa'), "
+             "drain with ACC/ASCALE read-modify-write, RMAX.",
         extra=["tests/test_rtl.py::test_attention_layer_rtl[1]",
                "tests/test_rtl.py::test_mlp_rtl[2]"]),
     "otpu_quant": dict(
         files=["rtl/vpu/otpu_quant.sv"], top="otpu_quant",
         params=dict(D=128, LANES=8, SID=0),
-        desc="Quantizer: QACT (fp32 TMEM rows -> int8 ACT RAM rows with per-block or per-row "
-             "scales, streaming or two-pass) and QST (int8 bytes + scales to DRAM); prescale, amax "
-             "trees, reciprocal (Newton), q8 rounding.",
+        desc="Quantizer: QACT (fp32 TMEM rows -> int8 ACT RAM rows, a row scale and a power-of-"
+             "two offset per D/4) and QST (int8 bytes + the row's scale and offset bytes to DRAM), "
+             "two passes a row (amaxes, then the bytes); prescale, amax trees, reciprocal "
+             "(Newton), q8 rounding.",
         extra=["tests/test_rtl.py::test_attention_layer_rtl[1]",
                "tests/test_rtl.py::test_scoreboard_stress_single_slice[3]"]),
     "otpu_vpu": dict(
@@ -84,8 +87,9 @@ C = {
     "otpu_actram": dict(
         files=["rtl/mem/otpu_actram.sv"], top="otpu_actram",
         params=dict(D=128, MCOLS=4, BLOCKS=128, LANES=8),
-        desc="ACT RAM: MCOLS rows x BLOCKS blocks of D int8 plus block scales; written by the "
-             "quantizer, read one block per cycle by the MXU.",
+        desc="ACT RAM: MCOLS rows x BLOCKS blocks of D int8 plus a 64-bit record a block (the "
+             "row's scale, four offsets); written by the quantizer, read one block per cycle by "
+             "the MXU.",
         extra=["tests/test_rtl.py::test_attention_layer_rtl[1]"]),
     "otpu_coll": dict(
         files=["rtl/top/otpu_coll.sv"], top="otpu_coll",

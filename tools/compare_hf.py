@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import inspect
 import sys
 from pathlib import Path
 
@@ -141,8 +142,10 @@ def main() -> None:
         print(f"   first difference at token {k + 1}: HF {tok.decode([want[k]])!r}, device "
               f"{tok.decode([got[k]])!r} (HF's choice #{rank}, {gap:.3f} logits below the top)")
         if a.emulate:
+            sk = {"S": eng.cfg.S} if "S" in inspect.signature(emulated_logits).parameters \
+                else {}                                     # (the slices' QACT ranges)
             emu = emulated_logits(spec, W, ids + want[:k], D=eng.cfg.D, wformat=a.wformat,
-                                  head_format=a.head_format)[-1]
+                                  head_format=a.head_format, **sk)[-1]
             print(f"   the emulation's top two there: {top2(emu)}")
     print(f"{same}/{len(prompts)} prompts identical for {a.tokens} tokens; logits vs HF: "
           f"max |diff| {worst[0]:.3f}, min cosine {worst[1]:.5f}")

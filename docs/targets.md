@@ -53,7 +53,8 @@ ACT RAM or DRAM than the device has.
 
 - The core, `rtl/top`, `rtl/mxu`, `rtl/vpu`, `rtl/mem`, `rtl/seq`, `rtl/dma`: no vendor cell.
 - `rtl/tech/<family>/`: the same modules in each family, the file list picks one. Today the
-  systolic MXU's cells `otpu_pe` and `otpu_colend` (`otpu_tech_dsp.sv`): `generic` (behavioural:
+  systolic MXU's cells `otpu_pe` and the MX column end `otpu_mxce` (`otpu_tech_dsp.sv`; docs/
+  mx_mxu.md section 9): `generic` (behavioural:
   the simulators and the ASIC flows), `xilinx7` (DSP48E1: the YPCB card), `xilinxus` (DSP48E2:
   UltraScale+). `tests/test_tech.py` checks that the xilinx7 cells equal the generic ones cycle
   for cycle on yosys's DSP48E1 model.

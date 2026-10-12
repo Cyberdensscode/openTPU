@@ -19,9 +19,10 @@ checkpoint's pages given back once the image is written. `defaults(spec)` holds 
 weight formats.
 
 A pool is checked before the image is built (check_pool): it must exist, have this image's
-layout and key (moe.pool_key: the quantizer's code, the format, D, the layout, the checkpoint),
-and hold every expert unless the checkpoint has the experts to pack the rest. `create=True`
-(moe_card's) makes a missing pool and packs each expert on its first use instead.
+layout and key (moe.pool_key: the MXU's numerics, the quantizer's code, the format, D, the
+layout, the checkpoint; a pool of the MXU before MX is refused), and hold every expert unless
+the checkpoint has the experts to pack the rest. `create=True` (moe_card's) makes a missing pool
+and packs each expert on its first use instead.
 """
 from __future__ import annotations
 

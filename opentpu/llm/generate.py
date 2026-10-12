@@ -32,7 +32,7 @@ import numpy as np
 from .. import fp32 as F
 from .. import isa as I
 from .. import language as ol
-from ..compiler import CompileError, Tensor, current
+from ..compiler import CompileError, Tensor, current, trace_fit
 
 # ---- the state block (fp32 words in DRAM, one per slice; 128-byte aligned). Its 64-byte beats
 # have one writer each during a run: words 0..15 the card's (the run-time variables), 16..31 the
@@ -714,12 +714,15 @@ def compile_generate(image, kernel, blocks: int, lo: int, block: int, chain: boo
     rp = RunPos(blocks, block, lo, image.lookup.get("zmask", 0), image.cap)
     fn, kw = {None: (_generate, {"chain": chain, "debug": debug}), 0: (_generate_layers, {}),
               1: (_generate_head, {"debug": debug})}[part]
-    progs = []
+    progs, k = [], ol.jit(fn)
     for s in range(image.cfg.S):
-        m = image.descriptors(s)
-        progs.append(ol.jit(fn).trace(image.cfg, s, {"m": m, "pos": rp, "block": block,
-                                                     "step": kernel, "spec": image.spec,
-                                                     "samp": samp, **kw}).finish())
+        def args(s=s):
+            return {"m": image.descriptors(s), "pos": rp, "block": block, "step": kernel,
+                    "spec": image.spec, "samp": samp, **kw}
+        # the split form has no smaller form to fall back to: placed best-fit where next-fit
+        # leaves no gap (trace_fit; a small TMEM), as a decode step is
+        progs.append((trace_fit(k, image.cfg, s, args) if part is not None else
+                      k.trace(image.cfg, s, args())).finish())
     return progs
 
 

@@ -18,7 +18,8 @@ import numpy as np
 
 from . import fp32 as F
 from . import quant as Q
-from .compiler import Affine, Compiled, KVDesc, Kernel, QTensor, Tensor, vt_tiled, vt_untiled
+from .compiler import (Affine, Compiled, KVDesc, Kernel, QTensor, Tensor, k_scale_bytes,
+                       vt_tiled, vt_untiled)
 from .isasim import Config, Machine
 
 ALIGN = 128                  # DRAM allocations: whole MXU chunks (D <= 128)
@@ -35,8 +36,9 @@ class Output:
 
 
 class Weight:
-    """`fmt`: "int8" (int8 + fp32 scale per D-block), "int4" or "fp4" (4-bit elements with a
-    two-level scale word per D-block; opentpu/quant.py, docs/isa.md "Weight formats")."""
+    """`fmt`: an MXU format, "int8", "int4", "fp4" or "nvfp4" (a per-row fp32 scale and
+    power-of-two block offsets under it; opentpu/quant.py, docs/isa.md "Weight formats"). A
+    slice's part (sharded by rows or columns) is quantized on its own."""
 
     def __init__(self, array, shard: int | None = None, fmt: str = "int8"):
         a = np.asarray(array, dtype=np.float32)
@@ -44,8 +46,8 @@ class Weight:
             raise ValueError("Weight must be 2-D [N, K]")
         if shard not in (None, 0, 1):
             raise ValueError("Weight shard must be None, 0 (rows) or 1 (columns)")
-        if fmt not in ("int8", "int4", "fp4"):
-            raise ValueError("Weight fmt must be int8, int4 or fp4")
+        if fmt not in Q.MXU_FORMATS:
+            raise ValueError(f"Weight fmt must be one of {Q.MXU_FORMATS}")
         self.array, self.shard, self.fmt = a, shard, fmt
 
 
@@ -61,13 +63,17 @@ class KVCache:
             raise ValueError("more tokens than capacity")
 
 
-def quantize_rows(a: np.ndarray, D: int) -> tuple[np.ndarray, np.ndarray]:
-    """Per-(row, D-block) int8 quantization, bit-identical to the hardware quantizer."""
+def quantize_rows(a: np.ndarray, D: int, row: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """Rows as QST quantizes and stores them, bit for bit: int8 values [N, K] and each row's
+    scale row (uint8 [N, 4] with `row`, QST ROW's fp32 scale; else the int8 scale row, the S and
+    an offset byte per D-block: quant.scale_bytes(K, "int8"))."""
     N, K = a.shape
     if K % D:
         raise ValueError(f"inner dimension {K} is not a multiple of D={D}")
-    q, s = F.quantize(a.reshape(N, K // D, D), axis=2)
-    return q.reshape(N, K), s.astype(np.float32)
+    q, S, d = F.quantize_mx(np.asarray(a, np.float32), D, row)
+    if row:
+        return q, S.astype(np.float32).view(np.uint8).reshape(N, 4)
+    return q, Q.pack_scales("int8", S, dw=d)
 
 
 class _Dram:
@@ -128,17 +134,15 @@ def place(cfg: Config, args: dict) -> tuple[_Dram, Layout, list]:
                 parts = [a.array[:, s * K:(s + 1) * K] for s in range(S)]
             else:
                 n_loc, parts = N, [a.array] * S
-            KB = K // D
-            rs = Q.row_bytes(K, a.fmt, D)
+            rs, srs = Q.row_bytes(K, a.fmt, D), Q.scale_bytes(K, a.fmt, D)
             daddr = dram.alloc(n_loc * rs)
-            saddr = dram.alloc(4 * n_loc * KB)
+            saddr = dram.alloc(n_loc * srs)
             for s, p in enumerate(parts):
                 q, sc = Q.quantize_mxu(p, a.fmt, D)
                 dram.put(s, daddr, q)
                 dram.put(s, saddr, sc)
             layout.params[name] = (a, (daddr, saddr))
-            desc = QTensor(Affine(daddr), Affine(saddr), (n_loc, K), rs, 4 * KB, D,
-                           wf=Q.mxu_wf(a.fmt))
+            desc = QTensor.weight(daddr, saddr, n_loc, K, a.fmt, D)
             for s in range(S):
                 bound[s][name] = desc
         elif isinstance(a, KVCache):
@@ -150,19 +154,20 @@ def place(cfg: Config, args: dict) -> tuple[_Dram, Layout, list]:
             per_slice = [[h for h in range(a.H) if h % S == s] for s in range(S)]
             nloc = max(len(p) for p in per_slice)
             regions = []
+            ksb = k_scale_bytes(d, D)
             for _ in range(nloc):
-                regions.append({"k": dram.alloc(cap * d), "ks": dram.alloc(4 * cap * (d // D)),
+                regions.append({"k": dram.alloc(cap * d), "ks": dram.alloc(cap * ksb),
                                 "vt": dram.alloc(d * cap), "vs": dram.alloc(4 * cap)})
             heads = [dict() for _ in range(S)]
             for s in range(S):
                 for j, h in enumerate(per_slice[s]):
                     r = regions[j]
                     heads[s][h] = r
-                    kq, ks = quantize_rows(a.k[h], D)
+                    kq, ks = quantize_rows(a.k[h], D, row=d == D)
                     vq, vs = F.quantize(a.v[h], axis=1)
                     kfull = np.zeros((cap, d), np.int8)
                     kfull[:a.T] = kq
-                    ksf = np.zeros((cap, d // D), np.float32)
+                    ksf = np.zeros((cap, ksb), np.uint8)
                     ksf[:a.T] = ks
                     vt = np.zeros((d, cap), np.int8)
                     vt[:, :a.T] = vq.T
@@ -219,13 +224,13 @@ class Result:
         D = self.compiled.cfg.D
         K = np.zeros((a.H, a.cap, a.d), np.float32)
         V = np.zeros((a.H, a.cap, a.d), np.float32)
+        ksb = k_scale_bytes(a.d, D)
         for s, hs in enumerate(heads):
             img = self.drams[s]
             for h, r in hs.items():
-                kq = img[r["k"]:r["k"] + a.cap * a.d].view(np.int8).reshape(a.cap, a.d)
-                ks = img[r["ks"]:r["ks"] + 4 * a.cap * (a.d // D)].view(np.float32)
-                ks = ks.reshape(a.cap, a.d // D)
-                K[h] = kq.astype(np.float32) * np.repeat(ks, D, axis=1)
+                kq = img[r["k"]:r["k"] + a.cap * a.d].reshape(a.cap, a.d)
+                ks = img[r["ks"]:r["ks"] + a.cap * ksb].reshape(a.cap, ksb)
+                K[h] = Q.dequantize_mxu(kq, ks, "int8", a.d, D, rsc=a.d == D)
                 vt = vt_untiled(img[r["vt"]:r["vt"] + a.d * a.cap].view(np.int8), a.d, a.cap)
                 vs = img[r["vs"]:r["vs"] + 4 * a.cap].view(np.float32)
                 V[h] = vt.T.astype(np.float32) * vs[:, None]

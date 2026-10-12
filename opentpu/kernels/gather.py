@@ -1,17 +1,23 @@
-"""Rows of a quantized table (int8 or 4-bit, block-scaled: an MXU operand in DRAM) gathered and
+"""Rows of a quantized table (int8 or 4-bit, an MXU format: opentpu/quant.py) gathered and
 dequantized on the device, at a row index known only at run time (the token id): an embedding
-straight from a tied int8 LM head, or Gemma 4's per-layer embeddings, with no fp32 copy of the
-table and no host work per token.
+straight from a tied LM head, or Gemma 4's per-layer embeddings, with no fp32 copy of the table
+and no host work per token.
 
 The MXU does it. A table row is streamed as a matrix of its D-blocks (one block, or for 4-bit
 one D-byte chunk of two blocks, per streamed row), against a stationary operand of one-hot
 rows: row j of one-hot block k is 1 at element M k + j (M = MCOLS), so one MM gives element
-M k + j of every block, dequantized by the MXU's own arithmetic, t = (i2f(127 w) * ws) * (1 /
-127) (the one-hot quantizes to 127 with scale f32(1/127)); D / M MMs give every element (for
-4-bit, twice as many, one for each block of a chunk: the one-hot blocks are interleaved with
-zero blocks, [Z, O_0, Z, O_1, ..., O_{D/M-1}, Z], and [O_k, Z] reads a chunk's first block,
-[Z, O_k] its second). The operand is the constant `onehot(D, M, fmt)` from DRAM, quantized once
-(operand; where it does not fit ACT RAM or TMEM whole, each MM's blocks on their own).
+M k + j of every block, dequantized by the MXU's own arithmetic (the one-hot quantizes to 127
+with Sa = f32(1/127), every offset 0); D / M MMs give every element (for 4-bit, twice as many,
+one for each block of a chunk: the one-hot blocks are interleaved with zero blocks, [Z, O_0, Z,
+O_1, ..., O_{D/M-1}, Z], and [O_k, Z] reads a chunk's first block, [Z, O_k] its second). The
+operand is the constant `onehot(D, M, fmt)` from DRAM, quantized once (operand; where it does
+not fit ACT RAM or TMEM whole, each MM's blocks on their own).
+
+A streamed row's scales are its own, so a table keeps them per streamed row, its gather scales
+(quant.gather_scales, next to the scale rows an MM over the table reads, or alone): int8 an
+fp32 per block, Sw 2^-dw (MM RSC); 4-bit a scale row per chunk (Sw and the chunk's two blocks'
+offsets and multipliers). An element is then rne(rne(i2f(127 w m 2^sh) Sw) (f32(1/127) 2^-W)),
+sh = W - dw (MM's window; a block with sh < 0 gives 0).
 
   gather_row     a row of a row-major table (the LM head): the MMs write the elements
                  transposed, [D, blocks], and one VOP per block copies a column to the row
@@ -31,7 +37,7 @@ from .. import isa as I
 from .. import language as ol
 from .. import qcache as QC
 from .. import quant as Q
-from ..compiler import QTensor
+from ..compiler import Affine, QTensor
 
 
 # =============================================================================== the operand
@@ -85,6 +91,14 @@ def operand(desc):
     return _Parts(desc)
 
 
+def table(data, gscale, n: int, k: int, fmt: str, D: int) -> QTensor:
+    """The descriptor of a row-major table [n, k] in MXU format fmt to gather from: its element
+    rows (quant.quantize_mxu's) at `data` and their gather scales (quant.gather_scales) at
+    `gscale`."""
+    return QTensor(Affine.of(data), Affine.of(gscale), (n, k), Q.row_bytes(k, fmt, D),
+                   Q.gather_scale_bytes(k, fmt, D), D, wf=Q.mxu_wf(fmt))
+
+
 def _mms(oh, qv: QTensor, out, fmt: str, half: int = 0):
     """The one-hot MMs of a row viewed as blocks (int8: qv [nb, D]; 4-bit: chunks, qv [nc,
     2D]): element M k + j of streamed row n into out(k)[j, n] (4-bit: the chunks' first blocks
@@ -98,33 +112,30 @@ def _mms(oh, qv: QTensor, out, fmt: str, half: int = 0):
             ol.dot(oh.blocks(2 * k, 2), qv, out=out(k, 1))
 
 
-def _view(table: QTensor, row, fmt: str, n: int, rs_scale: int) -> QTensor:
-    """Row `row` of `table` as the MXU streams its blocks: n blocks of D (int8) or n chunks of
-    two blocks (4-bit), each a streamed row D bytes apart, with its scale words."""
-    D = table.D
-    r = table[row:row + 1, :] if table.shape[0] > 1 else table
-    if fmt == "int8":
-        return QTensor(r.data, r.scale, (n, D), D, 4, D, wf=I.W8)
-    return QTensor(r.data, r.scale, (n, 2 * D), D, 8, D, wf=table.wf)
+def _chunk_srs(fmt: str, D: int) -> int:
+    """A 4-bit chunk's gather scale row: its bytes and its stride."""
+    return Q.gather_scale_bytes(2 * D, fmt, D)
 
 
 # =============================================================================== kernels
-def gather_row(oh, table: QTensor, row, fmt: str):
-    """Row `row` (an int or a run-time value) of a row-major table [N, K] of MXU rows (int8 or
-    4-bit, qwen3's LM head layout), dequantized: an fp32 [K] tile. oh: quantize(onehot(D, M,
-    fmt)) (a live stationary operand)."""
-    D, K = table.D, table.shape[1]
+def gather_row(oh, tab: QTensor, row, fmt: str):
+    """Row `row` (an int or a run-time value) of a row-major table [N, K] (int8 or 4-bit, its
+    gather scales: `table`), dequantized: an fp32 [K] tile. oh: quantize(onehot(D, M, fmt)) (a
+    live stationary operand)."""
+    D, K = tab.D, tab.shape[1]
     nb = K // D
     M = oh.src.rows
+    r = tab[row:row + 1, :] if tab.shape[0] > 1 else tab
     if fmt == "int8":
         T = ol.empty([D, nb])                       # T[p, b]: element p of block b
-        _mms(oh, _view(table, row, fmt, nb, 4), lambda k, h: T[M * k:M * k + M, :], fmt)
+        qv = QTensor(r.data, r.scale, (nb, D), D, 4, D, wf=I.W8, rsc=True)
+        _mms(oh, qv, lambda k, h: T[M * k:M * k + M, :], fmt)
         Ts = [(T, b) for b in range(nb)]
     else:
         nc = -(-nb // 2)
         T0, T1 = ol.empty([D, nc]), ol.empty([D, nc])
-        _mms(oh, _view(table, row, fmt, nc, 8),
-             lambda k, h: (T0, T1)[h][M * k:M * k + M, :], fmt)
+        qv = QTensor(r.data, r.scale, (nc, 2 * D), D, _chunk_srs(fmt, D), D, wf=tab.wf)
+        _mms(oh, qv, lambda k, h: (T0, T1)[h][M * k:M * k + M, :], fmt)
         Ts = [((T0, T1)[b % 2], b // 2) for b in range(nb)]
     out = ol.empty([K])
     for b, (T, c) in enumerate(Ts):                 # the transpose, a column per VOP
@@ -132,18 +143,21 @@ def gather_row(oh, table: QTensor, row, fmt: str):
     return out
 
 
-def gather_record(oh, table: QTensor, row, fmt: str, S: int):
-    """Row `row` of a table packed by pack_records (S blocks per record; table.shape[1] =
-    S * D elements), dequantized in order: an fp32 [S * D] tile (the first n are the row)."""
-    D, M = table.D, oh.src.rows
+def gather_record(oh, tab: QTensor, row, fmt: str, S: int):
+    """Row `row` of a table packed by pack_records (S blocks per record; tab.shape[1] = S * D
+    elements, tab.scale the records' gather scales), dequantized in order: an fp32 [S * D]
+    tile (the first n are the row)."""
+    D, M = tab.D, oh.src.rows
     out = ol.empty([S * D])
     v = out.reshape(D, S)                           # v[p, c] = element p S + c
+    r = tab[row:row + 1, :] if tab.shape[0] > 1 else tab
     if fmt == "int8":
-        _mms(oh, _view(table, row, fmt, S, 4), lambda k, h: v[M * k:M * k + M, :], fmt)
+        qv = QTensor(r.data, r.scale, (S, D), D, 4, D, wf=I.W8, rsc=True)
+        _mms(oh, qv, lambda k, h: v[M * k:M * k + M, :], fmt)
     else:
         nc = S // 2
-        _mms(oh, _view(table, row, fmt, nc, 8),
-             lambda k, h: v[M * k:M * k + M, h * nc:(h + 1) * nc], fmt)
+        qv = QTensor(r.data, r.scale, (nc, 2 * D), D, _chunk_srs(fmt, D), D, wf=tab.wf)
+        _mms(oh, qv, lambda k, h: v[M * k:M * k + M, h * nc:(h + 1) * nc], fmt)
     return out
 
 
@@ -165,83 +179,129 @@ def record_blocks(n: int, fmt: str) -> int:
     return s
 
 
+def record_data(S: int, fmt: str, D: int) -> int:
+    """Bytes of a record's elements (its gather scales follow them)."""
+    return S * D if fmt == "int8" else S * D // 2
+
+
 def record_bytes(S: int, fmt: str, D: int) -> int:
-    """Bytes of one record: the S blocks' data, then their scale words, padded to D bytes."""
-    data = S * D if fmt == "int8" else S * D // 2
-    return data + -(-4 * S // D) * D
+    """Bytes of one record: the S blocks' data, then their gather scales (int8 an fp32 per
+    block, 4-bit a scale row per chunk), padded to D bytes."""
+    sc = 4 * S if fmt == "int8" else S // 2 * _chunk_srs(fmt, D)
+    return record_data(S, fmt, D) + -(-sc // D) * D
+
+
+def record_table(base, n: int, S: int, fmt: str, D: int) -> QTensor:
+    """The descriptor of n records of S blocks at `base` (pack_records' layout) to gather from."""
+    rec = record_bytes(S, fmt, D)
+    return QTensor(Affine.of(base), Affine.of(base) + record_data(S, fmt, D), (n, S * D), rec,
+                   rec, D, wf=Q.mxu_wf(fmt))
 
 
 def pack_records(rows: np.ndarray, fmt: str, D: int, S: int) -> np.ndarray:
     """Records [T, record_bytes] (uint8) of fp32 rows [T, n], n <= S D: element i of a row is
     element i // S of block i % S (int8: block c is the c-th D bytes; 4-bit: blocks c and S/2
-    + c are the two halves of chunk c), zeros past n; the scale words follow the data (block
-    order; 4-bit: chunk order, two words per chunk)."""
+    + c are the two halves of chunk c), zeros past n; the gather scales follow the data. Each
+    block is quantized on its own (int8: a row of one block, its scale Sw), a 4-bit chunk's two
+    blocks as one row (one Sw, their offsets and multipliers: the chunk's scale row)."""
     T, n = rows.shape
     x = np.zeros((T, S * D), np.float32)
     x[:, :n] = rows
     blk = x.reshape(T, D, S).transpose(0, 2, 1).reshape(T * S, D)     # [T*S, D]: block c
     rec = np.zeros((T, record_bytes(S, fmt, D)), np.uint8)
+    nd = record_data(S, fmt, D)
     if fmt == "int8":
-        q, s = QC.quantize_rows(blk, fmt, D)                          # [T*S, D], [T*S, 1]
-        rec[:, :S * D] = q.reshape(T, S * D)
-        rec[:, S * D:S * D + 4 * S] = s.reshape(T, S).view(np.uint8).reshape(T, 4 * S)
+        q, s = QC.quantize_rows(blk, fmt, D)                          # [T*S, D], [T*S, 8]
+        rec[:, :nd] = q.reshape(T, nd)
+        rec[:, nd:nd + 4 * S] = Q.gather_scales(s, fmt, D, D).view(np.uint8).reshape(T, 4 * S)
         return rec
-    b, w = QC.quantize_rows(blk, fmt, D)                              # [T*S, D/2 padded to D]
-    b = b[:, :D // 2].reshape(T, 2, S // 2, D // 2)                   # (half, chunk)
-    rec[:, :S * D // 2] = b.transpose(0, 2, 1, 3).reshape(T, S * D // 2)
-    w = w.reshape(T, 2, S // 2).transpose(0, 2, 1)                     # chunk, then half
-    rec[:, S * D // 2:S * D // 2 + 4 * S] = np.ascontiguousarray(w).view(np.uint8).reshape(
-        T, 4 * S)
+    nc = S // 2
+    pair = blk.reshape(T, 2, nc, D).transpose(0, 2, 1, 3).reshape(T * nc, 2 * D)  # chunk rows
+    b, s = QC.quantize_rows(pair, fmt, D)                             # [T*nc, D], [T*nc, srs]
+    rec[:, :nd] = b.reshape(T, nd)
+    cs = _chunk_srs(fmt, D)
+    rec[:, nd:nd + nc * cs] = Q.gather_scales(s, fmt, 2 * D, D).reshape(T, nc * cs)
     return rec
 
 
 def _onehot_q(D: int):
-    """The quantized one-hot: (q, s) as QACT makes them."""
-    x = np.zeros(D, np.float32)
-    x[0] = 1.0
-    q, s = F.quantize(x)
-    return int(q[0]), np.float32(s)
+    """The quantized one-hot: (q, Sa) as QACT makes them (every offset 0)."""
+    x = np.zeros((1, D), np.float32)
+    x[0, 0] = 1.0
+    q, s, _ = F.quantize_mx(x, D // Q.NSUB)
+    return int(q[0, 0]), np.float32(s[0])
 
 
-def dequant_blocks(q, ws, fmt: str, D: int) -> np.ndarray:
-    """The one-hot MMs' values of blocks [N, D]: int8 q (int8) with fp32 scales ws [N]; 4-bit
-    q packed [N, D/2] with scale words ws [N] (uint32). fp32 [N, D], as the MXU computes."""
-    q1, s1 = _onehot_q(D)
+def dequant_blocks(w, Sw, dw, m, fmt: str) -> np.ndarray:
+    """The one-hot MMs' values of blocks [N, D]: their integer elements w [N, D] (int8, or the
+    4-bit codes decoded) and per block its Sw [N] and per group (G of them) dw and m [N, G].
+    fp32 [N, D], as the MXU computes: rne(rne(i2f(127 w (m << sh)) Sw) (Sa 2^-W)), sh = W - dw
+    (sh < 0: 0)."""
+    q1, s1 = _onehot_q(np.asarray(w).shape[1])
+    W = I.MX_W[Q.mxu_wf(fmt)]
+    w = np.asarray(w, np.int64)
+    N, D = w.shape
+    G = np.asarray(dw).shape[1]
+    sh = W - np.asarray(dw, np.int64)
+    B = np.where(sh >= 0, np.asarray(m, np.int64) << np.maximum(sh, 0), 0)
+    acc = q1 * w * np.repeat(B, D // G, axis=1)
+    return F.mul(F.mul(F.i2f(acc), np.asarray(Sw, np.float32)[:, None]),
+                 F.mul(s1, np.float32(2.0 ** -W)))
+
+
+def dequant_gathered(rows: np.ndarray, gsc: np.ndarray, fmt: str, K: int,
+                     D: int = 128) -> np.ndarray:
+    """The gathered values of table rows [N, K] (fp32): their element rows (row_bytes) and
+    gather scales (quant.gather_scales: int8 fp32 [N, KB], 4-bit uint8 [N, chunks, srs])."""
+    rows = np.asarray(rows, np.uint8)
+    N, KB = rows.shape[0], K // D
+    w = Q.elements(rows, fmt, K).reshape(N * KB, D)
     if fmt == "int8":
-        isum = q1 * np.asarray(q, np.int64)
-        scale = np.asarray(ws, np.float32)[:, None]
-    else:
-        w = Q.DEC[fmt][Q.unpack4(np.asarray(q, np.uint8))].astype(np.int64)      # [N, D]
-        words = np.asarray(ws, np.uint32)
-        mb = np.stack([(words >> np.uint32(16 + 4 * b)) & np.uint32(15)
-                       for b in range(Q.NSUB)], -1).astype(np.int64)             # [N, NSUB]
-        isum = q1 * w * np.repeat(mb, D // Q.NSUB, axis=1)
-        scale = F.ftz((words << np.uint32(16)).view(np.float32))[:, None]
-    return F.mul(F.mul(F.i2f(isum), scale), s1)
+        Sw = np.asarray(gsc).reshape(N, -1)[:, :KB].view(np.float32) \
+            if np.asarray(gsc).dtype == np.uint8 else np.asarray(gsc, np.float32)
+        Sw = Sw.reshape(N * KB)
+        zero = np.zeros((N * KB, Q.NSUB), np.int64)
+        return dequant_blocks(w, Sw, zero, zero + 1, fmt).reshape(N, K)
+    g = np.asarray(gsc, np.uint8).reshape(N, -1, _chunk_srs(fmt, D))   # [N, nc, srs]
+    nc = g.shape[1]
+    Sw, dw, m = Q.unpack_scales(g.reshape(N * nc, -1), fmt, 2)        # [N*nc], [N*nc, 2, G]
+    Sw = np.repeat(Sw, 2)[:N * nc * 2].reshape(N, 2 * nc)[:, :KB].reshape(-1)
+    dw = dw.reshape(N, 2 * nc, -1)[:, :KB].reshape(N * KB, -1)
+    m = m.reshape(N, 2 * nc, -1)[:, :KB].reshape(N * KB, -1)
+    return dequant_blocks(w, Sw, dw, m, fmt).reshape(N, K)
 
 
-def dequant_row(qrow: np.ndarray, srow: np.ndarray, fmt: str, D: int) -> np.ndarray:
-    """gather_row's values of one table row: its MXU bytes (quant.quantize_mxu's row) and
-    scale words (fp32 bits for int8)."""
-    if fmt == "int8":
-        q = np.asarray(qrow).view(np.int8).reshape(-1, D)
-        return dequant_blocks(q, np.asarray(srow).view(np.float32), fmt, D).reshape(-1)
-    K = 4 * len(srow) * D // 4
-    q = np.asarray(qrow, np.uint8)[:K // 2].reshape(-1, D // 2)
-    return dequant_blocks(q, np.asarray(srow).view(np.uint32), fmt, D).reshape(-1)
+def dequant_row(qrow: np.ndarray, gsrow: np.ndarray, fmt: str, D: int, K: int | None = None
+                ) -> np.ndarray:
+    """gather_row's values of one table row: its MXU bytes (quant.quantize_mxu's row) and its
+    gather scales (quant.gather_scales' row)."""
+    qrow = np.asarray(qrow, np.uint8)
+    if K is None:
+        K = len(qrow) if fmt == "int8" else 2 * len(qrow)
+    return dequant_gathered(qrow[None], np.asarray(gsrow)[None], fmt, K, D)[0]
+
+
+def gathered(a: np.ndarray, fmt: str, D: int = 128) -> np.ndarray:
+    """The values gather_row gives for fp32 rows [n, K] of a table in MXU format fmt
+    (quantize_mxu, gather_scales): [n, K] fp32, bit for bit."""
+    a = np.atleast_2d(np.asarray(a, np.float32))
+    q, s = Q.quantize_mxu(a, fmt, D)
+    return dequant_gathered(q, Q.gather_scales(s, fmt, a.shape[1], D), fmt, a.shape[1], D)
 
 
 def dequant_records(rec: np.ndarray, fmt: str, D: int, S: int) -> np.ndarray:
     """gather_record's values of records [T, record_bytes]: fp32 [T, S * D]."""
     T = rec.shape[0]
+    nd = record_data(S, fmt, D)
     if fmt == "int8":
-        q = rec[:, :S * D].view(np.int8).reshape(T * S, D)
-        s = rec[:, S * D:S * D + 4 * S].copy().view(np.float32).reshape(T * S)
-        v = dequant_blocks(q, s, fmt, D).reshape(T, S, D)
+        q = rec[:, :nd].reshape(T * S, D)
+        s = rec[:, nd:nd + 4 * S].copy().view(np.float32).reshape(T * S, 1)
+        v = dequant_gathered(q, s, fmt, D, D).reshape(T, S, D)
     else:
         nc = S // 2
-        b = rec[:, :S * D // 2].reshape(T, nc, 2, D // 2).transpose(0, 2, 1, 3)
-        w = rec[:, S * D // 2:S * D // 2 + 4 * S].copy().view(np.uint32).reshape(T, nc, 2)
-        v = dequant_blocks(b.reshape(T * S, D // 2), w.transpose(0, 2, 1).reshape(T * S),
-                           fmt, D).reshape(T, S, D)
+        cs = _chunk_srs(fmt, D)
+        b = rec[:, :nd].reshape(T * nc, D)                               # a chunk row each
+        g = rec[:, nd:nd + nc * cs].reshape(T * nc, 1, cs)
+        v = dequant_gathered(b, g, fmt, 2 * D, D).reshape(T, nc, 2, D)
+        v = v.transpose(0, 2, 1, 3).reshape(T, S, D)                    # block c, S/2 + c
     return np.ascontiguousarray(v.transpose(0, 2, 1)).reshape(T, S * D)

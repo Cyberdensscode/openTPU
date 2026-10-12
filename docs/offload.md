@@ -927,16 +927,19 @@ the paths in `env.sh`. The host's files come from `tools/offload/strip_experts.p
 checkpoint without its experts) and `pack_pool.py` (the pool, packed in workers or streamed to
 another host).
 
-A pool file has a key, `<pool>.key` (`moe.pool_key`): the quantizer's code (quant.py, and for
-int8 fp32.py too), the experts' format, D, the layout (the pool's and the slot's) and the
+A pool file has a key, `<pool>.key` (`moe.pool_key`): the MXU's numerics (key 2,
+`"numerics": quant.MX_NUMERICS`: the MX MXU, docs/mx_mxu.md), the quantizer's code (quant.py and
+fp32.py), the experts' format, D, the layout (the pool's and the slot's) and the
 checkpoint's config.json (strip_experts.py copies it as it is). `pack_pool.py init` and a run that
 creates the pool write it; every run that opens the pool checks it (`moe.open_pool`), and so do
 `pack` and `recv` (against the key that `send` puts first in its stream). A pool packed by another
 quantizer, in another format of the same size (int4 against fp4) or from another checkpoint is
-refused, with how to repack it. A pool packed before keys is taken with a one-line warning;
-`pack_pool.py MODEL POOL stamp` gives it the key of MODEL and `--wformat` once it is known to be
-current, and `pack_pool.py MODEL POOL info` prints the key, or for a pool without one its format as
-its slot size says (int8, or 4-bit: fp4 and int4 have the same size).
+refused, with how to repack it, and so is every pool of the MXU before MX: a key 1 pool, or one
+packed before keys (no key file). Their scale words are the former MXU's, so the experts are
+repacked (MX image: a new pool); `pack_pool.py MODEL POOL stamp` gives a pool without a key the
+key of MODEL and `--wformat` only once `sums` shows it holds this tree's bytes, and
+`pack_pool.py MODEL POOL info` prints the key, or for a pool without one its format as its slot
+size says (int8, or 4-bit: fp4 and int4 have the same size).
 
 The first run found a bug. The Engine's compile worker process, which the card's backend
 compiles ahead in, built its image without the MoE's `experts`: every expert resident, over
@@ -3778,14 +3781,16 @@ build's minutes. It stops with the reason and the commands to fix it when the po
 - is missing (the message gives the pack commands);
 - has another size (another model or format; the runtime would take it for a new pool and
   truncate it);
-- has another key (moe.pool_key: the quantizer's code, the format, D, the layout, the
-  checkpoint's config.json): packed by an older quantizer or from another checkpoint. Repack it;
+- has another key (moe.pool_key: the MXU's numerics, the quantizer's code, the format, D, the
+  layout, the checkpoint's config.json): packed for the MXU before MX, by an older quantizer or
+  from another checkpoint. Repack it;
 - is not whole, beside a checkpoint without the experts to pack the rest.
 
-A pool packed before keys has none. It is served with a warning until `pack_pool.py MODEL POOL
-stamp` writes its key. Stamp a pool only once it is known current: `pack_pool.py MODEL POOL sums
-32` prints the sha256 of 32 of its experts, and `pack_pool.py MODEL - sums 32` (on a host with
-the whole checkpoint) the same experts as this tree packs them. The lists must be equal.
+A pool packed before keys has none: it is refused (it predates the MX MXU) until
+`pack_pool.py MODEL POOL stamp` writes its key. Stamp a pool only once it is known current:
+`pack_pool.py MODEL POOL sums 32` prints the sha256 of 32 of its experts, and
+`pack_pool.py MODEL - sums 32` (on a host with the whole checkpoint) the same experts as this
+tree packs them. The lists must be equal.
 
 ### 14.2 What runs
 

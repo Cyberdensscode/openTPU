@@ -62,7 +62,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -108,10 +107,11 @@ class MoESpec:
 
 
 class ExpertFormat:
-    """One expert in its slot: W_gate, W_up [F, H] (rows, then their scale words) and W_down
-    [H, F] in column parts of `C` (swiglu_down's chunks), each D-byte aligned. A width that is
-    not a whole number of the format's chunks (Gemma 4's 704) is padded with zero rows of
-    W_gate and W_up and zero columns of W_down to `F` (768): exact, act(0) * 0 = 0."""
+    """One expert in its slot: W_gate, W_up [F, H] (rows, then their scale rows) and W_down
+    [H, F] in column parts of `C` (swiglu_down's chunks; its rows quantized whole, each part's
+    scale rows the row's Sw and its blocks': quant.column_parts), each D-byte aligned. A width
+    that is not a whole number of the format's chunks (Gemma 4's 704) is padded with zero rows
+    of W_gate and W_up and zero columns of W_down to `F` (768): exact, act(0) * 0 = 0."""
 
     def __init__(self, H: int, F: int, D: int, wformat: str):
         rb = lambda k: Q.row_bytes(k, wformat, D)                       # noqa: E731
@@ -125,11 +125,17 @@ class ExpertFormat:
             nonlocal a
             at, a = a, a + -(-n // align) * align
             return at
-        self.wg = (take(F * rb(H)), take(4 * F * (H // D)))
-        self.wu = (take(F * rb(H)), take(4 * F * (H // D)))
-        self.wd = [(take(H * rb(self.C)), take(4 * H * (self.C // D)))
-                   for _ in range(F // self.C)]
+        sb = lambda k: Q.scale_bytes(k, wformat, D)                     # noqa: E731
+        self.wg = (take(F * rb(H)), take(F * sb(H)))
+        self.wu = (take(F * rb(H)), take(F * sb(H)))
+        self.wd = [(take(H * rb(self.C)), take(H * sb(self.C))) for _ in range(F // self.C)]
         self.nbytes = a
+
+    def ranges(self) -> list[int]:
+        """The down projection's QACT ranges over the expert's own width F0, for an emulation
+        of the unpadded expert: a chunk of C each, the last cut at F0 (the slot's zero columns
+        change no range's amax)."""
+        return [min(self.C, self.F0 - c) for c in range(0, self.F0, self.C)]
 
     def pack(self, wg: np.ndarray, wu: np.ndarray, wd: np.ndarray) -> np.ndarray:
         """The slot's bytes for W_gate, W_up [F0, H] and W_down [H, F0] (float)."""
@@ -139,30 +145,30 @@ class ExpertFormat:
             wg, wu = (np.pad(np.asarray(w, np.float32), ((0, pad), (0, 0))) for w in (wg, wu))
             wd = np.pad(np.asarray(wd, np.float32), ((0, 0), (0, pad)))
 
-        def put(pair, W):
-            q, s = Q.quantize_mxu(W, self.wformat, self.D)
-            for at, v in zip(pair, (q, s)):
+        def put(pair, qs):
+            for at, v in zip(pair, qs):
                 v = np.ascontiguousarray(v).view(np.uint8).reshape(-1)
                 out[at:at + v.size] = v
-        put(self.wg, wg)
-        put(self.wu, wu)
-        C = self.C
-        for j, pair in enumerate(self.wd):
-            put(pair, wd[:, j * C:(j + 1) * C])
+        fm, D = self.wformat, self.D
+        put(self.wg, Q.quantize_mxu(wg, fm, D))
+        put(self.wu, Q.quantize_mxu(wu, fm, D))
+        # W_down's rows quantized whole (one Sw a row), stored in column parts of C
+        q, s = Q.quantize_mxu(np.asarray(wd, np.float32), fm, D)
+        for pair, qs in zip(self.wd, Q.column_parts(q, s, fm, self.F, self.C, D)):
+            put(pair, qs)
         return out
 
     def descs(self, base) -> SimpleNamespace:
         """wg, wu, wd QTensors of the expert whose slot starts at `base` (an address
         expression: a DevVar for a slot found at run time)."""
         H, F, D, C, fm = self.H, self.F, self.D, self.C, self.wformat
-        wf, base = Q.mxu_wf(fm), Affine.of(base)
+        base = Affine.of(base)
 
         def q(pair, n, k):
-            return QTensor(base + pair[0], base + pair[1], (n, k), Q.row_bytes(k, fm, D),
-                           4 * (k // D), D, wf=wf)
+            return QTensor.weight(base + pair[0], base + pair[1], n, k, fm, D)
         parts = tuple(q(p, H, C) for p in self.wd)
-        wd = QTensor(parts[0].data, parts[0].scale, (H, F), Q.row_bytes(C, fm, D),
-                     4 * (C // D), D, parts=parts, pw=C, wf=wf)
+        wd = QTensor(parts[0].data, parts[0].scale, (H, F), parts[0].rs, parts[0].srs, D,
+                     parts=parts, pw=C, wf=parts[0].wf)
         return SimpleNamespace(wg=q(self.wg, F, H), wu=q(self.wu, F, H), wd=wd)
 
 
@@ -192,12 +198,12 @@ def gemma_router(W, p: str) -> np.ndarray:
 
 # ---------------------------------------------------------------------------- the pool's key
 def quant_source(wformat: str) -> str:
-    """The quantizer's code an expert's bytes depend on: quant.py, and for int8 fp32.py too
-    (runtime.quantize_rows rounds by fp32.quantize, its scale by fp32.recip). Not numpy's
-    version (qcache._source's): a pool is packed on one host and read on another."""
+    """The quantizer's code an expert's bytes depend on: quant.py and fp32.py (int8x's
+    quantize_mx, the 4-bit formats' scale arithmetic). Not numpy's version (qcache._source's):
+    a pool is packed on one host and read on another."""
     from .. import fp32 as F
     h = hashlib.blake2b(digest_size=16)
-    for f in [Q.__file__] + ([F.__file__] if wformat == "int8" else []):
+    for f in (Q.__file__, F.__file__):
         h.update(Path(f).read_bytes())
     return h.hexdigest()
 
@@ -214,11 +220,13 @@ def checkpoint_id(model_dir) -> str | None:
 
 def pool_key(image, model_dir=None) -> dict:
     """The key of `image`'s expert pool (`<pool>.key`, JSON): what decides its experts' bytes,
-    the quantizer's code (quant_source), the format, D, the layout (the pool's and the slot's:
-    ExpertFormat's parts) and the checkpoint (checkpoint_id); "numpy" and "model" are notes,
-    not compared."""
+    the MXU's numerics (quant.MX_NUMERICS: key 2 and on; a key 1 pool holds the scale words of
+    the MXU before MX, docs/mx_mxu.md), the quantizer's code (quant_source), the format, D, the
+    layout (the pool's and the slot's: ExpertFormat's parts) and the checkpoint
+    (checkpoint_id); "numpy" and "model" are notes, not compared."""
     f, L = image.fmt, image.offload
-    return {"key": 1, "quant": quant_source(f.wformat), "format": f.wformat, "D": f.D,
+    return {"key": 2, "numerics": Q.MX_NUMERICS, "quant": quant_source(f.wformat),
+            "format": f.wformat, "D": f.D,
             "layout": {"layers": L.layers, "E": L.E, "slot_bytes": L.slot_bytes, "H": f.H,
                        "F": f.F0, "C": f.C, "wg": list(f.wg), "wu": list(f.wu),
                        "wd": [list(x) for x in f.wd]},
@@ -229,7 +237,8 @@ def pool_key(image, model_dir=None) -> dict:
 def key_diff(have: dict, want: dict) -> list:
     """The fields in which a pool's key `have` differs from `want` (the checkpoint only when
     both know it)."""
-    out = [k for k in ("key", "quant", "format", "D", "layout") if have.get(k) != want.get(k)]
+    out = [k for k in ("key", "numerics", "quant", "format", "D", "layout")
+           if have.get(k) != want.get(k)]
     if None not in (have.get("checkpoint"), want.get("checkpoint")) and \
             have["checkpoint"] != want["checkpoint"]:
         out.append("checkpoint")
@@ -238,14 +247,19 @@ def key_diff(have: dict, want: dict) -> list:
 
 def check_pool_key(pool_file, want: dict) -> None:
     """Refuse an expert pool whose key (`<pool>.key`) is not `want`: its experts were packed by
-    another quantizer, in another format or layout, or from another checkpoint. A pool without
-    a key (packed before keys) is taken with a warning."""
+    another quantizer, for the MXU before MX, in another format or layout, or from another
+    checkpoint. A pool without a key is refused too: it was packed before keys, so before the
+    MX numerics (its scale words are the former MXU's); pack_pool stamp gives one its key once
+    `sums` shows it holds this tree's bytes."""
     kf = Path(str(pool_file) + ".key")
     if not kf.exists():
-        print(f"warning: {pool_file} has no key file (a pool packed before keys): taken as "
-              f"{want['format']}, unchecked; once it is known current, stamp it: python3 "
-              f"tools/offload/pack_pool.py MODEL {pool_file} stamp", file=sys.stderr, flush=True)
-        return
+        raise ValueError(
+            f"{pool_file} has no key file: a pool packed before keys, for the MXU before MX "
+            f"(docs/mx_mxu.md), whose experts' bytes are not this image's. Repack it: remove "
+            f"{pool_file} and its .packed and .format, then python3 tools/offload/pack_pool.py "
+            f"MODEL {pool_file} init and its pack workers (or let the run pack the experts it "
+            f"asks for); a pool known to hold this tree's bytes (pack_pool.py ... sums) gets "
+            f"its key by pack_pool.py MODEL {pool_file} stamp")
     have = json.loads(kf.read_text())
     diff = key_diff(have, want)
     if diff:
@@ -269,7 +283,7 @@ def open_pool(layout: Layout, pool_file, mapped: bool = True,
     one is a pool packed whole). A new file is in the split format
     (opentpu.host.offload.split_order), as `<pool_file>.format` says; a file without it holds
     the slot format. With `key` (pool_key) a new file gets it as `<pool_file>.key`, and an
-    existing one must have it (check_pool_key; one without a key file is taken with a warning).
+    existing one must have it (check_pool_key; one without a key file is refused).
     The page cache stays the kernel's to reclaim: nothing is pinned. mapped: PoolFile's (its
     reads touched through a read-only map: docs/offload.md 10.7)."""
     L = layout

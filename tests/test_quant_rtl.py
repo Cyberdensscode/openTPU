@@ -1,32 +1,35 @@
-"""The quantization path's corners on the RTL against the ISA simulator (docs/isa.md, "MM",
-"Weight formats", "QACT", "QST"): every 4-bit code under every sub-block multiplier, with and
-without column reuse; the scale words' corners (4-bit bf16 scales and int8 fp32 scales:
-negative, signed zeros, denormals, the largest finite, inf, NaN) and int8's -128, which the
-host's quantizers never write and the fuzzers never draw; and the quantizer's rounding ties
-(q8 rounds x * inv half to even and saturates at +-127), through QST (blocks and rows) and
-QACT (blocks and rows, read back by an MM with identity weights). Each runs the same program on
-both and compares DRAM and TMEM bit for bit."""
+"""The MX column and the quantizer on the RTL against the ISA simulator (docs/isa.md "MM",
+"Weight formats", "Quantization", "QACT", "QST"; docs/mx_mxu.md): MMs in every weight format
+(int8x with -128, int4x, fp4x6, NVFP4) with UNIT, RSC, PAIR, k0, ACC, RMAX and ASCALE, the
+scale words' corners (Sw negative, signed zeros, denormals, the largest finite, inf, NaN), groups
+at the shift window's edge (sh = 0 kept, sh = -1 dropped), at MCOLS 4 and 8 and 1, 2 or 4
+epilogue lanes; QACT and QST in every mode (ROW, CSCALE, RSCALE, DUP, HALF, element strides,
+unaligned rows, KB not a multiple of 4, zero, inf and denormal rows, a chunk holding two QACT
+groups at D = 32 with 16 lanes), and the quantizer's rounding ties (q8 rounds x * (inv * 2^d)
+half to even), read back through MMs with identity weights. Each runs the same program on both
+and compares DRAM and TMEM bit for bit."""
 import numpy as np
 import pytest
 
 from opentpu import Config, fp32 as F, isa as I, quant as Q, rtlsim
 from opentpu.isasim import Machine
 
-# bf16 scale corners (the top 16 bits of an fp32): -1.5, +0, -0, the smallest and largest
-# denormals, the smallest normal, the largest finite, +inf, NaN
-BF16_CORNERS = [0xBFC0, 0x0000, 0x8000, 0x0001, 0x007F, 0x0080, 0x7F7F, 0x7F80, 0x7FC0]
+from test_mx import _scale_rows
+
 F32_CORNERS = [0xBF400000, 0x00000000, 0x80000000, 0x00000001, 0x007FFFFF, 0x00800000,
                0x7F7FFFFF, 0x7F800000, 0x7FC00000]
 
 
-def _both(cfg, prog, dram):
+def _both(cfg, prog, dram, uarch=None):
     m = Machine(cfg, [prog], [dram.copy()]).run()
-    drams, tmems, _ = rtlsim.run(cfg, [prog], [dram.copy()])
+    drams, tmems, _ = rtlsim.run(cfg, [prog], [dram.copy()], uarch=uarch)
     bad = np.nonzero(tmems[0] != m.slices[0].tmem)[0]
     assert len(bad) == 0, (f"{len(bad)} TMEM words differ, first {bad[:6]}: RTL "
                            f"{[hex(int(v)) for v in tmems[0][bad[:6]]]} ISA "
                            f"{[hex(int(v)) for v in m.slices[0].tmem[bad[:6]]]}")
-    assert np.array_equal(drams[0], m.slices[0].dram)
+    bad = np.nonzero(drams[0] != m.slices[0].dram)[0]
+    assert len(bad) == 0, (f"{len(bad)} DRAM bytes differ, first at {bad[:6]}: RTL "
+                           f"{drams[0][bad[:6]]} ISA {m.slices[0].dram[bad[:6]]}")
     return m
 
 
@@ -35,76 +38,188 @@ def _put(dram, at, a):
     dram[at:at + b.size] = b
 
 
-X, WA, SA, OUT = 0, 0x40000, 0x80000, 0x8000
+X, WA, SA, OUT, SC, AL = 0, 0x40000, 0x80000, 0x8000, 0xA0000, 0xB0000
 
 
-@pytest.mark.parametrize("fmt,D,pair", [("int4", 32, False), ("fp4", 32, False),
-                                        ("int4", 128, True), ("fp4", 128, True),
-                                        ("fp4", 128, False)])
-def test_mm_4bit_codes_multipliers_and_scale_corners_rtl(have_verilator, fmt, D, pair):
-    """Rows 0..15: random positive and negative normal bf16 scales; every code at every
-    position class under every multiplier 0..15 (block k of row n: code (i + n + k) % 16 at
-    element i, multiplier m_b = (4 (n KB + k) + b) % 16). Rows 16..: one scale corner each, in
-    all its blocks. KB = 3 (an odd count: PAIR's last chunk has one block)."""
-    cfg = Config(S=1, D=D, MCOLS=4, PAIR=pair, DRAM_BYTES=1 << 20)
-    rng = np.random.default_rng(D + pair)
-    KB, M = 3, 2 if pair else 4
-    N = 16 + len(BF16_CORNERS)
-    x = rng.standard_normal((M, KB * D)).astype(np.float32)
-    i = np.arange(D)
-    codes = np.array([[(i + n + k) % 16 for k in range(KB)] for n in range(N)]).reshape(N, -1)
-    rb = -(-KB // 2) * D                                    # the row: whole D-byte chunks
-    rows = np.zeros((N, rb), np.uint8)
-    rows[:, :KB * D // 2] = Q.pack4(codes)
-    s = rng.uniform(2.0 ** -10, 2.0 ** -3, (16, KB)).astype(np.float32)
-    s[rng.random((16, KB)) < 0.3] *= -1
-    sb = np.concatenate([F.bits(s) >> 16, np.repeat(np.uint32(BF16_CORNERS)[:, None], KB, 1)])
-    mb = (4 * (np.arange(N)[:, None, None] * KB + np.arange(KB)[None, :, None])
-          + np.arange(4)) % 16
-    sh = 16 + 4 * np.arange(4, dtype=np.uint32)
-    words = (sb.astype(np.uint32) | (mb.astype(np.uint32) << sh).sum(-1)).astype(np.uint32)
-    srs = 8 * -(-KB // 2)                                   # PAIR: 8-byte aligned pairs
-    wpad = np.zeros((N, srs // 4), np.uint32)
-    wpad[:, :KB] = words
+def _xrows(rng, rows, n, g, spread=6.0):
+    """Rows of n elements whose groups of g span a wide range of magnitudes (offsets d from 0 to
+    beyond the shift window), with a zero group."""
+    x = (rng.standard_normal((rows, n)) *
+         np.exp(rng.uniform(-spread, spread, (rows, n // g, 1))).repeat(g, 2).reshape(rows, n))
+    x = x.astype(np.float32)
+    x[0, g:2 * g] = 0
+    return x
+
+
+# wf, D, MCOLS, pair, rsc, k0, E
+MM_CASES = [
+    (I.W8, 32, 4, False, False, 0, 0), (I.W8, 128, 4, False, False, 3, 1),
+    (I.W8, 32, 8, False, False, 1, 4), (I.W8, 128, 4, False, True, 0, 2),
+    (I.W4I, 32, 4, False, False, 1, 0), (I.W4I, 128, 4, True, False, 2, 2),
+    (I.W4F, 128, 4, False, False, 0, 1), (I.W4F, 32, 8, True, False, 0, 4),
+    (I.W4F, 128, 4, False, True, 0, 0), (I.WNV, 128, 4, False, False, 1, 2),
+    (I.WNV, 128, 8, True, False, 2, 1), (I.WNV, 32, 4, False, False, 0, 0),
+]
+
+
+@pytest.mark.parametrize("wf,D,mcols,pair,rsc,k0,E", MM_CASES)
+def test_mm_mx_rtl(have_verilator, wf, D, mcols, pair, rsc, k0, E):
+    """QACT, then MMs over its rows: with scales (rows 0 and 1 of each block at the window's
+    edge for ACT row 0, sh = 0 and sh = -1; random offsets elsewhere, many past the window),
+    UNIT, ACC onto the first, RMAX, ASCALE; Sw corners in rows 16.. . KB = 3 (PAIR's last chunk
+    holds one block)."""
+    cfg = Config(S=1, D=D, MCOLS=mcols, PAIR=pair, DRAM_BYTES=1 << 20)
+    rng = np.random.default_rng(100 * wf + D + mcols + 3 * pair + 5 * rsc + k0)
+    KB, M = 3, (mcols // 2 if pair else mcols)
+    N = 16 + (0 if rsc else len(F32_CORNERS))
+    W = I.MX_W[wf]
+    x = _xrows(rng, M, KB * D, D // 4)
+    KBr = k0 + KB
+    if wf == I.W8:
+        wel = rng.integers(-128, 128, (N, KB * D))
+        wel[:, ::7] = -128
+        data = wel.astype(np.int8).view(np.uint8)
+    else:
+        data = Q.pack4(rng.integers(0, 16, (N, KB * D)))
+    rs = -(-data.shape[1] // D) * D
+    rows, *_ = _scale_rows(rng, wf, N, KBr, rsc, True)
+    rows = rows.copy()
+    sw = rows[:, :4].copy().view(np.uint32)
+    if not rsc:
+        sw[16:, 0] = F32_CORNERS
+        # rows 0 / 1: every block's group 0 at sh = 0 / -1 for ACT row 0's offsets
+        _, _, d = F.quantize_mx(x, D // 4)
+        for n, off in ((0, 0), (1, 1)):
+            for k in range(KB):
+                da = int(d[0, 4 * k])
+                kk = k0 + k
+                if wf == I.W8:
+                    rows[n, 4 + kk] = max(0, W - da + off)
+                elif wf == I.WNV:
+                    rows[n, 16 + 8 * kk] = (rows[n, 16 + 8 * kk] & 7) | (min(15, da + 2 - off) << 3)
+                else:
+                    rows[n, 8 + 4 * kk] = max(0, W - da + off)
+    rows[:, :4] = sw.view(np.uint8)
+    srs = rows.shape[1]
     dram = np.zeros(cfg.DRAM_BYTES, np.uint8)
     _put(dram, X, x)
-    _put(dram, WA, rows)
-    _put(dram, SA, wpad)
-    wf = Q.mxu_wf(fmt)
-    prog = [I.ld(X, 0, x.size), I.qact(0, M, 0, KB, KB * D, dup=pair),
-            I.mm(WA, SA, OUT, N, KB, rb, N, M, 0, srs, wf=wf, pair=pair),
-            I.mm(WA, SA, OUT + 2 * M * N, N, KB, rb, N, M, 0, srs, wf=wf, pair=pair, unit=True),
+    for n in range(N):
+        dram[WA + n * rs:WA + n * rs + data.shape[1]] = data[n]
+    _put(dram, SA, rows)
+    alpha = rng.uniform(-1.5, 1.5, M).astype(np.float32)
+    _put(dram, AL, alpha)
+    mm = dict(sa=WA, n=N, kb=KB, rs=rs, ors=N + 1, m=M, ab=1, srs=srs, wf=wf, pair=pair, k0=k0,
+              rsc=rsc)
+    prog = [I.ld(X, 0, x.size), I.ld(AL, 0x7000, M), I.qact(0, M, 1, KB, KB * D, dup=pair),
+            I.mm(ssa=SA, out=OUT, **mm),
+            I.mm(ssa=SA, out=OUT + 4096, **mm, unit=True, rmax=True),
+            I.mm(ssa=SA, out=OUT, **mm, acc=True, rmax=True),
+            I.mm(ssa=0, out=OUT + 4096, **mm, unit=True, acc=True, ascale=0x7000),
             I.halt()]
-    m = _both(cfg, prog, dram)
-    # the finite rows against float64 math on the dequantized weights (the ISA's own check)
-    got = m.slices[0].tget(OUT + np.arange(M * N)).reshape(M, N)[:, :16].astype(np.float64)
-    q, sx = F.quantize(x.reshape(M, KB, D), axis=2)
-    xa = (q.astype(np.float64) * sx[..., None]).reshape(M, -1)
-    want = xa @ Q.dequantize_w4(rows[:16, :KB * D // 2], words[:16], fmt, D).T
-    assert np.allclose(got, want, rtol=1e-5, atol=1e-6 * np.abs(want).max())
+    m = _both(cfg, prog, dram, uarch={"MXU_E": E})
+    if not rsc:                                    # the window's edge was reached, both ways
+        s = m.slices[0]
+        da = s.adoff[0, 1:1 + KB, 0].astype(int)
+        if wf == I.WNV:
+            E4 = rows[:2, 16 + 8 * (k0 + np.arange(KB))] >> 3
+            sh = np.maximum(E4, 1) - 2 - da
+        else:
+            col = 4 + k0 + np.arange(KB) if wf == I.W8 else 8 + 4 * (k0 + np.arange(KB))
+            sh = W - rows[:2, col].astype(int) - da
+        assert (sh[0] == 0).any() and (sh[1] == -1).any(), sh
 
 
-def test_mm_int8_minus_128_and_scale_corners_rtl(have_verilator):
-    """int8 weights of -128 (a code the host never writes) beside random ones, and every fp32
-    scale corner, one per row; UNIT and with scales."""
-    cfg = Config(S=1, D=32, MCOLS=4, DRAM_BYTES=1 << 20)
-    D, KB, M = cfg.D, 3, 4
-    rng = np.random.default_rng(7)
-    N = 8 + len(F32_CORNERS)
-    x = rng.standard_normal((M, KB * D)).astype(np.float32)
-    w = rng.integers(-128, 128, (N, KB * D)).astype(np.int8)
-    w[:, ::5] = -128
-    s = F.from_bits(np.concatenate([F.bits(rng.uniform(0.01, 0.1, (8, KB)).astype(np.float32)),
-                                    np.repeat(np.uint32(F32_CORNERS)[:, None], KB, 1)]))
+@pytest.mark.parametrize("mcols,rows,wf,D", [(4, 8, I.W8, 32), (2, 6, I.W4F, 32),
+                                             (4, 12, I.WNV, 32), (4, 16, I.W4F, 32),
+                                             (4, 16, I.WNV, 128)])
+def test_mm_mx_replay_rtl(have_verilator, mcols, rows, wf, D):
+    """M > MCOLS: each streamed chunk and its scale entry serve every group of MCOLS rows (up to
+    ACT_ROWS 16, the production build's, at the card's D = 128)."""
+    cfg = Config(S=1, D=D, MCOLS=mcols, ACT_ROWS=rows, DRAM_BYTES=1 << 20)
+    rng = np.random.default_rng(300 + rows)
+    KB, N = 4, 9
+    x = _xrows(rng, rows, KB * D, D // 4, 3.0)
+    data = (rng.integers(-128, 128, (N, KB * D)).astype(np.int8).view(np.uint8) if wf == I.W8
+            else Q.pack4(rng.integers(0, 16, (N, KB * D))))
+    rs = -(-data.shape[1] // D) * D
+    srows, *_ = _scale_rows(rng, wf, N, KB + 1, False, False)
     dram = np.zeros(cfg.DRAM_BYTES, np.uint8)
     _put(dram, X, x)
-    _put(dram, WA, w)
-    _put(dram, SA, s)
-    prog = [I.ld(X, 0, x.size), I.qact(0, M, 0, KB, KB * D),
-            I.mm(WA, SA, OUT, N, KB, KB * D, N, M, 0, 4 * KB),
-            I.mm(WA, SA, OUT + 2 * M * N, N, KB, KB * D, N, M, 0, 4 * KB, unit=True),
+    for n in range(N):
+        dram[WA + n * rs:WA + n * rs + data.shape[1]] = data[n]
+    _put(dram, SA, srows)
+    prog = [I.ld(X, 0, x.size), I.qact(0, rows, 0, KB, KB * D),
+            I.mm(WA, SA, OUT, N, KB, rs, N + 3, rows, 0, srows.shape[1], wf=wf, k0=1),
+            I.mm(WA, SA, OUT, N, KB, rs, N + 3, rows, 0, srows.shape[1], wf=wf, acc=True),
             I.halt()]
     _both(cfg, prog, dram)
+
+
+def _qrows(rng, R, n, g):
+    """Rows for the quantizer: wide-ranging groups (and a zero group), then a zero row, a row
+    with an infinity, a row of denormals and normals (denormals flush), a NaN row."""
+    x = _xrows(rng, R, n, g)
+    x[1] = 0
+    x[2, 3] = np.inf
+    x[3, :] = F.from_bits(rng.integers(1, 0x800000, n).astype(np.uint32))
+    x[3, ::5] *= 0
+    x[3, ::5] += 1e-30
+    x[4, 7] = np.nan
+    return x
+
+
+@pytest.mark.parametrize("D,lanes,xd", [(32, 8, None), (32, 16, None), (128, 8, None),
+                                         (128, 16, None), (32, 8, 0), (32, 8, 32), (128, 8, 128)])
+def test_quantizer_modes_rtl(have_verilator, D, lanes, xd):
+    """QACT (ROW or not, CSCALE, RSCALE, DUP) read back by identity MMs, UNIT (y = q * Sa *
+    2^-da; groups past the window drop) and int8x; QST (ROW or not, HALF, element strides 1 to
+    3, rows not word aligned, KB 1 to 6) into DRAM with its scale rows. xd: the quantizer's row
+    buffer (QUANT_XD; default 1024 chunks: every QACT here goes through it), 0 (none: two passes
+    over TMEM), or one row and a third of the next (the reads wait for free entries)."""
+    cfg = Config(S=1, D=D, MCOLS=4, LANES=lanes, DRAM_BYTES=1 << 20)
+    rng = np.random.default_rng(D + lanes)
+    R, KB = 6, 3
+    x = _qrows(rng, R, 2 * KB * D, D // 4)
+    cs = rng.uniform(0.25, 4.0, 2 * KB * D).astype(np.float32)
+    rsf = rng.uniform(0.25, 4.0, R).astype(np.float32)
+    dram = np.zeros(cfg.DRAM_BYTES, np.uint8)
+    _put(dram, X, x)
+    _put(dram, X + x.nbytes, cs)
+    _put(dram, X + x.nbytes + cs.nbytes, rsf)
+    _put(dram, WA, np.eye(D, dtype=np.int8))
+    int8x = np.zeros((D, 8), np.uint8)
+    int8x[:, :4] = np.array([1.0], np.float32).view(np.uint8)   # Sw 1, dw 0
+    _put(dram, SC, int8x)
+    T = 2 * KB * D * R
+    prog = [I.ld(X, 0, x.size + cs.size + rsf.size)]
+    out = 0x2000                                   # after the rows and factors
+    # (src row, ROW, CSCALE, RSCALE, DUP): rows 0..3 (a zero group, a zero row, an infinity,
+    # denormals), rows 2..5 (a NaN)
+    for r0, row, csf, rscf, dup in [(0, False, False, False, False), (0, True, False, False, False),
+                                    (0, False, True, True, False), (2, True, True, False, False),
+                                    (0, False, False, True, True), (2, False, False, False, False)]:
+        rows = 2 if dup else 4
+        prog.append(I.qact(r0 * 2 * KB * D, rows, 0, 2 * KB, 2 * KB * D, row=row, dup=dup,
+                           cscale=T if csf else None,
+                           rscale=T + 2 * KB * D + r0 if rscf else None))
+        for k in range(2 * KB):
+            prog.append(I.mm(WA, 0, out, D, 1, D, D, 2 * rows if dup else rows, k, 0,
+                             unit=True))
+            prog.append(I.mm(WA, SC, out + 4 * D, D, 1, D, D, rows, k, 8))
+            out += 8 * D
+    assert out < cfg.TMEM_WORDS
+    sd = 0x50000
+    for row, half, es, off, kb in [(False, False, 1, 0, KB), (True, False, 1, 0, 2 * KB),
+                                   (True, True, 1, 0, 2 * KB), (False, False, 2, 1, 5),
+                                   (False, False, 3, 2, 1), (True, False, 1, 3, 2),
+                                   (False, False, 1, 4, 6)]:
+        n = R
+        drs = kb * D * es + 4
+        prog.append(I.qst(0, sd + off, sd + 0x6000, n, kb, 2 * KB * D, drs, es, row=row,
+                          half=half))
+        sd += 0x8000
+    prog.append(I.halt())
+    _both(cfg, prog, dram, uarch=None if xd is None else {"QUANT_XD": xd})
 
 
 def _ties(amax, rng):
@@ -126,32 +241,34 @@ def _ties(amax, rng):
     return out[rng.permutation(len(out))]
 
 
-def _tie_rows(D, rng, row: bool, nrows=8, KB=6):
-    """Rows of KB blocks: the group's amax (each block's, or with `row` the row's) at element
-    0 of each block, with either sign, and ties of that amax elsewhere. Returns x and how many
-    of its elements are exact ties."""
+def _tie_rows(D, g, rng, nrows=8, KB=6):
+    """Rows of KB blocks with groups of g: the row's amax A at element 0, each group its offset
+    d (0 to 5; element 0 of the group is +-A 2^-d, so the group's d is d) and the ties of A
+    scaled by 2^-d elsewhere: x * (inv * 2^d) is a tie of A's. Returns x and its tie count
+    (with the groups' offsets)."""
     x = np.zeros((nrows, KB * D), np.float32)
-    amaxes = F.f32(rng.uniform(0.5, 3.0, (nrows, KB)))
-    amaxes[0, :] = F.f32([1.0, 2.0, 0.75, 127.0, 3.0, 1.5])
-    if row:
-        amaxes[:] = amaxes[:, :1]
     for r in range(nrows):
-        for k in range(KB):
-            blk = np.resize(_ties(amaxes[r, k], rng), D)
-            blk[0] = amaxes[r, k] * (1 if (r + k) % 2 else -1)
-            x[r, k * D:(k + 1) * D] = blk
-    a = np.abs(x).reshape(nrows, KB, D).max(-1, keepdims=True)
-    p = F.mul(x.reshape(nrows, KB, D), F.mul(F.f32(127), F.recip(a)))
+        A = F.f32([1.0, 2.0, 0.75, 127.0][r] if r < 4 else rng.uniform(0.5, 3.0))
+        t = _ties(A, rng)
+        for i in range(0, KB * D, g):
+            d = 0 if i == 0 else int(rng.integers(0, 6))
+            blk = np.resize(np.roll(t, -i), g) * np.float32(2.0 ** -d)
+            blk[0] = A * np.float32(2.0 ** -d) * (1 if (r + i // g) % 2 else -1)
+            x[r, i:i + g] = blk
+    q_, s_, d = F.quantize_mx(x, g)
+    inv = F.mul(F.f32(127), F.recip(np.abs(x).max(1)))
+    ig = F.mul(inv[:, None], np.ldexp(F.f32(1), d.astype(np.int32)).astype(np.float32))
+    p = F.mul(x.reshape(nrows, -1, g), ig[:, :, None])
     return x, int((p - np.floor(p) == 0.5).sum())
 
 
 @pytest.mark.parametrize("D,row", [(32, False), (32, True), (128, False), (128, True)])
 def test_quantizer_ties_qst_rtl(have_verilator, D, row):
-    """QST (blocks, rows) on exact ties of x * inv and their neighbours: the bytes and scales
-    land in DRAM."""
+    """QST (D-block offsets, or ROW) on exact ties of x * (inv * 2^d) and their neighbours: the
+    bytes and scale rows land in DRAM."""
     cfg = Config(S=1, D=D, DRAM_BYTES=1 << 20)
     rng = np.random.default_rng(D + row)
-    x, ties = _tie_rows(D, rng, row)
+    x, ties = _tie_rows(D, D, rng)
     assert ties > 100
     R, KB = x.shape[0], x.shape[1] // D
     dram = np.zeros(cfg.DRAM_BYTES, np.uint8)
@@ -165,12 +282,12 @@ def test_quantizer_ties_qst_rtl(have_verilator, D, row):
 
 @pytest.mark.parametrize("row", [False, True])
 def test_quantizer_ties_qact_rtl(have_verilator, row):
-    """QACT (blocks, rows) on the same ties, read back by MMs with identity int8 weights and
-    UNIT scales: T[out + j, n] = i2f(q[j][n]) * s[j] for each block."""
+    """QACT (sub-block offsets, or ROW) on the same ties, read back by MMs with identity int8
+    weights and UNIT: T[out + j, n] = q[j][n] * Sa[j] * 2^-da for each block."""
     cfg = Config(S=1, D=32, MCOLS=8, DRAM_BYTES=1 << 20)
     D = cfg.D
     rng = np.random.default_rng(5 + row)
-    x, ties = _tie_rows(D, rng, row)
+    x, ties = _tie_rows(D, D // 4, rng)
     assert ties > 100
     R, KB = x.shape[0], x.shape[1] // D
     dram = np.zeros(cfg.DRAM_BYTES, np.uint8)
@@ -182,7 +299,9 @@ def test_quantizer_ties_qact_rtl(have_verilator, row):
     prog.append(I.halt())
     m = _both(cfg, prog, dram)
     got = m.slices[0].tget(OUT + np.arange(KB * R * D)).reshape(KB, R, D)
-    q, s = F.quantize(x if row else x.reshape(R, KB, D), axis=-1 if row else 2)
-    q = q.reshape(R, KB, D)
-    s = np.repeat(s[:, None], KB, 1) if row else s
-    assert np.array_equal(got, F.mul(F.i2f(q), s[..., None]).transpose(1, 0, 2))
+    q, s, d = F.quantize_mx(x, D // 4, row)
+    q = q.reshape(R, KB, D).astype(np.int64)
+    d = np.repeat(d.reshape(R, KB, 4), D // 4, 2).astype(np.int64)
+    acc = np.where(d <= 16, q << np.maximum(16 - d, 0), 0)
+    want = F.mul(F.i2f(acc), F.mul(s, F.f32(2.0 ** -16))[:, None, None])
+    assert np.array_equal(got.view(np.uint32), want.transpose(1, 0, 2).view(np.uint32))

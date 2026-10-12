@@ -145,9 +145,9 @@ def main(argv=None) -> int:
     ap.add_argument("--model",
                     help="qwen3, lfm2, qwen35 or a checkpoint directory: the model stage")
     ap.add_argument("--tokens", type=int, default=8, help="tokens to generate in the model stage")
-    ap.add_argument("--wformat", default="int8", choices=["int8", "fp4", "int4", "mix"],
+    ap.add_argument("--wformat", default="int8", choices=["int8", "fp4", "int4", "nvfp4", "mix"],
                     help="weight format of the model stage's layers")
-    ap.add_argument("--head-format", default=None, choices=["int8", "fp4", "int4"],
+    ap.add_argument("--head-format", default=None, choices=["int8", "fp4", "int4", "nvfp4"],
                     help="weight format of the model stage's LM head (default: --wformat)")
     ap.add_argument("--bw-mib", type=int, default=512, help="bandwidth test size (MiB)")
     a = ap.parse_args(argv)

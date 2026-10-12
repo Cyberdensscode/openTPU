@@ -1,14 +1,17 @@
 """Accuracy of weight quantization formats (opentpu/quant.py) on the real checkpoints.
 
-    python3 tools/quant_eval.py [--model qwen3|lfm2|qwen35] [--configs NAME ...] [--no-a8]
-                                [--gen 40] [--json out.json] [--threads 8]
+    python3 tools/quant_eval.py [--model qwen3|lfm2|qwen35] [--configs NAME ...]
+                                [--a8 mx|block|off] [--gen 40] [--json out.json] [--threads 8]
     python3 tools/quant_eval.py --report out.json ...     (markdown tables of saved results)
 
 Runs the Hugging Face model in fp32 (PyTorch, CPU) with every matmul weight that openTPU streams
 through the MXU (each nn.Linear of the decoder with K % 128 == 0, and the LM head; embeddings stay
-fp32, they are gathered on the host) replaced by its quantize-dequantized copy. With A8 (the
-default) every such matmul's input is also fake-quantized to int8 per 128-block, as QACT does on
-the device (W8A8 today, W4A8 with 4-bit weights). The reference is the unquantized fp32 model.
+fp32, they are gathered on the host) replaced by its quantize-dequantized copy (opentpu/quant.py
+quantize: the survey's formats, and mx-int8 / mx-int4 / mx-fp4 / mx-nvfp4, the MX MXU's). With
+A8 every such matmul's input is also fake-quantized to int8 as QACT does on the device: --a8 mx
+(the default) the MX MXU's, a scale per row and a power-of-two offset per 32 (a8x32, the whole
+input row one range); --a8 block the MXU's before MX, a scale per 128 (the survey's numbers in
+docs/quant.md); --a8 off (or --no-a8) none. The reference is the unquantized fp32 model.
 
 Metrics, all against the fp32 reference:
   wErr    relative squared weight error sum ||W - Q(W)||^2 / sum ||W||^2 over the quantized mats
@@ -62,6 +65,10 @@ CONFIGS = {
     "int4k-s": (dict(fmt="int4k", search=True), {}),
     "e2m1k": (dict(fmt="e2m1k"), {}),
     "e2m1k-s": (dict(fmt="e2m1k", search=True), {}),
+    "mx-int8": (dict(fmt="mx-int8"), {}),
+    "mx-int4": (dict(fmt="mx-int4"), {}),
+    "mx-fp4": (dict(fmt="mx-fp4"), {}),
+    "mx-nvfp4": (dict(fmt="mx-nvfp4"), {}),
 }
 # mixed 4/8 policies, built on a 4-bit format: LM head 8-bit; + first/last layer; + down_proj
 MIXED = {"head8": {r"lm_head": I8},
@@ -73,14 +80,19 @@ BASE_DEFAULT = ["int8", "int4-g128-fp32", "int4-g128-fp32-s", "int4-g64-fp16", "
                 "e2m1-g128-fp32-s", "mxfp4", "mxfp4-ceil", "mxfp4-s", "nvfp4", "nvfp4-s",
                 "int4k", "int4k-s", "e2m1k", "e2m1k-s",
                 "mxfp4-s+head8", "nvfp4-s+head8", "int4k-s+head8", "e2m1k-s+head8",
-                "e2m1k-s+ends8", "e2m1k-s+down8", "e2m1k-s+attn8"]
+                "e2m1k-s+ends8", "e2m1k-s+down8", "e2m1k-s+attn8",
+                "mx-int8", "mx-fp4", "mx-nvfp4", "mx-fp4+head8", "mx-nvfp4+head8"]
 
 
 def config(name: str):
-    """A CONFIGS name, or '<base>+<mixed policy>' (e.g. mxfp4-s+head8)."""
+    """A CONFIGS name, or '<base>+<mixed policy>' (e.g. mxfp4-s+head8; an mx- base's 8-bit
+    weights are mx-int8)."""
     base, _, mix = name.partition("+")
     d, ov = CONFIGS[base]
-    return d, {**(MIXED[mix] if mix else {}), **ov}
+    mixed = dict(MIXED[mix]) if mix else {}
+    if base.startswith("mx-"):
+        mixed = {k: CONFIGS["mx-int8"][0] if v is I8 else v for k, v in mixed.items()}
+    return d, {**mixed, **ov}
 
 
 def quant_targets(model) -> dict:
@@ -94,14 +106,28 @@ def quant_targets(model) -> dict:
     return out
 
 
-def fake_q8(x, D: int = 128):
-    """int8 per-D-block fake quantization of a matmul input (QACT numerics, float math)."""
+def fake_q8(x, D: int = 128, mode: str = "mx"):
+    """int8 fake quantization of a matmul input (QACT's numerics, float math): "mx" a scale
+    per row (amax / 127) and a power-of-two offset per D/4, the largest (<= 31) that keeps the
+    group's amax within the row's (quant.fake_act's); "block" a scale per D (before MX)."""
     import torch
     sh = x.shape
-    xb = x.reshape(*sh[:-1], sh[-1] // D, D)
-    s = xb.abs().amax(-1, keepdim=True) / 127
-    s = torch.where(s == 0, torch.ones_like(s), s)
-    return (torch.clamp(torch.round(xb / s), -127, 127) * s).reshape(sh)
+    if mode == "block":
+        xb = x.reshape(*sh[:-1], sh[-1] // D, D)
+        s = xb.abs().amax(-1, keepdim=True) / 127
+        s = torch.where(s == 0, torch.ones_like(s), s)
+        return (torch.clamp(torch.round(xb / s), -127, 127) * s).reshape(sh)
+    g = D // Q.NSUB
+    xd = x.double()
+    xb = xd.reshape(*sh[:-1], sh[-1] // g, g)
+    a = xd.abs().amax(-1, keepdim=True)                         # the row's amax
+    ag = xb.abs().amax(-1)                                      # each group's
+    fa, ea = torch.frexp(ag)
+    fm, em = torch.frexp(a.expand_as(ag))
+    d = torch.where(ag > 0, (em - ea - (fa > fm).int()).clamp(0, 31), torch.zeros_like(ea))
+    s = torch.where(a == 0, torch.ones_like(a), a / 127)
+    unit = (s * torch.exp2(-d.double()))[..., None]
+    return (torch.clamp(torch.round(xb / unit), -127, 127) * unit).reshape(sh).to(x.dtype)
 
 
 def report(paths) -> str:
@@ -135,11 +161,15 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--model", default="qwen3")
     ap.add_argument("--configs", nargs="*", default=BASE_DEFAULT)
-    ap.add_argument("--no-a8", action="store_true", help="weights only (fp32 activations)")
+    ap.add_argument("--a8", choices=["mx", "block", "off"], default="mx",
+                    help="the matmul inputs' int8 quantization (mx: today's QACT)")
+    ap.add_argument("--no-a8", action="store_true", help="weights only (--a8 off)")
     ap.add_argument("--gen", type=int, default=40, help="greedy tokens per prompt")
     ap.add_argument("--json", default=None, help="append results to this JSON file")
     ap.add_argument("--threads", type=int, default=8)
     a = ap.parse_args()
+    if a.no_a8:
+        a.a8 = "off"
     torch.set_grad_enabled(False)
     torch.set_num_threads(a.threads)
 
@@ -161,9 +191,10 @@ def main() -> None:
                              pad_token_id=tok.eos_token_id)
         gen_ids.append((out, ids.shape[1]))
 
-    a8 = {"on": not a.no_a8}
-    hooks = [m.register_forward_pre_hook(lambda mod, inp: (fake_q8(inp[0]),) if a8["on"] else None)
-             for m in targets.values()]
+    a8 = {"on": a.a8 != "off"}
+    hooks = [m.register_forward_pre_hook(
+        lambda mod, inp: (fake_q8(inp[0], mode=a.a8),) if a8["on"] else None)
+        for m in targets.values()]
 
     def run():
         """log-probs of every evaluated position: texts (all), greedy runs (generated part)."""
@@ -173,7 +204,7 @@ def main() -> None:
 
     a8["on"] = False
     ref_text, ref_gen = run()
-    a8["on"] = not a.no_a8
+    a8["on"] = a.a8 != "off"
 
     def metrics(lp_text, lp_gen):
         r = {}
@@ -191,7 +222,7 @@ def main() -> None:
     ref = metrics(ref_text, ref_gen)
     print(f"# {a.model}: {len(targets)} matmuls, "
           f"{sum(w.numel() for w in orig.values()) / 1e6:.1f} M streamed weights, "
-          f"A8={'on' if not a.no_a8 else 'off'}; eval tokens: text {[t.shape[1] for t in text_ids]}"
+          f"A8={a.a8}; eval tokens: text {[t.shape[1] for t in text_ids]}"
           f", greedy {sum(o.shape[1] - n for o, n in gen_ids)}")
     print(f"# fp32 reference: ppl {ref['ppl0']:.3f} / {ref['ppl1']:.3f}")
     hdr = f"{'config':28s} {'bits':>5s} {'MB':>6s} {'wErr':>8s} {'ppl0':>7s} {'ppl1':>7s} " \
@@ -218,7 +249,7 @@ def main() -> None:
         r = metrics(*run())
         for n, m in targets.items():
             m.weight = torch.nn.Parameter(orig[n].clone())
-        r.update(config=name, model=a.model, a8=not a.no_a8, bits=nbits / nw,
+        r.update(config=name, model=a.model, a8=a.a8, bits=nbits / nw,
                  MB=nbits / 8 / 1e6, werr=num / den)
         results.append(r)
         print(f"{name:28s} {r['bits']:5.2f} {r['MB']:6.1f} {r['werr']:8.5f} {r['ppl0']:7.3f} "

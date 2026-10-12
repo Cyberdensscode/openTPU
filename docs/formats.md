@@ -11,7 +11,7 @@ In short:
 - **Mechanism.** A formats string sets the format per kind of weight and per layer range over
   the image's `wformat` (`opentpu/llm/formats.py`): `OTPU_FORMATS`, a caller's `formats=`, or
   the named choice `wformat="mix"`, which is int8 with the model's recommended string
-  (`Spec.mix`, from `formats.MIXES`). int8, int4 and fp4 stay uniform.
+  (`Spec.mix`, from `formats.MIXES`). int8, int4, fp4 and nvfp4 stay uniform.
 - **Measure.** dKL: the mean KL divergence of the variant's next-token distribution from the
   float model's, beyond int8's, with its standard error paired over the tokens
   (`tools/formats_scan.py`). It is about ΔNLL against int8 (its % is about the perplexity
@@ -38,7 +38,11 @@ In short:
 
 ## Formats strings
 
-`"kind=fmt,kind@a-b=fmt,..."`, fmt one of int8, int4 and fp4, a..b checkpoint layers. A rule
+`"kind=fmt,kind@a-b=fmt,..."`, fmt one of int8, int4, fp4 and nvfp4, a..b checkpoint layers.
+The formats are the MX MXU's ([mx_mxu.md](mx_mxu.md), [quant.md](quant.md) "The MX formats"):
+int8 is int8x, int4 int4x, fp4 fp4x6 and nvfp4 NVIDIA's NVFP4; any kind may take any of them.
+The scans and mixes on this page were measured on the MXU before MX (fp4 with bf16 block scales,
+a8 per 128); the mixes stay until they are scanned again in the MX formats. A rule
 with a range wins over one without; among equals the first one wins. The kinds: attn, mlp
 (the default of gateup and down), gateup, down and head (no range); LFM2 also conv, Qwen3.5
 also delta (the DeltaNet mixer). The string comes from the caller, else `OTPU_FORMATS`, else

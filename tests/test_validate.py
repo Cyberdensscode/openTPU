@@ -165,21 +165,19 @@ def test_quantized_golden_follows_the_isa_simulator(name, wformat):
 
 
 class _DeviceCodes:
-    """The int8 groups of a device run (every fp32.quantize call: the ISA simulator's QACT / QST
-    and the image's host-side ones), each as r = x * 127 / amax and its codes, found again by
-    content: the place of the largest |r|, then the smallest max |r - r_device| (under 0.25; a
-    group the device did not quantize is 25 or more away)."""
+    """The int8 rows of a device run (every fp32.quantize_mx call: the ISA simulator's QACT /
+    QST and the image's host-side ones), each as r = x 127 / amax 2^d (d its groups' offsets)
+    and its codes, found again by content: the place of the largest |r|, then the smallest max
+    |r - r_device| (under 0.25; a row the device did not quantize is 25 or more away)."""
 
     def __init__(self):
         self.parts, self.unmatched = [], 0
 
-    def record(self, x, axis, q):
-        x = np.moveaxis(np.asarray(x, np.float32), axis, -1)
-        n = x.shape[-1]
-        x = x.reshape(-1, n).astype(np.float64)
+    def record(self, x, g, q, d):
+        x = np.asarray(x, np.float64)
         a = np.abs(x).max(-1, keepdims=True)
-        self.parts.append((x * 127 / np.where(a == 0, 1, a),
-                           np.moveaxis(q, axis, -1).reshape(-1, n)))
+        unit = np.where(a == 0, 1, a / 127) * np.exp2(-np.repeat(d.astype(np.float64), g, -1))
+        self.parts.append((x / unit, np.asarray(q)))
 
     def index(self):
         self.R, self.Q, self.at = {}, {}, {}
@@ -224,36 +222,46 @@ class _DeviceCodes:
 
 
 def _teacher_forced(mp, mod, dev):
-    """The emulation's int8 points (opentpu.llm.qwen3's _fake_q and _v_parts, which its _pv and
-    _fake_w call, and the port module's imports of them) with the device's codes near ties:
-    their own results but a forced code's value (code * scale)."""
+    """The emulation's int8 points (quant.fake_act, through which every activation, K and P
+    goes, and opentpu.llm.qwen3's _v_parts with the port module's import of it) with the
+    device's codes near ties: their own results but a forced code's value (code S 2^-d)."""
+    from opentpu import quant as Q
     from opentpu.llm import qwen3 as Q3
-    fake_q, v_parts = Q3._fake_q, Q3._v_parts
+    fake_act, v_parts = Q.fake_act, Q3._v_parts
 
-    def fq(x, D=128):
-        out = np.asarray(fake_q(x, D), np.float64)
-        xb = np.asarray(x, np.float64).reshape(-1, D)
-        a = np.abs(xb).max(-1, keepdims=True)
-        s = np.where(a == 0, 1, a / 127)
-        q = np.rint(out.reshape(-1, D) / s)
-        return out + ((dev.force(xb / s, q) - q) * s).reshape(out.shape)
+    def fa(x, D=128, n=None, row=False, g=None):
+        out = fake_act(x, D, n, row, g)      # ranges of their own come back through fa
+        if n is not None and not isinstance(n, (int, np.integer)):
+            return out
+        x = np.asarray(x, np.float64)
+        n = x.shape[-1] if n is None else n
+        g = D // Q.NSUB if g is None else g
+        xr = x.reshape(-1, n)
+        d = np.asarray(out.da).reshape(len(xr), -1)[:, ::g * Q.NVG // D]   # [rows, n / g]
+        a = np.abs(xr).max(-1, keepdims=True)
+        unit = np.where(a == 0, 1, a / 127) * np.exp2(-np.repeat(d, g, -1))
+        o = np.asarray(out).view(np.ndarray).reshape(len(xr), n)
+        q = np.rint(o / unit)
+        res = (o + (dev.force(xr / unit, q) - q) * unit).reshape(out.shape).view(Q.MXAct)
+        res.da = out.da
+        return res
 
     def vp(v):
         q, sc = v_parts(v)
         a = np.abs(v).max(-1, keepdims=True)
         r = (v / np.where(a == 0, 1, a / 127)).reshape(-1, v.shape[-1])
         return dev.force(r, q.reshape(r.shape)).reshape(q.shape), sc
+    mp.setattr(Q, "fake_act", fa)
     for m in {Q3, mod}:
-        mp.setattr(m, "_fake_q", fq)
         mp.setattr(m, "_v_parts", vp)
 
 
-def _unfolded_pv(pp, Vq, vs, D: int = 128):
+def _unfolded_pv(pp, Vq, vs, D: int = 128, block=None, start: int = 0):
     """P.V with V's per-token scales applied after P is quantized (a wrong emulation)."""
     from opentpu.llm import qwen3 as Q3
     ppad = np.zeros(-(-len(pp) // D) * D)
     ppad[:len(pp)] = pp
-    return (Q3._fake_q(ppad, D)[:len(pp)] * vs) @ Vq
+    return (np.asarray(Q3._fake_q(ppad, D))[:len(pp)] * vs) @ Vq
 
 
 @pytest.mark.parametrize("name", ["qwen3", "lfm2", "qwen35"])
@@ -273,14 +281,14 @@ def test_emulated_logits_follow_the_isa_simulator(name, monkeypatch):
     from opentpu import fp32 as F
     from opentpu.llm import qwen3 as Q3
     _, W, spec = _tiny(name)
-    dev, quantize = _DeviceCodes(), F.quantize
+    dev, quantize_mx = _DeviceCodes(), F.quantize_mx
 
-    def recorded(x, axis=-1):
-        q, s = quantize(x, axis)
-        dev.record(x, axis, q)
-        return q, s
+    def recorded(x, g, row_mode=False):
+        q, s, d = quantize_mx(x, g, row_mode)
+        dev.record(x, g, q, d)
+        return q, s, d
     with monkeypatch.context() as mp:
-        mp.setattr(F, "quantize", recorded)
+        mp.setattr(F, "quantize_mx", recorded)
         _, runs = _runs(spec, W, "fp4")
     dev.index()
     mod = importlib.import_module(type(spec).__module__)
@@ -305,20 +313,16 @@ def test_emulated_logits_follow_the_isa_simulator(name, monkeypatch):
 @pytest.mark.parametrize("fmt", ["int8", "fp4"])
 def test_golden_weights_are_the_images(fmt):
     """device_weight of the tied LM head equals the head rows the Engine's image holds,
-    dequantized as the MXU reads them (int8 q * s; 4-bit S * m * code)."""
+    dequantized as the MXU reads them (w m 2^-dw Sw)."""
     from opentpu import quant as Q
     m, W, spec = _tiny("qwen3")
     eng = Engine(spec, W, cap=256, cfg=board_config(DRAM_BYTES=1 << 24), head_format=fmt)
     im, dram = eng.image, eng.backend.machine.slices[0].dram
     V_, H, D = spec.vocab, spec.hidden, eng.cfg.D
-    rb = Q.row_bytes(H, fmt, D)
+    rb, sb = Q.row_bytes(H, fmt, D), Q.scale_bytes(H, fmt, D)
     rows = dram[im.head[0]:im.head[0] + V_ * rb].reshape(V_, rb)
-    sc = dram[im.head[1]:im.head[1] + 4 * V_ * (H // D)].view(np.uint32).reshape(V_, H // D)
-    if fmt == "int8":
-        want = (rows.view(np.int8).reshape(V_, H // D, D).astype(np.float32)
-                * sc.view(np.float32)[..., None]).reshape(V_, H)
-    else:
-        want = Q.dequantize_w4(rows[:, :H // 2], sc, fmt, D).astype(np.float32)
+    sc = dram[im.head[1]:im.head[1] + V_ * sb].reshape(V_, sb)
+    want = Q.dequantize_mxu(rows, sc, fmt, H, D).astype(np.float32)
     got = V.device_weight(W["model.embed_tokens.weight"], fmt, D)
     assert np.array_equal(got, want)
     assert V.Golden(m, spec, "int8", fmt).formats["lm_head.weight"] == fmt
@@ -329,7 +333,9 @@ def test_golden_takes_the_devices_k_smoothing():
     test_qwen3's): the device smooths K's channels into the q_norm / k_norm gains
     (qwen3.qk_gains) and stays near the fp32 golden (KL 3e-5; 1.1e-3 unsmoothed), and the
     quantized golden smooths them too: it follows the ISA simulator as on the plain model (KL
-    1e-14 here; a golden that did not smooth K would be 1e-3 away). The weights mode takes the
+    5e-6 here, the golden's own floor: bit for bit but from the longer prompt's twelfth
+    position on, where an offset group falls the other way; a golden that did not smooth K
+    would be 1.1e-3 away). The weights mode takes the
     device's gains, bit-identical to the checkpoint's there (sigma, a power of two, changes
     only how K rounds); fp32 is the checkpoint (the fp32 reference)."""
     from dataclasses import replace
@@ -349,7 +355,7 @@ def test_golden_takes_the_devices_k_smoothing():
     g = V.Golden(m, spec, "int8", image=V.image_formats(eng.image))
     gold = V.against_golden(g, PROMPTS, runs, ["quant", "fp32"], 8, spec.eos)
     q = V.summary([x["goldens"]["quant"] for x in gold])
-    assert q["top1"] >= V.MIN_TOP1 and q["min_cos"] > 0.999 and q["kl_mean"] < 1e-6
+    assert q["top1"] >= V.MIN_TOP1 and q["min_cos"] > 0.999 and q["kl_mean"] < 1e-4
     assert V.summary([x["goldens"]["fp32"] for x in gold])["kl_mean"] < 1e-4
     g.set("weights")
     smooth = g.logits(PROMPTS[1])

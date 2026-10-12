@@ -2,7 +2,7 @@
 configuration for several MXU widths (MCOLS) and activation-row counts M (batched decode rows or
 prefill tokens), then a projection to full-model prefill / batched decode / TTFT.
 
-    python3 tools/mxu_bench.py [--mcols 2,4,8,16] [--rows 1,2,4,8,16] [--impl 0|1] [--json out]
+    python3 tools/mxu_bench.py [--mcols 2,4,8,16] [--rows 1,2,4,8,16] [--json out]
 
 The MLP layer streams 9.4 MB of int8 weights; with M rows the compiler splits the rows into
 ceil(M / MCOLS) groups and streams the weights once per group, so the measured cycles per group
@@ -97,7 +97,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mcols", default="2,4,8,16")
     ap.add_argument("--rows", default="1,2,4,8,16")
-    ap.add_argument("--impl", type=int, default=0)
+    ap.add_argument("--impl", type=int, default=2, help="MXU_IMPL: 2, the systolic MX column, "
+                    "the only one")
     ap.add_argument("--bw", type=int, default=100)
     ap.add_argument("--lat", type=int, default=30)
     ap.add_argument("--json")
