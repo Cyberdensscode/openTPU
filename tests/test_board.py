@@ -273,7 +273,7 @@ def test_stream_on_board_model(have_verilator):
 def test_op_check_on_board_model(have_verilator, group, name, prog):
     """otpu-diag's per-instruction programs (opentpu/host/opchecks.py), bit for bit."""
     ok, msg, _ = run_demo(Board(SimTransport(ch_bytes=CFG.DRAM_BYTES // 2)), CFG, prog,
-                          diag_image())
+                          diag_image(CFG))
     assert ok, msg
 
 
@@ -332,6 +332,9 @@ def test_run_dropped_then_load_and_run_at_once(have_verilator, native, after):
     words = [np.asarray(I.assemble(p), np.uint32) for p in (prog_a, prog_b)]
     at = [PROG_AT, PROG_AT + 0x10000]
     for a, w in zip(at, words):
+        if b.waitc:                                     # WAITC: the entries after the words
+            from opentpu import waits as W
+            w = W.loadable(w, W.entries(w, CFG.D, CFG.S), CFG.D)
         b.write(a, w.view(np.uint8))
 
     def load(a, w):
