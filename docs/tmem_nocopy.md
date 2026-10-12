@@ -16,9 +16,11 @@ loses its RAM is replayed the next cycle while its unit holds, QUANT 3 and COLL 
 guests, and the read ports sit on the RAM ports by measured conflict (QUANT and VPU A on port A).
 On the FPGA screen it makes 2.8-8.2% extra TMEM reads (the replays) and costs +0.70% cycles
 geomean (+1.66% at worst, p8_q3), for 13.3K LUTs routed at 133.33 / 266.67 MHz, +0.232 ns
-(today's TMEM 11.9K). With WAITC v2 on the full model list: +0.72% geomean against today's TMEM
+(today's TMEM 11.9K). With WAITC v2 on the full model list: +0.66% geomean against today's TMEM
 without WAITC (section 6.5). A board builds it with `TMEM_IMPL=3`, the 2x clock from the block
-design's MMCM (section 10). The user chose the
+design's MMCM (section 10). On the ASIC there is no pump: the copy is two-port macros at the core
+clock, and a write takes one of the two accesses. That form costs +2.75% in cycles and 25-42%
+extra TMEM reads, five times the pumped copy's (section 6.4). The user chose the
 single copy over P3 (2026-10-12), and copies are out for the ASIC this core is for. What is left is
 one RAM port's traffic: QUANT's data reads against the MXU's. Placement has done what it can;
 fewer consumers remove the rest. In `dataflow`'s co-simulation, with the VPU's softmax numerators
@@ -394,10 +396,41 @@ On xcku5p-2 at 200 / 400 MHz: `ku-p3` +0.131 ns (180 block RAM tiles), `ku-r1pgR
 and route's spread). Both meet the bars' +0.1 ns; the worst paths are now the write stage into
 the RAMs at the fast edge, a fast period by design.
 
-### 6.4 The pumped one copy (`r1pgR`, `r2pgR`)
+### 6.4 The one copy: the ASIC form, then the pumped FPGA form
 
-One copy pumped at 2x (`TMEM_PMP`; co-simulated with its core-clock model, `PMP 2`), true
-dual-port, replays, QUANT 3 and COLL the DMA's guests. Without WAITC, against `i0`:
+**The ASIC form (the headline).** On the ASIC the copy is two-port SRAM macros at the core clock
+(`TMEM_TDP` without `TMEM_PMP`). A bank's two accesses in a cycle are both reads only when no
+write lands. A write takes port A, and a port-A read of another word in that RAM loses and is
+replayed. The runs below use 2 RAMs a bank (the two 4K x 32 macros a 64K bank is anyway), replays,
+QUANT 3 and COLL as the DMA's guests, on the screen against `i0`, without WAITC:
+
+| workload | `i0` cycles | `r2xgR` | extra TMEM reads | `r2xgRs` | extra TMEM reads | (FPGA: `r2pgRs`) |
+|---|---:|---:|---:|---:|---:|---:|
+| p_q3 | 372,383 | +2.48 | 33.6% | +7.93 | 54.1% | +1.12 |
+| p_q35 | 1,137,275 | +6.05 | 24.7% | +8.39 | 36.5% | +0.67 |
+| p8_q3 | 502,925 | +4.26 | 42.2% | +12.70 | 67.6% | +1.66 |
+| b4_q3 | 1,671,279 | +0.87 | 26.3% | +1.99 | 42.3% | +0.25 |
+| l_q35m | 679,296 | +1.81 | 24.7% | +3.51 | 34.4% | +0.24 |
+| d_lf | 1,339,842 | +1.12 | 31.3% | +2.32 | 38.2% | +0.25 |
+| geomean | | **+2.75** | | +6.07 | | +0.70 |
+
+Every run is bit-exact.
+- **Cost.** The ASIC form costs +2.75% in cycles (p_q35 +6.05%, p8_q3 +4.26%). By the measure that
+  counts on the ASIC it costs 25-42% extra TMEM reads, five times the pumped copy's 3-8%. A write
+  takes one of a two-port macro's two accesses, so whenever a write lands the bank has one read
+  slot instead of the pump's two.
+- **Sides.** The sides run opposite to the pump's. Port A, with the writes, should carry the light
+  ports: VPU B, QUANT 3, QUANT 2 and COLL (`r2xgR`, the unpumped default, `TM_SIDED`). Moving QUANT
+  and VPU A there (`r2xgRs`, the pump's sides) more than doubles the cost: +6.07%, 34-68% extra
+  reads.
+- **Not measured on the ASIC form.** Two levers would take the write's port away from the reads:
+  - fewer consumers, which removed 98-99% of the pumped copy's replays (section 6.6);
+  - a write stage that lands writes in cycles where port A reads nothing (a write can wait; a read
+    cannot).
+
+**The pumped FPGA form (the board build).** One copy pumped at 2x (`TMEM_PMP`; co-simulated with
+its core-clock model, `PMP 2`), true dual-port, replays, QUANT 3 and COLL the DMA's guests. Without
+WAITC, against `i0`:
 
 | candidate | p_q3 | p_q35 | p8_q3 | b4_q3 | l_q35m | d_lf | geomean | extra TMEM reads |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -471,7 +504,7 @@ copy at 1 RAM a bank (`wcmP1`, default sides):
 | geomean | +1.05 | +0.13 | +1.41 | +1.28 |
 
 The pick under WAITC v2 (`wcmP2s`: `r2pgRs` in the WAITC v2 tree, b5d6bcef + ffd1140c) on the full
-model list (`all.txt`, 17 workloads), against WAITC v2 with today's TMEM (`wcm`) and against today's
+model list (`all.txt`'s 17 workloads and wr.txt's dr_q3), against WAITC v2 with today's TMEM (`wcm`) and against today's
 TMEM without WAITC (`i0`):
 
 | workload | `i0` cycles | wcm vs i0 | wcmP2s vs i0 | **wcmP2s vs wcm** | extra TMEM reads |
@@ -493,12 +526,13 @@ TMEM without WAITC (`i0`):
 | l_g26 | 1,963,377 | +0.67 | +0.83 | +0.17 | 3.1% |
 | m_q35m | 15,297,819 | +0.08 | +0.10 | +0.02 | 3.1% |
 | m_g26 | 3,886,066 | +0.26 | +0.41 | +0.15 | 1.3% |
-| geomean | | +0.28 | +0.72 | **+0.39** | |
+| dr_q3 | 3,694,791 | -0.38 | -0.27 | +0.10 | 3.9% |
+| geomean | | +0.28 | +0.66 | **+0.38** | |
 
-On top of WAITC v2 the pick costs +0.39% geomean. `wcmP1` cost +1.28% on the seven workloads of
+On top of WAITC v2 the pick costs +0.38% geomean. `wcmP1` cost +1.28% on the seven workloads of
 the table above; the pick has two RAMs a bank and the screen's sides. The worst case is p8_q3 at
 +1.71% (the 8-row prefill at MCOLS 8, 5.6% extra TMEM reads), then p_q3 +0.73% and p_lf +0.66%. The
-MoE layers and models (`l_`, `m_`) cost +0.02 to +0.22%. With WAITC v2 the total is +0.72% against
+MoE layers and models (`l_`, `m_`) cost +0.02 to +0.22%. With WAITC v2 the total is +0.66% against
 today's TMEM without WAITC: l_q35m's +2.01% is WAITC's (+1.79%), not the TMEM's. The extra TMEM
 reads are 1.3-6.7% of the reads. Every run is bit-exact. z8_q2_r4 has no `i0` run (`i0` ran
 z8_q4_r4, whose 4 rows at MCOLS 8 do not fit 64K words).
@@ -634,6 +668,8 @@ out even when they buy 1-3% in cycles):
 | **one copy pumped, 2 RAMs a bank, sides s (`r2pgRs`)** | **64** | **2.8-8.2%** | **13.3K** | **+0.70** |
 | ... the MXU ranked first (`r2pgRsm`) | 64 | 3.8-9.5% | 13.4K | +0.53 |
 | ... and QUANT's inputs off TMEM (screen, section 6.6) | 64 | ~0.5% | | (0.19 no-feedback) |
+| **ASIC form: two-port macros at the core clock, 2 a bank, old sides (`r2xgR`)** | **64 (16 macros)** | **24.7-42.2%** | (not built) | **+2.75** |
+| ... with the pump's sides (`r2xgRs`) | 64 | 34.4-67.6% | | +6.07 |
 
 Copies are rejected whatever they buy (P3, two copies). Among the single copies the sub-banks are
 what costs logic (section 6.2): the pumped copy needs none for bandwidth and at most two for
@@ -673,7 +709,10 @@ which those parts have, so the TMEM can leave the UltraRAM for capacity elsewher
 **ASIC.** No pumping (an SRAM macro at twice the core clock caps the core at half the macro's
 speed): the one copy's two reads and write a bank come from two-port macros at the core clock,
 the write taking one port (`TMEM_TDP` without `TMEM_PMP`: the write's port-A conflict comes back,
-`wk` / `wm`). 2 RAMs a bank are the two 4K x 32 macros a 64K bank needs anyway. *(The ASIC form at 2 RAMs a bank, `r2xgR` / `r2xgRs`, is running on the screen.)* The macro
+`wk` / `wm`). 2 RAMs a bank are the two 4K x 32 macros a 64K bank needs anyway. Co-simulated
+(section 6.4): +2.75% cycles and 25-42% extra TMEM reads with the writes' port A carrying the
+light ports, the unpumped default. The write's port is the ASIC form's cost, and fewer consumers or
+deferred writes are its levers. The macro
 area is a third of P3's banked three copies (`docs/asic.md`: 48 macros of 4096 x 32, 4.05 mm2 on
 nangate45, 38% of the core): 16 macros, about 1.35 mm2, before the conflict logic.
 
@@ -686,6 +725,9 @@ nangate45, 38% of the core): 16 macros, about 1.35 mm2, before the conflict logi
   the DMA's guests, sides s (now the default for a pumped TMEM, b5d6bcef), the default rank. 2.8-8.2%
   extra TMEM reads, +0.70% cycles geomean on the screen (p8_q3 +1.66%), 13.3K LUTs and +0.232 ns
   routed at 133.33 / 266.67 MHz (`k7-r2pgRs`).
+- **The ASIC form** (two-port macros at the core clock) costs more than the pumped FPGA copy: +2.75%
+  and 25-42% extra TMEM reads (section 6.4). Its sides are the unpumped default (the writes' port A
+  for the light ports). The next ASIC step is to measure fewer consumers and deferred writes on it.
 - **64K words** for the MCOLS 8 build, with the tile kernel; 128K only if today's kernel ships.
 - **The port-B finding** is what is left to solve: most of the replays come from one RAM port
   (QUANT's data and the MXU), so one copy does not fail for want of read slots; the operands are
@@ -737,8 +779,10 @@ nangate45, 38% of the core): 16 macros, about 1.35 mm2, before the conflict logi
   run, its compiler's static counts (`opentpu/waits.py`) are the deployable ones.
 - **The tile kernel** overlaps the units more than today's kernel; one copy's replays have not been
   measured on it.
-- **The ASIC form** (two-port macros at the core clock) is co-simulated only (running: `r2xgR` / `r2xgRs`), never
-  through the ASIC flow.
+- **The ASIC form** (two-port macros at the core clock) is co-simulated only, never through the
+  ASIC flow. Its write takes a port: +2.75% cycles and 25-42% extra TMEM reads (section 6.4), five
+  times the pumped copy's. The levers (fewer consumers, deferred writes) are not yet measured on
+  it.
 - **Replay counts are port-cycles**, not bytes: a replay re-reads the lost read's lanes, from one
   word (QUANT 3) to eight.
 - `TMEM_IMPL 3` without replays (the grant in the RAM's address path) at 16 RAMs a bank was not
