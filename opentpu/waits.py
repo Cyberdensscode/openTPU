@@ -604,6 +604,41 @@ def entries(words, D: int = 128, S: int = 1, run_args=None, prog=None) -> np.nda
     return e
 
 
+def _compute(words, D: int, S: int, run_args) -> np.ndarray:
+    """entries() in a worker process (entries_many): kept on the disk there, returned here."""
+    return entries(words, D, S, run_args)
+
+
+def entries_many(items, D: int, S: int, pool=None) -> list:
+    """entries() of several programs [(words, run_args or None, prog or None)], those not kept
+    yet computed in `pool` (a concurrent.futures executor: the engine's compile worker
+    processes) at once, then kept here; without a pool one after another."""
+    out = [None] * len(items)
+    todo = []
+    for i, (w, ra, p) in enumerate(items):
+        if ra is None:
+            ra = getattr(p, "run_args", None) or getattr(w, "run_args", None)
+        k = entries_key(w, D, S, ra)
+        if k in _mem:
+            _mem.move_to_end(k)
+            stats["memory"] += 1
+            out[i] = _mem[k]
+        else:
+            todo.append((i, w, ra, p, k))
+    if pool is not None and len(todo) > 1:
+        futs = [(i, k, pool.submit(_compute, np.asarray(w, np.uint32), D, S, ra))
+                for i, w, ra, p, k in todo]
+        for i, k, f in futs:
+            out[i] = _mem[k] = f.result()
+            stats["computed"] += 1
+        while len(_mem) > MEM_N:
+            _mem.popitem(last=False)
+    else:
+        for i, w, ra, p, k in todo:
+            out[i] = entries(w, D, S, ra, prog=p)
+    return out
+
+
 # ------------------------------------------------------------------------- checking
 class Checker:
     """Checks wait entries on a concrete execution: feed it each unit instruction as it issues

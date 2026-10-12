@@ -1885,20 +1885,30 @@ def _worker_ready() -> bool:
     return True
 
 
+def worker_words(image, prog, run_args=None) -> np.ndarray:
+    """A compile worker's program (one slice's) as the engine takes it: its words (Words: with
+    its run_args), and on a configuration whose sequencer takes wait entries (SEQ_WC) its
+    entries, computed here and kept beside the program cache's programs (waits.entries)."""
+    from ..isa import assemble
+    ra = run_args if run_args is not None else getattr(prog, "run_args", ())
+    w = Words.of(assemble(prog), ra)
+    if image.cfg.SEQ_WC:
+        w.waits = WC.entries(w, image.cfg.D, image.cfg.S, ra, prog=prog)
+    return w
+
+
 def _worker_compile(pos: int) -> np.ndarray:
     """The worker process: the decode program for `pos`, assembled (one slice)."""
-    from ..isa import assemble
     image, block = _WORKER
-    return np.asarray(assemble(image.compile_step(pos, block)[0]), np.uint32)
+    return worker_words(image, image.compile_step(pos, block)[0])
 
 
 def _worker_decode(blocks: int, lo: int):
     """The worker process: the resident decode program of a bucket, assembled (one slice),
     and its run_args (compile_decode)."""
-    from ..isa import assemble
     image, block = _WORKER
     progs, ra = image.compile_decode(blocks, lo, block)
-    return np.asarray(assemble(progs[0]), np.uint32), ra
+    return worker_words(image, progs[0], ra), ra
 
 
 def layer_programs(image, key, block: int, hint: bool = False, em: bool = False):
@@ -1926,19 +1936,17 @@ def layer_programs(image, key, block: int, hint: bool = False, em: bool = False)
 def _worker_layer(key, hint: bool = False, em: bool = False):
     """The worker process: layer_programs' program, assembled (one slice), and its
     run_args."""
-    from ..isa import assemble
     image, block = _WORKER
     progs, ra = layer_programs(image, key, block, hint, em)
-    return np.asarray(assemble(progs[0]), np.uint32), ra
+    return worker_words(image, progs[0], ra), ra
 
 
 def _worker_chunk(seq: int, p0: int, n: int, left: int, fit: int, toks=None,
                   whole: bool = True, logits: bool = True):
     """The worker process: fit_chunk's run, its program assembled (one slice)."""
-    from ..isa import assemble
     image, block = _WORKER
     n, progs, fit = fit_chunk(image, block, seq, p0, n, left, fit, toks, whole, logits)
-    return n, None if progs is None else np.asarray(assemble(progs[0]), np.uint32), fit
+    return n, None if progs is None else worker_words(image, progs[0]), fit
 
 
 def fit_chunk(image, block: int, seq: int, p0: int, n: int, left: int, fit: int,
@@ -2993,6 +3001,12 @@ class Engine:
         new = [k for k in range(lo, b1 + 1) if k not in have]
         if not new:
             return
+        if getattr(self.backend, "waitc", False):   # (their wait entries at once: the workers)
+            items = [(np.asarray(I.assemble(prog), np.uint32), None, prog)
+                     for k in new for pj in (lambda p: p if isinstance(p, tuple) else (p,))(
+                         self._generate_prog(k, samp)) for prog in pj]
+            WC.entries_many(items, self.cfg.D, self.cfg.S,
+                            self._pool if self._procs and self._ready.done() else None)
         for k in new:
             progs = self._generate_prog(k, samp)
             for j, pj in enumerate(progs if isinstance(progs, tuple) else (progs,)):

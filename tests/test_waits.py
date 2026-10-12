@@ -478,3 +478,107 @@ def test_entries_are_kept(monkeypatch, tmp_path):
     W._mem.clear()
     assert np.array_equal(W.entries(words, D, 1), e)
     assert W.stats["disk"] == n0["disk"] + 1 and len(list(tmp_path.glob("*/*.npz"))) == 1
+
+
+# ------------------------------------------------------------------------------ off the critical path
+def test_words_pickle_with_their_run_args_and_entries():
+    """A compile worker's words reach the engine with their run_args and entries (Words)."""
+    import pickle
+
+    from opentpu.compiler import RunVar, Words
+    w = Words.of(I.assemble(_prog()), [(RunVar("pos", 64), 1)], np.arange(5, dtype=np.uint64))
+    r = pickle.loads(pickle.dumps(w))
+    assert isinstance(r, Words) and np.array_equal(r, w) and r.run_args[0][1] == 1
+    assert r.run_args[0][0].bound == 64 and np.array_equal(r.waits, w.waits)
+    assert Words.of(r, r.run_args).waits is r.waits        # (kept through Words.of)
+
+
+def test_worker_words_carry_the_entries_on_a_waitc_configuration():
+    """qwen3.worker_words: the entries computed with the words (in the worker process) when the
+    image's configuration takes them, none otherwise; BoardBackend loads a worker's entries as
+    they come."""
+    from types import SimpleNamespace
+
+    from opentpu.compiler import Program, RunVar
+    from opentpu.host.board import BoardBackend
+    from opentpu.host.fake import FakeTransport
+    from opentpu.isasim import board_config
+    from opentpu.llm.qwen3 import worker_words
+    prog = Program([I.addi(1, 15, 0), I.ld(0, 100, 8, ra=1),
+                    I.qst(2000, 0x10000, 0x18000, 1, 1, D, D, 1), I.halt()],
+                   [(RunVar("pos", 64), 64)])
+    on = SimpleNamespace(cfg=board_config(SEQ_WC=True))
+    w = worker_words(on, prog)
+    assert np.array_equal(w.waits, W.wait_counts(prog, D, 1)) and w.run_args == prog.run_args
+    assert worker_words(SimpleNamespace(cfg=board_config()), prog).waits is None
+    t = FakeTransport(regmap=4, devname=None, seq_wc=True)
+    be = BoardBackend(board_config(DRAM_BYTES=1 << 21, SEQ_WC=True), [np.zeros(4096, np.uint8)],
+                      transport=t, status=False)
+    w.waits = np.full(len(prog), W.DEFAULT, np.uint64)     # (what the worker said: loaded)
+    be.start(w)
+    be.wait()
+    got = be.board.read(be.prog_at + D, 8 * len(prog)).view("<u8")
+    assert (got == W.DEFAULT).all()
+    be.close()
+
+
+def test_entries_many_in_a_pool():
+    """waits.entries_many: the programs not kept yet computed in the pool at once, then kept."""
+    from concurrent.futures import ThreadPoolExecutor
+    W._mem.clear()
+    progs = [_prog(), [I.ld(0, 300, 8), vop(I.V_ADD, 300, 300, 300), I.halt()]]
+    items = [(np.asarray(I.assemble(p), np.uint32), None, p) for p in progs]
+    with ThreadPoolExecutor(2) as pool:
+        got = W.entries_many(items, D, 1, pool)
+    assert all(np.array_equal(g, W.wait_counts(p, D, 1)) for g, p in zip(got, progs))
+    n = W.stats["memory"]
+    assert all(np.array_equal(a, b) for a, b in zip(W.entries_many(items, D, 1), got))
+    assert W.stats["memory"] == n + 2
+
+
+def test_prebuild_keeps_the_sessions_entries(tmp_path, monkeypatch):
+    """prebuild's entries step (waits_ahead) on a WAITC configuration: each bucket's resident
+    decode and generate programs and the warm prompt runs, kept on the disk under the keys a
+    session's engine looks them up by; nothing without SEQ_WC."""
+    import dataclasses
+
+    from opentpu.compiler import Words
+    from opentpu.host import prebuild as PB
+    from opentpu.llm.qwen3 import PREFILL_ROWS, Engine, device_config
+    from test_autodecode import _tiny
+    monkeypatch.setenv("OTPU_PROG_CACHE", str(tmp_path))
+    monkeypatch.setattr(W, "_mem", W.OrderedDict())
+    Wt, spec = _tiny("qwen3")
+    cfg = dataclasses.replace(device_config(spec, 512, rows=PREFILL_ROWS, lookup=True),
+                              SEQ_WC=True)
+    eng = Engine(spec, Wt, cap=512, cfg=cfg, backend=PB._Drop, resident=True, pipeline=False)
+    n = PB.waits_ahead(eng)
+    assert n["programs"] >= 4 and n["computed"] == n["programs"]
+    assert PB.waits_ahead(Engine(spec, Wt, cap=512, cfg=dataclasses.replace(cfg, SEQ_WC=False),
+                                 backend=PB._Drop, resident=True, pipeline=False)) is None
+    W._mem.clear()                          # (a session: another process, the card's flags)
+    ses = Engine(spec, Wt, cap=512, cfg=cfg, backend=PB._Drop, resident=True)
+    assert ses.resident
+    for b in (1, 2):
+        progs, ra = ses._decode((b - 1) * 256)
+        w = progs if isinstance(progs, Words) else I.assemble(progs[0])
+        assert (tmp_path / (k := W.entries_key(w, cfg.D, cfg.S, ra))[:2] / f"{k}.npz").is_file()
+        g = ses._generate_prog(b)[0]
+        k = W.entries_key(I.assemble(g), cfg.D, cfg.S, g.run_args)
+        assert (tmp_path / k[:2] / f"{k}.npz").is_file()
+
+
+def test_prebuilds_backend_has_the_cards_flags():
+    """prebuild's _Drop compiles what a card session does: BoardBackend's flags on a bitstream
+    with run arguments and the decode loop, on a transport that streams."""
+    from opentpu.host import prebuild as PB
+    from opentpu.host.board import BoardBackend
+    from opentpu.host.fake import FakeTransport
+    from opentpu.isasim import board_config
+    t = FakeTransport(regmap=4, devname=None, args=True, gen=True)
+    t.streams = True
+    be = BoardBackend(board_config(DRAM_BYTES=1 << 21), [np.zeros(4096, np.uint8)], transport=t,
+                      status=False)
+    for k in ("args", "chains", "generates", "fills"):
+        assert bool(getattr(be, k)) and getattr(PB._Drop, k), k
+    be.close()

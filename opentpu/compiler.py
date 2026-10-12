@@ -119,17 +119,28 @@ class Program(list):
 
 
 class Words(np.ndarray):
-    """A program's assembled words (uint32) with its run_args, as Program keeps them: the
-    words a compile worker process returns, tagged by the Engine with the run_args returned
-    beside them (opentpu.waits bounds the arguments with them on a WAITC device)."""
+    """A program's assembled words (uint32) with its run_args, as Program keeps them (opentpu.waits
+    bounds the arguments with them on a WAITC device), and its wait entries when a compile
+    worker process computed them (waits: None, or uint64 per instruction). Pickled with both."""
 
     run_args: list = []
+    waits = None
 
     @staticmethod
-    def of(words, run_args=()) -> "Words":
+    def of(words, run_args=(), waits=None) -> "Words":
+        """words (any words; a Words keeps its entries unless `waits` replaces them)."""
         w = np.asarray(words, np.uint32).view(Words)
         w.run_args = list(run_args or ())
+        w.waits = getattr(words, "waits", None) if waits is None else waits
         return w
+
+    def __reduce__(self):
+        fn, args, state = super().__reduce__()
+        return fn, args, (state, self.run_args, self.waits)
+
+    def __setstate__(self, s):
+        state, self.run_args, self.waits = s
+        super().__setstate__(state)
 
 
 def arg_reg(k: int) -> int:

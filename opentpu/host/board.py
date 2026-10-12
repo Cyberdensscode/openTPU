@@ -1557,12 +1557,15 @@ class BoardBackend:
             return None
         D, S = self.cfg.D, self.cfg.S
         if isinstance(words, np.ndarray):
+            if getattr(words, "waits", None) is not None:   # (a compile worker's)
+                return words.waits
             p = programs[0] if programs is not None and not isinstance(programs, np.ndarray) \
                 else None
             return self.W.entries(words, D, S, prog=p)
         ps = programs if programs is not None and not all(
             isinstance(w, np.ndarray) for w in programs) else [None] * len(words)
-        return [self.W.entries(w, D, S, prog=p) for w, p in zip(words, ps)]
+        return [w.waits if getattr(w, "waits", None) is not None else
+                self.W.entries(w, D, S, prog=p) for w, p in zip(words, ps)]
 
     def slot_words(self, prog) -> np.ndarray:
         """A chain slot's contents for `prog` (one slice's: generate.slot_words): its words,

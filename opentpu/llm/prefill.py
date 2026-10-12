@@ -32,9 +32,8 @@ import time
 
 import numpy as np
 
-from .. import isa as I
 from .. import progcache as PC
-from ..compiler import CompileError, Words
+from ..compiler import CompileError
 from . import generate as G
 from . import tiled as TL
 from .qwen3 import RUN_WORDS
@@ -133,8 +132,9 @@ def _prepared(eng, what, blocks: int, progs, ra):
         raise CompileError(f"prompt run {what}: {max(map(len, progs))} instructions, "
                            f"IMEM {img.cfg.IMEM_WORDS // 8}")
     prep = getattr(eng.backend, "prepare", None)
-    if getattr(eng.backend, "runs_words", False) and len(progs) == 1:   # (Words: run_args)
-        progs = Words.of(I.assemble(progs[0]), ra or getattr(progs[0], "run_args", ()))
+    if getattr(eng.backend, "runs_words", False) and len(progs) == 1:   # (Words: run_args;
+        from .qwen3 import worker_words                                 # WAITC: the entries)
+        progs = worker_words(img, progs[0], ra or getattr(progs[0], "run_args", ()))
     elif prep is not None:
         prep(progs)
     names = {v.name for v, _ in ra or ()}
