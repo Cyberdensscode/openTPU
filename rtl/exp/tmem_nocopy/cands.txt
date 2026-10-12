@@ -94,3 +94,9 @@ s16h2qA OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3,+tm_sbh=2,+tm_rq
 # VPU A; port A: VPU B, QUANT 3, QUANT 2, COLL and the writes): a unit's ports never share a RAM port
 s8xq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_rq=1,+tm_cpy=00001111,+tm_tdp=1,+tm_wcpy=1
 s8hxq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_sbh=2,+tm_rq=1,+tm_cpy=00001111,+tm_tdp=1,+tm_wcpy=1
+# ... the replays on one true dual-port copy (otpu_tmem TDP, otpu_slice TMEM_TDP): the MXU, the DMA,
+# QUANT and VPU A on the RAMs' port B, VPU B, QUANT 3, QUANT 2 and COLL on port A with the writes
+# (s8xq in RTL); r8iRb: r8iR on the RTL with one asker a port (must equal r8iR cycle for cycle)
+r8xR OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=8 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1 OTPU_TMEM_TDP=1
+r8xhR OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=8 OTPU_TMEM_SBP=3 OTPU_TMEM_SBH=2 OTPU_TMEM_RPL=1 OTPU_TMEM_TDP=1
+r8iRb OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=8 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1

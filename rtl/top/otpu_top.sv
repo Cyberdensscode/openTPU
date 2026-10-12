@@ -33,7 +33,8 @@ module otpu_top
   parameter int TMEM_NSB   = 8,       // TMEM_IMPL 3: sub-banks per bank (otpu_slice)
   parameter int TMEM_SBP   = 3,       // TMEM_IMPL 3: the sub-bank field's word-address bit
   parameter int TMEM_SBH   = 0,       // TMEM_IMPL 3: the sub-bank hashed (otpu_slice)
-  parameter bit TMEM_RPL   = 1'b0     // TMEM_IMPL 3: lost reads replayed (otpu_slice)
+  parameter bit TMEM_RPL   = 1'b0,    // TMEM_IMPL 3: lost reads replayed (otpu_slice)
+  parameter bit TMEM_TDP   = 1'b0     // TMEM_IMPL 3: true dual-port RAMs (otpu_slice)
 ) (
   input  logic          clk,
   input  logic          sys_rst,
@@ -125,7 +126,7 @@ module otpu_top
                  .WPB(WPB), .MXU_IMPL(MXU_IMPL), .MXU_CL(MXU_CL), .VPU_CL(VPU_CL), .ULANES(ULANES),
                  .TMEM_IMPL(TMEM_IMPL), .TMEM_RQ(TMEM_RQ), .TMEM_NCP(TMEM_NCP),
                  .TMEM_NSB(TMEM_NSB), .TMEM_SBP(TMEM_SBP), .TMEM_SBH(TMEM_SBH),
-                 .TMEM_RPL(TMEM_RPL))
+                 .TMEM_RPL(TMEM_RPL), .TMEM_TDP(TMEM_TDP))
     u_slice (
       .clk, .sys_rst, .rst, .rinit, .ld_start, .ld_addr, .ld_n, .ld_busy(ldb[s]),
       .a_rdy, .b_rdy, .sw_rdy, .wr_idle, .rd_idle,

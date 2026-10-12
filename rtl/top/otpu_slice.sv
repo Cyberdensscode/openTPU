@@ -58,8 +58,10 @@ module otpu_slice
   parameter int TMEM_SBP   = 3,       //   RAMs, the sub-bank at word-address bit TMEM_SBP
                                       //   (docs/tmem_nocopy.md)
   parameter int TMEM_SBH   = 0,       // TMEM_IMPL 3: the sub-bank hashed (otpu_tmem SBH)
-  parameter bit TMEM_RPL   = 1'b0     // TMEM_IMPL 3: lost reads replayed (otpu_tmem RPL), the
+  parameter bit TMEM_RPL   = 1'b0,    // TMEM_IMPL 3: lost reads replayed (otpu_tmem RPL), the
                                       //   board's arbiter (ARB_MASK) with the replays' holds
+  parameter bit TMEM_TDP   = 1'b0     // TMEM_IMPL 3: true dual-port RAMs (otpu_tmem TDP), a
+                                      //   unit's ports on different RAM ports (TM_SIDE)
 ) (
   input  logic          clk,
   input  logic          sys_rst,
@@ -176,6 +178,11 @@ module otpu_slice
   //                                        COLL  Q2    Q3    VB    VA    Q     DMA   MXU
   localparam logic [NRP-1:0][2:0] RGRP = {3'(G_COLL), 3'(G_Q), 3'(G_Q), 3'(G_VPU), 3'(G_VPU),
                                           3'(G_Q), 3'(G_DMA), 3'(G_MXU)};
+  // TMEM_TDP: the RAM port each read port asks on (1: port A, which the writes take first): the
+  // MXU, the DMA, QUANT and VPU A on port B; VPU B, QUANT 3, QUANT 2 and COLL on port A (the
+  // VPU's and the quantizer's operands never share a RAM port)
+  localparam logic [NRP-1:0] TM_SIDE = (NRP'(1) << P_VB) | (NRP'(1) << P_Q3) | (NRP'(1) << P_Q2) |
+                                       (NRP'(1) << P_COLL);
   initial if (TMEM_IMPL == 3 && (WPB != 1 || ARB_MASK != TMEM_RPL))
     $fatal(1, "otpu_slice: TMEM_IMPL 3 needs WPB = 1 (WPB %0d), and RPB >= %0d with TMEM_RPL",
            WPB, NRP * LANES);
@@ -344,7 +351,7 @@ module otpu_slice
               .SID(SID), .IMPL((TMEM_IMPL == 2) ? 0 : TMEM_IMPL), .NCP(NCP), .CPY(CPY), .RQ(TMEM_RQ),
               .PRANK((TMEM_IMPL == 3) ? PRANK3 : PRANK), .NSB(TMEM_NSB), .SBP(TMEM_SBP),
               .GRP(RGRP), .SBH(TMEM_SBH), .RPL(TMEM_RPL), .RPLM(~(NRP'(1) << P_COLL)),
-              .TOPP(P_DMA)) u_tmem (
+              .TOPP(P_DMA), .TDP(TMEM_TDP), .SIDE(TM_SIDE)) u_tmem (
     .clk, .r_en, .r_req(rq_t), .r_addr, .r_data, .w_en, .w_req(wq_en), .w_gnt, .w_addr,
     .w_data, .blk_x(tm_bx), .blk_s(tm_bs), .lost(tm_lost), .frz(tm_frz), .dump);
   assign coll_rdata = r_data[P_COLL];

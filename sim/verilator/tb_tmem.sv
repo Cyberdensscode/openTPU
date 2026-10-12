@@ -11,9 +11,10 @@
 // grants ignore the RAMs; a read that lost (lost) is read again while its group holds (frz: no
 // request from the group's ports), and its lanes show the word of the first read's cycle once a
 // replay of it wins (the cycle a read or replay loses, the port's lanes are not checked); SBH
-// hashes the sub-bank.
+// hashes the sub-bank. TDP: true dual-port RAMs, port 2 on their port A with the writes, ports 0
+// and 1 on port B.
 module tb_tmem #(parameter int IMPL = 0, parameter int NSB = 4, parameter int SBP = 2,
-                 parameter int SBH = 0, parameter bit RPL = 1'b0);
+                 parameter int SBH = 0, parameter bit RPL = 1'b0, parameter bit TDP = 1'b0);
   localparam int WORDS = 256, LANES = 4, NRP = 3, NWP = 2, WPB = 1, CYCLES = 20000;
   localparam int BW = $clog2(LANES);
   localparam int NCP = 2;
@@ -30,7 +31,7 @@ module tb_tmem #(parameter int IMPL = 0, parameter int NSB = 4, parameter int SB
   localparam logic [NRP-1:0][2:0] GRP = {3'd1, 3'd1, 3'd0};
   otpu_tmem #(.WORDS(WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .WPB(WPB), .IMPL(IMPL),
               .NCP(NCP), .CPY(CPY), .NSB(NSB), .SBP(SBP), .PRANK({3'd2, 3'd1, 3'd0}),
-              .GRP(GRP), .SBH(SBH), .RPL(RPL), .TOPP(0)) dut (
+              .GRP(GRP), .SBH(SBH), .RPL(RPL), .TOPP(0), .TDP(TDP), .SIDE(3'b100)) dut (
     .clk, .r_en, .r_req, .r_addr, .r_data, .w_en, .w_req, .w_gnt, .w_addr, .w_data,
     .blk_x, .blk_s, .lost, .frz, .dump(1'b0));
 

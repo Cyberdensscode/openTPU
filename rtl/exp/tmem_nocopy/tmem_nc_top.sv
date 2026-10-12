@@ -10,6 +10,8 @@
 //   VAR 4  otpu_tmem IMPL 3 RPL (replays) with the board's arbiter and the replays' holds
 //          (otpu_slice TMEM_RPL: tm_frz into the grants, the VPU's registered enable from
 //          tm_lost, as otpu_vpu's WBUF en_r)
+//   VAR 5  VAR 4 with true dual-port RAMs (otpu_slice TMEM_TDP: the MXU, the DMA, QUANT and VPU A
+//          on port B; VPU B, QUANT 3, QUANT 2 and COLL on port A with the writes)
 // So the paths it times are the TMEM's own and the grant's up to the units' enables (the units'
 // requests come from registers here; in the slice they come out of each unit's state).
 module tmem_nc_top #(
@@ -37,6 +39,8 @@ module tmem_nc_top #(
   localparam logic [NRP-1:0] GEN_R = NRP'(1) << P_MXU;
   localparam logic [NWP-1:0] GEN_W = NWP'(1) << W_MXU;
   localparam logic [NRP-1:0] SH_MASK = (NRP'(1) << P_Q3) | (NRP'(1) << P_COLL);
+  localparam logic [NRP-1:0] TM_SIDE = (NRP'(1) << P_VB) | (NRP'(1) << P_Q3) | (NRP'(1) << P_Q2) |
+                                       (NRP'(1) << P_COLL);
   localparam logic [NRP-1:0][2:0] PRANK3 = {3'd1, 3'd6, 3'd7, 3'd3, 3'd2, 3'd5, 3'd0, 3'd4};
   localparam logic [NRP-1:0][2:0] RGRP = {3'(G_COLL), 3'(G_Q), 3'(G_Q), 3'(G_VPU), 3'(G_VPU),
                                           3'(G_Q), 3'(G_DMA), 3'(G_MXU)};
@@ -93,7 +97,7 @@ module tmem_nc_top #(
 
   logic [NRP-1:0] tm_bx, tm_bs, tm_sv, tm_pre, tm_lost, tm_frz;
   logic           v_en;            // VAR 4: the VPU's registered enable (otpu_vpu en_r)
-  if (VAR == 4) begin : g_v4
+  if (VAR >= 4) begin : g_v4
     logic [NG-1:0] frzg;
     always_comb
       for (int g = 0; g < NG; g++)
@@ -175,7 +179,7 @@ module tmem_nc_top #(
     if (!gnt[G_MXU])  begin r_en[P_MXU] = '0; w_en[W_MXU] = '0; end
     if (!gnt[G_Q])    begin r_en[P_Q] = '0; r_en[P_Q2] = '0; r_en[P_Q3] = '0; end
     if (VAR == 3 && !gnt[G_VPU]) begin r_en[P_VA] = '0; r_en[P_VB] = '0; end
-    if (VAR == 4 && !v_en) begin r_en[P_VA] = '0; r_en[P_VB] = '0; end
+    if (VAR >= 4 && !v_en) begin r_en[P_VA] = '0; r_en[P_VB] = '0; end
     if (!gnt[G_VPU])  w_en[W_VPU] = '0;
     if (!gnt[G_COLL]) begin r_en[P_COLL] = '0; w_en[W_COLL] = '0; end
     if (VAR == 3)
@@ -188,7 +192,8 @@ module tmem_nc_top #(
   otpu_tmem #(.WORDS(WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .WPB(1), .GEN_R(GEN_R),
               .GEN_W(GEN_W), .SH_HOST(P_DMA), .SH_MASK(VAR == 0 ? SH_MASK : '0), .SID(0),
               .IMPL(VAR == 0 ? 0 : 3), .PRANK(PRANK3), .NSB(NSB), .SBP(SBP), .GRP(RGRP),
-              .SBH(SBH), .RPL(VAR == 4), .RPLM(~(NRP'(1) << P_COLL)), .TOPP(P_DMA)) u_tmem (
+              .SBH(SBH), .RPL(VAR >= 4), .RPLM(~(NRP'(1) << P_COLL)), .TOPP(P_DMA),
+              .TDP(VAR == 5), .SIDE(TM_SIDE)) u_tmem (
     .clk, .r_en, .r_req(rq_t), .r_addr, .r_data, .w_en, .w_req(wq_en), .w_gnt, .w_addr, .w_data,
     .blk_x(tm_bx), .blk_s(tm_bs), .lost(tm_lost), .frz(tm_frz), .dump(1'b0));
 endmodule

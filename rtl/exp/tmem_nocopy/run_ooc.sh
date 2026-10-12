@@ -12,6 +12,9 @@
 #   k7-r16hR   the same, 16 RAMs a bank, the sub-bank hashed (SBH 2)
 #   k7-r16hR-128k  k7-r16hR at 128K words
 #   ku-r8iR, ku-r16hR   the replays on xcku5p-2 at 200 MHz
+#   k7-r8xR    the replays on true dual-port RAMs (TMEM_TDP, VAR 5), 8 RAMs a bank; -128k, -256k
+#   k7-r8xhR   the same, hashed (SBH 2); ku-r8xR on xcku5p-2 at 200 MHz
+#   k7-r8iR-256k, k7-r16hR-256k   the replays at 256K words
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 O=${1:?outdir}; shift
 mkdir -p "$O"
@@ -36,6 +39,13 @@ for s in "$@"; do
     k7-r16hR) viv $s 4 65536 16 3 $K7 7.5 2 ;;
     k7-r16hR-128k) viv $s 4 131072 16 3 $K7 7.5 2 ;;
     ku-r8iR)  viv $s 4 65536 8 3 $KU 5.0 0 ;;
+    k7-r8xR)  viv $s 5 65536 8 3 $K7 7.5 0 ;;
+    k7-r8xhR) viv $s 5 65536 8 3 $K7 7.5 2 ;;
+    k7-r8xR-128k) viv $s 5 131072 8 3 $K7 7.5 0 ;;
+    k7-r8xR-256k) viv $s 5 262144 8 3 $K7 7.5 0 ;;
+    ku-r8xR)  viv $s 5 65536 8 3 $KU 5.0 0 ;;
+    k7-r8iR-256k) viv $s 4 262144 8 3 $K7 7.5 0 ;;
+    k7-r16hR-256k) viv $s 4 262144 16 3 $K7 7.5 2 ;;
     ku-r16hR) viv $s 4 65536 16 3 $KU 5.0 2 ;;
     ku-v0)    viv $s 0 65536 8 3 $KU 5.0 ;;
     ku-r8i)   viv $s 3 65536 8 3 $KU 5.0 ;;
