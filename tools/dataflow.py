@@ -611,6 +611,20 @@ def role(op: str, site_: str) -> str | None:
         return "rope"
     if fn in ("qwen3._rope_padded", "qwen3._rope_rows_padded", "qwen3._padded"):
         return "pad"
+    # the tile kernel's (opentpu/llm/tiled.py): its norm statistics, residual adds, acc / l and
+    # SwiGLU have their own sites
+    if fn == "tiled._norm_quantize":
+        return "norm.stat"
+    if fn == "tiled._add_parts":
+        return "residual"
+    if fn == "tiled.emit":
+        return "attn.out"
+    if fn == "tiled._mlp_tile":
+        return "glu"
+    if fn in ("lib.sigmoid", "lib.silu", "lib.gelu_tanh") and "_mlp_tile" in chain:
+        return "glu"
+    if fn == "attention.fill":
+        return "mask"
     if fn in ("lib.sigmoid", "lib.silu", "lib.gelu_tanh"):
         if chain & {"swiglu_down", "_dense", "_swiglu_down_loop", "down"}:
             return "glu"
@@ -710,13 +724,41 @@ def card_env() -> None:
         os.environ.setdefault(k, "1")
 
 
-def case(model, kind, n, pos, mcols=None, layers=None, wformat="fp4", head="int8", rows_kw=None):
-    """(cfg, programs, poke, info) of a dense case (tools/vpu_hack.compile_case)."""
-    card_env()
+def compile_tile(model, T, pos, mcols=None, wformat="fp4", head="int8", layers=None,
+                 dram_bytes=1 << 32):
+    """A tiled prompt run of T rows from pos (opentpu/llm/tiled.compile_tile, as
+    tools/perf_tiled.py --kernel tile builds it: ACT_ROWS max(the board's, MCOLS, T), the
+    card's TMEM); vpu_hack.compile_case's full tuple."""
     sys.path.insert(0, str(ROOT / "tools"))
     import vpu_hack as VH
-    cfg, progs, img, area, spec = VH.compile_case(model, kind, n, pos, mcols, wformat, head,
-                                                  layers=layers, dram_bytes=1 << 32, full=True)
+    from opentpu.isasim import board_config
+    from opentpu.llm import load_spec, model_dir, tiled
+    os.environ.setdefault("OTPU_TILE", "1")          # the image's mask tiles (Gemma)
+    spec = VH._prefix(load_spec(model_dir(model)), layers)
+    mk = {"MCOLS": mcols} if mcols else {}
+    c0 = board_config(DRAM_BYTES=dram_bytes, **mk)
+    cfg = board_config(DRAM_BYTES=dram_bytes, ACT_ROWS=max(c0.act_rows, c0.MCOLS, T), **mk)
+    cap = 256 * ((pos + T - 1) // 256 + 1)
+    img = spec.image(cfg, cap, rows=T, wformat=wformat, head_format=head)
+    return cfg, tiled.compile_tile(img, pos, T, 256), img, None, spec
+
+
+def compile_any(model, kind, n, pos, mcols=None, wformat="fp4", head="int8", layers=None,
+                dram_bytes=1 << 32):
+    """vpu_hack.compile_case's full tuple; kind "tile": compile_tile."""
+    if kind == "tile":
+        return compile_tile(model, n, pos, mcols, wformat, head, layers, dram_bytes)
+    sys.path.insert(0, str(ROOT / "tools"))
+    import vpu_hack as VH
+    return VH.compile_case(model, kind, n, pos, mcols, wformat, head, layers=layers,
+                           dram_bytes=dram_bytes, full=True)
+
+
+def case(model, kind, n, pos, mcols=None, layers=None, wformat="fp4", head="int8", rows_kw=None):
+    """(cfg, programs, poke, info) of a dense case (tools/vpu_hack.compile_case; kind "tile":
+    a tiled prompt run)."""
+    card_env()
+    cfg, progs, img, area, spec = compile_any(model, kind, n, pos, mcols, wformat, head, layers)
     end = area["end"] if area else img.nbytes
     # the run's DRAM is the image's; a program over IMEM (8 batched rows) runs as one here (the
     # card splits the step into groups of rows that fit, each streaming the weights again)
@@ -768,6 +810,14 @@ FUSE_MODES = {
     "ASB": {"a", "a*", "x", "b"},            # + softmax's P on QUANT's input path
     "C": {"a", "a*", "x", "b", "c"},         # every VOP (the VPU free, dependencies kept)
 }
+# stages by role (docs/dataflow.md 7.3): T, what today's ISA takes with compiler changes alone
+# (the residual as MM ACC, o / l as W_o's RSCALE, the gain as CSCALE, the pad copies); GE, the
+# quantizer's two composite modes (GLU: act(g) x u, the gates, PLE; EXP + SUM: the softmax
+# numerators with the mask). A mode's parts may also name roles (FUSION) one by one.
+STAGE_ROLES = {
+    "T": {"residual", "attn.out", "norm.apply", "pad"},
+    "GE": {"glu", "gate", "ple", "softmax.p", "mask"},
+}
 
 
 def _span(base, rows, rs, cols) -> tuple[int, int]:
@@ -813,13 +863,19 @@ def span_qact(ins) -> I.Instr:
 
 
 def fuse_apply(prog, mode: str, keep=None):
-    """prog with mode's roles spanned (FUSE_MODES; ',Q' adds QACT's spans); returns (program,
-    counts by role)."""
+    """prog with mode's roles spanned (FUSE_MODES' classes, STAGE_ROLES' or FUSION's roles,
+    ','-joined; ',Q' adds QACT's spans); returns (program, counts by role)."""
     parts = mode.split(",")
-    verd = set()
+    verd, roles = set(), set()
     for p in parts:
-        if p and p != "Q":
+        if p in FUSE_MODES:
             verd |= FUSE_MODES[p]
+        elif p in STAGE_ROLES:
+            roles |= STAGE_ROLES[p]
+        elif p in FUSION:
+            roles.add(p)
+        elif p and p != "Q":
+            raise ValueError(f"fuse mode {mode!r}: unknown part {p!r}")
     q = "Q" in parts
     out, n = [], defaultdict(int)
     for ins in prog:
@@ -828,7 +884,7 @@ def fuse_apply(prog, mode: str, keep=None):
             continue
         if ins.op == I.VOP:
             rl = role(opkey(ins), site(ins))
-            if FUSION[rl][0] in verd:
+            if FUSION[rl][0] in verd or rl in roles:
                 out.append(span_vop(ins))
                 n[rl] += 1
                 continue
@@ -851,10 +907,19 @@ def cosim(cfg, progs, dram, args=None) -> dict:
     plus = rtlsim.ldc_plusargs(1066, MHZ) + ddr3_plusargs(3200 / 3, MHZ)[2:]
     t = time.time()
     kw = {"args": args} if args is not None else {}
-    _, _, st = rtlsim.run(cfg, progs, [dram], uarch=rtlsim.BOARD_UARCH, axi=True, boot=True,
+    # the epilogue lanes: the card's E at MCOLS 4, E = MCOLS / 2 above (OTPU_MXU_E overrides)
+    uarch = dict(rtlsim.BOARD_UARCH)
+    if "MXU_E" not in uarch:                 # a tree before the MX column: no lanes to set
+        pass
+    elif os.environ.get("OTPU_MXU_E"):
+        uarch["MXU_E"] = int(os.environ["OTPU_MXU_E"])
+    elif cfg.MCOLS >= 8:
+        uarch["MXU_E"] = cfg.MCOLS // 2
+    _, _, st = rtlsim.run(cfg, progs, [dram], uarch=uarch, axi=True, boot=True,
                           stall=0, bw=100, lat=round(0.3 * MHZ), max_cycles=1 << 40, ldc=1066,
                           plusargs=["+axi_dram=1", "+axi_map=1"] + plus, **kw)
-    rec = {"cycles": int(st["cycles"]), "sim_s": round(time.time() - t)}
+    rec = {"cycles": int(st["cycles"]), "sim_s": round(time.time() - t),
+           "E": uarch.get("MXU_E", 0)}
     if st.get("act_reads"):                  # the ACT RAM's column reads (otpu_mxu xa_*)
         rec["act"] = st["act_reads"][0]
     return rec
@@ -886,10 +951,9 @@ def cosim_cmd(o) -> None:
         keep = VH.moe_keep
         end, area, spec_ = img.nbytes, None, s
     else:
-        cfg, progs0, img, area, spec_ = VH.compile_case(o.model, o.kind, o.n, o.pos, o.mcols,
-                                                        o.wformat, o.head_format,
-                                                        layers=o.layers,
-                                                        dram_bytes=VH.COSIM_DRAM, full=True)
+        cfg, progs0, img, area, spec_ = compile_any(o.model, o.kind, o.n, o.pos, o.mcols,
+                                                    o.wformat, o.head_format, o.layers,
+                                                    VH.COSIM_DRAM)
         end = area["end"] if area else img.nbytes
     for mode in o.modes.split(":"):
         rec = dict(model=Path(o.model).name, kind=o.kind, n=o.n, pos=o.pos, mcols=cfg.MCOLS,
@@ -1071,7 +1135,8 @@ def report(paths) -> str:
         wr = [4 * t["tmem_wr"].get(p, 0) / k / 1e3 for p in wp]
         L.append(f"| {label(r)} | " + " | ".join(f"{x:.1f}" for x in rd + wr) +
                  f" | {sum(rd) + sum(wr):.1f} | {t['act_wr'] / k / 1e3:.1f} | "
-                 f"{t['act_rd'] / k / 1e3:.0f} | {t['act_rd_phys'] / k / 1e3:.0f} | "
+                 f"{t['act_rd'] / k / 1e3:.0f} | {t['act_rd_phys'] / k / 1e3:.0f}"
+                 f"{' (gated %.0f)' % (t['act_rd_gated'] / k / 1e3) if 'act_rd_gated' in t else ''} | "
                  f"{t['imem'] / k / 1e3:.1f} |")
     L.append("\nVPU roles: issue cycles and TMEM words (read + written), per token / row / user\n")
     allr = sorted({rl for r in rs for rl in roles(r)}, key=lambda x: list(FUSION).index(x))
@@ -1108,11 +1173,120 @@ def report(paths) -> str:
     return "\n".join(L)
 
 
+# ---------------------------------------------------------------------------- KV options
+# docs/dataflow.md 4.8: the KV cache's bytes and the attention MMs' advances today and under the
+# layout / format options, estimated from decode / batch ledger runs (MCOLS 4). The attention
+# layers' (q heads, KV heads, head dim) of the card models (Gemma 4 E2B: its sliding layers';
+# its 512-wide global K rows are whole chunks either way).
+KV_HEADS = {"Qwen3-0.6B": (16, 8, 128), "SmolLM3-3B": (16, 4, 128),
+            "Phi-4-mini-instruct": (24, 8, 128), "Qwen3.5-0.8B": (8, 2, 256),
+            "Qwen3.5-2B": (8, 2, 256), "Qwen3.5-4B": (16, 4, 256), "LFM2.5-230M": (16, 8, 64),
+            "LFM2-2.6B": (32, 8, 64), "gemma-4-E2B-it": (8, 1, 256)}
+
+
+def kv_parts(r) -> dict:
+    """A run's KV bytes (K values and scales, V values, V's per-token scales by LD), appends
+    (beats written + read-merges; useful bytes; QSTs), attention advances (K, V), all DRAM."""
+    p = dict(kv_k=0, ks=0, kv_v=0, vs=0, app=0, app_use=0, app_n=0, adv_k=0, adv_v=0)
+    for c in r["classes"]:
+        st, op, rd, wr = c["site"], c["op"], c["dram_rd"], c["dram_wr"]
+        if op.startswith("MM") and st.startswith("attention.scores"):
+            p["kv_k"] += rd.get("kv", 0)
+            p["ks"] += rd.get("kvscale", 0)
+            p["adv_k"] += c["mxu_adv"]
+        elif op.startswith("MM") and st.startswith("attention.finish"):
+            p["kv_v"] += rd.get("kv", 0)
+            p["adv_v"] += c["mxu_adv"]
+        elif op.startswith("LD") and st.startswith("attention."):
+            p["vs"] += rd.get("ld.kv", 0)
+        if op.startswith("QST"):
+            p["app"] += wr.get("qst_beats", 0) + rd.get("qst_rmw", 0)
+            p["app_use"] += wr.get("qst", 0)
+            p["app_n"] += c["n"]
+    t = r["total"]
+    p["all"] = sum(t["dram_rd"].values()) + sum(t["dram_wr"].values()) - t["dram_wr"].get("qst", 0)
+    return p
+
+
+def kv_options(heads, p, mcols: int, D: int = 128) -> dict:
+    """{option: (KV read bytes, append bytes, K advances, V advances, q.K^T outputs an
+    advance)} at MCOLS mcols. A K row takes whole D-byte chunks unless N-pair (two rows a chunk,
+    2G <= MCOLS) packs half-chunk rows; fp4x6 K: d/2 value bytes, its scale row Sw + a word a
+    block; fp4 V^T (E2M1, UNIT, the per-token scale in P's CSCALE): half the bytes, PAIR halves
+    its advances (2G <= MCOLS); V rows: the append writes whole beats (+ a scale beat's merge)."""
+    q, kv, d = heads
+    g = q // kv
+    pair = 2 * g <= mcols
+    G4, G = -(-g // 4), -(-g // mcols)            # replay groups (the runs': MCOLS 4)
+    p = dict(p, adv_k=p["adv_k"] * G / G4, adv_v=p["adv_v"] * G / G4)
+    rows_k = p["adv_k"] / max(1, d // D) / G      # K rows streamed
+
+    def kbytes(rb):                               # a K row of rb bytes: stream bytes, advances
+        per = rb if rb >= D else (D / 2 if (pair and rb <= D / 2) else D)
+        return rows_k * per, G * rows_k * per / D
+
+    kb = max(1, d // D)
+    k8, ak8 = kbytes(d)
+    k4, ak4 = kbytes(d // 2)
+    if d >= D:                                    # whole-chunk rows
+        k8, k4 = p["kv_k"], p["kv_k"] / 2
+    if d // 2 >= D and not pair:                  # 4-bit whole-chunk rows: two advances a chunk
+        ak4 = 2 * ak4
+    v8, vs = p["kv_v"], p["vs"]
+    av4 = p["adv_v"] / 2 if pair else p["adv_v"]
+    app_rows = p["app_use"] + 128 * p["app_n"]
+
+    def opa(ak):
+        return round(rows_k * g / ak, 2)
+    o = {"today": (p["kv_k"] + p["ks"] + v8 + vs, p["app"], p["adv_k"], p["adv_v"],
+                   opa(p["adv_k"]))}
+    o["N-pair int8 K"] = (k8 + p["ks"] + v8 + vs, p["app"], ak8, p["adv_v"], opa(ak8))
+    o["V rows"] = (o["today"][0], app_rows, p["adv_k"], p["adv_v"], opa(p["adv_k"]))
+    o["fp4 V"] = (o["today"][0] - v8 / 2, p["app"], p["adv_k"], av4, opa(p["adv_k"]))
+    # 6-bit (int6 / MXFP6; a proposal): 3/4 of the values' bytes, rows packed in the stream (d
+    # 128: 96 bytes a row), scales as today's (MXFP6's E8M0 a 32-block: d / 32 bytes a row)
+    k6 = rows_k * 0.75 * d
+    o["6b V"] = (o["today"][0] - v8 / 4, p["app"], p["adv_k"], p["adv_v"], opa(p["adv_k"]))
+    o["6b K"] = (o["today"][0] - p["kv_k"] + k6, p["app"], p["adv_k"], p["adv_v"],
+                 opa(p["adv_k"]))
+    o["6b K+V"] = (o["6b K"][0] - v8 / 4, p["app"], p["adv_k"], p["adv_v"], opa(p["adv_k"]))
+    o["fp4 K"] = (k4 + p["ks"] * (2 + kb) + v8 + vs, p["app"], ak4, p["adv_v"], opa(ak4))
+    o["fp4 K+V"] = (o["fp4 K"][0] - v8 / 2, p["app"], ak4, av4, opa(ak4))
+    o["fp4 K+V, V rows"] = (o["fp4 K+V"][0], app_rows - p["app_use"] / 2, ak4, av4, opa(ak4))
+    return o
+
+
+def kv_report(paths) -> str:
+    """dataflow.py kv JSONs...: the KV options of the decode / batch runs."""
+    L = ["| model | pos | B | G | option | KV MB / user (MCOLS 8) | change of the step, MCOLS 8 | "
+         "MCOLS 4 | attention advances K / user (MCOLS 8) | q.K^T outputs an advance |",
+         "|---|---:|---:|---:|---|---:|---:|---:|---:|---:|"]
+    for r in load(paths):
+        c = r["case"]
+        heads = c.get("heads") or KV_HEADS.get(c["model"])
+        if heads is None or c["kind"] not in ("decode", "batch"):
+            continue
+        p = kv_parts(r)
+        o4, o8 = kv_options(heads, p, 4), kv_options(heads, p, 8)
+        B = c["n"] if c["kind"] == "batch" else 1
+        t8, t4 = sum(o8["today"][:2]), sum(o4["today"][:2])
+        for name in o8:
+            b8, b4 = sum(o8[name][:2]), sum(o4[name][:2])
+            L.append(f"| {c['model']} | {c['pos']} | {B} | {heads[0] // heads[1]} | {name} | "
+                     f"{b8 / B / 1e6:.1f} | {(b8 - t8) / p['all']:+.1%} | "
+                     f"{(b4 - t4) / p['all']:+.1%} | {(o8[name][2] + o8[name][3]) / B / 1e3:.0f} | "
+                     f"{o8[name][4]} |")
+    return "\n".join(L)
+
+
 def main(argv=None) -> int:
     a = list(argv if argv is not None else sys.argv[1:])
     ap = argparse.ArgumentParser(prog="dataflow.py")
     if a and a[0] == "report":
         print(report(a[1:]))
+        return 0
+    if a and a[0] == "kv":
+        print(kv_report(a[1:]))
         return 0
     if a and a[0] == "cosim":
         ap.add_argument("cmd")

@@ -100,18 +100,146 @@ def _down(spec, wf, name, D):
     return None if f is None else down_chunk(spec.ffn, D, f)
 
 
+# The KV cache's format under test (docs/dataflow.md 4.8, a proposal): "" the device's (int8 K
+# with a per-token scale, int8 V with a per-token scale); a variant whose label ends in ";kv=MODE"
+# runs with MODE (emulate sets it per variant), parts joined by "+":
+#   fp4k / nvfp4k   K as the MX column streams that weight format (quant.fake_w over the K rows:
+#                   one Sw a token, the format's block scales along d)
+#   fp4v / int4v    V as E2M1 (max |v| / 6) or int4 (max |v| / 7) values with one scale a token,
+#                   folded into P as today's V scale (UNIT; the 4-bit windows): token-major V
+#   fp4vt / nvfp4vt V^T as weight rows of that format, an attention block of tokens a row (one
+#                   Sw a channel and block, the format's block scales along the tokens): P.V's
+#                   streamed operand, the format's own use
+#   int6k / fp6k    6-bit K (a proposal: no MXU format yet): int6 (+-31, one Sw a token and a
+#                   power-of-two offset a D-block, as int8x's with 31) or MXFP6 (E2M3 values, an
+#                   E8M0 power of two a 32-element block along d)
+#   int6v / fp6vt   6-bit V: token-major int6 with one scale a token (folded into P as today's),
+#                   or V^T rows in MXFP6 (the E8M0 blocks along the tokens)
+# fp4kv / nvfp4kv: fp4k / nvfp4k + fp4v.
+_KV = [""]
+E2M1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+
+
+def _kv_mode(label: str) -> str:
+    return label.partition(";kv=")[2]
+
+
+def _v_e2m1(v):
+    """V rows [..., d] as E2M1 values (round to the nearest grid point, ties to the even code)
+    and one scale a row (max |v| / 6; an all-zero row's 0)."""
+    a = np.abs(v).max(-1, keepdims=True)
+    x = np.abs(v) / np.where(a == 0, 1, a / 6)
+    dist = np.abs(x[..., None] - E2M1)
+    best = dist.min(-1, keepdims=True)
+    cand = np.where(np.isclose(dist, best, rtol=0, atol=1e-12), np.arange(8), 99)
+    even = np.where(cand % 2 == 0, cand, 99).min(-1)
+    idx = np.where(even < 99, even, cand.min(-1))
+    return np.sign(v) * E2M1[idx], a[..., 0] / 6
+
+
+def _v_int4(v):
+    """V rows [..., d] as int4 values (-7 .. 7) and one scale a row (max |v| / 7)."""
+    a = np.abs(v).max(-1, keepdims=True)
+    return np.clip(np.rint(v / np.where(a == 0, 1, a / 7)), -7, 7), a[..., 0] / 7
+
+
+E2M3 = np.concatenate([np.arange(8) / 8, 1 + np.arange(8) / 8, 2 + np.arange(8) / 4,
+                       4 + np.arange(8) / 2])                   # 0 .. 7.5
+
+
+def _int6_rows(x, D: int):
+    """Rows [..., n] in int6 as int8x's quantizer with 31 levels: Sw = amax / 31 a row, each
+    D-block's offset d the largest (<= 31) with the block's amax 2^d <= the row's; dequantized."""
+    x = np.asarray(x, np.float64)
+    n = x.shape[-1]
+    B = min(D, n)
+    xb = x.reshape(*x.shape[:-1], n // B, B)
+    a = np.abs(x).max(-1, keepdims=True)[..., None]
+    bm = np.abs(xb).max(-1, keepdims=True)
+    with np.errstate(divide="ignore"):
+        d = np.where(bm > 0, np.clip(np.floor(np.log2(a / np.where(bm > 0, bm, 1))), 0, 31), 0)
+    u = np.where(a == 0, 1, a / 31) * np.exp2(-d)
+    return (np.clip(np.rint(xb / u), -31, 31) * u).reshape(x.shape)
+
+
+def _mxfp6_rows(x, B: int = 32):
+    """Rows [..., n] in MXFP6 (OCP MX: E2M3 elements, an E8M0 scale a block of B along the row,
+    2^(floor(log2 amax) - 2)); values to the nearest E2M3 point (ties to the even code), 7.5 at
+    most; dequantized."""
+    x = np.asarray(x, np.float64)
+    n = x.shape[-1]
+    xb = x.reshape(*x.shape[:-1], n // B, B)
+    bm = np.abs(xb).max(-1, keepdims=True)
+    with np.errstate(divide="ignore"):
+        sc = np.where(bm > 0, np.exp2(np.floor(np.log2(np.where(bm > 0, bm, 1))) - 2), 1)
+    y = np.minimum(np.abs(xb) / sc, 7.5)
+    dist = np.abs(y[..., None] - E2M3)
+    best = dist.min(-1, keepdims=True)
+    cand = np.where(np.isclose(dist, best, rtol=0, atol=1e-12), np.arange(len(E2M3)), 999)
+    even = np.where(cand % 2 == 0, cand, 999).min(-1)
+    idx = np.where(even < 999, even, cand.min(-1))
+    return (np.sign(xb) * E2M3[idx] * sc).reshape(x.shape)
+
+
+def _kv_parts(kv: str, k, v, D: int) -> tuple:
+    """(Kw, Vp, Vw, window) of KV format kv (_KV) over K and V [T, n_kv, d]: Kw [n_kv][T, d], K
+    as the MX column streams that weight format (None: the device's int8 K, _fake_k); Vp (V,
+    its per-token scales) in a 4-bit token-major format (None: int8, _v_parts); Vw [n_kv][d,
+    Tb] V^T as weight rows (None: V per token); P.V's weight window."""
+    parts = {"fp4kv": {"fp4k", "fp4v"}, "nvfp4kv": {"nvfp4k", "fp4v"}}.get(
+        kv, set(kv.split("+")) if kv else set())
+    Kw, Vp, Vw, win = None, None, None, I.MX_W[I.W8]
+    T, n_kv, d = v.shape
+    Tb = -(-T // ATTN_BLOCK) * ATTN_BLOCK
+    for f in ("fp4", "nvfp4"):
+        if f + "k" in parts:
+            Kw = [Q.fake_w(np.asarray(k[:, h], np.float32), f, D) for h in range(n_kv)]
+        if f + "vt" in parts:
+            vp = np.zeros((Tb, n_kv, d), np.float32)
+            vp[:T] = v
+            Vw = [np.concatenate([np.asarray(Q.fake_w(np.ascontiguousarray(
+                vp[t0:t0 + ATTN_BLOCK, h].T), f, D)) for t0 in range(0, Tb, ATTN_BLOCK)], 1)
+                for h in range(n_kv)]
+            win = I.MX_W[I.WFORMATS[f]]
+    if "fp4v" in parts:
+        Vp, win = _v_e2m1(v), I.MX_W[I.W4F]
+    if "int4v" in parts:
+        Vp, win = _v_int4(v), I.MX_W[I.W4I]
+    if "int6k" in parts:
+        Kw = [_int6_rows(k[:, h], D) for h in range(n_kv)]
+    if "fp6k" in parts:
+        Kw = [_mxfp6_rows(k[:, h]) for h in range(n_kv)]
+    if "int6v" in parts:
+        a = np.abs(v).max(-1, keepdims=True)
+        Vp = (np.clip(np.rint(v / np.where(a == 0, 1, a / 31)), -31, 31), a[..., 0] / 31)
+    if "fp6vt" in parts:
+        vp = np.zeros((Tb, n_kv, d))
+        vp[:T] = v
+        Vw = [_mxfp6_rows(vp[:, h].T) for h in range(n_kv)]
+    known = {"fp4k", "nvfp4k", "fp4v", "int4v", "fp4vt", "nvfp4vt", "int6k", "fp6k", "int6v",
+             "fp6vt"}
+    if parts - known:
+        raise ValueError(f"KV format {kv!r}: unknown parts {sorted(parts - known)}")
+    return Kw, Vp, Vw, win
+
+
 def _attend(q, k, v, fq, D, scale, lo=None):
     """Causal attention of every row [T, n_q, d] on its query group's K and V [T, n_kv, d] as
     the device reads them (emulated_logits' points; fq _ident: none): q quantized per head row,
     K as the cache holds it (qwen3._fake_k: ROW at d = D, else an offset per D-block), V per
     token, P per attention block of ATTN_BLOCK positions with V's scales folded in, against
-    V^T (UNIT: MM's drops of P's groups). lo [T]: each row's first key (a sliding window)."""
+    V^T (UNIT: MM's drops of P's groups). lo [T]: each row's first key (a sliding window).
+    _KV[0]: the KV format under test (above)."""
     T, nq, _ = q.shape
     quant = fq is not _ident
     G, Tb = nq // k.shape[1], -(-T // ATTN_BLOCK) * ATTN_BLOCK
+    Kw, Vw, vwin = None, None, I.MX_W[I.W8]
     if quant:
         K, dK = _fake_k(k, D)
-        V, vs = _v_parts(v)
+        Kw, Vp, Vw, vwin = _kv_parts(_KV[0], k, v, D)
+        V, vs = _v_parts(v) if Vp is None else Vp
+        if Vw is not None:
+            vs = np.ones(v.shape[:2])
     else:
         K, dK, V, vs = k, None, v, np.ones(v.shape[:2])
     t = np.arange(T)
@@ -122,15 +250,22 @@ def _attend(q, k, v, fq, D, scale, lo=None):
     for hq in range(nq):
         h = hq // G
         qq = fq(q[:, hq] / scale, D)
-        sc = _qk(qq, K[:, h], None if dK is None else dK[:, h], D) if quant else qq @ K[:, h].T
+        if Kw is not None:
+            sc = qq @ Kw[h].T
+        else:
+            sc = (_qk(qq, K[:, h], None if dK is None else dK[:, h], D) if quant
+                  else qq @ K[:, h].T)
         sc = np.where(ok, sc, -np.inf)
         pp = np.exp(sc - sc.max(1, keepdims=True))
         if quant:
             pf = np.zeros((T, Tb))
             pf[:, :T] = pp * vs[:, h]
-            vt = np.zeros((Tb, V.shape[2]))
-            vt[:T] = V[:, h]
-            pv = Q.mx_matmul(fq(pf, D, ATTN_BLOCK), vt.T, None, I.MX_W[I.W8], D)
+            if Vw is not None:
+                pv = fq(pf, D, ATTN_BLOCK) @ Vw[h].T
+            else:
+                vt = np.zeros((Tb, V.shape[2]))
+                vt[:T] = V[:, h]
+                pv = Q.mx_matmul(fq(pf, D, ATTN_BLOCK), vt.T, None, vwin, D)
         else:
             pv = pp @ V[:, h]
         o[:, hq] = pv / pp.sum(1, keepdims=True)
@@ -306,6 +441,7 @@ def emulate(spec, W, tokens, variants: dict, D: int = 128, logits: bool = False,
 
         for lab, f in variants.items():
             fq = _fake_q if f is not None else _ident
+            _KV[0] = _kv_mode(lab)
             wf = (lambda n, f=f: None if f is None else f(*M.weight_kind(n)))
             wl = (lambda n, wf=wf: w(n, wf(n)))
             xs[lab] = LAYER[M](spec, W, i, xs[lab], wl, fq, c, s, D, wf)
@@ -565,8 +701,11 @@ def _g4_run(spec, W, ids, specs: dict, D, log, cache=None, head_rows: int = HEAD
     for lab, v in specs.items():
         wf, hf, wmap, pf = _g4_args(spec, v)
         fmts[lab], pfs[lab] = None if hf == "none" else hf, pf
+        kv = _kv_mode(lab)              # (the KV format under test: the emulation's hook)
+        if E is not None:
+            E.KV[0] = (lambda k, v, D, kv=kv: _kv_parts(kv, k, v, D)) if kv else None
         key = repr((str(getattr(W, "model_dir", "")), spec, list(ids), D, wf, hf, pf,
-                    sorted(wmap.items())))
+                    sorted(wmap.items()))) + (f";kv={kv}" if kv else "")
         f = Path(cache) / f"{hashlib.sha256(key.encode() + src).hexdigest()[:20]}.npz" \
             if cache else None
         if f is not None and f.exists():
@@ -710,8 +849,9 @@ def ppl(name, formats: list, wformat: str, n_tok: int, D: int = 128, out=None,
     spec, run, nbytes, _, _ = _open(path, D, cache)
     ids = text_ids(path, n_tok, ids_file)
     specs = {"float": None, "int8": (base, "int8", None)}
-    specs.update({f or "(none)": (",".join(x for x in (base, f) if x), wformat, None)
-                  for f in formats})
+    specs.update({f or "(none)": (",".join(x for x in (base, f.partition(";kv=")[0]) if x),
+                                  wformat, None)
+                  for f in formats})                    # f: a formats string, ";kv=MODE"
     rows = run(specs, ids, (lambda m: print(m, flush=True)) if isinstance(spec, G.Spec)
                else None)
     _finish(rows, nbytes)
