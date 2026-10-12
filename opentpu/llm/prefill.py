@@ -97,8 +97,11 @@ def layer_tile_flag(t) -> bool:
 
 def tiling(eng) -> bool:
     """Tiled prompt runs on (opentpu/llm/tiled.py): tile_flag of the engine's tile_runs, for
-    an image whose family has a tile kernel."""
-    return tile_flag(getattr(eng, "tile_runs", None)) and TL.family(eng.image) is not None
+    an image whose family has a tile kernel, on one slice (tiled.check: a configuration of
+    more, the design point's two, takes today's runs)."""
+    img = eng.image
+    return tile_flag(getattr(eng, "tile_runs", None)) and TL.family(img) is not None \
+        and img.cfg.S == 1
 
 
 def programs(eng, p: int, R: int, kind: str, hidden: bool = False, slot: int = 0,

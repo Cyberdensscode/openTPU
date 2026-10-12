@@ -2164,9 +2164,10 @@ class Engine:
         if lookup:
             wkw["lookup"] = True
         self.cfg = cfg or device_config(spec, cap, batch=batch, rows=self.rows, **wkw)
-        if prompt_runs and PF.tile_flag(tile_runs) and self.cfg.act_rows > self.rows:
-            # tiled prompt runs of up to ACT_ROWS rows (prefill.py): the image's I/O rows hold
-            # an L run's last row's logits (row T - 1)
+        if prompt_runs and PF.tile_flag(tile_runs) and self.cfg.S == 1 and \
+                self.cfg.act_rows > self.rows:
+            # tiled prompt runs of up to ACT_ROWS rows (prefill.py; one slice): the image's I/O
+            # rows hold an L run's last row's logits (row T - 1)
             self.rows = self.cfg.act_rows
             if cfg is None:
                 self.cfg = device_config(spec, cap, batch=batch, rows=self.rows, **wkw)

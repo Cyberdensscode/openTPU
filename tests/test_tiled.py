@@ -522,6 +522,48 @@ def test_engine_tile_runs_rows(tmp_path_factory, monkeypatch, how):
     assert np.array_equal(lg.view(np.uint32), want.view(np.uint32))
 
 
+def test_tile_default_leaves_two_slices_today(monkeypatch):
+    """The default reaches one slice only (tiled.check): a design configuration's engine (two
+    slices) keeps its rows and today's prompt runs, the tiled default on."""
+    import test_prefill as TP
+    W, spec, cfg, kw = TP._model("qwen3-design")
+    monkeypatch.delenv("OTPU_TILE", raising=False)
+    eng = Engine(spec, W, cap=512, cfg=cfg, resident=True, prompt_runs=True, **kw)
+    assert cfg.S == 2 and eng.rows == TP.PREFILL_ROWS and not PF.tiling(eng)
+    toks = [int(t) for t in np.random.default_rng(4).integers(0, 1000, 30)]
+    eng.prefill(toks)
+    assert eng._prompt_progs and not any(k[0] == "prompt tile" for k in eng._prompt_progs)
+
+
+@pytest.mark.parametrize("P1", [40, 245])
+def test_tiled_mtp_prompt_runs_are_todays(P1):
+    """MTP (Qwen3.5's drafter: the tiled P / L runs store their hidden rows, today's M runs
+    follow each), the tiled prompt runs against today's (tile_runs False): a prompt, greedy
+    decoding with the drafter, then the next turn's prompt from the committed slot (at P1 245
+    across the bucket's end): the tokens, the runs' drafts, the DeltaNet states and windows and
+    the MTP layer's KV cache bit for bit."""
+    import test_prefill as TP
+    from opentpu.llm.mtp import MTPDecoder, MTPStats, mtp_engine
+    _, W, spec = TP._tiny_model(8, init=0.2)
+    W = TP._mtp_weights(W, spec)
+    r = np.random.default_rng(P1)
+    p1, p2 = [int(t) for t in r.integers(0, 1000, P1)], [int(t) for t in r.integers(0, 1000, 9)]
+    a, b = (MTPDecoder(mtp_engine(spec, W, cap=512, cfg=TP.CFG, prompt_runs=True, tile_runs=t))
+            for t in (True, False))
+    assert PF.tiling(a.eng) and not PF.tiling(b.eng)
+    sa, sb = a.generate(p1, max_new=6), b.generate(p1, max_new=6)
+    assert sa.tokens == sb.tokens and a.slot == b.slot and a.eng.pos == b.eng.pos
+    assert [x[:2] for x in sa.runs] == [x[:2] for x in sb.runs]
+    q = [sa.tokens[-1]] + p2
+    assert a.prefill(q, MTPStats()) == b.prefill(q, MTPStats())
+    n = a.eng.pos
+    assert n == b.eng.pos == P1 + 5 + len(q)
+    assert all(np.array_equal(x, y) for x, y in
+               zip(TP._states(a.eng, spec, a.slot), TP._states(b.eng, spec, b.slot)))
+    assert all(np.array_equal(x, y) for x, y in zip(TP._mtp_kv(a.eng, n), TP._mtp_kv(b.eng, n)))
+    assert any(k[0] == "prompt tile" for k in a.eng._prompt_progs)
+
+
 @pytest.fixture(scope="module")
 def gmoe(tmp_path_factory):
     """test_gemma4_moe's tiny Gemma 4 MoE: 8 experts 96 wide, top 2, beside the 320-wide MLP;
