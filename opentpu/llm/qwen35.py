@@ -1330,6 +1330,7 @@ class Image(EmbedHost):
             L = self.offload
             dev = SimpleNamespace(mbox=L.mbox, served=L.served, answer=L.answer, dir=L.dir,
                                   tag=L.tag, fmt=self.fmt, hint_off=L.layers * L.E,
+                                  slots=L.slot_bounds, ids=L.layers * L.E,
                                   scratch=self.io.get("moe_scratch"),
                                   need_off=2 * L.layers * L.E, em_base=L.slots[0][0],
                                   em_rec=MO.em_record(H, spec.moe.k),

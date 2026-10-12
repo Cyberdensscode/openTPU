@@ -1407,6 +1407,7 @@ class Image:
             ns.moe_dev = SimpleNamespace(mbox=Lo.mbox, served=Lo.served, answer=Lo.answer,
                                          dir=Lo.dir, tag=Lo.tag, fmt=self.fmt,
                                          hint_off=Lo.layers * Lo.E,
+                                         slots=Lo.slot_bounds, ids=Lo.layers * Lo.E,
                                          scratch=self.io.get("moe_scratch"),
                                          need_off=2 * Lo.layers * Lo.E,
                                          em_base=Lo.slots[0][0],

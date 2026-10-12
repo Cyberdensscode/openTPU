@@ -216,6 +216,9 @@ class Slice:
             v = v if ins.flags & I.F_RAW else I.f2i(v)
             if ins.flags & I.F_MUL:
                 v = (v * ((self.reg(ins.rb) + w[1]) & 0xFFFFFFFF)) & 0xFFFFFFFF
+            if ins.flags & I.F_BOUND and not w[2] <= v <= w[3]:
+                raise SimError(f"RLD at pc {self.pc}: {v} outside its bound [{w[2]}, {w[3]}] "
+                               f"({ins.comment})")
             if ins.rd:
                 self.R[ins.rd] = v
             return

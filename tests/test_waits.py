@@ -582,3 +582,37 @@ def test_prebuilds_backend_has_the_cards_flags():
     for k in ("args", "chains", "generates", "fills"):
         assert bool(getattr(be, k)) and getattr(PB._Drop, k), k
     be.close()
+
+
+def test_an_rld_bound_narrows_the_footprints_and_the_isa_simulator_checks_it():
+    """isa.rld's bound (flag bit 2, w3..w4: what the kernel knows of the word, e.g. an index
+    below E): the waits pass gives the register those values instead of any, so a VOP addressed
+    by it conflicts only with what its range can reach; the ISA simulator stops on a value
+    outside it; the hardware ignores the field (unbounded RLDs are as before)."""
+    from opentpu import Config
+    from opentpu.isasim import Machine, SimError
+    ins = I.rld(1, 100, bound=(0, 7))
+    assert ins.flags & I.F_BOUND and ins.w[2:4] == [0, 7]
+    back = I.Instr.decode(ins.encode())
+    assert back.flags == ins.flags and back.w == ins.w
+    assert I.rld(1, 100).flags & I.F_BOUND == 0
+    with pytest.raises(ValueError):
+        I.rld(1, 100, bound=(5, 4))
+
+    def prog(bound):
+        return [I.rld(1, 100, bound=bound),
+                vop(I.V_FILL, 1000, 0, 0, cols=1, ra=1, bmode=I.B_SCALAR, imm=1.0),
+                vop(I.V_ADD, 3000, 2000, 2000),            # nowhere near 1000 .. 1007
+                I.ld(0, 2000, 8),
+                I.halt()]
+    loose, tight = (W.wait_counts(prog(b), args=[0] * 8) for b in (None, (0, 7)))
+    assert vm(loose, 2) == 0b1 and vm(tight, 2) == 0    # R1 any: the FILL may hit 2000
+    assert vm(loose, 3) == 0b11 and vm(tight, 3) == 0b1  # (the ADD reads 2000: WAR either way)
+    cfg = Config(S=1, D=128, DRAM_BYTES=1 << 16)
+    for v, ok in ((7.0, True), (8.0, False)):
+        p = [vop(I.V_FILL, 100, 0, 0, cols=1, bmode=I.B_SCALAR, imm=v)] + prog((0, 7))
+        if ok:
+            Machine(cfg, [p], [None]).run()
+        else:
+            with pytest.raises(SimError, match="outside its bound"):
+                Machine(cfg, [p], [None]).run()

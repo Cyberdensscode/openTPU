@@ -789,7 +789,8 @@ class Image(EmbedHost):
         if self.offload is not None:
             L = self.offload
             dev = SimpleNamespace(mbox=L.mbox, served=L.served, answer=L.answer, dir=L.dir,
-                                  tag=L.tag, fmt=self.fmt)
+                                  tag=L.tag, fmt=self.fmt, slots=L.slot_bounds,
+                                  ids=L.layers * L.E)
         return SimpleNamespace(
             spec=spec, layer=layer, plan=self.plan, moe_dev=dev,
             x=_tdesc(self.io["x"], (1, H)), cos=_tdesc(self.io["cos"], (d // 2,)),

@@ -165,7 +165,7 @@ and ST's `n`, QACT's `w2` and `w3`, GATHER's `w3`).
 | 0x03 | ADDI | `R[rd] = R[ra] + w1` |
 | 0x04 | LOOP | body = next `w1` instructions, executed `R[ra] + w2` times (0: skipped). Loops nest (depth 4); a body must not end on the same instruction as an enclosing body. |
 | 0x05 | BAR | wait until every slice has reached a `BAR` |
-| 0x06 | RLD | `R[rd] = f2i(T[R[ra]+w1])`, flag bit0 RAW: the word's bits, bit1 MUL: times `R[rb]+w2` (see "RLD") |
+| 0x06 | RLD | `R[rd] = f2i(T[R[ra]+w1])`, flag bit0 RAW: the word's bits, bit1 MUL: times `R[rb]+w2`, bit2 BOUND: `w3 <= R[rd] <= w4` (see "RLD") |
 | 0x07 | WAITW | DMA: wait until `M32[R[ra]+w1] & w4` compares (flags[1:0]: EQ, NE, GE) with `R[rc]+w3`, then `T[R[rb]+w2]` = the word's bits (see "WAITW") |
 | 0x10 | LD | DRAM -> TMEM, `n = w3` words: `T[R[rb]+w2+i] = M32[R[ra]+w1+4i]` |
 | 0x11 | ST | TMEM -> DRAM: `M32[R[ra]+w1+4i] = T[R[rb]+w2+i]` for `i < w3` |
@@ -422,7 +422,12 @@ the flushed denormals) gives 0, `|x| >= 2^31`, infinities and NaN give `0x800000
 up to 24 significant bits come out exact. Flag bit0 RAW: the word's bits instead. Flag bit1
 MUL: the value (f2i's or RAW's) times `R[rb] + w2`, the low 32 bits of the product (signed and
 unsigned alike): an integer the device computed scaled into a byte offset past fp32's 24 bits,
-e.g. a token's row in a 2.4 GB table (`tok * 9344`). `rd = 0` writes nothing.
+e.g. a token's row in a 2.4 GB table (`tok * 9344`). `rd = 0` writes nothing. Flag bit2
+BOUND: the value lies in `[w3, w4]` (unsigned), what the kernel knows of the word (an expert's
+index below E, a slot of the expert pool, a row's place in a scratch); the compiler's wait
+entries (`opentpu.waits`, "Wait counts") bound the footprints computed from the register by it
+instead of taking any value, the ISA simulator stops on a value outside it, and the hardware
+ignores the field.
 
 RLD reads its word after every older instruction that writes it (the scoreboard, like any TMEM
 read), and no younger instruction is issued until `R[rd]` holds the value: they may use it. The
@@ -557,7 +562,7 @@ refuses such a bitstream).
 
 **Compiler.** `opentpu/waits.py` `wait_counts(program)` computes them from the program alone:
 an abstract execution with the registers as intervals (the run's arguments bounded by their
-variables where the program says so, every RLD value unknown), each instruction's footprint
+variables where the program says so, an RLD's value within its BOUND or else unknown), each instruction's footprint
 over every value its registers may hold, and per unit the last 15 instructions' footprints
 (the VPU's last 31), joined where paths can meet (a loop's exits, a count the program does not know); a pc's count
 is the smallest over all its visits, its mask the union. It is conservative: an unknown address

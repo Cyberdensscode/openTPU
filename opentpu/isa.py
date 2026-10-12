@@ -32,6 +32,7 @@ F_DUP = 0x8                     # QACT: also write the rows to ACT rows rows..2*
 F_HALF = 0x2                    # QST, ROW mode: write only the first half of each row
 F_RAW = 0x1                     # RLD: the word's bits (no fp32 -> int conversion)
 F_MUL = 0x2                     # RLD: times R[rb] + w2 (mod 2^32)
+F_BOUND = 0x4                   # RLD: w3 <= the value <= w4 (the waits pass's; the hardware ignores it)
 F_CHAIN = 0x1                   # HALT: then load and start the program at R[ra], R[rb] words
 C_EQ, C_NE, C_GE = 0, 1, 2      # WAITW flags[1:0]: the word ==, != or >= (signed difference) ref
 
@@ -134,12 +135,20 @@ def bar():
     return Instr(BAR)
 
 
-def rld(rd, tmem, ra=0, raw=False, mul=None, rb=0, comment=""):
+def rld(rd, tmem, ra=0, raw=False, mul=None, rb=0, bound=None, comment=""):
     """R[rd] = f2i(T[R[ra] + tmem]) (raw: the word's bits), times R[rb] + mul (mod 2^32) if mul
-    is given; docs/isa.md "RLD"."""
+    is given; docs/isa.md "RLD". bound (lo, hi): the values the register may take, lo <= v <= hi
+    as unsigned 32-bit numbers, what the kernel knows of the word (an index below E, a slot of
+    the pool): the waits pass bounds the footprints computed from the register by it
+    (opentpu.waits), the ISA simulator checks it, the hardware ignores it (flag bit 2, w3, w4)."""
     flags = (F_RAW if raw else 0) | (F_MUL if mul is not None else 0)
+    lo = hi = 0
+    if bound is not None:
+        lo, hi = (int(x) for x in bound)
+        _check(0 <= lo <= hi <= 0xFFFFFFFF, f"RLD: bound {bound}")
+        flags |= F_BOUND
     return Instr(RLD, ra=ra, rb=rb, rd=rd, flags=flags,
-                 w=_w(tmem, 0 if mul is None else mul), comment=comment)
+                 w=_w(tmem, 0 if mul is None else mul, lo, hi), comment=comment)
 
 
 def waitw(dram, tmem, ref, cmp, ra=0, rb=0, rc=0, mask=0xFFFFFFFF, interval=0, timeout=0,

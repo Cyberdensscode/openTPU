@@ -403,8 +403,11 @@ class _Pass:
         H[u] = (fp,) + H[u][:DEPTH[u] - 1]
         R = st.R
         if op == I.RLD and ins.rd:
+            # the kernel's bound on the value (isa.rld's bound: flag bit 2, w3..w4), else any
             R = list(R)
-            v = self.rld.get(pc, TOP)
+            v = self.rld.get(pc)
+            if v is None:
+                v = (ins.w[2] & M32, ins.w[3] & M32) if ins.flags & I.F_BOUND else TOP
             R[ins.rd] = v
         return _State(R, tuple(H))
 
@@ -481,7 +484,8 @@ def wait_counts(prog: list, D: int = 128, S: int = 1, args=None, rld: dict | Non
     """The wait entries of a program (uint64 per instruction: the counts' word, the VPU mask's
     word above it). args: the run's arguments if known (R8..R15); else run_args (default: the
     program's own, compiler.Program.run_args) bounds those whose variable has a bound, and the
-    others are unknown. rld: {pc: (lo, hi)} the values an RLD may load (default unknown).
+    others are unknown. rld: {pc: (lo, hi)} the values an RLD may load (default: its own
+    bound, isa.rld's, else unknown).
     stats: filled with the visits and the loops run on widened registers."""
     R = [(0, 0)] * 8 + [TOP] * 8
     if args is not None:

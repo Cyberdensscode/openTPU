@@ -1090,12 +1090,14 @@ class Builder:
             self.set_in[r] = g
         self.free_regs.append((r, frozenset(id(lb.loop) for lb in self.loops)))
 
-    def rld(self, r: int, t: "Tile", raw: bool = False, comment: str = "") -> None:
-        """R[r] = the one-word tile t as an int (RLD: f2i, or its bits with raw)."""
+    def rld(self, r: int, t: "Tile", raw: bool = False, comment: str = "",
+            bound: tuple | None = None) -> None:
+        """R[r] = the one-word tile t as an int (RLD: f2i, or its bits with raw); bound: the
+        values it may take (isa.rld)."""
         self.check_live(t)
         if t.rows * t.cols != 1:
             raise CompileError(f"rld: {t} is not one word")
-        self.emit(I.rld(r, t.base, raw=raw, comment=comment or "rld"))
+        self.emit(I.rld(r, t.base, raw=raw, bound=bound, comment=comment or "rld"))
 
     def waitw(self, t: "Tile", dram: int, ref: int = 0, cmp: int = I.C_EQ, ra: int = 0,
               rc: int = 0, interval: int = 0, timeout: int = 0, comment: str = "") -> None:
