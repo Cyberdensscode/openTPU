@@ -44,8 +44,9 @@ FORMATS = {"lfm2": ("fp4", "int8", None), "qwen35": ("fp4", "int8", None),
 # runs wait, an idle part an expert (35B 1.06 ms, 26B 1.89 ms) against a request's 0.82 /
 # 1.59 ms a miss (session emdef: Qwen3.5-35B-A3B's turns of 24 and 31 new tokens +0.50 /
 # +0.39 s TTFT, each a call and the 4 rows after its snapshot; gemma-4-26B-A4B-it's 25 even,
-# 31 -0.36 s). Session emdef2 measures the crossover (tools/offload/sessions/emdef2.sh)
-EM_ROWS = {"qwen35": 48, "gemma4": 24}
+# 31 -0.36 s). Session emdef2's crossover, expert-major calls against layer-major: the 35B's
+# +0.27 s at 27 rows, -0.21 s at 45 (even at about 37); the 26B's -0.09 s at 21
+EM_ROWS = {"qwen35": 44, "gemma4": 24}
 
 
 class PoolError(ValueError):

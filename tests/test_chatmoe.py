@@ -538,7 +538,9 @@ def test_the_scripted_chat_checks_a_run_against_its_reference(tmp_path, monkeypa
     """tools/qual/chatmoe.py (the card check's driver): two greedy turns on the ISA simulator
     with the card's configuration as JSON (each turn's tokens and numbers); a second run
     --check'ed against the first passes turn by turn, and a reference with another token fails
-    (exit 1, the turn and the token named)."""
+    (exit 1, the turn and the token named). Each turn lists its calls (rows, mode, the server's
+    counts, the host's time on requests and parts); without --em-rows the tool does not pass
+    em_rows (it runs on production's tree, whose engine has none)."""
     d = _checkpoint("qwen35", tmp_path / "model")
     monkeypatch.delenv("OTPU_FORMATS", raising=False)
     pool = d / "pool-fp4.bin"
@@ -553,7 +555,14 @@ def test_the_scripted_chat_checks_a_run_against_its_reference(tmp_path, monkeypa
         sys.path.remove(str(ROOT / "tools" / "qual"))
     argv = [str(d), "--cfg", str(tmp_path / "cfg.pkl"), "--experts", str(K), "--max-new", "5",
             "--turn", "11 22 33 44 55 66", "--turn", "77 88 99"]
+    engine = ST.engine
+
+    def production_engine(*a, **kw):        # (a tree without em_rows: the tool runs on it)
+        assert "em_rows" not in kw
+        return engine(*a, **kw)
+    monkeypatch.setattr(ST, "engine", production_engine)
     assert chatmoe.main(argv + ["--out", str(tmp_path / "ref.json")]) == 0
+    monkeypatch.setattr(ST, "engine", engine)
     ref = json.loads((tmp_path / "ref.json").read_text())
     assert len(ref["turns"]) == 2 and ref["layer_major"] == 2 and ref["on_card"]
     t1, t2 = ref["turns"]
@@ -572,6 +581,8 @@ def test_the_scripted_chat_checks_a_run_against_its_reference(tmp_path, monkeypa
     # each turn's prompt calls: with 2 slots a layer layer-major (no room for expert-major)
     assert [(c["rows"], c["em"]) for c in t1["calls"]] == [(6, False)]
     assert t1["calls"][0]["misses"] == t1["prefill_misses"] and not t1["calls"][0]["need_lines"]
+    assert t1["calls"][0]["requests"] > 0 and t1["calls"][0]["serve_s"] > 0    # (the host's
+    assert t1["calls"][0]["parts_s"] == 0                                       # time on them)
     assert sum(c["rows"] for c in t2["calls"]) == t2["prompt_tokens"]
     # the DRAM filled, expert-major from 6 rows a call (--em-rows 6): the first turn's call,
     # not the second's 4 rows; the same tokens as the 2-slot run's; --trace: each call's

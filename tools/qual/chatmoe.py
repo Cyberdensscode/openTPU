@@ -14,9 +14,10 @@ picks the same tokens as the simulator's), --max-new tokens each. The pool, slot
 settings are otpu-chat's (opentpu/host/streamed.py; --em-rows: expert-major's least rows a
 call, docs/offload.md 13.16). Each turn lists its prompt's calls (a layer-major prompt's
 prefill_layers: a model with state has two, up to the snapshot at the reply's start and after):
-rows, expert-major or not, wall and device seconds, and the expert server's counts over it
-(--trace: each call's runs and the server's timeline too). Exit 1 when --check finds another
-token.
+rows, expert-major or not, wall and device seconds, the expert server's counts over it and the
+host's time on its requests and idle parts (--trace: each call's runs and the server's timeline
+too). On a tree whose streamed.engine has no em_rows (production's) it runs without --em-rows.
+Exit 1 when --check finds another token.
 """
 from __future__ import annotations
 
@@ -61,9 +62,10 @@ CALL_COUNTS = ("hits", "misses", "need_lines", "needs_queued", "need_hits", "nee
 def _calls(eng, calls: list, trace: list | None = None) -> None:
     """Each prefill_layers call of eng appended to `calls`: its rows, expert-major or not (the
     gate's choice, streamed.gate_expert_major, else the Engine's), wall and device seconds,
-    runs, and the server's CALL_COUNTS over it; with `trace` (a list) also its runs (key,
-    start, end, cycles; s from the call's start) and the server's events (seen, done, kind,
-    layer or expert, misses or bytes)."""
+    runs, the server's CALL_COUNTS over it, and from the server's events its requests and the
+    host's seconds on them (serve_s: each seen to served, while the card waits) and on idle
+    parts (parts_s); with `trace` (a list) also its runs (key, start, end, cycles; s from the
+    call's start) and those events (seen, done, kind, layer or expert, misses or bytes)."""
     base, srv = eng.prefill_layers, eng.server
     khz = (getattr(eng.backend, "info", None) or {}).get("core_khz")
     runs, t0 = [], [None]
@@ -92,9 +94,10 @@ def _calls(eng, calls: list, trace: list | None = None) -> None:
     def prefill_layers(tokens, logits: bool = True):
         c0 = {k: getattr(srv, k, 0) for k in CALL_COUNTS}
         k, t = len(eng.stats), time.perf_counter()
+        srv.events = []                         # (the server's timeline: each poll that did work)
         if trace is not None:
             runs.clear()
-            t0[0], srv.events = t, []
+            t0[0] = t
         try:
             return base(tokens, logits)
         finally:
@@ -102,12 +105,16 @@ def _calls(eng, calls: list, trace: list | None = None) -> None:
             cyc = sum((x or {}).get("cycles") or 0 for x in eng.stats[k:])
             last = getattr(eng, "em_last", None)
             em = last[1] if last is not None and last[0] == len(tokens) else eng.expert_major
+            ev, srv.events = srv.events or [], None
+            req = [e for e in ev if e[2] == "d"]
             calls.append(dict(rows=len(tokens), em=bool(em), s=round(dt, 3),
                               device_s=round(cyc / (khz * 1e3), 3) if khz else None,
-                              runs=len(eng.stats) - k,
+                              runs=len(eng.stats) - k, requests=len(req),
+                              serve_s=round(sum(e[1] - e[0] for e in req), 3),
+                              parts_s=round(sum(e[1] - e[0] for e in ev if e[2] == "p"), 3),
                               **{c: getattr(srv, c, 0) - c0[c] for c in CALL_COUNTS}))
             if trace is not None:
-                ev, srv.events, t0[0] = srv.events or [], None, None
+                t0[0] = None
                 trace.append(dict(rows=len(tokens), em=bool(em), runs=[list(r) for r in runs],
                                   events=[[round(e[0] - t, 6), round(e[1] - t, 6)] +
                                           list(e[2:]) for e in ev]))
@@ -139,7 +146,7 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
     eng = ST.engine(path, cfg or board_config(), be, cap, pool or ST.DEFAULT, experts=experts,
                     wformat=wformat, head_format=head, formats=formats, layer_major=layer_major,
                     create=create, snapshots=C.SNAPSHOTS,     # (otpu-chat's: its turns roll back)
-                    em_rows=em_rows)
+                    **({} if em_rows is None else {"em_rows": em_rows}))    # (13.16)
     load_s = time.time() - t
     calls: list = []
     if eng.layer_major:                         # (the prompt's calls, each turn's)
@@ -219,8 +226,9 @@ def main(argv=None) -> int:
         for c in t["calls"]:
             print(f"    call: {c['rows']} rows {'expert' if c['em'] else 'layer'}-major, "
                   f"{c['s']} s (device {c['device_s']}), {c['runs']} runs; misses "
-                  f"{c['misses']}, needs {c['needs_queued']} ({c['need_lines']} lines), parts "
-                  f"{c['prefetched']}, holds {c['holds']}", flush=True)
+                  f"{c['misses']} ({c['requests']} requests, served in {c['serve_s']} s), needs "
+                  f"{c['needs_queued']} ({c['need_lines']} lines), parts {c['prefetched']} "
+                  f"({c['parts_s']} s), holds {c['holds']}", flush=True)
     if a.trace:
         Path(a.trace).write_text(json.dumps(dict(
             run_fields=["key", "start", "end", "cycles"],

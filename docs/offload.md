@@ -3914,12 +3914,13 @@ Why the 35B's short prompts lose:
   error), and the 26B's 21-row call already gains on the device.
 
 The threshold (streamed.EM_ROWS):
-- A prefill_layers call runs expert-major only with at least EM_ROWS new rows: Qwen3.5-MoE 48,
-  Gemma 4 MoE 24. Below, it runs as production's: layer-major, pooled, a request a run.
-  - 48 lies above the 35B's estimated crossover.
+- A prefill_layers call runs expert-major only with at least EM_ROWS new rows: Qwen3.5-MoE 44
+  (48 at first), Gemma 4 MoE 24. Below, it runs as production's: layer-major, pooled, a request a
+  run.
+  - 48 lay above the 35B's estimated crossover; emdef2 measured it at about 37 rows, so 44.
   - 24 lies between the 26B's 21-row call (even, with its 4-row call's cost) and its 27-row
     call (-0.36 s with it).
-- So a turn's 4 rows after its snapshot always run layer-major, and its part before it from 48
+- So a turn's 4 rows after its snapshot always run layer-major, and its part before it from 44
   rows (35B) or 24 (26B).
 - `streamed.gate_expert_major` sets Engine.expert_major for each call and swaps the layer runs'
   compiled programs per mode: a run's key does not hold the mode, and an expert-major run posts
@@ -3928,19 +3929,67 @@ The threshold (streamed.EM_ROWS):
 - `em_rows` overrides it (streamed.engine, chatmoe.py `--em-rows`); 0 runs every call
   expert-major. An explicit `expert_major=True` (moe_card `--expert-major`) is every call.
 - Only opentpu/host and tools changed: the image and program keys stay.
-- chatmoe.py reports each turn's calls: rows, mode, wall and device seconds, runs, and the
-  server's counts (misses, needs, parts, holds). `--trace` adds each call's runs and the server's
-  timeline.
+- chatmoe.py reports each turn's calls: rows, mode, wall and device seconds, runs, the server's
+  counts (misses, needs, parts, holds), and the host's time on its requests and idle parts
+  (`serve_s`, `parts_s`). `--trace` adds each call's runs and the server's timeline. It passes
+  `em_rows` only when given, so it also runs on a tree without it (production's).
 
-Session emdef2 (tools/offload/sessions/emdef2.sh; the lead runs it) checks the threshold and
-finds the crossover:
-- Same card, hosts and checks as emdef.
+Session emdef2 (tools/offload/sessions/emdef2.sh) checked the threshold (then 48 / 24) and found
+the crossover. The lead ran it on 2026-10-12, 11:39-12:03 by the opentpu clock.
+- Same card, hosts and checks as emdef. N was 0c2b6f6a.
 - Five turns continuing one context: about 24, 31, 49, 80 and 163 new tokens on the 35B (TURNS'
   two, a question, a request, lmtime's passage with a question).
 - Arms: P (production), N (EM_ROWS), X (`--em-rows 8`: every call but the 4-row ones
   expert-major). A warm-up (N), then P N X X N P.
-- The swap's rule: N no worse than P at every turn and faster on the long ones. X - P per call
-  length is where EM_ROWS belongs.
+- Everything passed and every run was token-exact. Not swapped: the 35B's turn 2 failed the rule.
+
+TTFT against P, s (pairs; L layer-major, E expert-major; each turn also has a 4-row call, always L):
+
+| turn: new tokens | 35B N's call | 35B N - P | 35B X - P | 26B N's call | 26B N - P | 26B X - P |
+|:--|:--|:--|:--|:--|:--|:--|
+| 1: 24 / 25 | 20 L | -0.018, -0.020 | +0.306, +0.273 | 21 L | +0.179, -0.132 | -0.170, -0.017 |
+| 2: 31 / 31 | 27 L | **+0.400, +0.515** | +0.198, +0.347 | 27 E | -0.425, -0.468 | -0.678, -0.657 |
+| 3: 49 / 50 | 45 L | -0.157, -0.015 | -0.240, -0.175 | 46 E | -0.782, -1.036 | -0.766, -0.980 |
+| 4: 80 / 79 | 76 E | -0.697, -0.734 | -0.827, -0.964 | 75 E | -1.295, -1.546 | -1.488, -1.460 |
+| 5: 163 / 161 | 159 E | -1.758, -2.372 | -2.108, -2.158 | 157 E | -2.408, -2.494 | -2.422, -2.540 |
+
+- **The crossover (X - P).** The 35B's expert-major call loses at 20 and 27 rows (+0.29, +0.27 s)
+  and gains from 45 (-0.21 s), so it breaks even at about 37 rows. The 26B's already gains at 21
+  rows (-0.09 s).
+- **The 4-row call.** With it layer-major (X) the 35B's 24- and 31-token turns lost 0.29 and 0.27
+  s, against emdef's 0.50 and 0.39 with it expert-major: about +0.1 to +0.2 s a turn, as
+  estimated.
+- **N's 35B turn 2.** Its 27-row call ran layer-major, as P's, and took +0.46 s.
+  - The misses were the same as P's (3535 in the prompt, 3136 in that call), and the device time
+    was +0.22 / +0.35 s (31 tokens at 7.27 / 7.06 tok/s against 7.66 / 7.68).
+  - On the ISA simulator the two run the same calls: a 3-turn chat of the tiny Qwen3.5-MoE (2
+    slots a layer, a Qwen3-shaped template, so two calls a turn) through production's tree
+    (23b68089) and through 0c2b6f6a's gated engine (expert-major built, every call below
+    em_rows). Every call compiled the same layer runs (13 keys, the same program words, none
+    compiled after turn 1 in either), made the same requests and left the same slot map, with
+    the same snapshots and tokens.
+  - So the card ran the same work. The extra device time is its waits on the host. N1's trace
+    shows that call's requests served at 0.92-0.96 ms a miss all along it, against 0.82-0.89 in
+    the same run's turn 3 and 0.83-0.96 in its turn 1. emdef2 recorded the host's time for N and X
+    only, so P's cannot be compared.
+  - The host's time varies by turn and run without a code change. The decode, the same misses in
+    every arm, ran 4.86 / 5.22 tok/s in N's turn 2 against P's 5.06 / 5.09. The warm-up's turn 3
+    (N's settings, its first run after a pool read) took +0.43 s of device time.
+  - The card host shows 1Password and Hyprland at 11.5 % and 9.7 % CPU averaged over 17 hours (the
+    headless spin, an intermittent full core).
+
+EM_ROWS since: Qwen3.5 44 (the crossover about 37; both pairs gain at 45), Gemma 4 24 (unchanged:
+its 21-row call is a small gain, its turn 1 noise).
+
+Session emdef3 (tools/offload/sessions/emdef3.sh; the lead runs it) checks EM_ROWS 44 / 24 and the
+host's share:
+- emdef2's arms, turns and checks.
+- P runs this tree's chatmoe.py on production's opentpu (PYTHONPATH). The tool only records: each
+  P call gets the same counts as N's and X's, and its requests' host time (`serve_s`).
+- Every run but the warm-up writes its trace.
+- Before each run the host's load and its busiest processes are logged.
+- The summary adds each arm's layer-major calls' host ms a miss, so a gap between N and P shows
+  whether it is the host's.
 
 ## 14. Chatting with a streamed MoE (otpu-chat)
 
@@ -4014,7 +4063,7 @@ the whole checkpoint) the same experts as this tree packs them. The lists must b
   them), replaced by least decayed use (`--policy lru` for least recently used).
 - **The prompt.** Qwen3.5-MoE and Gemma 4 MoE run it layer by layer in runs of two rows, every
   slot serving the running layer (13; `--layer-major R`, 0 for token by token). In a call of at
-  least EM_ROWS new rows (Qwen3.5 48, Gemma 4 24; 13.16) each MoE layer's experts run once, in
+  least EM_ROWS new rows (Qwen3.5 44, Gemma 4 24; 13.16) each MoE layer's experts run once, in
   one expert run, after the layer's runs have posted them as needs (expert-major, 13.11-13.15).
   LFM2-MoE runs it token by token.
 - **Turns** keep the context as a dense model's do (docs/host.md 6): a later turn rolls back to
