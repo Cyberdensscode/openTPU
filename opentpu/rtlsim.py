@@ -174,6 +174,10 @@ if os.environ.get("OTPU_MXU", "systolic") != "systolic":
 UARCH["MXU_IMPL"] = 2
 if os.environ.get("OTPU_MXU_E"):
     UARCH["MXU_E"] = int(os.environ["OTPU_MXU_E"])
+# OTPU_QUANT_XD: the quantizer's row buffer in chunks (otpu_quant XD; timing only, 0: QACT reads
+# its rows from TMEM twice)
+if os.environ.get("OTPU_QUANT_XD"):
+    UARCH["QUANT_XD"] = int(os.environ["OTPU_QUANT_XD"])
 # VPU lanes with the composite functions (exp2, recip, rsqrt; timing only): OTPU_VPU_CL=4
 if os.environ.get("OTPU_VPU_CL"):
     UARCH["VPU_CL"] = int(os.environ["OTPU_VPU_CL"])

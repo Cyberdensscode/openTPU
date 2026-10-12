@@ -42,6 +42,7 @@ module otpu_slice
   parameter int MXU_IMPL   = 2,       // MXU dot product: 2 systolic, the only one (docs/mxu_systolic.md)
   parameter int MXU_CL     = 16,      // cascade chain length
   parameter int MXU_E      = 0,       // MXU epilogue lanes (0: MCOLS / 2; otpu_mxu E)
+  parameter int QUANT_XD   = 1024,    // quantizer row buffer chunks (0: two passes over TMEM; otpu_quant XD)
   parameter int VPU_CL     = (LANES >= 8) ? LANES / 4 : 1,  // VPU lanes with the composite functions
   parameter int ULANES     = LANES,   // TMEM lanes of the MXU and the quantizer (<= LANES)
   parameter int PQ_WIN     = 64,      // cycles per P/Q counter window (+bucket= in simulation)
@@ -335,7 +336,7 @@ module otpu_slice
   // every QACT and QST the ISA's bounds allow fits (the card: 512)
   localparam int QG = (4 * ACT_BLOCKS > TMEM_WORDS / D) ? 4 * ACT_BLOCKS : TMEM_WORDS / D;
   localparam int Q_GR = (QG <= 8) ? 8 : (1 << $clog2(QG));
-  otpu_quant #(.D(D), .LANES(ULANES), .GR(Q_GR), .SID(SID)) u_quant (
+  otpu_quant #(.D(D), .LANES(ULANES), .GR(Q_GR), .XD(QUANT_XD), .SID(SID)) u_quant (
     .clk, .rst(rst_q), .start(ustart[U_Q]), .cmd(ucmd[U_Q]), .rdy(r_q), .done(d_q), .gnt(gnt[G_Q]),
     .t_ren(q_ren), .t_raddr(q_raddr), .t_rdata(r_data[P_Q][ULANES-1:0]),
     .t_ren2(q_ren2), .t_raddr2(q_raddr2), .t_rdata2(r_data[P_Q2][ULANES-1:0]),
