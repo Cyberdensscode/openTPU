@@ -973,6 +973,29 @@ port A's scale words not counted):
 | SmolLM3-3B (4) | 661.4K (4) | 655.1K (12) | -0.9% | 41.4 | 15.4 | -63% |
 | Gemma 4 E2B (5) | 580.7K (4) | 574.1K (8) | -1.1% | 27.1 | 15.3 | -44% |
 
+By level (dataflow's ledger: tools/dataflow.py at 46609834 on branch dataflow, the ISA
+simulator on a zero image, the same runs; a row, over the model's first layers as above; DRAM
+reads and writes, the K / V re-stream its attention's part; TMEM and ACT RAM as words x 4 and
+bytes; the scratch: the outputs' ST and LD at tiled.py's sites):
+
+| model | DRAM a row: today -> tile | K / V re-stream | TMEM read | TMEM written | ACT RAM written | scratch round trip |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B | 4.61 -> 2.49 MB (-46%) | 2.20 -> 1.11 MB | +3% | -1% | -37% | 32 KB (1.3% of DRAM) |
+| Phi-4-mini | 56.5 -> 16.2 MB (-71%) | 2.21 -> 2.21 MB | +2% | 0% | -30% | 48 KB (0.3%) |
+| Qwen3.5-4B | 134.1 -> 74.1 MB (-45%) | 1.09 -> 1.09 MB | -3% | -4% | -42% | 32 KB (0.04%) |
+| LFM2-2.6B | 132.1 -> 67.0 MB (-49%) | 1.70 -> 1.70 MB | -2% | -2% | -42% | 32 KB (0.05%) |
+| Qwen3.5-0.8B | 18.4 -> 13.7 MB (-25%) | 0.54 -> 0.54 MB | 0% | 0% | 0% | 16 KB (0.1%) |
+| LFM2.5-230M | 6.62 -> 4.21 MB (-36%) | 1.67 -> 0.85 MB | 0% | -2% | -27% | 16 KB (0.4%) |
+| SmolLM3-3B | 45.1 -> 16.8 MB (-63%) | 2.23 -> 2.23 MB | +2% | +1% | 0% | 64 KB (0.4%) |
+| Gemma 4 E2B | 29.2 -> 16.5 MB (-44%) | 3.24 -> 3.24 MB | +6% | +3% | -4% | 101 KB (0.6%) |
+
+The weights' stream is what the tile cuts (each weight read once for T rows); the K / V
+re-stream halves where G <= MCOLS / 2 packs two rows a stream (Qwen3-0.6B, LFM2.5-230M) and is
+unchanged elsewhere; TMEM traffic a row stays within -4% to +6% (the scratch's round trip and
+the staging of the whole operands against fewer per-run tiles); the ACT RAM's writes a row
+fall by up to 42% on four models (where they go in today's runs is not analysed here); its
+reads (the stationary for every weight chunk) are the same a row.
+
 - **Bytes first.** The tile streams each weight once for its T rows: a row's DRAM traffic falls
   by a quarter to three quarters on every model, cycles by 8-11% where today's runs hold 2 rows
   (the 4-bit layers' MXU knee at MCOLS 4 rows) or Qwen3-0.6B's G = 2 packs two rows a K / V
@@ -984,15 +1007,15 @@ port A's scale words not counted):
   models' gains were within 0.5 points of these (Phi-4-mini 443.5K, -10.1%; Qwen3.5-4B 8 rows
   1,006.4K; LFM2-2.6B 8 rows 997.6K). Before MX (10.4, the 2-lane MXU) the tile's gains were
   the same: -9.7% to -10.7% on the 3-row models, -8.7% on Qwen3-0.6B.
-- **The I/O scratch's round trip, by arithmetic**: a whole form stores the attention's outputs
-  (fp32) a part at a time and loads them back whole, 2 x 4 x n_q d bytes a row a layer through
-  DRAM and the same through TMEM: 16 KiB on Qwen3-0.6B (n_q d = 2,048) against ~0.5 MB of fp4
-  weights a row a layer at 16 rows (~3%); 24 KiB on Phi-4-mini, 32 KiB on E2B's global layers.
+- **The I/O scratch's round trip**: a whole form stores the attention's outputs (fp32) a part
+  at a time and loads them back whole, 2 x 4 x n_q d bytes a row a layer through DRAM and the
+  same through TMEM: 16 KiB on Qwen3-0.6B (n_q d = 2,048), 24 KiB on Phi-4-mini, 32 KiB on
+  E2B's global layers; the ledger finds exactly that, 0.04-1.3% of the tile's DRAM bytes a
+  row (Qwen3-0.6B's 1.3% against ~0.5 MB of fp4 weights a row a layer at 16 rows).
   It buys today's bits (one Sa over W_o's operand); the range forms, which skip it, are within
   ~1% in cycles (Qwen3-0.6B at 16 rows 86.5K against 87.4K, 2 lanes; Qwen3.5-0.8B 285.0K,
   SmolLM3 666.8K, E2B at 12 rows 573.6K, Qwen3.5-4B at 12 1,011.2K) and as close to the fp32
-  forward as today's (11), not the same bits. A per-level ledger (dataflow's tools/dataflow.py,
-  in progress) will put TMEM and ACT RAM bytes beside these.
+  forward as today's (11), not the same bits.
 - **More rows is not always cheaper** (SmolLM3: 12 rows 664.1K against 16 668.2K, 2 lanes);
   the engine takes the largest T that fits (a cost-aware T: 10.4's note on Gemma 4).
 
@@ -1021,8 +1044,7 @@ default's; OTPU_TILE=0 and =1 have keys of their own.
   checked against today's, not assumed).
 - **IMEM** holds most models to fewer rows than TMEM on the card (11.1: Qwen3.5-4B and
   LFM2-2.6B at 4); the looped attention (10.3) lifts it.
-- **A cost-aware T** (Qwen3.5-0.8B +0.5% at 12 rows; SmolLM3 12 rows cheaper than 16), and
-  the bytes ledger (TMEM, ACT RAM) beside 11.2's DRAM bytes once tools/dataflow.py lands.
+- **A cost-aware T** (Qwen3.5-0.8B +0.5% at 12 rows; SmolLM3 12 rows cheaper than 16).
 - **The scratch's round trip** (11.2) is the price of one Sa over W_o's operand; dataflow's
   epilogue fold (the row scale applied in the MXU's epilogue lanes) may let the parts be
   quantized as they end without it.
