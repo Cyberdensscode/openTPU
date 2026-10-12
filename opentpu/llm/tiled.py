@@ -25,9 +25,12 @@ docs/isa.md MM) with what TMEM holds made independent of the projections' widths
 
 Each row's arithmetic is today's rows kernels' (qwen3_rows, qwen35_rows, lfm2_rows), so the
 logits, the KV cache and the recurrent states are bit for bit those of today's prefill runs
-over the same rows where their MMs pair alike (PAIR: a 4-bit MM of a stationary of at most
-MCOLS / 2 rows sums each even K block into the odd one first; the tile pairs when T <= MCOLS /
-2, today's run when R <= MCOLS / 2; tests/test_tiled.py). Qwen3 and the Llama-likes on its code
+over the same rows (tests/test_tiled.py): an MM's output is one exact integer (the MX MXU,
+docs/isa.md MM: replayed or paired alike) and each operand is quantized over today's columns
+(one QACT, a row's one Sa: the attention's outputs whole into W_o's, a down chunk's activation,
+LFM2's gated product whole). Where the outputs whole do not fit TMEM at a layer run's rows the
+range forms (ranges) quantize them a part at a time (a QACT range each, W_o an MM a range): not
+today's bits, as close to the fp32 forward. Qwen3 and the Llama-likes on its code
 (llama.py: Phi-4-mini, SmolLM3), Qwen3.5 (gated attention and the MLP tiled, its DeltaNet rows
 today's: they already stream each weight once a run, pair of heads by pair) and LFM2 / LFM2.5.
 
@@ -149,16 +152,17 @@ def _alloc_at(base: int, shape, rs: int):
 
 
 def _attention_tile(res: Res, lw, c, s_, pos, T: int, spec, block: int, parts: int,
-                    gated: bool = False, depth: int = ATTN_DEPTH):
+                    gated: bool = False, depth: int = ATTN_DEPTH, whole: bool = True):
     """x += W_o . attention(x) for T rows of sequence 0 at positions pos .. pos + T - 1 (pos an
     int, or a prompt run's RunRows: run-time positions), their K / V appended first, each row
     attending causally over the cache: _attention_rows' arithmetic, one KV head's projections
     at a time, its query group in parts of at most MCOLS heads (a part's [T, heads d] at most
     TMEM / QPART words: Qwen3.5-35B's G = 8) and each part's rows in packed tiles (MCOLS query
-    rows), its outputs quantized into W_o's operand as it ends. gated (Qwen3.5): each head's
-    outputs times
-    sigmoid(W_gate x) before W_o, as _attention_rows' (acc / l) * sigmoid(gate). x: res.x,
-    spilled while the heads attend (Res)."""
+    rows). gated (Qwen3.5): each head's outputs times sigmoid(W_gate x) before W_o, as
+    _attention_rows' (acc / l) * sigmoid(gate). x: res.x, spilled while the heads attend (Res).
+    whole: the outputs [T, n_q d] quantized at once into W_o's operand, as _attention_rows'
+    (one QACT: a row's one Sa, one MM a W_o part); else each part's as it ends (quantize_into:
+    a QACT range of its own, an MM of W_o's a range, docs/isa.md MM; not the same bits)."""
     d, G, eps = spec.head_dim, spec.n_q // spec.n_kv, spec.eps
     D = ol.block_size()
     dk = -(-d // D) * D
@@ -178,7 +182,10 @@ def _attention_tile(res: Res, lw, c, s_, pos, T: int, spec, block: int, parts: i
     P = packing(mc, gs)                        # rows of a tile (P gs <= MCOLS query rows)
     tiles = [(r0, min(P, T - r0)) for r0 in range(0, T, P)]
     gparts = [(g0, min(G, g0 + gs)) for g0 in range(0, G, gs)]
-    ost = ol.stationary(T, nq * d)             # W_o's operand, a part's columns at a time
+    if whole:                                  # the outputs, quantized once (W_o's operand)
+        o_all, ost = ol.empty([T, nq * d]), None
+    else:                                      # W_o's operand, a part's columns at a time
+        o_all, ost = None, ol.stationary(T, nq * d)
     made, oh = {}, {}                          # (KV head, part) -> its queries, its outputs
     ent, qhs, kvh, seqs = [], [], [], []
 
@@ -230,24 +237,31 @@ def _attention_tile(res: Res, lw, c, s_, pos, T: int, spec, block: int, parts: i
     def emit(i, acc, l):
         j, g0, g1, r0, n = ent[i]
         w = g1 - g0
-        if (j, g0) not in oh:
-            oh[(j, g0)] = ol.empty([T, w * d])
+        if whole:                              # (the part's columns of the outputs)
+            o, o0 = o_all, (j * G + g0) * d
+        else:
+            if (j, g0) not in oh:
+                oh[(j, g0)] = ol.empty([T, w * d])
+            o, o0 = oh[(j, g0)], 0
         for a in range(n):
-            oh[(j, g0)][r0 + a, :].reshape(w, d).set(
+            o[r0 + a, o0:o0 + w * d].reshape(w, d).set(
                 acc[a * w:(a + 1) * w, :] / l[a * w:(a + 1) * w][:, None])
-        if r0 + n == T:                        # the part's rows done: quantized, freed
-            o = oh.pop((j, g0))
+        if r0 + n == T:                        # the part's rows done
             if gated:                          # a head at a time (TMEM: [T, d] temporaries)
                 for g in range(w):
                     h0 = (j * G + g0 + g) * d
-                    og = o[:, g * d:(g + 1) * d]
+                    og = o[:, o0 + g * d:o0 + (g + 1) * d]
                     og.set(og * sigmoid(ol.dot(xs, lw.wgate[h0:h0 + d, :])))
                     del og
-            ol.quantize_into(ost, o, (j * G + g0) * d)
-            del o
+            if not whole:                      # quantized into its columns, freed
+                ol.quantize_into(ost, oh.pop((j, g0)), (j * G + g0) * d)
+        del o
 
     _attend_heads(qhs, kvc, kvh, seqs, block, scale, depth=depth, emit=emit)
     xs = None
+    if whole:
+        ost = ol.quantize(o_all)
+        del o_all
     _add_parts(res.back(), [ost], [lw.wo], parts)              # x += W_o o, by output parts
 
 
@@ -285,8 +299,8 @@ def down_chunk(wg, wd) -> int:
 def _mlp_tile(x, lw, spec, parts: int, sub: int, act=silu, g=None, out=None, xs=None):
     """x + W_down(act(W_gate xn) * (W_up xn)) for T rows (xn: x normed by g, default
     lw.g_post): every chunk's activation quantized once and kept in ACT RAM (the C columns of
-    a W_down part, made `sub` columns at a time: each piece's QACT gives its blocks what one
-    of the whole chunk would), then the down projection by `parts` parts of its output
+    a W_down part: one QACT, as swiglu_down's, of the chunk made `sub` columns at a time into
+    a [T, C] tile when sub < C), then the down projection by `parts` parts of its output
     columns, each summing the chunks in swiglu_down's order (the same bits). out: the MLP's
     output into that [T, H] tile instead (_add_parts). xs: the operand, quantized already (x
     then may be None, with out)."""
@@ -302,15 +316,21 @@ def _mlp_tile(x, lw, spec, parts: int, sub: int, act=silu, g=None, out=None, xs=
         a = c0 + s0
         return ol.dot(xs, wg[a:a + sub, :]), ol.dot(xs, wu[a:a + sub, :])
 
-    acts = {}
+    acts, a = {}, None
     nxt = gate_up(*pieces[0])
     for i, (c0, s0) in enumerate(pieces):
         g, u = nxt
         if i + 1 < len(pieces):
             nxt = gate_up(*pieces[i + 1])                      # streams while the VPU works
-        if s0 == 0:
-            acts[c0] = ol.stationary(T, C)
-        ol.quantize_into(acts[c0], act(g) * u, s0)
+        if sub == C:                                           # the chunk's activation
+            acts[c0] = ol.quantize(act(g) * u)
+        else:
+            if s0 == 0:
+                a = ol.empty([T, C])
+            a[:, s0:s0 + sub].set(act(g) * u)
+            if s0 + sub == C:
+                acts[c0] = ol.quantize(a)
+                a = None
         del g, u
     xs = nxt = None                     # the operand's ACT blocks are free for the down MMs
     _add_parts(out if x is None else x, [acts[c0] for c0 in starts],
@@ -329,10 +349,10 @@ def mlp_parts(H: int, D: int, T: int, tmem: int) -> int:
 
 def mlp_sub(C: int, D: int, T: int, tmem: int) -> int:
     """Gate / up columns an MM: the most (whole D blocks, dividing the chunk C) whose four
-    [T, sub] results in flight (this piece's gate and up, the next one's) take at most a
-    quarter of TMEM."""
+    [T, sub] results in flight (this piece's gate and up, the next one's), with the chunk's
+    [T, C] activation when sub < C, take at most a quarter of TMEM."""
     for sub in range(C, D - 1, -D):
-        if C % sub == 0 and 4 * T * (sub + 1) <= tmem // 4:
+        if C % sub == 0 and 4 * T * (sub + 1) + (T * (C + 1) if sub < C else 0) <= tmem // 4:
             return sub
     return D
 
@@ -340,7 +360,7 @@ def mlp_sub(C: int, D: int, T: int, tmem: int) -> int:
 def conv_parts(n: int, K: int, D: int, T: int, tmem: int) -> int:
     """LFM2's convolution channel parts: the fewest (whole D blocks each, dividing n) whose
     rows (K - 1 + T of B * x, the part's taps, three [T, n / parts] products and the sum in
-    flight) take at most a quarter of TMEM."""
+    flight) take at most a quarter of TMEM (beside the [T, n] gated product)."""
     for parts in range(1, n // D + 1):
         cp = n // parts
         if n % (parts * D) == 0 and (K - 1 + T + K + 4 * T) * (cp + 1) <= tmem // 4:
@@ -370,16 +390,16 @@ def _conv_tile(x, lw, pos: RunRows, spec, parts: int, cparts: int):
     """x += out_proj(conv(B * x) * C) for T rows at a prompt run's run-time positions (LFM2's
     convolution block, lfm2._conv_rows): by `cparts` parts of the channels, each part's B, x
     and C streamed once for the T rows, its ring rows and taps loaded, the ring rewritten from
-    its last K rows (the run's rotation), the gated product quantized into out_proj's operand;
-    then out_proj by output parts. Per channel and row _conv_rows' products and sums in its
-    order: the same bits."""
+    its last K rows (the run's rotation), the gated product to its columns of [T, n]; then
+    out_proj's operand quantized at once (one QACT, as _conv_rows') and out_proj by output
+    parts. Per channel and row _conv_rows' products and sums in its order: the same bits."""
     from .lfm2 import _ring_rows
     K, T = spec.conv_k, x.rows
     n = lw.taps.shape[1]
     if not isinstance(pos, RunRows):
         raise CompileError("a tiled convolution block runs at a prompt run's position")
     xs = _norm_quantize(x, lw.g_in, spec.eps)
-    yst = ol.stationary(T, n)
+    y = ol.empty([T, n])                                       # the gated product
     cp = n // cparts
     rows = _ring_rows(K, pos)[0]
     for q in range(cparts):
@@ -396,9 +416,11 @@ def _conv_tile(x, lw, pos: RunRows, spec, parts: int, cparts: int):
         for j in range(1, K):
             acc = acc + E[K - 1 - j:K - 1 + T - j, :] * taps[K - 1 - j, :][None, :]
         del E, bx, taps
-        ol.quantize_into(yst, acc * ol.dot(xs, lw.win[n + c0:n + c0 + cp, :]), c0)
+        y[:, c0:c0 + cp].set(acc * ol.dot(xs, lw.win[n + c0:n + c0 + cp, :]))
         del acc
     xs = None
+    yst = ol.quantize(y)
+    del y
     _add_parts(x, [yst], [lw.wout], parts)
     return x
 
@@ -431,31 +453,33 @@ def _rows_of(pos, T: int):
 
 @ol.jit
 def qwen3_tile(m, p0, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool = False,
-               depth: int = ATTN_DEPTH):
+               depth: int = ATTN_DEPTH, whole: bool = True):
     """T rows at positions p0 .. p0 + T - 1 of sequence 0 (p0 an int: their embedding and RoPE
     rows in the I/O area, as qwen3_rows'; a RunRows: a prompt run's tokens and positions), the
     logits of `logit_rows` (empty: none). spill: x in the I/O area's rows while each layer's
     heads attend (Res). depth: the attention's pipeline (_attend_heads: blocks in flight a
-    head; fewer, a smaller program: compile_tile_run's forms)."""
+    head; fewer, a smaller program: compile_tile_run's forms). whole: W_o's operand quantized
+    at once (_attention_tile's; else a QACT range a part)."""
     spec = m.spec
     x, c, s_ = _inputs_rows(m, _rows_of(p0, T))
     res = Res(x, m.xr[0:T, :] if spill else None)
     del x
     parts, sub = _widths(m, T)
     for lw in _layers(m):
-        _attention_tile(res, lw, c, s_, p0, T, spec, block, parts, depth=depth)
+        _attention_tile(res, lw, c, s_, p0, T, spec, block, parts, depth=depth, whole=whole)
         _mlp_tile(res.x, lw, spec, parts, sub(lw))
     _lm_head_rows(res.x, m, spec, logit_rows)
 
 
 @ol.jit
 def qwen35_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, hidden: bool = False,
-                spill: bool = False, drows: int = 0, depth: int = ATTN_DEPTH):
+                spill: bool = False, drows: int = 0, depth: int = ATTN_DEPTH,
+                whole: bool = True):
     """qwen35_rows tiled: T rows of a prompt run (pos a RunRows), its attention layers and
     MLPs tiled, its DeltaNet layers today's rows (_deltanet_rows over the T rows, or in runs
     of `drows` rows one after another: their pair buffers grow with the rows; each weight
     streamed once a run, pair of heads by pair). hidden: MTP's rows (each row's final-normed
-    hidden to m.hid, as qwen35_rows'). spill, depth: as qwen3_tile's."""
+    hidden to m.hid, as qwen35_rows'). spill, depth, whole: as qwen3_tile's."""
     from ..kernels.lib import rmsnorm
     from .qwen35 import LIN, _deltanet_rows, run_layers
     spec = m.spec
@@ -480,7 +504,7 @@ def qwen35_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, hidden: boo
         else:
             del x
             _attention_tile(res, lw, c, s_, pos, T, spec, block, parts, gated=True,
-                            depth=depth)
+                            depth=depth, whole=whole)
         _mlp_tile(res.x, lw, spec, parts, sub(lw))
 
     run_layers(m.plan, layer)
@@ -495,9 +519,9 @@ def qwen35_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, hidden: boo
 
 @ol.jit
 def lfm2_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool = False,
-              depth: int = ATTN_DEPTH):
+              depth: int = ATTN_DEPTH, whole: bool = True):
     """lfm2_rows tiled: T rows of a prompt run (pos a RunRows), its attention layers, its
-    convolution blocks and its MLPs tiled. spill, depth: as qwen3_tile's."""
+    convolution blocks and its MLPs tiled. spill, depth, whole: as qwen3_tile's."""
     from .lfm2 import CONV, run_layers
     spec = m.spec
     if not isinstance(pos, RunRows):
@@ -514,7 +538,8 @@ def lfm2_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool =
             n = lw.taps.shape[1]
             _conv_tile(res.x, lw, pos, spec, parts, conv_parts(n, spec.conv_k, D, T, W))
         else:
-            _attention_tile(res, lw, c, s_, pos, T, spec, block, parts, depth=depth)
+            _attention_tile(res, lw, c, s_, pos, T, spec, block, parts, depth=depth,
+                            whole=whole)
         _mlp_tile(res.x, lw, spec, parts, sub(lw))
 
     run_layers(m.plan, layer)
@@ -570,16 +595,17 @@ def _rope_rows_g(x, c, s, out):
 
 
 def _gemma_attention_tile(res: Res, lw, m, pos: RunRows, ropes, T: int, block: int,
-                          parts: int, depth: int = ATTN_DEPTH):
+                          parts: int, depth: int = ATTN_DEPTH, whole: bool = True):
     """gemma4._attention tiled for T rows of a prompt run: x += norm(W_o attention(norm(x))).
     Per KV head its K / V (own layers: projected for the T rows, normed, K RoPE'd, appended a
     row at a time to its slot: the sliding ring's or the cache's), then its query group in
     parts of MCOLS heads, each part's [T, heads d] projected, normed and RoPE'd in place and
     its rows attending in packed tiles (P = MCOLS / G rows; a row's span is its own: the
     sliding window's Blocks or the global Bucket, their masks the mask tiles), the outputs
-    written over the part's queries and quantized into W_o's operand; then W_o by output parts
-    into [T, H] and the post-norm. Each row's arithmetic is _attention's. x: res.x, spilled
-    while the heads attend and W_o runs (Res)."""
+    to [T, n_q d], quantized at once into W_o's operand (whole: _attention's one QACT), or
+    written over the part's queries and quantized as the part ends (a QACT range each, as
+    _attention_tile's); then W_o by output parts into [T, H] and the post-norm. Each row's
+    arithmetic is _attention's. x: res.x, spilled while the heads attend (Res)."""
     from ..kernels.lib import rmsnorm
     from .gemma4 import SLIDE, _RowPos, _add_norm, _full_seq, _slide_seq, _slot
     spec = m.spec
@@ -603,7 +629,10 @@ def _gemma_attention_tile(res: Res, lw, m, pos: RunRows, ropes, T: int, block: i
     #                                            times a row whatever gs (P gs = MCOLS)
     tiles = [(r0, min(P, T - r0)) for r0 in range(0, T, P)]
     gparts = [(g0, min(G, g0 + gs)) for g0 in range(0, G, gs)]
-    ost = ol.stationary(T, spec.n_q * d)
+    if whole:                                  # the outputs, quantized once (W_o's operand)
+        o_all, ost = ol.empty([T, spec.n_q * d]), None
+    else:                                      # W_o's operand, a part's columns at a time
+        o_all, ost = None, ol.stationary(T, spec.n_q * d)
     made, ent, qhs, kvh, seqs = {}, [], [], [], []
 
     def part(j, g0, g1):
@@ -644,6 +673,14 @@ def _gemma_attention_tile(res: Res, lw, m, pos: RunRows, ropes, T: int, block: i
     def emit(i, acc, l):
         j, g0, g1, r0, n = ent[i]
         w = g1 - g0
+        if whole:                              # the part's columns of the outputs
+            h0 = (j * G + g0) * d
+            for a in range(n):
+                o_all[r0 + a, h0:h0 + w * d].reshape(w, d).set(
+                    acc[a * w:(a + 1) * w, :] / l[a * w:(a + 1) * w][:, None])
+            if r0 + n == T:
+                del made[(j, g0)]              # (its queries)
+            return
         o = made[(j, g0)]                      # the outputs over the part's queries
         o.reshape(T * w, d)[r0 * w:(r0 + n) * w, :].set(acc / l[:, None])
         if r0 + n == T:
@@ -652,21 +689,24 @@ def _gemma_attention_tile(res: Res, lw, m, pos: RunRows, ropes, T: int, block: i
 
     _attend_heads(qhs, kv, kvh, seqs, block, ol.LOG2E, depth=depth, emit=emit)
     xs = None
+    if whole:
+        ost = ol.quantize(o_all)
+        del o_all
     x = res.back()
     y = ol.empty([T, spec.hidden])
     _add_parts(y, [ost], [lw.wo], parts, y)
-    del ost
+    ost = None
     _add_norm(x, y, ol.load(lw.g_attn), eps)
 
 
 @ol.jit
 def gemma4_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool = False,
-                depth: int = ATTN_DEPTH):
+                depth: int = ATTN_DEPTH, whole: bool = True):
     """gemma4_step's rows tiled: T rows of a prompt run (pos a RunRows with the image's mask
     tiles), their tokens gathered from out[] and per-layer inputs as gemma4_step's; per layer
     the tiled attention, the dense MLP (GeGLU) tiled into [T, H] for its post-norm, the
     per-layer input block as gemma4._ple. spill: x in the I/O area's input rows while each
-    layer's heads attend and W_o runs (Res). depth: as qwen3_tile's."""
+    layer's heads attend and W_o runs (Res). depth, whole: as qwen3_tile's."""
     from ..kernels.lib import gelu_tanh
     from .gemma4 import _add_norm, _gathered_out, _ple, _ple_inputs, _pos_rows
     from .qwen3 import fill_logits
@@ -685,7 +725,7 @@ def gemma4_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool
 
     def layer(li, it=None, jt=None):
         lw = m.layer(li, it, jt)
-        _gemma_attention_tile(res, lw, m, pos, ropes, T, block, parts, depth)
+        _gemma_attention_tile(res, lw, m, pos, ropes, T, block, parts, depth, whole)
         x = res.x
         y = ol.empty([T, spec.hidden])
         _mlp_tile(x, lw, spec, parts, sub(lw), act=gelu_tanh, g=lw.g_pre, out=y)
@@ -719,7 +759,7 @@ EM_GROUP = 2    # rows a group of an expert-major tiled run's per-row record wor
 
 @ol.jit
 def gemma4_layer_tile(m, li: int, pos, row, T: int, block: int = ATTN_BLOCK,
-                      spill: bool = False, depth: int = ATTN_DEPTH):
+                      spill: bool = False, depth: int = ATTN_DEPTH, whole: bool = True):
     """gemma4_layer_run's expert-major run tiled (a MoE model's layer-major prefill,
     docs/offload.md 13.11): the T rows of the chunk from `row` (a run argument; their records'
     X, moe.em_x) at the run-time positions pos .. pos + T - 1 (a RunRows with the image's mask
@@ -749,7 +789,7 @@ def gemma4_layer_tile(m, li: int, pos, row, T: int, block: int = ATTN_BLOCK,
     res = Res(x, X if spill else None)
     del x
     parts, sub = _widths(m, T)
-    _gemma_attention_tile(res, lw, m, pos, ropes, T, block, parts, depth)
+    _gemma_attention_tile(res, lw, m, pos, ropes, T, block, parts, depth, whole)
     x = res.x
     ol.store(X, x)
     g = max(1, (LINE // 4) // k)                # rows a need line
@@ -768,7 +808,8 @@ def gemma4_layer_tile(m, li: int, pos, row, T: int, block: int = ATTN_BLOCK,
 
 @ol.jit
 def qwen35_layer_tile(m, li: int, pos, row, T: int, block: int = ATTN_BLOCK,
-                      spill: bool = False, drows: int = 0, depth: int = ATTN_DEPTH):
+                      spill: bool = False, drows: int = 0, depth: int = ATTN_DEPTH,
+                      whole: bool = True):
     """qwen35_layer_run's expert-major run tiled (Qwen3.5-MoE's layer-major prefill,
     docs/offload.md 13.11): the T rows of the chunk from `row` (their records' X) at the
     run-time positions pos .. pos + T - 1 (a RunRows with the image's mask tiles) through layer
@@ -805,7 +846,8 @@ def qwen35_layer_tile(m, li: int, pos, row, T: int, block: int = ATTN_BLOCK,
         s_ = ol.load(m.sin_t[pos.pos:pos.pos + T, :])
         res = Res(x, X if spill else None)
         del x
-        _attention_tile(res, lw, c, s_, pos, T, spec, block, parts, gated=True, depth=depth)
+        _attention_tile(res, lw, c, s_, pos, T, spec, block, parts, gated=True, depth=depth,
+                        whole=whole)
         x = res.x
         del c, s_
     if not lw.moe:
@@ -912,6 +954,8 @@ def _first_fit(trace, forms, cfg):
             try:
                 bs = trace(f)
             except CompileError as e:
+                if "QACT range" in str(e):     # (a range form's part at an odd block of
+                    break                      # 4-bit weights: the form does not apply)
                 if not any(w in str(e) for w in ("TMEM", "ACT RAM")):
                     raise
                 err = e
@@ -929,7 +973,9 @@ def _first_fit(trace, forms, cfg):
 def variants(fam: str, T: int, mcols: int) -> list:
     """A tiled run's forms, tried in order until one fits TMEM and ACT RAM: as it is; x spilled
     while the heads attend (Res); Qwen3.5's DeltaNet layers in runs of fewer rows (whole passes
-    of MCOLS, then fewer: their pair buffers grow with the rows)."""
+    of MCOLS, then fewer: their pair buffers grow with the rows). Each with the attention's
+    outputs whole (W_o's operand one QACT: today's bits); a prompt run whose outputs do not
+    fit takes fewer rows (prefill._probe_tile)."""
     out = [{}, {"spill": True}]
     if fam == "qwen35":
         d = T
@@ -937,6 +983,12 @@ def variants(fam: str, T: int, mcols: int) -> list:
             d = d - mcols if d > mcols else d - 1
             out.append({"spill": True, "drows": d})
     return out
+
+
+def ranges(forms: list) -> list:
+    """The forms, then each with the attention's outputs quantized a part at a time (whole
+    False: a QACT range a part, W_o an MM a range; the bits are not today's)."""
+    return forms + [dict(f, whole=False) for f in forms]
 
 
 LAYER_KERNELS = {"gemma4": gemma4_layer_tile, "qwen35": qwen35_layer_tile}
@@ -993,12 +1045,14 @@ def untiled_rows(img) -> int:
 
 def layer_variants(img, fam: str, T: int) -> list:
     """A tiled layer run's forms (variants'): Qwen3.5's DeltaNet rows in runs of at most the
-    image's gr / on rows (grows), then fewer."""
+    image's gr / on rows (grows), then fewer; the run's rows are the engine's (layer_major),
+    so then the attention's outputs a part at a time (ranges: the 26B's global layers'
+    [8, 16 x 512] outputs alone are TMEM's 64K words)."""
     if fam != "qwen35":
-        return [{}, {"spill": True}]
+        return ranges([{}, {"spill": True}])
     d = min(T, img.grows)
     out = [{"drows": d}, {"spill": True, "drows": d}]
     while d > 1:
         d = d - img.cfg.MCOLS if d > img.cfg.MCOLS else d - 1
         out.append({"spill": True, "drows": d})
-    return out
+    return ranges(out)

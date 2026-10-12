@@ -1,9 +1,12 @@
 """Tiled prefill (opentpu/llm/tiled.py, docs/tiled_prefill.md): a run of T rows, every weight
 chunk streamed once for all of them and the attention's rows packed MCOLS / G to an MM, against
-today's prefill runs over the same tokens on the ISA simulator: the KV cache, every layer block
-and the last row's logits bit for bit, where their 4-bit MMs pair alike (PAIR). Tiled prompt
-runs (prefill.py's tile mode) of every dense family against today's prompt runs: Qwen3, the
-Llama-likes (SmolLM3, Phi-4-mini's shape), LFM2, Qwen3.5."""
+today's prefill runs over the same tokens on the ISA simulator (the MX MXU: an MM's output one
+exact integer, PAIR's too): the KV cache, every layer block and the last row's logits bit for
+bit, each operand quantized over today's columns (one QACT: W_o's whole, a down chunk's). Tiled
+prompt runs (prefill.py's tile mode) of every dense family against today's prompt runs: Qwen3,
+the Llama-likes (SmolLM3, Phi-4-mini's shape), LFM2, Qwen3.5, Gemma 4; expert-major layer runs
+of the MoE ones. The range forms (W_o's operand a QACT range a part: not today's bits) by the
+logits' KL divergence from today's, and RTL = ISA."""
 import dataclasses
 import sys
 from pathlib import Path
@@ -207,12 +210,12 @@ def _dram_but_scratch(eng, P):
     ("phi3", 4, 37, 30, 8, 16, None),       # G = 3, RoPE on 96 of 128 dimensions, LongRoPE
     ("phi3", 8, 37, 30, 8, 16, None),       # 2 rows of 3 heads a tile
     ("lfm2", 4, 250, 20, 8, 16, None),      # convolution blocks by channel parts, 64-wide heads
-    ("kh8", 4, 250, 20, 4, 16, None),       # Qwen3.5: gated attention in query parts of
-    ("kh16", 4, 37, 30, 4, 16, None),       # 2 heads (QPART), DeltaNet rows; 16 DeltaNet heads
+    ("kh8", 4, 250, 20, 4, 12, None),       # Qwen3.5: gated attention in query parts of
+    ("kh16", 4, 37, 30, 4, 12, None),       # 2 heads (QPART), DeltaNet rows; 16 DeltaNet heads
     ("qwen3", 4, 250, 20, 8, 16, {"spill": True}),     # x spilled while the heads attend
     ("lfm2", 4, 37, 30, 8, 16, {"spill": True}),
-    ("kh8", 4, 250, 20, 4, 16, {"spill": True, "drows": 5}),   # DeltaNet: 4 x 4 rows
-])
+    ("kh8", 4, 250, 20, 4, 12, {"spill": True, "drows": 5}),   # DeltaNet: 3 x 4 rows
+])                                          # (Qwen3.5: the [16, n_q d] outputs whole: TMEM)
 def test_tiled_prompt_runs_are_todays(tmp_path_factory, monkeypatch, case, mcols, P1, P2, R, T,
                                       form):
     """Two prompts (a chat's turns, the second from where the first left) through tiled prompt
@@ -237,27 +240,64 @@ def test_tiled_prompt_runs_are_todays(tmp_path_factory, monkeypatch, case, mcols
                                                     _dram_but_scratch(b, P1 + P2)))
 
 
-@pytest.mark.parametrize("pair, P1, P2, same", [
-    (True, 36, 24, True),       # today's runs of 4 (and 3) rows, the tile's of 8: none pairs
-    (True, 250, 20, False),     # today's 2-row runs (at the bucket's end, the prompt's) pair
-    (False, 250, 20, True),     # the same without PAIR: bit for bit
-])
-def test_tiled_prompt_runs_pair_rounding(tmp_path_factory, pair, P1, P2, same):
-    """4-bit Qwen3.5: a tiled run and today's differ exactly where one of them pairs (a run of
-    at most MCOLS / 2 rows: a paired MM sums each even K block into the odd one first) -- the
-    tile's 8 rows never pair, today's 2-row runs do; without PAIR they are the same bits."""
+@pytest.mark.parametrize("P1, P2", [(36, 24), (250, 20)])
+def test_tiled_prompt_runs_pair_alike(tmp_path_factory, P1, P2):
+    """4-bit Qwen3.5 with PAIR: a tiled run and today's are the same bits whether or not one
+    of them pairs (a run of at most MCOLS / 2 rows: the MX MXU's paired MM sums the same exact
+    integer, docs/isa.md "Column reuse") -- the tile's rows never pair, today's 2-row runs at
+    the bucket's and the prompt's end (250 + 20) do."""
     r = np.random.default_rng(P1)
     p1, p2 = ([int(t) for t in r.integers(0, 1000, n)] for n in (P1, P2))
-    _, a, b = _prompt_engines("fp4", 4, 16, 4, tmp_path_factory, pair=pair)
+    _, a, b = _prompt_engines("fp4", 4, 16, 4, tmp_path_factory, pair=True)
     got = [a.prefill(p1), a.prefill(p2)]
     want = [b.prefill(p1), b.prefill(p2)]
-    eq = all(np.array_equal(x, y) for x, y in zip(_dram_but_scratch(a, P1 + P2),
-                                                  _dram_but_scratch(b, P1 + P2)))
-    eq = eq and all(np.array_equal(x, y) for x, y in zip(got, want))
-    assert eq == same
-    if not same:
-        assert any(s["rows"] <= 2 for s in b.stats)
-        assert all(np.abs(x - y).max() < 1e-3 * np.abs(y).max() for x, y in zip(got, want))
+    assert any(s["rows"] <= 2 for s in b.stats) == (P1 == 250)
+    for x, y in zip(got, want):
+        assert np.array_equal(x.view(np.uint32), y.view(np.uint32))
+    assert all(np.array_equal(x, y) for x, y in zip(_dram_but_scratch(a, P1 + P2),
+                                                    _dram_but_scratch(b, P1 + P2)))
+
+
+def _dkl(want, got) -> float:
+    """KL(softmax(want) || softmax(got)) of two logits vectors, in nats."""
+    lw, lg = (np.asarray(v, np.float64) for v in (want, got))
+    lw, lg = lw - lw.max(), lg - lg.max()
+    lw, lg = lw - np.log(np.exp(lw).sum()), lg - np.log(np.exp(lg).sum())
+    return float((np.exp(lw) * (lw - lg)).sum())
+
+
+def _in_ranges(forms):
+    """A form search (tiled.variants, layer_variants) in its range forms only."""
+    return lambda *a: [dict(f, whole=False) for f in forms(*a)]
+
+
+@pytest.mark.parametrize("case, mcols, P1, P2, R, T", [
+    ("qwen3", 4, 250, 20, 8, 16),           # a part of 2 heads a range (G = 2)
+    ("phi3", 4, 37, 30, 8, 16),             # 3 heads (G = 3): ranges at odd blocks (int8)
+    ("kh8", 4, 250, 20, 4, 16),             # Qwen3.5: 16 rows (its outputs whole: 12)
+])
+def test_tiled_prompt_runs_in_ranges(tmp_path_factory, monkeypatch, case, mcols, P1, P2, R, T):
+    """The range forms (tiled.ranges: each part's outputs quantized as it ends, a QACT range
+    of its own, W_o an MM a range added up with ACC): their own rows (T), and logits not
+    today's prompt runs' bits (a range's Sa is its own row maximum) but as close to the fp32
+    forward's (reference_logits) by the KL divergence: no worse than today's by more than a
+    quarter (and 1e-4), and from today's under 0.4 of today's own divergence."""
+    monkeypatch.setattr(tiled, "variants", _in_ranges(tiled.variants))
+    r = np.random.default_rng(P1)
+    p1, p2 = ([int(t) for t in r.integers(0, 1000, n)] for n in (P1, P2))
+    spec, a, b = _prompt_engines(case, mcols, 16, R, tmp_path_factory)
+    got = [a.prefill(p1), a.prefill(p2)]
+    assert max(a._prompt_tile.values()) == T
+    want = [b.prefill(p1), b.prefill(p2)]
+    W = _family(case, tmp_path_factory)[0]
+    ref = sys.modules[type(a.image).__module__].reference_logits(spec, W, p1 + p2)
+    ref = [ref[P1 - 1], ref[-1]]
+    kl = [_dkl(y, x) for x, y in zip(got, want)]
+    kr = [(_dkl(f, x), _dkl(f, y)) for x, y, f in zip(got, want, ref)]
+    print(case, "dKL", kl, "against fp32 (ranges, today's)", kr)
+    assert not all(np.array_equal(x, y) for x, y in zip(got, want))
+    for k, (kg, kw) in zip(kl, kr):
+        assert kg <= 1.25 * kw + 1e-4 and k <= 0.4 * kw
 
 
 def test_tiled_shallow_pipeline(tmp_path_factory, monkeypatch):
@@ -301,11 +341,13 @@ def test_tiled_shallow_pipeline(tmp_path_factory, monkeypatch):
 @pytest.mark.parametrize("case, mcols, act, p0, T, form", [
     ("qwen3", 4, 4, 300, 4, None),      # the card's ACT RAM (4 rows): a whole block, then the
     ("lfm2", 4, 16, 200, 16, None),     # masked one; 16 rows: replayed MMs, the convolution's
-    ("kh8", 4, 16, 300, 16, None),      # channel parts; Qwen3.5: DeltaNet rows (DSTEP), gated
+    ("kh8", 4, 16, 300, 12, None),      # channel parts; Qwen3.5: DeltaNet rows (DSTEP), gated
     ("gemma4-1", 4, 16, 600, 4, None),  # Gemma 4: the sliding window's start-masked block (IMEM:
     ("gemma4-2", 8, 16, 300, 8, None),  # 4 rows in bucket 3); E4B's groups of 4, two rows a tile
     ("kh8", 4, 16, 300, 12, {"spill": True, "drows": 5}),  # x stored and loaded back in place,
-])                                                          # DeltaNet in runs of 4 x 3
+    #                                                         DeltaNet in runs of 4 x 3
+    ("kh8", 4, 16, 300, 16, {"whole": False}),  # W_o's operand in QACT ranges: an MM a range
+])                                              # (ACC)
 def test_tiled_prompt_run_on_rtl(tmp_path_factory, monkeypatch, have_verilator, case, mcols,
                                  act, p0, T, form):
     """A tiled prompt run (an L run, at a run-time position from the state's words, its tokens
@@ -466,6 +508,27 @@ def test_tiled_expert_major_layer_runs(gmoe, monkeypatch, wf, T, R):
         t = int(np.argmax(ga))
 
 
+def test_tiled_expert_major_layer_runs_in_ranges(gmoe, monkeypatch):
+    """Gemma 4 MoE's tiled layer runs in the range forms (tiled.ranges, the forms a run takes
+    where its outputs whole do not fit: gemma-4-26B-A4B's global layers at 8 rows): 8 rows a
+    run against expert-major runs of 4 rows (fp4): the logits within a small KL divergence."""
+    from opentpu.llm import gemma4 as G4
+    _, W, spec = gmoe
+    monkeypatch.setattr(G4, "PREFILL_CHUNK", 24)
+    monkeypatch.setenv("OTPU_TILE", "1")
+    monkeypatch.setattr(tiled, "layer_variants", _in_ranges(tiled.layer_variants))
+    cfg = board_config(DRAM_BYTES=1 << 26, ACT_ROWS=16)
+    kw = dict(cap=1024, cfg=cfg, rows=1, wformat="fp4", experts=6)
+    toks = [int(t) for t in np.random.default_rng(13).integers(0, 1000, 40)]
+    a = Engine(spec, W, layer_major=8, expert_major=True, **kw)
+    b = Engine(spec, W, layer_major=4, expert_major=True, tile_runs=False, **kw)
+    la, lb = a.prefill(toks), b.prefill(toks)
+    assert any(k[-1] == "tile" for k in a._layer_runs if isinstance(k, tuple))
+    assert not np.array_equal(la, lb)
+    print("gemma4 em dKL", _dkl(lb, la))
+    assert _dkl(lb, la) < 1e-3
+
+
 @pytest.mark.parametrize("wf, T, R", [("int8", 8, 0), ("fp4", 8, 4), ("fp4", 6, 4)])
 def test_tiled_qwen35_expert_major_layer_runs(monkeypatch, wf, T, R):
     """Qwen3.5-MoE's expert-major layer runs tiled (Engine.layer_tile): runs of T rows (the
@@ -505,20 +568,24 @@ def test_tiled_qwen35_expert_major_layer_runs(monkeypatch, wf, T, R):
         t = int(np.argmax(ga))
 
 
-@pytest.mark.parametrize("fam, act, T, li", [("gemma4", 4, 4, 1), ("gemma4", 16, 8, 5),
-                                              ("qwen35", 4, 4, 2), ("qwen35", 16, 8, 3)])
+@pytest.mark.parametrize("fam, act, T, li, form", [
+    ("gemma4", 4, 4, 1, None), ("gemma4", 16, 8, 5, None), ("qwen35", 4, 4, 2, None),
+    ("qwen35", 16, 8, 3, None), ("gemma4", 16, 8, 5, {"whole": False})])
 def test_tiled_expert_major_layer_run_on_rtl(gmoe, monkeypatch, have_verilator, fam, act, T,
-                                             li):
+                                             li, form):
     """A tiled expert-major layer run on the RTL with the board's memory path (DRAM and TMEM as
     the ISA simulator's), from chunk row 3 (its records as a prompt left them), every need
     served: the tiny Gemma 4 MoE's sliding layer, 4 rows on the card's ACT RAM (4 rows), and a
-    global one's 8 on ACT_ROWS 16, at position 300 after a 300-token prompt; the tiny
-    Qwen3.5-MoE's attention layer (4 rows, ACT_ROWS 4) and the DeltaNet layer after it (its
-    MoE's end; 8 rows on 16, DSTEP, PAIR), at position 200 after 200 tokens."""
+    global one's 8 on ACT_ROWS 16 (and in QACT ranges: form), at position 300 after a
+    300-token prompt; the tiny Qwen3.5-MoE's attention layer (4 rows, ACT_ROWS 4) and the
+    DeltaNet layer after it (its MoE's end; 8 rows on 16, DSTEP, PAIR), at position 200 after
+    200 tokens."""
     from opentpu import rtlsim
     from opentpu.compiler import arg_words
     from opentpu.llm.qwen3 import RunPos
     monkeypatch.setenv("OTPU_TILE", "1")
+    if form is not None:
+        monkeypatch.setattr(tiled, "layer_variants", lambda img, fam, T: [form])
     if fam == "gemma4":
         _, W, spec = gmoe
         cfg, p, cap = board_config(DRAM_BYTES=1 << 26, ACT_ROWS=act), 300, 1024
