@@ -61,7 +61,11 @@ def prefix(spec, p: str):
 
 
 def config(a, **kw):
-    over = dict(PAIR=True, DSTEP=True, STREAM=True, DRAM_BYTES=DRAM, MCOLS=a.mcols,
+    # the stream engine (DSTEP, STREAM) exists at 8 lanes only (otpu_slice.sv: HAS_SS =
+    # HAS_DSTEP && LANES == 8): at other lane counts DeltaNet runs on the VOP fallback, and a
+    # program with DSTEP stops the slice with ERROR at its first one (vpu-pump, 2026-10-12)
+    ss = a.lanes == 8
+    over = dict(PAIR=True, DSTEP=ss, STREAM=ss, DRAM_BYTES=DRAM, MCOLS=a.mcols,
                 LANES=a.lanes, TMEM_WORDS=a.tmem_words, ACT_ROWS=a.act_rows, S=a.S)
     over.update(kw)
     return board_config(**over)
@@ -111,7 +115,8 @@ def cmd_run(a):
                 rec = dict(model=Path(a.model).name, layers=p, rows=R, pos=pos,
                            batch=bool(a.batch and R), wformat=a.wformat,
                            head_format=a.head_format, formats=a.formats, mcols=a.mcols,
-                           act_rows=a.act_rows, lanes=a.lanes, tmem=a.tmem_words, mem=a.mem, S=a.S,
+                           act_rows=a.act_rows, lanes=a.lanes, dstep=a.lanes == 8,
+                           tmem=a.tmem_words, mem=a.mem, S=a.S,
                            mhz=a.mhz, bw=a.bw, lat=a.lat, mts=a.mts)
                 try:
                     cfg = config(a, IMEM_WORDS=IMEM)       # the fit is IMEM's 4K: instructions

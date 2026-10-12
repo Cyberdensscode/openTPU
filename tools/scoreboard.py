@@ -361,7 +361,14 @@ def board(b: str = "ypcb", **kw) -> HW:
 # - vpu_share: the share of it that scales with the vector unit (the RTL at 16 lanes);
 # - a DeltaNet layer's recurrence: DSTEP at 8 state words a cycle plus a fill a head; one row's
 #   hides behind the layer's weight stream, every further row's adds (the RTL's Qwen3.5-0.8B
-#   prefill at R = 4: 1.95 M of 6.82 M cycles are DSTEP's);
+#   prefill at R = 4: 1.95 M of 6.82 M cycles are DSTEP's). With it run the DeltaNet's own
+#   VOPs (head_in and the conv's sigmoid at 0.875 cycles a conv channel each, the gate's 112 a
+#   v-head, norms and SiLU ~1.3 a v-head's value: vpu-pump's inventory, 15.7 K a row on the
+#   0.8B and 2B, 22.7 K on the 4B), dn_vop of a further row's exposed; dn_slack of the gap
+#   between the stream and the MXU hides part of them and of the DSTEPs (the campaign's
+#   DeltaNet layers at MCOLS 4 and 8, fitted with the kappas: the 2B's MXU-bound layer at
+#   MCOLS 4 takes 84 K over the MXU for 108 K of DSTEP, the 0.8B's stream-bound one at
+#   MCOLS 8 166 K over the stream);
 # - attention streams a row's KV once a group of MCOLS query heads of a KV head (the code's
 #   parts: gemma4._attention, qwen3._attend_heads);
 # - run: cycles a device run; head_row: a logits row's sink (argmax / sampling);
@@ -387,6 +394,10 @@ CAL = {
     "head_row": 2000.0,
     "dstep_fill": 200.0,
     "dstep_words": 8.0,
+    "dn_vop": 0.4,                  # a DeltaNet row's VOPs after the first: the share exposed
+    "dn_slack": 0.24,               # ... less this share of |MXU - stream| (the campaign's
+                                    # 6 layers and the card, fitted with the kappas)
+    "dn_hide": 0.5,                 # ... which hides at most this share of them
     "moe_alpha": 0.6,               # a run's union of R rows' experts: k R^alpha (consecutive
                                     # tokens share experts), at most the prompt's curve
     "att_serial": True,             # attention between the matmuls, not under their stream
@@ -406,10 +417,10 @@ CAL = {
 }
 
 
-KAPPA = {                           # `scoreboard.py fit` (2026-10-12: serial attention, a run + a row)
-    "gemma4": (3.7081, 0.8979), "lfm2": (0.0283, 0.2592), "lfm2-2.6b": (0.4237, 0.3046),
-    "phi4-mini": (0.5064, 0.3276), "qwen3": (0.266, 0.7267), "qwen35": (0.0, 1.2847),
-    "qwen35-2b": (0.2813, 0.0), "qwen35-4b": (0.0, 0.0), "smollm3": (0.4908, 0.635)}
+KAPPA = {     # `scoreboard.py fit` (2026-10-12: serial attention, a run + a row, DeltaNet VOPs)
+    "gemma4": (3.7091, 0.898), "lfm2": (0.0286, 0.2592), "lfm2-2.6b": (0.4248, 0.3043),
+    "phi4-mini": (0.5077, 0.3273), "qwen3": (0.2666, 0.7267), "qwen35": (0.0, 1.1987),
+    "qwen35-2b": (0.9086, 0.0), "qwen35-4b": (0.588, 0.0), "smollm3": (0.4921, 0.6348)}
 CAL["kappa"].update(KAPPA)
 
 
@@ -476,6 +487,14 @@ def over_cycles(m: dict, hw: HW, R: int) -> float:
 def dstep_cycles(lay: dict, hw: HW) -> float:
     dn = lay["deltanet"]
     return dn["dk"] * dn["dv"] / (CAL["dstep_words"] * hw.vpu) + CAL["dstep_fill"]
+
+
+def dn_vop_cycles(lay: dict, hw: HW) -> float:
+    """A DeltaNet row's own VOPs (not DSTEP), issue cycles at the configuration's vector
+    unit: vpu-pump's static inventory of Qwen3.5 (vpu_hack.inventory)."""
+    dn = lay["deltanet"]
+    conv = 2 * dn["k_heads"] * dn["dk"] + dn["v_heads"] * dn["dv"]
+    return (1.75 * conv + 112 * dn["v_heads"] + 1.3 * dn["v_heads"] * dn["dv"]) / hw.vpu
 
 
 def layer_cycles(m: dict, i: int, lay: dict, hw: HW, fmt: tuple, ctxs: list,
@@ -546,6 +565,13 @@ def layer_cycles(m: dict, i: int, lay: dict, hw: HW, fmt: tuple, ctxs: list,
     if S > 1:
         over += R * CAL["coll"]
     mem = byts / S / hw.bw()
+    if lay["kind"] == "delta" and R > 1:
+        # the further rows' DeltaNet VOPs run with their DSTEPs; the idle side of the stream
+        # and the MXU hides part of both (the campaign's layers at MCOLS 4 and 8), at most
+        # dn_hide of them (the campaign's R <= 4 hid at most 37%; a long run on a deep ACT
+        # RAM, one weight pass for its MXU's many, is not measured)
+        rec += CAL["dn_vop"] * (R - 1) * dn_vop_cycles(lay, hw) / S
+        rec -= min(CAL["dn_hide"] * rec, CAL["dn_slack"] * abs(mxu / S - mem))
     if tiled and lay["kind"] in ("attn", "sliding", "global"):
         # what the tile kernel leaves outside the MXU: a layer's and a row's (its co-sim at
         # MCOLS 4 and 8, T 4-16: the vector work it does not overlap, the MMs' fills)

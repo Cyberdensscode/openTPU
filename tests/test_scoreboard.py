@@ -24,7 +24,7 @@ def rows():
 @pytest.mark.parametrize("group,mean,worst", [
     ("decode", 1.0, 3.5), ("prefill", 1.5, 5.0), ("batched", 1.0, 2.0), ("co-sim", 2.0, 5.0),
     ("co-sim layer", 2.0, 3.5), ("co-sim tile kernel", 3.5, 13.0),
-    ("MoE layer run ms", 4.0, 6.0), ("MoE", 4.0, 6.0)])
+    ("MoE layer run ms", 4.0, 6.0), ("MoE", 4.0, 6.0), ("co-sim campaign", 6.0, 11.5)])
 def test_reproduces_card_and_cosim(rows, group, mean, worst):
     errs = [abs(e) for g, _, _, _, e, _ in rows if g == group]
     assert errs, group
@@ -92,6 +92,28 @@ def test_mcols_8_speeds_prefill_and_batches_but_not_decode():
     r = SB.compare(YPCB, YPCB.replace(mcols=8))
     assert r["decode"] == pytest.approx(1.0, abs=0.02)
     assert r["prefill"] > 1.2 and r["batch"] > 1.4
+
+
+def test_deltanet_layers_at_mcols_4_and_8():
+    """A DeltaNet layer's further rows expose part of their VOPs with their DSTEPs, less what
+    the gap between the stream and the MXU hides: the campaign's Qwen3.5-2B layer at R 4 takes
+    547.2 K cycles at MCOLS 4 and 401.4 K at MCOLS 8 (0.734x; without the VOP term the model
+    gave 0.665x). Decode (one row) is unchanged."""
+    m = SB.model("qwen35-2b")
+    fmt = SB.formats_of("qwen35-2b", "fp4")
+    i, lay = next((i, lay) for i, lay in SB.layers(m) if lay["kind"] == "delta" and i == 1)
+    ctxs = list(range(512, 516))
+    c4, c8 = (SB.layer_cycles(m, i, lay, SB.board("ypcb", mcols=mc), fmt, ctxs, prompt=True)
+              for mc in (4, 8))
+    assert c4 == pytest.approx(547150, rel=0.03) and c8 == pytest.approx(401395, rel=0.03)
+    assert c8 / c4 == pytest.approx(401395 / 547150, rel=0.03)
+    one = SB.layer_cycles(m, i, lay, YPCB, fmt, [544])
+    old = dict(SB.CAL)
+    try:
+        SB.CAL["dn_vop"] = SB.CAL["dn_slack"] = 0.0
+        assert SB.layer_cycles(m, i, lay, YPCB, fmt, [544]) == one
+    finally:
+        SB.CAL.update(old)
 
 
 def test_batched_total_grows_and_each_user_slows():
