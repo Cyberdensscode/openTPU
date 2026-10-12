@@ -52,6 +52,9 @@ from .qwen3 import (ATTN_BLOCK, ATTN_DEPTH, RunRows, RunWords, _amask, _inputs_r
                     _lm_head_rows, _load_opt, _norm_heads, _padded, _rope_gate,
                     _rope_rows_padded)
 
+QPART = 8       # a query part's [T, heads d] at most TMEM / QPART words (fewer heads, more rows)
+SHALLOW = 2     # the attention pipeline's depth of a run over IMEM at ATTN_DEPTH
+
 
 def packing(mcols: int, G: int) -> int:
     """Query rows of a KV head's group (G each) that one attention MM takes: MCOLS / G."""
@@ -150,7 +153,10 @@ def _attention_tile(res: Res, lw, c, s_, pos, T: int, spec, block: int, parts: i
     """x += W_o . attention(x) for T rows of sequence 0 at positions pos .. pos + T - 1 (pos an
     int, or a prompt run's RunRows: run-time positions), their K / V appended first, each row
     attending causally over the cache: _attention_rows' arithmetic, one KV head's projections
-    at a time and its queries in packed tiles. gated (Qwen3.5): each head's outputs times
+    at a time, its query group in parts of at most MCOLS heads (a part's [T, heads d] at most
+    TMEM / QPART words: Qwen3.5-35B's G = 8) and each part's rows in packed tiles (MCOLS query
+    rows), its outputs quantized into W_o's operand as it ends. gated (Qwen3.5): each head's
+    outputs times
     sigmoid(W_gate x) before W_o, as _attention_rows' (acc / l) * sigmoid(gate). x: res.x,
     spilled while the heads attend (Res)."""
     d, G, eps = spec.head_dim, spec.n_q // spec.n_kv, spec.eps
@@ -166,75 +172,78 @@ def _attention_tile(res: Res, lw, c, s_, pos, T: int, spec, block: int, parts: i
     heads = list(kvc.owned_heads(spec.n_kv))
     nq = len(heads) * G
     mc = ol.mxu_columns()
-    gs = min(G, mc)                            # a row's query heads in one entry
-    P = packing(mc, G) if G <= mc else 1       # rows of a tile
+    gs = min(G, mc)                            # a part of a KV head's query group: its heads
+    while gs % 2 == 0 and T * gs * dk > ol.tmem_words() // QPART:
+        gs //= 2                               # (a part's [T, gs dk] queries in TMEM / QPART)
+    P = packing(mc, gs)                        # rows of a tile (P gs <= MCOLS query rows)
     tiles = [(r0, min(P, T - r0)) for r0 in range(0, T, P)]
     gparts = [(g0, min(G, g0 + gs)) for g0 in range(0, G, gs)]
-    ost = ol.stationary(T, nq * d)             # W_o's operand, a KV head's columns at a time
-    oh = {}                                    # KV head j -> its outputs [T, G d] in progress
+    ost = ol.stationary(T, nq * d)             # W_o's operand, a part's columns at a time
+    made, oh = {}, {}                          # (KV head, part) -> its queries, its outputs
     ent, qhs, kvh, seqs = [], [], [], []
 
-    def head(j):
-        """KV head j's projections, K / V appends and queries [T G, dk], row (r, g) = r G + g."""
+    def part(j, g0, g1):
+        """KV head j's projections and K / V appends (with its first part), then the queries
+        of heads g0 .. g1 of its group [T (g1 - g0), dk], row (r, g) = r (g1 - g0) + g."""
         hh = heads[j]
-        k = ol.dot(xs, lw.wk[j * d:(j + 1) * d, :])
-        v = ol.dot(xs, lw.wv[j * d:(j + 1) * d, :])
-        kj = _rope_rows_padded(_norm_heads(k, kn, eps), c, s_)
-        vj = _padded(v)
-        if run:                                # V^T at a run-time position: a row at a time
-            for r in range(T):
-                ol.kv_append(kvc, hh, pos.pos + r, kj[r:r + 1, :], vj[r:r + 1, :])
-        else:
-            ol.kv_append(kvc, hh, pos, kj, vj)
-        del k, v, kj, vj
-        q = ol.dot(xs, lw.wq[j * G * d:(j + 1) * G * d, :])    # [T, G d]
-        Q = ol.empty([T * G, dk], dense=True)
+        if g0 == 0:
+            k = ol.dot(xs, lw.wk[j * d:(j + 1) * d, :])
+            v = ol.dot(xs, lw.wv[j * d:(j + 1) * d, :])
+            kj = _rope_rows_padded(_norm_heads(k, kn, eps), c, s_)
+            vj = _padded(v)
+            if run:                            # V^T at a run-time position: a row at a time
+                for r in range(T):
+                    ol.kv_append(kvc, hh, pos.pos + r, kj[r:r + 1, :], vj[r:r + 1, :])
+            else:
+                ol.kv_append(kvc, hh, pos, kj, vj)
+            del k, v, kj, vj
+        w = g1 - g0
+        q = ol.dot(xs, lw.wq[(j * G + g0) * d:(j * G + g1) * d, :])    # [T, w d]
+        Q = ol.empty([T * w, dk], dense=True)
         if dk > d:                                             # heads padded to whole blocks
             Q.set(0.0)
-        Qv = Q.reshape(T, G * dk)
-        for g in range(G):                                     # head g of every row at once
+        Qv = Q.reshape(T, w * dk)
+        for g in range(w):                                     # head g of every row at once
             _rope_rows_padded(_norm_heads(q[:, g * d:(g + 1) * d], qn, eps), c, s_,
                               out=Qv[:, g * dk:g * dk + d])
         return Q
 
-    made = {}
-
-    def query(j, r0, n, g0, g1):
+    def query(j, g0, g1, r0, n):
         def emit():
-            if j not in made:
-                made[j] = head(j)
-            Q = made[j]
-            if r0 + n == T and g1 == G:
-                made.pop(j)
-            return Q[r0 * G + g0:(r0 + n - 1) * G + g1, :]
+            if (j, g0) not in made:
+                made[(j, g0)] = part(j, g0, g1)
+            Q, w = made[(j, g0)], g1 - g0
+            if r0 + n == T:
+                made.pop((j, g0))
+            return Q[r0 * w:(r0 + n) * w, :]
         return emit
 
     for j in range(len(heads)):
-        for r0, n in tiles:
-            for g0, g1 in gparts:
-                ent.append((j, r0, n, g0, g1))
-                qhs.append(query(j, r0, n, g0, g1))
+        for g0, g1 in gparts:
+            for r0, n in tiles:
+                ent.append((j, g0, g1, r0, n))
+                qhs.append(query(j, g0, g1, r0, n))
                 kvh.append(heads[j])
                 seqs.append(run_seq(pos, r0, n, g1 - g0, kvc.cap) if run else
                             tile_seq(pos, r0, n, block, g1 - g0))
 
     def emit(i, acc, l):
-        j, r0, n, g0, g1 = ent[i]
-        if j not in oh:
-            oh[j] = ol.empty([T, G * d])
+        j, g0, g1, r0, n = ent[i]
         w = g1 - g0
+        if (j, g0) not in oh:
+            oh[(j, g0)] = ol.empty([T, w * d])
         for a in range(n):
-            oh[j][r0 + a, g0 * d:g1 * d].reshape(w, d).set(
+            oh[(j, g0)][r0 + a, :].reshape(w, d).set(
                 acc[a * w:(a + 1) * w, :] / l[a * w:(a + 1) * w][:, None])
-        if r0 + n == T and g1 == G:            # the head's rows done: quantized, freed
-            o = oh.pop(j)
+        if r0 + n == T:                        # the part's rows done: quantized, freed
+            o = oh.pop((j, g0))
             if gated:                          # a head at a time (TMEM: [T, d] temporaries)
-                for g in range(G):
-                    h0 = (j * G + g) * d
+                for g in range(w):
+                    h0 = (j * G + g0 + g) * d
                     og = o[:, g * d:(g + 1) * d]
                     og.set(og * sigmoid(ol.dot(xs, lw.wgate[h0:h0 + d, :])))
                     del og
-            ol.quantize_into(ost, o, j * G * d)
+            ol.quantize_into(ost, o, (j * G + g0) * d)
             del o
 
     _attend_heads(qhs, kvc, kvh, seqs, block, scale, depth=depth, emit=emit)
@@ -380,7 +389,8 @@ def _conv_tile(x, lw, pos: RunRows, spec, parts: int, cparts: int):
         for j, row in zip(range(1, K), rows):                  # the ring's rows before the run
             ol.load(lw.state[row, c0:c0 + cp], out=E[K - 1 - j, :])
         bx = E[K - 1:K - 1 + T, :]
-        bx.set(ol.dot(xs, lw.win[c0:c0 + cp, :]) * ol.dot(xs, lw.win[2 * n + c0:2 * n + c0 + cp, :]))
+        bx.set(ol.dot(xs, lw.win[c0:c0 + cp, :]) *
+               ol.dot(xs, lw.win[2 * n + c0:2 * n + c0 + cp, :]))
         _ring_store_part(lw, E[T - 1:T - 1 + K, :], pos.words["ringo"], K, n, c0)
         acc = bx * taps[K - 1, :][None, :]
         for j in range(1, K):
@@ -400,6 +410,19 @@ def _widths(m, T: int):
     D, W = ol.block_size(), ol.tmem_words()
     parts = mlp_parts(spec.hidden // ol.num_programs(), D, T, W)
     return parts, lambda lw: mlp_sub(down_chunk(lw.wg, lw.wd), D, T, W)
+
+
+def _pieces(T: int, most: int) -> list:
+    """T rows in the fewest runs of at most `most` rows, as even as they go ((r0, n), the
+    longer first: 6 by 4 is 3 + 3, not 4 + 2, whose 2 rows a 4-bit MM would pair at MCOLS 4)."""
+    k = -(-T // most)
+    q, r = divmod(T, k)
+    out, r0 = [], 0
+    for i in range(k):
+        n = q + (i < r)
+        out.append((r0, n))
+        r0 += n
+    return out
 
 
 def _rows_of(pos, T: int):
@@ -448,9 +471,8 @@ def qwen35_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, hidden: boo
         lw = m.layer(li, it)
         x = res.x
         if lw.kind == LIN:
-            for r0 in range(0, T, dr):
-                xr = x[r0:min(T, r0 + dr), :]
-                n = xr.rows
+            for r0, n in _pieces(T, dr):
+                xr = x[r0:r0 + n, :]
                 xr.set(_deltanet_rows(xr, lw, pos.lo, spec, m.gr[0:n, :], m.on[0:n, :],
                                       xs=_norm_quantize(xr, lw.g_in, spec.eps)))
                 del xr
@@ -545,8 +567,6 @@ def _rope_rows_g(x, c, s, out):
     return out
 
 
-QPART = 8       # Gemma 4: a query part's [T, heads d] at most TMEM / QPART words
-SHALLOW = 2     # the attention pipeline's depth of a run over IMEM at ATTN_DEPTH
 
 
 def _gemma_attention_tile(res: Res, lw, m, pos: RunRows, ropes, T: int, block: int,
@@ -747,6 +767,58 @@ def gemma4_layer_tile(m, li: int, pos, row, T: int, block: int = ATTN_BLOCK,
 
 
 @ol.jit
+def qwen35_layer_tile(m, li: int, pos, row, T: int, block: int = ATTN_BLOCK,
+                      spill: bool = False, drows: int = 0, depth: int = ATTN_DEPTH):
+    """qwen35_layer_run's expert-major run tiled (Qwen3.5-MoE's layer-major prefill,
+    docs/offload.md 13.11): the T rows of the chunk from `row` (their records' X) at the
+    run-time positions pos .. pos + T - 1 (a RunRows with the image's mask tiles) through layer
+    li. The MoE layer before ends first (moe.moe_combine_rows, EM_GROUP rows at a time); a
+    DeltaNet layer's rows in runs of `drows` (default T; at most the image's gr / on rows),
+    an attention layer tiled (_attention_tile, gated; spill: x in the records' X while the
+    heads attend); x to X; a MoE layer's route, need lines and shared expert over groups of
+    rows (moe.moe_prologue_rows, LINE / 4 ids a line), a dense layer's MLP tiled. Each row's
+    arithmetic is qwen35_layer_run's."""
+    from .moe import LINE, em_x, moe_combine_rows, moe_prologue_rows
+    from .qwen35 import LIN, _deltanet_rows
+    spec, dev = m.spec, m.moe_dev
+    if not isinstance(pos, RunRows) or pos.amask is None or spec.moe is None:
+        raise CompileError("a tiled Qwen3.5 layer run is a MoE model's, at a run-time "
+                           "position with the image's mask tiles")
+    H, mo, K = spec.hidden, spec.moe, spec.conv_k
+    X = em_x(dev, row, T, H)
+    x = ol.load(X)
+    if li > 0 and m.layer(li - 1).moe:          # (the layer before: its experts' outputs)
+        for r0 in range(0, T, EM_GROUP):
+            xg = x[r0:min(T, r0 + EM_GROUP), :]
+            xg.set(moe_combine_rows(xg, mo, dev, row + r0))
+            del xg
+    lw = m.layer(li)
+    parts, sub = _widths(m, T)
+    if lw.kind == LIN:
+        for r0, n in _pieces(T, drows or T):
+            xr = x[r0:r0 + n, :]
+            xr.set(_deltanet_rows(xr, lw, K - 1, spec, m.gr[0:n, :], m.on[0:n, :],
+                                  xs=_norm_quantize(xr, lw.g_in, spec.eps)))
+            del xr
+    else:
+        c = ol.load(m.cos_t[pos.pos:pos.pos + T, :])
+        s_ = ol.load(m.sin_t[pos.pos:pos.pos + T, :])
+        res = Res(x, X if spill else None)
+        del x
+        _attention_tile(res, lw, c, s_, pos, T, spec, block, parts, gated=True, depth=depth)
+        x = res.x
+        del c, s_
+    if not lw.moe:
+        _mlp_tile(x, lw, spec, parts, sub(lw))
+        ol.store(X, x)
+        return
+    ol.store(X, x)
+    g = max(1, (LINE // 4) // mo.k)             # rows a need line
+    for r0 in range(0, T, g):
+        moe_prologue_rows(x[r0:r0 + min(g, T - r0), :], lw, mo, dev, spec.eps, row + r0)
+
+
+@ol.jit
 def tile_run(m, kernel, pos, T: int, kind: str, block: int = ATTN_BLOCK, kw=None):
     """A tiled prompt run (docs/prefill.md): `kernel`'s T rows at the run-time position in the
     generate state's tpos word (pos: a RunRows, toks_at 0), their tokens from out[]; kind "P",
@@ -867,7 +939,7 @@ def variants(fam: str, T: int, mcols: int) -> list:
     return out
 
 
-LAYER_KERNELS = {"gemma4": gemma4_layer_tile}
+LAYER_KERNELS = {"gemma4": gemma4_layer_tile, "qwen35": qwen35_layer_tile}
 
 
 def layer_family(img) -> str | None:
@@ -905,4 +977,28 @@ def compile_layer_tile(img, li: int, blocks: int, T: int, block: int = ATTN_BLOC
             "m": img.descriptors(0), "li": li, "pos": pos, "row": row, "T": T, "block": block,
             **kw})]
 
-    return _first_fit(trace, [{}, {"spill": True}], cfg)
+    return _first_fit(trace, layer_variants(img, fam, T), cfg)
+
+
+def untiled_rows(img) -> int:
+    """The most rows of an untiled layer run (the image's compile_layer_run: its family's
+    RUN_ROWS, and R k <= LINE / 4 ids in its request): layer 0's runs that gather their rows
+    from the host's slot (embed_host) stay untiled."""
+    import sys
+    from .moe import LINE
+    spec = img.spec
+    k = spec.moe.k if getattr(spec, "moe", None) is not None else getattr(spec, "top_k", 1)
+    return max(1, min(sys.modules[type(img).__module__].RUN_ROWS, (LINE // 4) // max(1, k)))
+
+
+def layer_variants(img, fam: str, T: int) -> list:
+    """A tiled layer run's forms (variants'): Qwen3.5's DeltaNet rows in runs of at most the
+    image's gr / on rows (grows), then fewer."""
+    if fam != "qwen35":
+        return [{}, {"spill": True}]
+    d = min(T, img.grows)
+    out = [{"drows": d}, {"spill": True, "drows": d}]
+    while d > 1:
+        d = d - img.cfg.MCOLS if d > img.cfg.MCOLS else d - 1
+        out.append({"spill": True, "drows": d})
+    return out

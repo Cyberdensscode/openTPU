@@ -207,11 +207,11 @@ def _dram_but_scratch(eng, P):
     ("phi3", 4, 37, 30, 8, 16, None),       # G = 3, RoPE on 96 of 128 dimensions, LongRoPE
     ("phi3", 8, 37, 30, 8, 16, None),       # 2 rows of 3 heads a tile
     ("lfm2", 4, 250, 20, 8, 16, None),      # convolution blocks by channel parts, 64-wide heads
-    ("kh8", 4, 250, 20, 4, 12, None),       # Qwen3.5: gated attention, DeltaNet rows (16:
-    ("kh16", 4, 37, 30, 4, 12, None),       # TMEM); 16 DeltaNet heads
+    ("kh8", 4, 250, 20, 4, 16, None),       # Qwen3.5: gated attention in query parts of
+    ("kh16", 4, 37, 30, 4, 16, None),       # 2 heads (QPART), DeltaNet rows; 16 DeltaNet heads
     ("qwen3", 4, 250, 20, 8, 16, {"spill": True}),     # x spilled while the heads attend
     ("lfm2", 4, 37, 30, 8, 16, {"spill": True}),
-    ("kh8", 4, 250, 20, 4, 12, {"spill": True, "drows": 5}),   # DeltaNet in runs of 5, 5, 2
+    ("kh8", 4, 250, 20, 4, 16, {"spill": True, "drows": 5}),   # DeltaNet: 4 x 4 rows
 ])
 def test_tiled_prompt_runs_are_todays(tmp_path_factory, monkeypatch, case, mcols, P1, P2, R, T,
                                       form):
@@ -225,7 +225,7 @@ def test_tiled_prompt_runs_are_todays(tmp_path_factory, monkeypatch, case, mcols
     p1, p2 = ([int(t) for t in r.integers(0, 1000, n)] for n in (P1, P2))
     spec, a, b = _prompt_engines(case, mcols, 16, R, tmp_path_factory)
     got = [a.prefill(p1), a.prefill(p2)]
-    assert set(a._prompt_tile.values()) == {T}
+    assert max(a._prompt_tile.values()) == T     # (a forced form: fewer in a bucket over IMEM)
     assert max(s["rows"] for s in a.stats) == T
     keys = {k[0] for k in a._prompt_progs}
     assert "prompt tile" in keys
@@ -301,11 +301,11 @@ def test_tiled_shallow_pipeline(tmp_path_factory, monkeypatch):
 @pytest.mark.parametrize("case, mcols, act, p0, T, form", [
     ("qwen3", 4, 4, 300, 4, None),      # the card's ACT RAM (4 rows): a whole block, then the
     ("lfm2", 4, 16, 200, 16, None),     # masked one; 16 rows: replayed MMs, the convolution's
-    ("kh8", 4, 16, 300, 12, None),      # channel parts; Qwen3.5: DeltaNet rows (DSTEP), gated
+    ("kh8", 4, 16, 300, 16, None),      # channel parts; Qwen3.5: DeltaNet rows (DSTEP), gated
     ("gemma4-1", 4, 16, 600, 4, None),  # Gemma 4: the sliding window's start-masked block (IMEM:
     ("gemma4-2", 8, 16, 300, 8, None),  # 4 rows in bucket 3); E4B's groups of 4, two rows a tile
     ("kh8", 4, 16, 300, 12, {"spill": True, "drows": 5}),  # x stored and loaded back in place,
-])                                                          # DeltaNet in runs of 5, 5, 2
+])                                                          # DeltaNet in runs of 4 x 3
 def test_tiled_prompt_run_on_rtl(tmp_path_factory, monkeypatch, have_verilator, case, mcols,
                                  act, p0, T, form):
     """A tiled prompt run (an L run, at a run-time position from the state's words, its tokens
@@ -466,25 +466,77 @@ def test_tiled_expert_major_layer_runs(gmoe, monkeypatch, wf, T, R):
         t = int(np.argmax(ga))
 
 
-@pytest.mark.parametrize("act, T, li", [(4, 4, 1), (16, 8, 5)])
-def test_tiled_expert_major_layer_run_on_rtl(gmoe, monkeypatch, have_verilator, act, T, li):
+@pytest.mark.parametrize("wf, T, R", [("int8", 8, 0), ("fp4", 8, 4), ("fp4", 6, 4)])
+def test_tiled_qwen35_expert_major_layer_runs(monkeypatch, wf, T, R):
+    """Qwen3.5-MoE's expert-major layer runs tiled (Engine.layer_tile): runs of T rows (the
+    MoE layer before ended EM_GROUP rows at a time, the DeltaNet rows in runs of the image's
+    4 gr / on rows, the gated attention in tiles, the route, need lines and shared expert a
+    group of LINE / 4 ids at a time; layer 0's rows from the host's slot untiled, 4 a run)
+    against token by token (R = 0, int8) or expert-major runs of R rows (4-bit with PAIR: no
+    run of either of at most 2 rows, which would pair): the logits, the layers' blocks
+    (DeltaNet states and windows, KV caches) and the decode steps after, bit for bit; 43
+    tokens (the first 3 token by token), chunks of 24 and 16 rows, 6 slots a layer, the
+    embedding rows from the host's table."""
+    import test_qwen35_moe as TQM
+    from opentpu.llm import qwen35 as Q35
+    from opentpu.llm.qwen3 import device_config
+    monkeypatch.setattr(Q35, "PREFILL_CHUNK", 24)
+    monkeypatch.setenv("OTPU_TILE", "1")
+    spec, W = TQM._untied(TQM._tiny())
+    cfg = device_config(spec, 256, rows=1, lookup=True, S=1, experts=6, wformat=wf, MCOLS=4,
+                        PAIR=True, DSTEP=True, STREAM=True)
+    kw = dict(cap=256, cfg=dataclasses.replace(cfg, ACT_ROWS=16), rows=1, resident=True,
+              experts=6, wformat=wf)
+    a = Engine(spec, W, layer_major=T, expert_major=True, **kw)
+    b = Engine(spec, W, tile_runs=False, **(dict(kw, layer_major=R, expert_major=True)
+                                            if R else kw))
+    assert a.layer_tile and "amask" in b.image.lookup and a.image.embed_host
+    toks = [int(t) for t in np.random.default_rng(11).integers(0, 1000, 43)]
+    la, lb = a.prefill(toks), b.prefill(toks)
+    assert any(k[-1] == "tile" for k in a._layer_runs if isinstance(k, tuple))
+    assert np.array_equal(la.view(np.uint32), lb.view(np.uint32))
+    img = a.image
+    assert np.array_equal(a.backend.machine.slices[0].dram[img.layer0:img.head[0]],
+                          b.backend.machine.slices[0].dram[img.layer0:img.head[0]])
+    t = int(np.argmax(la))
+    for _ in range(2):
+        ga, gb = a.step(t), b.step(t)
+        assert np.array_equal(ga.view(np.uint32), gb.view(np.uint32))
+        t = int(np.argmax(ga))
+
+
+@pytest.mark.parametrize("fam, act, T, li", [("gemma4", 4, 4, 1), ("gemma4", 16, 8, 5),
+                                              ("qwen35", 4, 4, 2), ("qwen35", 16, 8, 3)])
+def test_tiled_expert_major_layer_run_on_rtl(gmoe, monkeypatch, have_verilator, fam, act, T,
+                                             li):
     """A tiled expert-major layer run on the RTL with the board's memory path (DRAM and TMEM as
-    the ISA simulator's): a sliding layer's 4 rows on the card's ACT RAM (4 rows), a global
-    one's 8 on ACT_ROWS 16, at position 300 of the tiny Gemma 4 MoE after a 300-token prompt,
-    from chunk row 3 (its records as the prompt left them), every need served."""
+    the ISA simulator's), from chunk row 3 (its records as a prompt left them), every need
+    served: the tiny Gemma 4 MoE's sliding layer, 4 rows on the card's ACT RAM (4 rows), and a
+    global one's 8 on ACT_ROWS 16, at position 300 after a 300-token prompt; the tiny
+    Qwen3.5-MoE's attention layer (4 rows, ACT_ROWS 4) and the DeltaNet layer after it (its
+    MoE's end; 8 rows on 16, DSTEP, PAIR), at position 200 after 200 tokens."""
     from opentpu import rtlsim
     from opentpu.compiler import arg_words
     from opentpu.llm.qwen3 import RunPos
-    _, W, spec = gmoe
     monkeypatch.setenv("OTPU_TILE", "1")
-    cfg = board_config(DRAM_BYTES=1 << 26, ACT_ROWS=act)
-    eng = Engine(spec, W, cap=1024, cfg=cfg, rows=1, wformat="fp4", experts=6, layer_major=T,
-                 expert_major=True)
-    toks = [int(t) for t in np.random.default_rng(300).integers(0, 1000, 301)]
-    eng.prefill(toks[:300])
+    if fam == "gemma4":
+        _, W, spec = gmoe
+        cfg, p, cap = board_config(DRAM_BYTES=1 << 26, ACT_ROWS=act), 300, 1024
+        eng = Engine(spec, W, cap=cap, cfg=cfg, rows=1, wformat="fp4", experts=6,
+                     layer_major=T, expert_major=True)
+    else:
+        import test_qwen35_moe as TQM
+        spec, W = TQM._untied(TQM._tiny())
+        cfg = board_config(DRAM_BYTES=1 << 26, ACT_ROWS=act, PAIR=True, DSTEP=True, STREAM=True)
+        p, cap = 200, 256
+        eng = Engine(spec, W, cap=cap, cfg=cfg, rows=1, resident=True, experts=6,
+                     wformat="fp4", layer_major=T, expert_major=True)
+    toks = [int(t) for t in np.random.default_rng(p).integers(0, 1000, p + 1)]
+    eng.prefill(toks[:p])
     img = eng.image
-    progs, ra = tiled.compile_layer_tile(img, li, 300 // 256 + 1, T, 256)
-    args = arg_words(ra, dict(RunPos.values(toks[300], 300, 1, 256), row=3))
+    progs, ra = tiled.compile_layer_tile(img, li, p // 256 + 1, T, 256)
+    K = getattr(spec, "conv_k", 1)
+    args = arg_words(ra, dict(RunPos.values(toks[p], p, K, 256), row=3))
     dram = eng.backend.machine.slices[0].dram.copy()
     served = img.offload.served
     dram[served:served + 4] = np.frombuffer(np.float32(1e6).tobytes(), np.uint8)

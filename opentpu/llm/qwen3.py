@@ -362,7 +362,7 @@ def qk_gains(spec: Spec, W, p: str) -> tuple[np.ndarray, np.ndarray]:
 # =============================================================================== lookup tables
 def _lookup_alloc(b: "_Bump", spec, cap: int, block: int = None, D: int = 128,
                   head: tuple | None = None, M: int = 4, embed_host: bool = False,
-                  rows: int = 1, imem: int = 1 << 15) -> dict:
+                  rows: int = 1, imem: int = 1 << 15, masks: bool = False) -> dict:
     """DRAM for the device-side inputs of a run-time position (RunPos): every token's embedding
     row, the RoPE cos / sin rows of every position, and the attention mask table
     (attention.Bucket: cap entries +inf, then a block of -inf). The embedding rows are fp32
@@ -372,7 +372,8 @@ def _lookup_alloc(b: "_Bump", spec, cap: int, block: int = None, D: int = 128,
     slice -- else a table of their own, or with `embed_host` a slot of `rows` of them that the
     host fills from the table it keeps (embed_record: each row's int8 data, then its scale
     words) and a mailbox for the generate loop's requests (opentpu.host.offload.RowLayout).
-    A dense model's image also holds the prompt runs' additive mask tiles (amask_table)."""
+    A dense model's image also holds the prompt runs' additive mask tiles (amask_table); a MoE
+    model's with `masks` (its tiled layer runs: tiled.compile_layer_tile)."""
     block = block or ATTN_BLOCK
     half = len(rope_tables(spec, 0)[0])
     V, H = spec.vocab, spec.hidden
@@ -392,7 +393,7 @@ def _lookup_alloc(b: "_Bump", spec, cap: int, block: int = None, D: int = 128,
         emb.update(onehot=b.alloc(4 * M * onehot_blocks(D, M, "int8") * D), M=M)
     else:
         emb = {"embed": b.alloc(4 * V * H)}
-    if getattr(spec, "moe", None) is None and not getattr(spec, "experts", 0):
+    if masks or (getattr(spec, "moe", None) is None and not getattr(spec, "experts", 0)):
         emb.update(amask=b.alloc(amask_table(block, M).nbytes), amask_M=M)
     return {**emb, "cos_t": b.alloc(4 * cap * half), "sin_t": b.alloc(4 * cap * half),
             "zmask": b.alloc(4 * (cap + block)), "half": half, "block": block, "D": D,
@@ -2697,6 +2698,7 @@ class Engine:
         chunk's records, moe.em_record a row), so the head runs before end_prefill hands them
         back. Bit-identical to step() token by token (the states, the KV cache, the logits):
         only the slots the experts sit in move. Returns the logits after the last token."""
+        from . import tiled as TL
         img, K, B, R = self.image, getattr(self.spec, "conv_k", 1), self.block, self.layer_major
         self._drain()
         tokens = [int(t) for t in tokens]
@@ -2741,7 +2743,9 @@ class Engine:
                     else:
                         n = min(R, len(part) - i, B - p % B)
                         gather = li == 0 and (R == 1 or host)   # (the run gathers its rows:
-                        key = (li, p // B + 1, n, R > 1 and not gather)     # the host's)
+                        if gather and self.layer_tile:          # the host's; untiled)
+                            n = min(n, TL.untiled_rows(img))
+                        key = (li, p // B + 1, n, R > 1 and not gather)
                         if self.layer_tile and n > 1 and not gather:
                             key += ("tile",)                    # (tiled.compile_layer_tile)
                         runs.append((key, dict(RunPos.values(part[i], p, K, B), row=i),
