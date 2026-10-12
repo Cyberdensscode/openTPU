@@ -1,5 +1,5 @@
 """Observability on the board model (sim/verilator/tb_board.sv; docs/observability.md): the
-version 3 register map, the free-running activity counters and their snapshots, and the
+version 5 register map, the free-running activity counters and their snapshots, and the
 hardware trace -- whose records, decoded by opentpu/hwtrace.py, must give exactly the trace
 lines the simulator prints (+trace) for the same run.
 """
@@ -84,7 +84,7 @@ def test_register_map(have_verilator):
                          R_DDR_MTS, R_SCRATCH, R_TRACE_CTRL, R_TRACE_ADDR, 0x0FC, 0x6C, 0x70])
     assert ident == 0x4F545055
     assert ver == (CFG.D << 16) | (CFG.MCOLS << 8) | CFG.LANES
-    assert regmap == 4
+    assert regmap == 5
     # log2 256, log2 1024; WAITW, GEN, STREAM (with DSTEP), run arguments, ACT_ROWS, chash, DSTEP,
     # PAIR, 4-bit, ddr, i2c, temp, trace
     assert caps == (0xC7 << 24) | (8 << 16) | (10 << 8) | 0x80 | 0b1111111
@@ -105,7 +105,7 @@ def test_cfg_registers(have_verilator):
     t = SimTransport(ch_bytes=1 << 20)
     info = Board(t).info()
     c = info["cfg"]
-    assert info["regmap"] == 4
+    assert info["regmap"] == 5 and info["caps2"] == {"gather": True}
     assert (c["S"], c["TMEM_WORDS"], c["IMEM_WORDS"], c["ACT_BLOCKS"]) == (1, 1 << 16, 1 << 15, 128)
     assert (c["DRAM_BYTES"], c["channels"], c["channel_bytes"]) == (1 << 32, 2, 1 << 31)
     assert (c["MXU_IMPL"], c["TMEM_IMPL"], c["VPU_CL"], c["ULANES"]) == (2, 0, 2, 8)
@@ -137,6 +137,52 @@ def test_caps_hostcal(have_verilator):
     assert caps & R.CAP_HOSTCAL and memcal.hostcal(t)
     assert st & R.ST_CALIB0 and st & R.ST_CALIB1
     assert memcal.ensure(t) is None
+
+
+def test_caps2_coll_bar(have_verilator):
+    """Register map 5's CAPS2 bit0 (GATHER): set with the full collective unit; clear on a
+    one-slice board built with COLL_GATHER 0 (otpu_coll_bar), which runs a BAR as before, has
+    the host refuse a program with GATHER, and on one loaded past the host moves no data and
+    raises ERROR."""
+    from opentpu.host.board import NoGather
+    assert SimTransport(ch_bytes=1 << 20).reg_read_many([R_REGMAP, R.R_CAPS2]) == [5, 1]
+    t = SimTransport(ch_bytes=1 << 20, params={"COLL_GATHER": 0}, plusargs=["+coll_gerr_ok"])
+    assert not t.gather
+    assert t.reg_read_many([R_REGMAP, R.R_CAPS2]) == [5, 0]
+    b = Board(t, check=False)
+    assert not b.gather
+    at, src, dst, n = 0x10000, 0, 1024, 32                      # 4 rows of 8 words
+    data = np.arange(1, n + 1, dtype=np.uint32)
+    copy = [I.ld(0, src, n), I.bar(), I.st(0x2000, src, n), I.halt()]
+    gat = [I.ld(0, src, n), I.ld(0x1000, dst, n), I.bar(), I.gather(src, dst, 4, 8, 8, 8, n),
+           I.st(0x2000, dst, n), I.halt()]
+
+    def raw_load(at, w):                    # what load_program does, without the refusal
+        b.write(at, w.view(np.uint8))
+        t.reg_write(R.R_PROG_ADDR, at)
+        t.reg_write(R.R_PROG_N, len(w) // 8)
+        t.reg_write(R_CTRL, R.CTRL_LOAD)
+        t.poll(R_STATUS, R.ST_LOADING, 0)
+
+    def run(prog, load):
+        b.write(0, data.view(np.uint8))
+        b.write(0x1000, np.zeros(4 * n, np.uint8))
+        b.write(0x2000, np.full(4 * n, 0xFF, np.uint8))
+        load(at, np.asarray(I.assemble(prog), np.uint32))
+        t.reg_write(R_CTRL, CTRL_CLEAR)
+        t.reg_write(R_CTRL, CTRL_RUN)
+        t.poll(R_STATUS, ST_HALTED, ST_HALTED)
+        st, ic = t.reg_read_many([R_STATUS, R_ICOUNT])
+        return st, ic, b.read(0x2000, 4 * n).view(np.uint32)
+
+    st, ic, out = run(copy, b.load_program)                     # BAR as before
+    assert st & ST_HALTED and not st & R.ST_ERROR and ic == len(copy)
+    assert (out == data).all()
+    with pytest.raises(NoGather, match="instruction 3"):
+        b.load_program(at, np.asarray(I.assemble(gat), np.uint32))
+    st, ic, out = run(gat, raw_load)                            # GATHER: ERROR, nothing moved
+    assert st & ST_HALTED and st & R.ST_ERROR and ic == len(gat)
+    assert not out.any()
 
 
 def test_i2c_pins(have_verilator):

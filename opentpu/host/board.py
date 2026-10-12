@@ -480,6 +480,12 @@ class SimTransport:
         self.regs_seen: dict[int, int] = {}     # last value read per address
         self.cycles = 0
 
+    @property
+    def gather(self) -> bool:
+        """The model's collective unit runs GATHER (CAPS2 bit0): every multi-slice build, and a
+        one-slice build unless its COLL_GATHER parameter is 0."""
+        return self.slices > 1 or str(self.params.get("COLL_GATHER", 1)) not in ("0", "1'b0")
+
     def mem_write(self, ch: int, off: int, data: np.ndarray) -> None:
         self.flush()
         self.ch[ch][off:off + len(data)] = data
@@ -603,6 +609,24 @@ def rates(a: dict, b: dict, core_khz: int | None) -> dict:
 
 class CardRunning(RuntimeError):
     """The card still runs a program another process started (Board.quiesce)."""
+
+
+class NoGather(RuntimeError):
+    """A program with GATHER for a bitstream whose collective unit runs BAR alone (CAPS2 bit0 =
+    0: a one-slice build without GATHER, docs/infra_hunt.md 5)."""
+
+
+def check_no_gather(progs) -> None:
+    """Raise NoGather when a program (words, 8 per instruction: the opcode in word 0's low
+    byte) has a GATHER: such a bitstream would only acknowledge it and raise ERROR."""
+    from opentpu import isa as I
+    for s, w in enumerate(progs):
+        w = np.asarray(w, "<u4")
+        ops = w[:len(w) // 8 * 8].reshape(-1, 8)[:, 0] & 0xFF
+        hit = np.flatnonzero(ops == I.GATHER)
+        if hit.size:
+            raise NoGather(f"slice {s}'s program has GATHER (instruction {int(hit[0])}), and "
+                           "this bitstream's collective unit runs BAR alone (CAPS2 bit0 = 0)")
 
 
 class Board:
@@ -740,17 +764,23 @@ class Board:
     def info(self) -> dict:
         """D / MCOLS / LANES, STATUS, calibration and, with register map 2: CAPS, CORE_KHZ,
         BUILD_ID, the die temperature and the DDR3 data rate (None where the bitstream lacks
-        them); with map 4 the configuration registers ("cfg": regs.cfg; None before)."""
+        them); with map 4 the configuration registers ("cfg": regs.cfg; None before); with map 5
+        CAPS2 ("caps2": regs.caps2, every capability present before)."""
         v, st, rm = self.t.reg_read_many([R.R_VERSION, R_STATUS, R.R_REGMAP])
         d = {"D": v >> 16, "MCOLS": (v >> 8) & 0xFF, "LANES": v & 0xFF, "status": st,
              "calib": [bool(st & ST_CALIB0), bool(st & ST_CALIB1)],
              "calibrated": bool(st & ST_CALIB0) and bool(st & ST_CALIB1),
              "running": bool(st & ST_RUN) and not st & ST_HALTED,
              "regmap": R.regmap(rm), "caps": None, "core_khz": None, "build_id": None,
-             "temp_c": None, "ddr_mts": None, "act_rows": (v >> 8) & 0xFF, "cfg": None}
+             "temp_c": None, "ddr_mts": None, "act_rows": (v >> 8) & 0xFF, "cfg": None,
+             "caps2": R.caps2(None)}
         if d["regmap"] >= 2:
-            cp, khz, bid, tp, mts = self.t.reg_read_many([R.R_CAPS, R.R_CORE_KHZ, R.R_BUILD_ID,
-                                                          R.R_TEMP, R.R_DDR_MTS])
+            offs = [R.R_CAPS, R.R_CORE_KHZ, R.R_BUILD_ID, R.R_TEMP, R.R_DDR_MTS]
+            if d["regmap"] >= R.CAPS2_SINCE:
+                offs.append(R.R_CAPS2)
+            cp, khz, bid, tp, mts, *c2 = self.t.reg_read_many(offs)
+            if c2:
+                d["caps2"] = R.caps2(c2[0])
             d.update(caps=R.caps(cp), core_khz=khz or None, build_id=bid,
                      temp_c=round(R.temp_c(tp), 2) if cp & R.CAP_TEMP and tp & R.TEMP_VALID
                      else None,
@@ -786,6 +816,14 @@ class Board:
         """The bitstream hashes the channel interleave (CAPS bit7)."""
         c = (self._info or self.info())["caps"]
         return bool(c and c.get("chash"))
+
+    @property
+    def gather(self) -> bool:
+        """The collective unit runs GATHER (CAPS2 bit0; every bitstream before register map 5).
+        The board model's transport knows it (as `slices`)."""
+        if self._info is None and getattr(self.t, "batched", False):
+            return getattr(self.t, "gather", True)
+        return (self._info or self.info())["caps2"]["gather"]
 
     @property
     def v2(self) -> bool:
@@ -958,6 +996,8 @@ class Board:
         for get a HALT."""
         progs = [np.asarray(w, "<u4") for w in words] if isinstance(words, (list, tuple)) \
             else [np.asarray(words, "<u4")]
+        if not self.gather:
+            check_no_gather(progs)
         S = self.slices
         if len(progs) > S:
             raise ValueError(f"{len(progs)} programs for a bitstream of {S} slices")

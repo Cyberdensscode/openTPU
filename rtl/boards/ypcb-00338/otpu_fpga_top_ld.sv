@@ -44,8 +44,10 @@ module otpu_fpga_top_ld #(
                                             // the LiteDRAM CSRs on core_clk (bd_native.tcl)
   parameter int PLATFORM = 1,               // targets/ypcb-00338.toml (CFG_PLATFORM)
   parameter logic [31:0] ARCH_HASH = 32'h0, // its arch_hash (CFG_HASH; create_project.tcl)
-  parameter int TRACE_DEPTH = 16384         // trace records (a power of two; 0: no trace buffer,
+  parameter int TRACE_DEPTH = 16384,        // trace records (a power of two; 0: no trace buffer,
                                             // CAPS trace bit 0: run_vivado.sh TRACE_DEPTH)
+  parameter bit COLL_GATHER = 1'b1          // 0: the collective unit without GATHER (CAPS2 bit0 0:
+                                            // run_vivado.sh COLL_GATHER)
 ) (
   // board
   input  logic        SYS_CLK,              // 50 MHz, AA28
@@ -261,7 +263,8 @@ module otpu_fpga_top_ld #(
                     .LANES(LANES),
                     .ULANES(ULANES), .CORE_KHZ(CORE_KHZ), .BUILD_ID(BUILD_ID), .DDR_MTS(DDR_MTS),
                     .DSTEP(DSTEP), .HOSTCAL(1'b1), .XREG(PCIE_GEN == 2),
-                    .PLATFORM(PLATFORM), .ARCH_HASH(ARCH_HASH), .TRACE_DEPTH(TRACE_DEPTH)) u_sys (
+                    .PLATFORM(PLATFORM), .ARCH_HASH(ARCH_HASH), .TRACE_DEPTH(TRACE_DEPTH),
+                    .COLL_GATHER(COLL_GATHER)) u_sys (
     .clk(core_clk), .rst(core_rst), .ctl_mrst(lrs2), .xclk(xdma_aclk), .xrst,
     .calib, .ded, .temp(device_temp), .led(board_led), .i2c_lo, .i2c_pin({lm73_alert_n, i2c_lvl}),
     .s_ctl_awaddr(ctl_awaddr[11:0]), .s_ctl_awvalid(ctl_awvalid), .s_ctl_awready(ctl_awready),

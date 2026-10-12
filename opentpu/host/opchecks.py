@@ -1,7 +1,7 @@
 """One small program per instruction variant, for otpu-diag's ISA coverage (and
 tests/test_board.py on the board model).
 
-op_checks(cfg, gen, waitw) -> [(group, name, program)]; every program starts from diag_image() in DRAM,
+op_checks(cfg, gen, waitw, gather) -> [(group, name, program)]; every program starts from diag_image() in DRAM,
 stores what it computed below checks.PROG_AT, and is compared with the ISA simulator bit for bit
 by checks.run_demo. The programs are self-contained on the card too, where TMEM and the ACT RAM
 keep the previous run's contents: they only store TMEM words they wrote, and every MM reads ACT
@@ -10,7 +10,8 @@ RAM blocks its own QACT filled.
 Groups (otpu-diag's diagnosis keys on them): control, dma, mxu, quant, collective, vpu,
 vpu-reduce, vpu-composite, vpu-edge, vpu-new (RDOT / OUTER / LOG2, which bitstreams before
 ddec900 lack), gen (RLD, VOP ARGMAX, HALT CHAIN: the decode loop's instructions, CAPS bit30;
-only with gen=True), waitw (WAITW whose condition holds, CAPS bit31; only with waitw=True).
+only with gen=True), waitw (WAITW whose condition holds, CAPS bit31; only with waitw=True);
+collective's GATHER only with gather=True (CAPS2 bit0: a one-slice bitstream may run BAR alone).
 
 The edge values leave out NaN inputs: the RTL and the ISA simulator disagree there (board
 model, 3c270c9): RECIP of a NaN gives 0 in the RTL, NaN in the simulator; MAX / ABS / COPY pass
@@ -81,7 +82,8 @@ def _mm(cfg, m=None, qflags=None, pre=(), ab=0, ors=16, **kw) -> list:
               I.mm(W8, SC, RES, 16, 2, 256, ors, m, ab, 8, **kw), I.st(OUT, RES, n))
 
 
-def op_checks(cfg, gen: bool = False, waitw: bool = False) -> list[tuple[str, str, list]]:
+def op_checks(cfg, gen: bool = False, waitw: bool = False,
+              gather: bool = True) -> list[tuple[str, str, list]]:
     M = cfg.MCOLS
     out = []
 
@@ -150,7 +152,8 @@ def op_checks(cfg, gen: bool = False, waitw: bool = False) -> list[tuple[str, st
                                      row=True)))
 
     # ---- collective (one slice: a strided TMEM copy)
-    add("collective", "GATHER", _p(I.gather(A, RES, 4, 64, 256, 64, 0), I.st(OUT, RES, 256)))
+    if gather:
+        add("collective", "GATHER", _p(I.gather(A, RES, 4, 64, 256, 64, 0), I.st(OUT, RES, 256)))
 
     # ---- VPU: every function under its legal broadcast modes
     for f, name in I.VFUNCS.items():

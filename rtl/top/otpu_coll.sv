@@ -190,6 +190,64 @@ module otpu_coll
 `endif
 endmodule
 
+// The collective unit without GATHER (otpu_board COLL_GATHER = 0, one slice only;
+// docs/infra_hunt.md 5): BAR as otpu_coll runs it (acknowledged two cycles after the request,
+// then a cycle cool-down), no TMEM access (its read and write ports tied off, so synthesis drops
+// the TMEM's collective write port). A GATHER is not run: it is acknowledged like a BAR, moves no
+// data, and raises gerr until reset (STATUS ERROR through otpu_board). The compiler never emits
+// GATHER at S = 1 (opentpu.language.all_gather), and the host refuses to load a program with one
+// on such a bitstream (CAPS2 bit0 = 0: opentpu/host/board.py). Ports as otpu_coll's, plus gerr.
+module otpu_coll_bar
+  import otpu_pkg::*;
+#(
+  parameter int S     = 1,
+  parameter int LANES = 8
+) (
+  input  logic                            clk,
+  input  logic                            rst,
+  input  logic [S-1:0]                    req,
+  input  cmd_t                            cmds [S],
+  input  logic                            gnt,
+  output logic                            ack,
+  output logic [S-1:0][LANES-1:0]         r_en,
+  output logic [S-1:0][LANES-1:0][31:0]   r_addr,
+  input  logic [S-1:0][LANES-1:0][31:0]   r_data,
+  output logic [LANES-1:0]                w_en,
+  output logic [LANES-1:0][31:0]          w_addr,
+  output logic [LANES-1:0][31:0]          w_data,
+  output logic                            gerr      // a GATHER came (sticky until rst)
+);
+  initial if (S != 1) $fatal(1, "otpu_coll_bar: one slice only (GATHER across slices needs otpu_coll)");
+  typedef enum logic [1:0] {C_IDLE, C_ACK, C_COOL} st_t;
+  st_t st;
+  assign ack    = (st == C_ACK);
+  assign r_en   = '0;
+  assign r_addr = '0;
+  assign w_en   = '0;
+  assign w_addr = '0;
+  assign w_data = '0;
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      st <= C_IDLE;
+      gerr <= 1'b0;
+    end else begin
+      case (st)
+        C_IDLE: if (&req) begin
+          st <= C_ACK;
+          if (cmds[0].op == OP_GATHER) gerr <= 1'b1;
+        end
+        C_ACK:  st <= C_COOL;
+        default: st <= C_IDLE;
+      endcase
+    end
+  end
+`ifndef SYNTHESIS
+  always @(posedge clk)
+    if (!rst && st == C_IDLE && &req && cmds[0].op == OP_GATHER && !$test$plusargs("coll_gerr_ok"))
+      $fatal(1, "otpu_coll_bar: GATHER on a collective unit without it (COLL_GATHER = 0)");
+`endif
+endmodule
+
 // The collective unit's side of the SLR crossings (otpu_board at S > 1, every slice a few
 // register stages away). otpu_coll runs unchanged against it, but its `gnt` is this hub's, from
 // the hub's own registers: no slice's TMEM grant in the cycle (at S = 1 the grant is the AND of

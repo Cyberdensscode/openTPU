@@ -1,5 +1,5 @@
 // Host control registers (AXI4-Lite slave, reached from the host through the PCIe bridge's
-// BAR). All in the core clock domain. Register map version 4 (docs/observability.md: the
+// BAR). All in the core clock domain. Register map version 5 (docs/observability.md: the
 // contract with the host); 12 address bits are decoded (the map repeats every 4 KiB).
 //
 //   0x00 ID        RO  0x4F545055 ("OTPU")
@@ -35,7 +35,7 @@
 //   0x30 SW_WR     RO  scalar (QST) write requests taken
 //   0x34 B_STALL   RO  cycles a port B request waited for the memory
 //   0x38 SCRATCH   RW  (host bring-up test)
-//   0x3C REGMAP    RO  register map version (4; 3 before the CFG_* registers)
+//   0x3C REGMAP    RO  register map version (5; 4 before CAPS2, 3 before the CFG_* registers)
 //   0x40 CAPS      RO  bit0 trace buffer, bit1 temperature, bit2 I2C pins, bit3 DDR_MTS,
 //                      bit4 4-bit MM weights (MM flags WF, docs/isa.md), bit5 column reuse (MM
 //                      PAIR / QACT DUP), bit6 DSTEP (the DMA's DeltaNet head step), bit7
@@ -53,6 +53,9 @@
 //   0x50 SNAP      W   latch every free-running counter into its shadow; R: snapshots taken
 //   0x54 DDR_MTS   RO  the DDR3 data rate in MT/s (build parameter; CAPS bit3 when nonzero)
 //   0x58 ACT_ROWS  RO  ACT RAM rows: the most rows of one MM (build parameter; CAPS bit24)
+//   0x5C CAPS2     RO  (version 5; CAPS is full) bit0 GATHER: the collective unit runs GATHER
+//                      (always at S > 1; at S = 1 unless built without it, otpu_board COLL_GATHER:
+//                      then BAR alone, and a GATHER raises ERROR)
 //   0x60 + 4k      RW  ARG0..ARG7: the run's arguments, R8..R15 when RUN rises (CAPS bit25;
 //                      docs/isa.md "Arguments"); reset 0
 //   0x80 CFG_SLICES   RO  slices S (version 4: the configuration the target file built,
@@ -99,6 +102,7 @@ module otpu_ctrl #(
   parameter bit CHASH = 1'b0,            // CAPS bit7: the hashed channel interleave (otpu_native_dram)
   parameter bit DSTEP = 1'b1,            // CAPS bit6 and bit26: the stream engine (DSTEP, STREAM)
   parameter bit HOSTCAL = 1'b0,          // CAPS bit27: the host calibrates the DDR3 controllers
+  parameter bit COLL_GATHER = 1'b1,      // CAPS2 bit0 (with S > 1): the collective unit runs GATHER
   parameter int LDP = 2,                 // cycles after LOAD before the loaders' busy shows (>= 2)
   // the configuration registers (CFG_*, register map 4): the target's values
   parameter int S          = 1,
@@ -183,6 +187,8 @@ module otpu_ctrl #(
                                   8'(TRACE_DEPTH != 0 ? $clog2(TRACE_DEPTH) : 0),
                                   CHASH, DSTEP, 1'b1, 1'b1, DDR_MTS != 0, HAS_I2C, HAS_TEMP,
                                   TRACE_DEPTH != 0};
+
+  localparam logic [31:0] CAPS2 = {31'd0, COLL_GATHER || S > 1};   // bit0 GATHER
 
   logic [63:0] cycles;
   logic [31:0] n_brd, n_bwr, n_ard, n_awr, n_bst, scratch;
@@ -328,7 +334,7 @@ module otpu_ctrl #(
       10'h00C: r_d <= n_awr;
       10'h00D: r_d <= n_bst;
       10'h00E: r_d <= scratch;
-      10'h00F: r_d <= 32'd4;
+      10'h00F: r_d <= 32'd5;
       10'h010: r_d <= CAPS;
       10'h011: r_d <= 32'(CORE_KHZ);
       10'h012: r_d <= BUILD_ID;
@@ -336,6 +342,7 @@ module otpu_ctrl #(
       10'h014: r_d <= n_snap;
       10'h015: r_d <= 32'(DDR_MTS);
       10'h016: r_d <= 32'(ACT_ROWS);
+      10'h017: r_d <= CAPS2;
       10'h018, 10'h019, 10'h01A, 10'h01B, 10'h01C, 10'h01D, 10'h01E, 10'h01F:
         r_d <= arg[r_a[2:0]];
       10'h020: r_d <= 32'(S);

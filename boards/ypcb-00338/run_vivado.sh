@@ -14,6 +14,8 @@
 #                                         # (250 MHz; vivado/bd_native.tcl, docs/offload.md section 6)
 #   TRACE_DEPTH=0 ./run_vivado.sh         # no hardware trace buffer (CAPS trace bit 0; the default is the
 #                                         # target's 16384 records: 32 RAMB36, docs/infra_hunt.md)
+#   COLL_GATHER=0 ./run_vivado.sh         # the collective unit without GATHER: BAR alone (CAPS2 bit0 = 0;
+#                                         # the host refuses GATHER programs; docs/infra_hunt.md 5)
 #   VIVADO_DOCKER=image ./run_vivado.sh   # Docker (e.g. Apple Silicon with Rosetta), see docs/board.md
 #   VIVADO_AS_USER=1                      # Docker on Linux: run as the calling user (see run())
 #   STEP=impl ./run_vivado.sh             # rerun implementation only (keeps project and synthesis)
@@ -89,6 +91,7 @@ export OTPU_IP_CACHE="${OTPU_IP_CACHE-$HOME/.cache/otpu-vivado-ip}"
 export OTPU_FAST="${FAST:-0}"
 export PCIE_GEN="${PCIE_GEN:-2}"    # read by vivado/bd_native.tcl and userclk1_reroute.tcl
 export TRACE_DEPTH="${TRACE_DEPTH:-${T_TRACE_DEPTH:-16384}}"   # read by vivado/create_project.tcl
+export COLL_GATHER="${COLL_GATHER:-1}"                          # read by vivado/create_project.tcl
 if [[ "${STEP:-}" == impl ]]; then
   run "$here/vivado/build.tcl" "$out" "$jobs" impl "${IMPL_STRATEGY:-}"
 else
