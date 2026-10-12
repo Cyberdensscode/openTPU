@@ -993,8 +993,10 @@ The weights' stream is what the tile cuts (each weight read once for T rows); th
 re-stream halves where G <= MCOLS / 2 packs two rows a stream (Qwen3-0.6B, LFM2.5-230M) and is
 unchanged elsewhere; TMEM traffic a row stays within -4% to +6% (the scratch's round trip and
 the staging of the whole operands against fewer per-run tiles); the ACT RAM's writes a row
-fall by up to 42% on four models (where they go in today's runs is not analysed here); its
-reads (the stationary for every weight chunk) are the same a row.
+fall by up to 42% where today's runs pair: PAIR's DUP writes each row of a 4-bit layer's
+operand twice at M <= MCOLS / 2 (Qwen3.5-4B, 2 rows: 187 KB a row, 109 KB with PAIR off, the
+same as the 4-row tile's; dataflow's reading, checked); its reads (the stationary for every
+weight chunk) are the same a row.
 
 - **Bytes first.** The tile streams each weight once for its T rows: a row's DRAM traffic falls
   by a quarter to three quarters on every model, cycles by 8-11% where today's runs hold 2 rows
