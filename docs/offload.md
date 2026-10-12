@@ -4121,6 +4121,47 @@ The layer is the first; ms is a layer's expert run.
 - At 16 rows nearly every expert has one or two entries (89 passes for 80 experts on the 35B), so
   a row costs 1.2-1.3x what it does at 124-131.
 
+A pass's row capacity. A pass streams its expert's weights once for up to C of its entries, so a
+layer makes sum_e ceil(n_e / C) passes. C is 2 today: PAIR, and c(M) grows with each pair of rows
+(13.11). The expert weight bytes a row are those passes x the expert's bytes / rows.
+
+Method:
+- The router traces: ~/otpu-build/offload/traces on omarchy, four texts x 2048 tokens, every MoE
+  layer's top-k.
+- Every non-overlapping window of W prompt rows, every layer, means over them.
+- Computed with tools/offload/em_capacity.py; no RTL.
+
+| model | W | distinct | layer-major R = 2 | C = 2 (today) | C = 32 | C = 64 |
+|:--|--:|--:|--:|--:|--:|--:|
+| 35B | 131 | 138 | 845 passes, 10.77 MB | 564, 7.19 MB | 147, 1.87 MB | 140, 1.79 MB |
+| 35B | 512 | 194 | 3292, 10.75 | 2100, 6.85 | 262, 0.85 | 217, 0.71 |
+| 26B | 124 | 72 | 764, 21.25 | 516, 14.34 | 84, 2.32 | 75, 2.07 |
+| 26B | 512 | 91 | 3156, 21.25 | 2072, 13.95 | 185, 1.25 | 127, 0.86 |
+
+(MB: the expert weights a prompt row, a layer.)
+
+- Against today's C = 2:
+  - C = 32 cuts the dominant byte stream by 74 % (35B) and 84 % (26B) at 124-131 rows, and by
+    88 % and 91 % at 512.
+  - C = 64 cuts it by 75 % and 86 %, and by 90 % and 94 %.
+- At 124-131 rows C = 32 is already near the floor of one pass per distinct expert (138 and 72).
+  The extra gain of 64 shows at 512 rows, where the popular experts have more than 32 entries.
+- The traces reproduce the co-sims' C = 2 passes: 564 and 516 against the synthetic routing's
+  565 and 515.
+
+The ISA check:
+- The harness counts the ISA's passes (`isa_passes`: its WAITWs) and checks them against the
+  bucketing.
+- The prose trace's layer 0, first window (35B 131 rows, 210 experts; 26B 124 rows, 78) runs 580
+  and 516 passes.
+- With `--set MCOLS=16 --set ACT_ROWS=64` it runs the same passes, the same instruction count and
+  the same check.
+- So today's kernel pairs its entries whatever the configuration. C = 32 or 64 needs:
+  - the expert run's pass table to take up to C entries a pass (its bucketing closes a pass at C);
+  - a pass to load, quantize and store up to C rows;
+  - an MXU that takes them at the stream's rate (dsp-pump's MCOLS 16 with ACT_ROWS 64,
+    mx_mxu.md 10).
+
 ## 14. Chatting with a streamed MoE (otpu-chat)
 
 otpu-chat runs the three MoE models bigger than the card's 4 GiB. Their experts stream from a pool

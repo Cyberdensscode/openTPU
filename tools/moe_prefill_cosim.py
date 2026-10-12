@@ -23,7 +23,8 @@ with its tag set and its directory entry {slot, 1.0}. The routing: each row k di
 uniform, of `used` (the layer's distinct experts in a chunk; by default the prompts' measured 144
 of the 35B's 256, 75 of the 26B's 128), or a router trace's layer-local ids (--route, .npy
 [rows, k]). After the run every used expert's tag must be zero and every (row, rank) output
-place written (checked; --isa: the ISA simulator, no cycles). Its record: passes (numpy's
+place written (checked; --isa: the ISA simulator, no cycles, its passes counted by their WAITWs
+and checked against the bucketing's, isa_passes). Its record: passes (numpy's
 bucketing), cycles, ms, ms a pass, the experts' bytes streamed (each pass streams its expert),
 the run's DRAM bytes by kind and a row (em_bytes), and layer-major's passes on the same ids in
 runs of 2 rows (lm2: each run's union; the synthetic routing's adjacent rows are independent,
@@ -45,6 +46,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from opentpu import isa as I  # noqa: E402
 from opentpu import language as ol  # noqa: E402
 from opentpu import rtlsim  # noqa: E402
 from opentpu.compiler import Affine, Tensor  # noqa: E402
@@ -388,9 +390,19 @@ def cmd_em(a):
                    lm2_weight_bytes_a_row=round(lm * fb / rows))
         t = time.time()
         if a.isa:
-            m = Machine(cfg, progs, [dram], args).run(max_steps=1 << 34)
-            after = m.slices[0].dram[:len(dram)]
-            rec["icount"] = m.slices[0].icount
+            m = Machine(cfg, progs, [dram], args)
+            sl, waits = m.slices[0], [0]
+            step = sl.step
+
+            def counted():              # the passes the program ran: one WAITW each
+                waits[0] += sl.prog[sl.pc].op == I.WAITW
+                step()
+            sl.step = counted
+            m.run(max_steps=1 << 34)
+            after = sl.dram[:len(dram)]
+            rec.update(icount=sl.icount, isa_passes=waits[0])
+            if waits[0] != passes:
+                raise AssertionError(f"the ISA ran {waits[0]} passes, the bucketing {passes}")
         else:
             after, st = _rtl(cfg, progs, dram, args, a.profile)
             rec.update(cycles=st["cycles"], ms=round(st["cycles"] / (MHZ * 1e3), 3),
