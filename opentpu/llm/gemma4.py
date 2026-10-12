@@ -860,7 +860,9 @@ class Image:
                    "rope": b.alloc(4 * self.rw * R), "gf": b.alloc(4 * H),
                    "logits": b.alloc(4 * spec.vocab * R), "pli": b.alloc(4 * R * L * P),
                    "mask": b.alloc(4 * 2 * block * mr), "z2": b.alloc(4 * 2 * block),
-                   "g_pln": b.alloc(4 * P)}
+                   "g_pln": b.alloc(4 * P),
+                   # a tiled run's attention outputs, a part at a time (tiled.py: OSCR)
+                   "o": b.alloc(4 * cfg.act_rows * spec.n_q * max(hs, hg))}
         if self.ple_host:           # the generate loop's requests for the next token's record
             self.io["ple_mbox"] = b.alloc(RowLayout.WORDS)
         if self.prefill_rows:       # its residual stream, and moe_ffn_rows' outputs (a
@@ -947,7 +949,10 @@ class Image:
                                D, cfg.MCOLS, "int8" if f == "int8" else "fp4")) for f in fmts},
                            # the decode loop's area
                            "gen": G.alloc(b, spec, cap, block, cfg.IMEM_WORDS)}
-            if not spec.experts:    # the prompt runs' mask tiles, ends then starts (Additive)
+            # the prompt runs' mask tiles, ends then starts (Additive); a MoE model's for its
+            # tiled layer runs (OTPU_TILE as the image is built: tiled.compile_layer_tile)
+            from .prefill import tile_flag
+            if not spec.experts or (self.prefill_rows and tile_flag(None)):
                 self.lookup.update(amask=b.alloc(2 * amask_table(block, cfg.MCOLS).nbytes),
                                    amask_M=cfg.MCOLS)
         self.offload = None
@@ -1375,6 +1380,8 @@ class Image:
             g_pln=_tdesc(self.io["g_pln"], (P,)),
             logits=_tdesc(self.io["logits"], (1, spec.vocab)),
             logitsr=_tdesc(self.io["logits"], (R, spec.vocab)),
+            oscr=_tdesc(self.io["o"], (self.cfg.act_rows,
+                                       spec.n_q * max(spec.head_dim, spec.global_head_dim))),
             pli=_tdesc(self.io["pli"], (R, L, P)),
             mask=_tdesc(self.io["mask"], (2, self.block)), z2=self.io["z2"],
             xbuf=_tdesc(self.io["xbuf"], (self.prefill_rows, H)) if self.prefill_rows else None,

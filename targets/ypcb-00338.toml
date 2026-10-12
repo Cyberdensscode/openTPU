@@ -26,6 +26,8 @@ STREAM = true
 [uarch]                         # timing only: RTL parameters the programs do not see
 MXU_IMPL = 2                    # systolic (docs/mxu_systolic.md)
 MXU_CL = 16
+MXU_E = 4                       # epilogue lanes: MCOLS, full rate (E 2 slowed Phi-4-mini and
+                                # SmolLM3's decode attention below production's: mx_mxu.md 9)
 VPU_CL = 2
 ULANES = 8
 TMEM_IMPL = 0                   # 0: one copy per read port (block RAM); 1: banked 1R1W macros

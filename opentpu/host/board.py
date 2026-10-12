@@ -536,6 +536,8 @@ class SimTransport:
              "ACT_ROWS": cfg.act_rows,
              "VPU_CL": rtlsim.UARCH.get("VPU_CL", 2), "ULANES": rtlsim.UARCH.get("ULANES", 8),
              "MXU_IMPL": rtlsim.UARCH.get("MXU_IMPL", 2),
+             # the MXU's epilogue lanes as the target builds them (OTPU_MXU_E overrides)
+             "MXU_E": rtlsim.UARCH.get("MXU_E", self.target.uarch.get("MXU_E", 0)),
              "MEM_NATIVE": 2 if native == "ld" else 1}
         p.update(self.params)
         # the configuration registers (register map 4) as the target's build of this
