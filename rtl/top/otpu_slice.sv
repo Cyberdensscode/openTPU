@@ -60,8 +60,10 @@ module otpu_slice
   parameter int TMEM_SBH   = 0,       // TMEM_IMPL 3: the sub-bank hashed (otpu_tmem SBH)
   parameter bit TMEM_RPL   = 1'b0,    // TMEM_IMPL 3: lost reads replayed (otpu_tmem RPL), the
                                       //   board's arbiter (ARB_MASK) with the replays' holds
-  parameter bit TMEM_TDP   = 1'b0     // TMEM_IMPL 3: true dual-port RAMs (otpu_tmem TDP), a
+  parameter bit TMEM_TDP   = 1'b0,    // TMEM_IMPL 3: true dual-port RAMs (otpu_tmem TDP), a
                                       //   unit's ports on different RAM ports (TM_SIDE)
+  parameter bit TMEM_GST   = 1'b0     // TMEM_IMPL 3: QUANT 3 and COLL the DMA's guests, as
+                                      //   TMEM_IMPL 0's (otpu_tmem GST: one data select)
 ) (
   input  logic          clk,
   input  logic          sys_rst,
@@ -351,7 +353,7 @@ module otpu_slice
               .SID(SID), .IMPL((TMEM_IMPL == 2) ? 0 : TMEM_IMPL), .NCP(NCP), .CPY(CPY), .RQ(TMEM_RQ),
               .PRANK((TMEM_IMPL == 3) ? PRANK3 : PRANK), .NSB(TMEM_NSB), .SBP(TMEM_SBP),
               .GRP(RGRP), .SBH(TMEM_SBH), .RPL(TMEM_RPL), .RPLM(~(NRP'(1) << P_COLL)),
-              .TOPP(P_DMA), .TDP(TMEM_TDP), .SIDE(TM_SIDE)) u_tmem (
+              .TOPP(P_DMA), .TDP(TMEM_TDP), .SIDE(TM_SIDE), .GST(TMEM_GST)) u_tmem (
     .clk, .r_en, .r_req(rq_t), .r_addr, .r_data, .w_en, .w_req(wq_en), .w_gnt, .w_addr,
     .w_data, .blk_x(tm_bx), .blk_s(tm_bs), .lost(tm_lost), .frz(tm_frz), .dump);
   assign coll_rdata = r_data[P_COLL];
@@ -586,8 +588,9 @@ module otpu_slice
   // the guests on the DMA's TMEM copy read only when no port before them there asks (from the
   // requests: the copy's block RAM address does not wait for the grants)
   // (TMEM_IMPL 1: no guests, the banked arbiter counts every copy's banks)
-  wire q3_blk = (TMEM_IMPL == 0) && (|rq_en[P_Q3]) && (|rq_en[P_DMA]);
-  wire coll_blk = (TMEM_IMPL == 0) && (|rq_en[P_COLL]) && ((|rq_en[P_DMA]) || (|rq_en[P_Q3]));
+  localparam bit GUESTS = TMEM_IMPL == 0 || (TMEM_IMPL == 3 && TMEM_GST);
+  wire q3_blk = GUESTS && (|rq_en[P_Q3]) && (|rq_en[P_DMA]);
+  wire coll_blk = GUESTS && (|rq_en[P_COLL]) && ((|rq_en[P_DMA]) || (|rq_en[P_Q3]));
   // TMEM_RPL: a group whose port replays a lost read is held (tm_frz, a register); the
   // collective, which is not replayed, reads only where its request does not lose (tm_bx)
   logic [NG-1:0] rpl_hold, rpl_frz;

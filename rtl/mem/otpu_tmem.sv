@@ -72,7 +72,8 @@ module otpu_tmem #(
   parameter logic [NRP-1:0] RPLM = '1,    // RPL: the ports whose reads may be replayed
   parameter int   TOPP  = 0,              // RPL: the port whose request comes before the replays
   parameter bit   TDP   = 1'b0,           // IMPL 3: true dual-port RAMs (see IMPL 3 below)
-  parameter logic [NRP-1:0] SIDE = '0     // TDP: each read port's RAM port (1: A, the writes')
+  parameter logic [NRP-1:0] SIDE = '0,    // TDP: each read port's RAM port (1: A, the writes')
+  parameter bit   GST   = 1'b0            // IMPL 3: SH_MASK's ports are SH_HOST's guests (see IMPL 3)
 ) (
   input  logic                                clk,
   input  logic [NRP-1:0][LANES-1:0]           r_en,     // granted reads
@@ -96,6 +97,8 @@ module otpu_tmem #(
   localparam int IW = $clog2(BD);
   initial if ((IMPL == 1 || IMPL == 3) && WPB != 1) $fatal(1, "otpu_tmem: IMPL %0d needs WPB = 1", IMPL);
   initial if (TDP && IMPL != 3) $fatal(1, "otpu_tmem: TDP needs IMPL 3");
+  initial if (GST && (IMPL != 3 || (RPL && SH_HOST != TOPP)))
+    $fatal(1, "otpu_tmem: GST needs IMPL 3, and SH_HOST = TOPP with RPL (no replay of a guest's read)");
   initial if (IMPL == 3 && (NSB < 2 || (1 << $clog2(NSB)) != NSB || SBP < BW || SBP + $clog2(NSB) > BW + IW))
     $fatal(1, "otpu_tmem: IMPL 3 sub-banks NSB %0d (a power of 2, >= 2) at bit SBP %0d", NSB, SBP);
   initial if (IMPL == 1) for (int p = 0; p < NRP; p++)
@@ -309,6 +312,10 @@ module otpu_tmem #(
   // port A of a RAM being written loses unless it reads the written word (a read takes the
   // bypass, a replay port A's read-first word). On the 7-series a true dual-port RAMB36 is at most
   // 36 bits wide: a RAM of 1K words is one RAMB36, as in the simple dual-port.
+  // GST: IMPL 0's guests (SH_MASK, the slice's QUANT 3 and COLL): a guest reads only while SH_HOST
+  // and the guests before it ask nothing (the slice's q3_blk / coll_blk), so it has no asker of its
+  // own: SH_HOST's asker asks for the first guest that reads, and the guests take its data (one
+  // data select for the three). With RPL the host is TOPP, which never loses.
   // an asker's rank (0 first): without RPL PRANK's; with it TOPP's request, the replays in PRANK
   // order, then the other requests in PRANK order. rlive: the port's reads may be replayed
   function automatic int rnk(input int p, input bit rp);
@@ -324,7 +331,8 @@ module otpu_tmem #(
     return (TDP && SIDE[p]) ? 1 : 0;
   endfunction
   // OTPU_TMEM_ABL_* (EXPERIMENTAL, out-of-context LUT breakdown only, docs/tmem_nocopy.md 6.3: the
-  // TMEM is wrong with any of them): _DSEL a port takes sub-bank 0's word (no data select), _CMP no
+  // TMEM is wrong with any of them): _DSEL a port takes two fixed RAMs' words XORed (no data
+  // select; every RAM output still used), _CMP no
   // conflict compares (nothing lost), _RPL no replay buffers (an asker is its request), _AMUX a
   // RAM's address is its side's first port's (no priority multiplexer)
   if (IMPL == 3) begin : g_one
@@ -365,6 +373,23 @@ module otpu_tmem #(
     logic [NRP-1:0][LANES-1:0][IW-1:0] rpa;
     logic [NRP-1:0][LANES-1:0]         rpl;
     logic [NRP-1:0]                    rp;      // the port's asker is its replay
+    // each port's requested banks and rows (GST: the host's are the first reading guest's while
+    // it asks nothing itself; a guest asks nothing)
+    logic [NRP-1:0][LANES-1:0]         qe;
+    logic [NRP-1:0][LANES-1:0][IW-1:0] qa;
+    always_comb begin
+      logic take;
+      qe = pb_en; qa = pb_a;
+      take = |r_req[SH_HOST];
+      if (GST)
+        for (int g = 0; g < NRP; g++)
+          if (SH_MASK[g]) begin
+            if (!take && |r_req[g]) begin
+              qe[SH_HOST] = pb_en[g]; qa[SH_HOST] = pb_a[g]; take = 1'b1;
+            end
+            qe[g] = '0;
+          end
+    end
     // each asker's banks, bank rows, sub-banks and RAM rows
     logic [NRP-1:0][LANES-1:0]          ae;
     logic [NRP-1:0][LANES-1:0][IW-1:0]  aa;
@@ -377,8 +402,8 @@ module otpu_tmem #(
       assign rp[i] = rlive(i) && rpv[i];
 `endif
       for (genvar b = 0; b < LANES; b++) begin : g_b
-        assign ae[i][b] = rp[i] ? rpe[i][b] : pb_en[i][b];
-        assign aa[i][b] = rp[i] ? rpa[i][b] : pb_a[i][b];
+        assign ae[i][b] = rp[i] ? rpe[i][b] : qe[i][b];
+        assign aa[i][b] = rp[i] ? rpa[i][b] : qa[i][b];
         assign asb[i][b] = sub_of(aa[i][b]);
         assign arw[i][b] = ram_row(aa[i][b]);
       end
@@ -491,7 +516,7 @@ module otpu_tmem #(
     always_ff @(posedge clk)
       for (int p = 0; p < NRP; p++) begin
         rpv[p] <= lost[p];
-        if (!rpv[p]) begin rpe[p] <= pb_en[p]; rpa[p] <= pb_a[p]; rpl[p] <= r_en[p]; end
+        if (!rpv[p]) begin rpe[p] <= qe[p]; rpa[p] <= qa[p]; rpl[p] <= r_en[p]; end
       end
 `ifndef SYNTHESIS
     initial rpv = '0;
@@ -550,6 +575,9 @@ module otpu_tmem #(
     // each port's data: per bank, the RAM it asked on its side (registered with the read), or the
     // write still in the registered stage that its word hit (a replay: the RAM's word, see above)
     for (genvar p = 0; p < NRP; p++) begin : g_pq
+     if (GST && SH_MASK[p]) begin : g_gu
+      assign pq[p] = pq[SH_HOST];
+     end else begin : g_ho
       localparam int SD = sd_of(p);
       logic [LANES-1:0][LSB-1:0] ss;
       logic [LANES-1:0]          bh;
@@ -562,19 +590,21 @@ module otpu_tmem #(
 `endif
             ss[b] <= sub_of(rpa[p][b]);
             bh[b] <= 1'b0;
-          end else if (pb_en[p][b]) begin
-            ss[b] <= sub_of(pb_a[p][b]);
-            bh[b] <= pw_v[b][0] && pw_a[b][0] == pb_a[p][b];
+          end else if (qe[p][b]) begin
+            ss[b] <= sub_of(qa[p][b]);
+            bh[b] <= pw_v[b][0] && pw_a[b][0] == qa[p][b];
           end
       always_comb
 `ifdef OTPU_TMEM_ABL_DSEL
-        for (int b = 0; b < LANES; b++) pq[p][b] = bh[b] ? pd[b][0] : s_q[b][0][SD];
+        for (int b = 0; b < LANES; b++)
+          pq[p][b] = bh[b] ? pd[b][0] : s_q[b][p % NSB][SD] ^ s_q[b][(p + NSB / 2) % NSB][SD];
 `else
         for (int b = 0; b < LANES; b++) pq[p][b] = bh[b] ? pd[b][0] : s_q[b][ss[b]][SD];
 `endif
 `ifndef SYNTHESIS
       initial bh = '0;
 `endif
+     end
     end
   end else begin : g_nosb
     assign blk_x = '0;

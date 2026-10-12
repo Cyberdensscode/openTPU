@@ -1,14 +1,16 @@
 # EXPERIMENTAL (docs/tmem_nocopy.md): out-of-context synthesis + implementation of tmem_nc_top
 # (the TMEM and the slice's arbiter for it, every input and output registered):
 #   vivado -mode batch -nojournal -source rtl/exp/tmem_nocopy/ooc.tcl -tclargs <out> <VAR> \
-#     <WORDS> <NSB> <SBP> <PART> <PERIOD_NS> [SBH] [MMCM] [FAMILY] [ABL] [SYNTHONLY]
+#     <WORDS> <NSB> <SBP> <PART> <PERIOD_NS> [SBH] [MMCM] [FAMILY] [ABL] [SYNTHONLY] [GST]
 # MMCM 1 (VAR 6, P3, always): the core clock (and 2x) from an MMCM on clk (FAMILY 0 7-series, 1
 # UltraScale+), with the pumped copies' multicycle paths (rtl/exp/tmem_pump/ooc.tcl's). ABL: an
 # otpu_tmem ablation (DSEL, CMP, RPL, AMUX: OTPU_TMEM_ABL_*; a LUT breakdown only, the TMEM is
-# wrong with one), "-" none. SYNTHONLY 1: stop after opt_design (utilization only).
+# wrong with one), "-" none. SYNTHONLY 1: stop after opt_design (utilization only). GST 1: QUANT 3
+# and COLL the DMA's guests (VAR 4 / 5).
 # Prints OTPU_* summary lines; reports go to <out>.
 set out [file normalize [lindex $argv 0]]
-lassign [lrange $argv 1 end] var words nsb sbp part period sbh mmcm family abl synthonly
+lassign [lrange $argv 1 end] var words nsb sbp part period sbh mmcm family abl synthonly gst
+if {$gst eq ""} { set gst 0 }
 if {$sbh eq ""} { set sbh 0 }
 if {$mmcm eq ""} { set mmcm 0 }
 if {$var == 6} { set mmcm 1 }
@@ -26,7 +28,7 @@ read_verilog -sv [list $root/rtl/tech/generic/otpu_tech_ram.sv $root/rtl/mem/otp
 synth_design -top tmem_nc_top -part $part -mode out_of_context -flatten_hierarchy rebuilt \
   -verilog_define $defs -generic VAR=$var -generic WORDS=$words -generic NSB=$nsb \
   -generic SBP=$sbp -generic SBH=$sbh -generic MMCM=$mmcm -generic FAMILY=$family \
-  -generic CLKIN_NS=$period
+  -generic CLKIN_NS=$period -generic GST=$gst
 create_clock -period $period -name clk [get_ports clk]
 if {$mmcm} {
   set cs [get_clocks -quiet -of_objects [get_pins -hier -filter {NAME =~ *u_mmcm/CLKOUT0}]]

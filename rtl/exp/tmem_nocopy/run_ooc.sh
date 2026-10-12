@@ -19,7 +19,9 @@
 #   k7-p3      P3 (the copies pumped at 2x, VAR 6) with the board's arbiter, the clocks from an
 #              MMCM (133.33 / 266.67 MHz); k7-v0m the card's TMEM on the same MMCM clocking
 #   s-<VAR>-<ABL>  synthesis + opt only (LUTs), xc7k480t-2: VAR v0, p3, r8iR, r8xR, r4xR; ABL
-#              full, DSEL, CMP, RPL, AMUX (otpu_tmem OTPU_TMEM_ABL_*: the LUT breakdown)
+#              full, DSEL, CMP, RPL, AMUX (otpu_tmem OTPU_TMEM_ABL_*: the LUT breakdown); VAR r8xgR,
+#              r4xgR, r2xgR: the dual-port replays with QUANT 3 and COLL the DMA's guests (GST)
+#   k7-r8xgR, k7-r4xgR, k7-r2xgR   those placed and routed
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 O=${1:?outdir}; shift
 mkdir -p "$O"
@@ -58,6 +60,9 @@ for s in "$@"; do
     k7-r4xR)  viv $s 5 65536 4 3 $K7 7.5 0 ;;
     k7-r2xR)  viv $s 5 65536 2 3 $K7 7.5 0 ;;
     k7-p3)    viv $s 6 65536 8 3 $K7 7.5 0 1 0 ;;
+    k7-r8xgR) viv $s 5 65536 8 3 $K7 7.5 0 0 0 - 0 1 ;;
+    k7-r4xgR) viv $s 5 65536 4 3 $K7 7.5 0 0 0 - 0 1 ;;
+    k7-r2xgR) viv $s 5 65536 2 3 $K7 7.5 0 0 0 - 0 1 ;;
     k7-v0m)   viv $s 0 65536 8 3 $K7 7.5 0 1 0 ;;
     s-*)
       v=${s#s-}; a=${v#*-}; v=${v%%-*}; [ "$a" = full ] && a=-
@@ -68,6 +73,9 @@ for s in "$@"; do
         r8xR) viv $s 5 65536 8 3 $K7 7.5 0 0 0 $a 1 ;;
         r4xR) viv $s 5 65536 4 3 $K7 7.5 0 0 0 $a 1 ;;
         r2xR) viv $s 5 65536 2 3 $K7 7.5 0 0 0 $a 1 ;;
+        r8xgR) viv $s 5 65536 8 3 $K7 7.5 0 0 0 $a 1 1 ;;
+        r4xgR) viv $s 5 65536 4 3 $K7 7.5 0 0 0 $a 1 1 ;;
+        r2xgR) viv $s 5 65536 2 3 $K7 7.5 0 0 0 $a 1 1 ;;
         *) echo "unknown step $s" >> "$O/progress.txt" ;;
       esac ;;
     *) echo "unknown step $s" >> "$O/progress.txt" ;;

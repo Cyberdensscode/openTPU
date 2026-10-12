@@ -1008,22 +1008,25 @@ def test_axi_write_bursts(have_verilator, stall, seed):
     assert aw == beats
 
 
-@pytest.mark.parametrize("impl,nsb,sbp,sbh,rpl,tdp", [
-    (0, 4, 2, 0, 0, 0), (1, 4, 2, 0, 0, 0), (3, 4, 2, 0, 0, 0), (3, 2, 4, 0, 0, 0), (3, 8, 2, 0, 0, 0),
-    (3, 4, 2, 2, 0, 0), (3, 4, 2, 0, 1, 0), (3, 4, 2, 2, 1, 0), (3, 2, 2, 1, 1, 0), (3, 4, 2, 0, 0, 1),
-    (3, 4, 2, 0, 1, 1), (3, 4, 2, 2, 1, 1), (3, 8, 2, 0, 1, 1)])
-def test_tmem_random_traffic(have_verilator, impl, nsb, sbp, sbh, rpl, tdp):
+@pytest.mark.parametrize("impl,nsb,sbp,sbh,rpl,tdp,gst", [
+    (0, 4, 2, 0, 0, 0, 0), (1, 4, 2, 0, 0, 0, 0), (3, 4, 2, 0, 0, 0, 0), (3, 2, 4, 0, 0, 0, 0),
+    (3, 8, 2, 0, 0, 0, 0), (3, 4, 2, 2, 0, 0, 0), (3, 4, 2, 0, 1, 0, 0), (3, 4, 2, 2, 1, 0, 0),
+    (3, 2, 2, 1, 1, 0, 0), (3, 4, 2, 0, 0, 1, 0), (3, 4, 2, 0, 1, 1, 0), (3, 4, 2, 2, 1, 1, 0),
+    (3, 8, 2, 0, 1, 1, 0), (3, 4, 2, 0, 1, 0, 1), (3, 2, 2, 0, 1, 0, 1), (3, 8, 2, 2, 1, 0, 1)])
+def test_tmem_random_traffic(have_verilator, impl, nsb, sbp, sbh, rpl, tdp, gst):
     """TMEM alone against a reference model; most reads hit the previous cycle's writes, which
     are still in TMEM's registered write stage (the bypass). impl 1: the banked TMEM (copies of
     1R1W bank RAMs shared by ports, one granted read per copy and bank). impl 3 (EXPERIMENTAL,
     docs/tmem_nocopy.md): one copy, nsb RAMs a bank with the sub-bank at word-address bit sbp
     (interleaved groups, or regions; sbh hashed), a port read only while no port before it takes
     one of its RAMs for another word, or (rpl) every read granted and a lost one replayed while
-    its group holds; tdp: true dual-port RAMs, one port on their port A with the writes."""
+    its group holds; tdp: true dual-port RAMs, one port on their port A with the writes; gst: a
+    port the guest of the first (no asker of its own, the host's data)."""
     exe = rtlsim.build("tb_tmem", [rtlsim.RTL / "mem/otpu_tmem.sv",
                                    rtlsim.RTL / "tech/generic/otpu_tech_ram.sv",
                                    rtlsim.TB / "tb_tmem.sv"],
-                       {"IMPL": impl, **({"NSB": nsb, "SBP": sbp, "SBH": sbh, "RPL": rpl, "TDP": tdp}
+                       {"IMPL": impl, **({"NSB": nsb, "SBP": sbp, "SBH": sbh, "RPL": rpl, "TDP": tdp,
+                                          "GST": gst}
                                          if impl == 3 else {})})
     r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=120)
     assert r.returncode == 0 and "PASS" in r.stdout, r.stdout[-2000:] + r.stderr[-2000:]

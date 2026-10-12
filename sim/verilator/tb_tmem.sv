@@ -12,9 +12,11 @@
 // request from the group's ports), and its lanes show the word of the first read's cycle once a
 // replay of it wins (the cycle a read or replay loses, the port's lanes are not checked); SBH
 // hashes the sub-bank. TDP: true dual-port RAMs, port 2 on their port A with the writes, ports 0
-// and 1 on port B.
+// and 1 on port B. GST: port 2 is port 0's guest (it reads only while port 0 asks nothing; its
+// group is not granted otherwise, as the slice's q3_blk).
 module tb_tmem #(parameter int IMPL = 0, parameter int NSB = 4, parameter int SBP = 2,
-                 parameter int SBH = 0, parameter bit RPL = 1'b0, parameter bit TDP = 1'b0);
+                 parameter int SBH = 0, parameter bit RPL = 1'b0, parameter bit TDP = 1'b0,
+                 parameter bit GST = 1'b0);
   localparam int WORDS = 256, LANES = 4, NRP = 3, NWP = 2, WPB = 1, CYCLES = 20000;
   localparam int BW = $clog2(LANES);
   localparam int NCP = 2;
@@ -31,7 +33,8 @@ module tb_tmem #(parameter int IMPL = 0, parameter int NSB = 4, parameter int SB
   localparam logic [NRP-1:0][2:0] GRP = {3'd1, 3'd1, 3'd0};
   otpu_tmem #(.WORDS(WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .WPB(WPB), .IMPL(IMPL),
               .NCP(NCP), .CPY(CPY), .NSB(NSB), .SBP(SBP), .PRANK({3'd2, 3'd1, 3'd0}),
-              .GRP(GRP), .SBH(SBH), .RPL(RPL), .TOPP(0), .TDP(TDP), .SIDE(3'b100)) dut (
+              .GRP(GRP), .SBH(SBH), .RPL(RPL), .TOPP(0), .TDP(TDP), .SIDE(3'b100), .GST(GST),
+              .SH_HOST(0), .SH_MASK(GST ? 3'b100 : 3'b000)) dut (
     .clk, .r_en, .r_req, .r_addr, .r_data, .w_en, .w_req, .w_gnt, .w_addr, .w_data,
     .blk_x, .blk_s, .lost, .frz, .dump(1'b0));
 
@@ -40,7 +43,8 @@ module tb_tmem #(parameter int IMPL = 0, parameter int NSB = 4, parameter int SB
   bit          valid_q [NRP][LANES];
   int unsigned recent [8];              // addresses written in the last cycles
   int unsigned last_wrote [$];          // the previous cycle's writes (still registered in TMEM)
-  int          hits = 0, checks = 0, blocked = 0, replays = 0;
+  int          hits = 0, checks = 0, blocked = 0, replays = 0, guest = 0;
+  localparam int MINB = GST ? 50 : 1000;   // (GST: one port left to lose, to the host)
   logic [NRP-1:0] lostc;
   logic [NRP-1:0][LANES-1:0]       pend_v = '0;
   logic [NRP-1:0][LANES-1:0][31:0] pend_a;
@@ -79,12 +83,18 @@ module tb_tmem #(parameter int IMPL = 0, parameter int NSB = 4, parameter int SB
           r_addr[p][l] = pick_addr(perm[l]);
           if (r_req[p][l]) banks[perm[l]] = 1'b1;
         end
+        if (GST && p == 0 && $urandom_range(1) == 0) begin   // the host idle: the guest's turn
+          r_req[0] = '0; banks = '0;
+        end
         g = $urandom_range(3) != 0 && (IMPL != 1 || (banks & rbusy[CPY[p]]) == '0);
         if (g && IMPL == 1) rbusy[CPY[p]] |= banks;
         if (RPL)                       // a group replaying a lost read holds: no request
           for (int q = 0; q < NRP; q++)
             if (frz[q] && GRP[q] == GRP[p]) begin g = 0; r_req[p] = '0; end
         for (int l = 0; l < LANES; l++) r_en[p][l] = g && r_req[p][l];
+        if (GST && p == 2 && (|r_req[0]) && (|r_req[2])) begin   // the guest's group waits
+          r_en[1] = '0; r_en[2] = '0;
+        end
       end
       // ---- writes: each port's lanes take a random permutation of banks
       busy = '0;
@@ -128,6 +138,7 @@ module tb_tmem #(parameter int IMPL = 0, parameter int NSB = 4, parameter int SB
       end
       for (int p = 0; p < NRP; p++) if (lostc[p]) blocked++;
       for (int p = 0; p < NRP; p++) if (frz[p]) replays++;
+      if (GST && |r_en[2]) guest++;
       // ---- the reads see the memory before this cycle's writes
       for (int p = 0; p < NRP; p++)
         for (int l = 0; l < LANES; l++)
@@ -159,10 +170,11 @@ module tb_tmem #(parameter int IMPL = 0, parameter int NSB = 4, parameter int SB
           end
     end
     if (hits < 1000) $fatal(1, "only %0d reads of the previous cycle's writes", hits);
-    if (IMPL == 3 && blocked < 1000) $fatal(1, "only %0d blocked reads", blocked);
-    if (RPL && replays < 1000) $fatal(1, "only %0d replays", replays);
-    $display("PASS checks=%0d bypass_reads=%0d blocked=%0d replays=%0d", checks, hits, blocked,
-             replays);
+    if (IMPL == 3 && blocked < MINB) $fatal(1, "only %0d blocked reads", blocked);
+    if (RPL && replays < MINB) $fatal(1, "only %0d replays", replays);
+    if (GST && guest < 1000) $fatal(1, "only %0d guest reads", guest);
+    $display("PASS checks=%0d bypass_reads=%0d blocked=%0d replays=%0d guest=%0d", checks, hits,
+             blocked, replays, guest);
     $finish;
   end
 endmodule

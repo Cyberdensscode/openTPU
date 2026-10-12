@@ -24,6 +24,7 @@ module tmem_nc_top #(
   parameter int NSB = 8,
   parameter int SBP = 3,
   parameter int SBH = 0,
+  parameter bit GST = 1'b0,          // VAR 4 / 5: QUANT 3 and COLL the DMA's guests (TMEM_GST)
   parameter bit MMCM = 1'b0,
   parameter int FAMILY = 0,
   parameter real CLKIN_NS = 7.5
@@ -152,6 +153,9 @@ module tmem_nc_top #(
       logic [NG-1:0] aok;
       for (int g = 0; g < NG; g++) begin
         aok[g] = !frzg[g] && !(g == G_COLL && tm_bx[P_COLL] && |rq_en[P_COLL]);
+        if (GST && ((g == G_Q && (|rq_en[P_Q3]) && (|rq_en[P_DMA])) ||
+                    (g == G_COLL && (|rq_en[P_COLL]) && ((|rq_en[P_DMA]) || (|rq_en[P_Q3])))))
+          aok[g] = 1'b0;
         for (int h = 0; h < g; h++) if (aok[h] && acf[g][h]) aok[g] = 1'b0;
       end
       gnt = aok;
@@ -246,10 +250,10 @@ module tmem_nc_top #(
     assign tm_frz = '0;
   end else begin : g_tm
     otpu_tmem #(.WORDS(WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .WPB(1), .GEN_R(GEN_R),
-                .GEN_W(GEN_W), .SH_HOST(P_DMA), .SH_MASK(VAR == 0 ? SH_MASK : '0), .SID(0),
+                .GEN_W(GEN_W), .SH_HOST(P_DMA), .SH_MASK((VAR == 0 || GST) ? SH_MASK : '0), .SID(0),
                 .IMPL(VAR == 0 ? 0 : 3), .PRANK(PRANK3), .NSB(NSB), .SBP(SBP), .GRP(RGRP),
                 .SBH(SBH), .RPL(VAR >= 4), .RPLM(~(NRP'(1) << P_COLL)), .TOPP(P_DMA),
-                .TDP(VAR == 5), .SIDE(TM_SIDE)) u_tmem (
+                .TDP(VAR == 5), .SIDE(TM_SIDE), .GST(GST)) u_tmem (
       .clk(ck), .r_en, .r_req(rq_t), .r_addr, .r_data, .w_en, .w_req(wq_en), .w_gnt, .w_addr,
       .w_data, .blk_x(tm_bx), .blk_s(tm_bs), .lost(tm_lost), .frz(tm_frz), .dump(1'b0));
   end
