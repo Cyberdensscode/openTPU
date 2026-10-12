@@ -32,7 +32,10 @@ In short:
   Gemma 4 E4B: the head and gate / up 0-11 in fp4 as below. The streamed MoE models
   ([offload.md](offload.md) 14.2, `streamed.FORMATS`): LFM2.5-8B-A1B nvfp4, its experts
   included, with an int8 head; Qwen3.5-35B-A3B nvfp4 attention, DeltaNet and shared expert,
-  fp4 experts and an int8 head; Gemma 4 26B-A4B-it int8 layers with fp4 experts and head.
+  fp4 experts and an int8 head; Gemma 4 26B-A4B-it int8 layers, nvfp4 experts and an fp4 head.
+  The 26B's nvfp4 experts are the user's choice (2026-10-12), over the rule: on chat text NVFP4
+  gains nothing over fp4x6 there, but it is the more robust to text off the scan's
+  distribution, for an estimated 6.6% more decode time.
 - **Before MX** (the scans on this page, the former fp4). Phi-4-mini: `mlp@4-29=fp4`, 31% faster
   than int8 for dKL 2.8% (fp4: 64% for 16%). Qwen3.5-4B: `delta=fp4,mlp=fp4` (the attention layers
   int8), 56% for 5.3% (fp4: 64% for 6.5%, on its bar). SmolLM3-3B: `gateup@9-35=fp4`, 23% for 2.1%.

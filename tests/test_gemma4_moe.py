@@ -206,8 +206,8 @@ def test_moe_device_follows_the_emulation(moe, wf, formats):
     token to the VPU's EXP2 / RECIP (the routing weights' softmax, gelu_tanh: 1 - 1.2e-4
     here), the others to cosine > 0.99. The card's experts in the first layer, whose input no
     routing has touched, are the emulation's wherever its k-th logit is clear of the next;
-    int8 follows HF. The experts in nvfp4 over int8 layers too (the 26B's alternative to its
-    fp4 experts: OTPU_FORMATS=experts=nvfp4)."""
+    int8 follows HF. The experts in nvfp4 over int8 layers too (the 26B's default on the card,
+    streamed.FORMATS)."""
     m, W, spec = moe
     spec = G.replace(spec, formats=formats)
     toks = [int(t) for t in np.random.default_rng(1).integers(0, 1000, 12)]
@@ -312,8 +312,8 @@ def test_moe_experts_gain_with_outliers(moe_g2):
                                            ("int8", "fp4", "experts=nvfp4")])
 def test_moe_small_cache_is_bit_exact(moe, wf, hf, formats):
     """k slots per layer: nearly every request misses and streams (while the dense MLP runs
-    beside it); the logits do not move. The 26B's alternative on the card too (int8 layers,
-    nvfp4 experts, an fp4 head: OTPU_FORMATS=experts=nvfp4)."""
+    beside it); the logits do not move. The 26B's formats on the card too (int8 layers, nvfp4
+    experts, an fp4 head: streamed.FORMATS)."""
     m, W, spec = moe
     moe = (m, W, G.replace(spec, formats=formats))
     toks = [int(t) for t in np.random.default_rng(2).integers(0, 1000, 10)]

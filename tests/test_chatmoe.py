@@ -89,7 +89,7 @@ def ckpt(request, tmp_path_factory):
 def formats(ckpt, monkeypatch):
     """The family's weight formats on the card (streamed.FORMATS), as moe_card takes them: the
     formats string through OTPU_FORMATS (Qwen3.5's nvfp4 layers beside fp4 experts, Gemma 4's
-    fp4 experts beside int8 layers); LFM2 nvfp4 throughout."""
+    nvfp4 experts beside int8 layers); LFM2 nvfp4 throughout."""
     fam, _ = ckpt
     monkeypatch.delenv("OTPU_FORMATS", raising=False)
     wf, hf, f = ST.FORMATS[fam]
@@ -124,7 +124,7 @@ def test_streamed_defaults_are_the_cards_runs():
     assert ST.defaults(object.__new__(qwen35.Spec)) == \
         ("fp4", "int8", "attn=nvfp4,delta=nvfp4,mlp=nvfp4")
     assert ST.defaults(object.__new__(lfm2.Spec)) == ("nvfp4", "int8", None)
-    assert ST.defaults(object.__new__(gemma4.Spec)) == ("int8", "fp4", "experts=fp4")
+    assert ST.defaults(object.__new__(gemma4.Spec)) == ("int8", "fp4", "experts=nvfp4")
     assert ST.default_pool("models/Qwen3.5-35B-A3B", "fp4") == \
         Path("models/Qwen3.5-35B-A3B/pool-fp4.bin")
     assert ST.default_pool("models/LFM2.5-8B-A1B", "nvfp4") == \
