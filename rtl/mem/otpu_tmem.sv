@@ -323,6 +323,10 @@ module otpu_tmem #(
   function automatic int sd_of(input int p);   // the RAM port a read port asks on (0: B)
     return (TDP && SIDE[p]) ? 1 : 0;
   endfunction
+  // OTPU_TMEM_ABL_* (EXPERIMENTAL, out-of-context LUT breakdown only, docs/tmem_nocopy.md 6.3: the
+  // TMEM is wrong with any of them): _DSEL a port takes sub-bank 0's word (no data select), _CMP no
+  // conflict compares (nothing lost), _RPL no replay buffers (an asker is its request), _AMUX a
+  // RAM's address is its side's first port's (no priority multiplexer)
   if (IMPL == 3) begin : g_one
     localparam int LSB = $clog2(NSB);
     localparam int SO  = SBP - BW;             // the sub-bank field's offset in a bank row
@@ -367,7 +371,11 @@ module otpu_tmem #(
     logic [NRP-1:0][LANES-1:0][LSB-1:0] asb;
     logic [NRP-1:0][LANES-1:0][RW-1:0]  arw;
     for (genvar i = 0; i < NRP; i++) begin : g_as
+`ifdef OTPU_TMEM_ABL_RPL
+      assign rp[i] = 1'b0;
+`else
       assign rp[i] = rlive(i) && rpv[i];
+`endif
       for (genvar b = 0; b < LANES; b++) begin : g_b
         assign ae[i][b] = rp[i] ? rpe[i][b] : pb_en[i][b];
         assign aa[i][b] = rp[i] ? rpa[i][b] : pb_a[i][b];
@@ -415,12 +423,19 @@ module otpu_tmem #(
         end
         always_comb
           for (int s = 0; s < NS; s++) begin
+            bit got;
+            got = 1'b0;
             s_en[b][k][s] = 1'b0;
             s_a[b][k][s] = '0;
             for (int i = 0; i < NRP; i++)
               if (sd_of(i) == s) begin
                 s_en[b][k][s] = s_en[b][k][s] | rq[i];
+`ifdef OTPU_TMEM_ABL_AMUX
+                if (!got) s_a[b][k][s] = arw[i][b];
+                got = 1'b1;
+`else
                 if (win[i]) s_a[b][k][s] = s_a[b][k][s] | arw[i][b];
+`endif
               end
           end
       end
@@ -437,7 +452,11 @@ module otpu_tmem #(
             assign hb[b] = ae[i][b] && ae[o][b] && asb[o][b] == asb[i][b] && !wk[i][b] &&
                            (!SHARE || aa[o][b] != aa[i][b]);
           end
+`ifdef OTPU_TMEM_ABL_CMP
+          assign cp[i][o] = 1'b0;
+`else
           assign cp[i][o] = |hb;
+`endif
         end else begin : g_n
           assign cp[i][o] = 1'b0;
         end
@@ -446,7 +465,11 @@ module otpu_tmem #(
       for (genvar b = 0; b < LANES; b++) begin : g_w
         assign wb[b] = ae[i][b] && wk[i][b] && pw_a[b][0] != aa[i][b];
       end
+`ifdef OTPU_TMEM_ABL_CMP
+      assign wm[i] = 1'b0;
+`else
       assign wm[i] = |wb;
+`endif
     end
     always_comb
       for (int i = 0; i < NRP; i++)
@@ -532,7 +555,11 @@ module otpu_tmem #(
       logic [LANES-1:0]          bh;
       always_ff @(posedge clk)
         for (int b = 0; b < LANES; b++)
+`ifdef OTPU_TMEM_ABL_RPL
+          if (1'b0) begin
+`else
           if (RPL && rpv[p] && rpe[p][b]) begin
+`endif
             ss[b] <= sub_of(rpa[p][b]);
             bh[b] <= 1'b0;
           end else if (pb_en[p][b]) begin
@@ -540,7 +567,11 @@ module otpu_tmem #(
             bh[b] <= pw_v[b][0] && pw_a[b][0] == pb_a[p][b];
           end
       always_comb
+`ifdef OTPU_TMEM_ABL_DSEL
+        for (int b = 0; b < LANES; b++) pq[p][b] = bh[b] ? pd[b][0] : s_q[b][0][SD];
+`else
         for (int b = 0; b < LANES; b++) pq[p][b] = bh[b] ? pd[b][0] : s_q[b][ss[b]][SD];
+`endif
 `ifndef SYNTHESIS
       initial bh = '0;
 `endif

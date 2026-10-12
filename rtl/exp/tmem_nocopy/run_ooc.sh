@@ -15,6 +15,11 @@
 #   k7-r8xR    the replays on true dual-port RAMs (TMEM_TDP, VAR 5), 8 RAMs a bank; -128k, -256k
 #   k7-r8xhR   the same, hashed (SBH 2); ku-r8xR on xcku5p-2 at 200 MHz
 #   k7-r8iR-256k, k7-r16hR-256k   the replays at 256K words
+#   k7-r4xR, k7-r2xR   the replays on true dual-port RAMs, 4 / 2 RAMs a bank
+#   k7-p3      P3 (the copies pumped at 2x, VAR 6) with the board's arbiter, the clocks from an
+#              MMCM (133.33 / 266.67 MHz); k7-v0m the card's TMEM on the same MMCM clocking
+#   s-<VAR>-<ABL>  synthesis + opt only (LUTs), xc7k480t-2: VAR v0, p3, r8iR, r8xR, r4xR; ABL
+#              full, DSEL, CMP, RPL, AMUX (otpu_tmem OTPU_TMEM_ABL_*: the LUT breakdown)
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 O=${1:?outdir}; shift
 mkdir -p "$O"
@@ -50,6 +55,21 @@ for s in "$@"; do
     ku-v0)    viv $s 0 65536 8 3 $KU 5.0 ;;
     ku-r8i)   viv $s 3 65536 8 3 $KU 5.0 ;;
     ku-r16i)  viv $s 3 65536 16 3 $KU 5.0 ;;
+    k7-r4xR)  viv $s 5 65536 4 3 $K7 7.5 0 ;;
+    k7-r2xR)  viv $s 5 65536 2 3 $K7 7.5 0 ;;
+    k7-p3)    viv $s 6 65536 8 3 $K7 7.5 0 1 0 ;;
+    k7-v0m)   viv $s 0 65536 8 3 $K7 7.5 0 1 0 ;;
+    s-*)
+      v=${s#s-}; a=${v#*-}; v=${v%%-*}; [ "$a" = full ] && a=-
+      case $v in
+        v0)   viv $s 0 65536 8 3 $K7 7.5 0 0 0 $a 1 ;;
+        p3)   viv $s 6 65536 8 3 $K7 7.5 0 1 0 $a 1 ;;
+        r8iR) viv $s 4 65536 8 3 $K7 7.5 0 0 0 $a 1 ;;
+        r8xR) viv $s 5 65536 8 3 $K7 7.5 0 0 0 $a 1 ;;
+        r4xR) viv $s 5 65536 4 3 $K7 7.5 0 0 0 $a 1 ;;
+        r2xR) viv $s 5 65536 2 3 $K7 7.5 0 0 0 $a 1 ;;
+        *) echo "unknown step $s" >> "$O/progress.txt" ;;
+      esac ;;
     *) echo "unknown step $s" >> "$O/progress.txt" ;;
   esac
 done
