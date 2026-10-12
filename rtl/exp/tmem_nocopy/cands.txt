@@ -1,0 +1,46 @@
+# EXPERIMENTAL (docs/tmem_nocopy.md): the TMEM candidates of run_cosim.sh, "NAME K=V ...".
+# OTPU_TMEM_IMPL=2 is otpu_slice's simulation model (otpu_tmem_model: the data in a copy per port,
+# the grants of the candidate); its plusargs (comma-separated): tm_nsb sub-banks per bank,
+# tm_sbp the sub-bank field's lowest address bit, tm_sbh a hash, tm_rps reads per RAM and cycle,
+# tm_rq request-priority addresses, tm_cpy each port's copy (MXU DMA Q VA VB Q3 Q2 COLL; 9 no
+# RAM read), tm_nbuf / tm_bufm lines kept per port. tm_sdly / tm_ddly / tm_sidle: the start and
+# completion delays of a longer read path (otpu_slice, any TMEM).
+#
+# references: the card's TMEM (six copies; TRACE writes its accesses), and the model with a
+# copy per port (no read conflicts, the model's arbiter path)
+i0 TRACE=1
+x8 OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_cpy=01234567,+tm_nsb=1
+# one copy of 8 banks (word address mod 8), one read per bank and cycle
+c1 OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=1
+# ... two reads per bank (a true dual-port RAM's second port, or the copy pumped at 2x); with the
+# row factor (QUANT 3) in a register
+c1r2 OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=1,+tm_rps=2
+c1r2q OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=1,+tm_rps=2,+tm_cpy=00000900
+# one copy, each bank 8 or 16 RAMs (sub-banks) with their own addresses: interleaved by 8-word
+# groups (sbp 3), as 8K-word regions (sbp 13), or hashed
+s8i OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3
+s16i OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3
+s8r OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=13
+s8h OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_sbh=1
+# ... with request-priority addresses (no grant on the RAM address path)
+s8iq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_rq=1
+s16iq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3,+tm_rq=1
+# ... with two reads per RAM
+s8i2 OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_rps=2
+# ... with two lines kept per port (a read of a kept line needs no RAM read)
+s8ib OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_nbuf=2
+s16ib OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3,+tm_nbuf=2
+s8rb OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=13,+tm_nbuf=2
+c1b OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=1,+tm_nbuf=2
+# ... with request-priority addresses and two lines per port
+s8iqb OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_rq=1,+tm_nbuf=2
+s16iqb OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3,+tm_rq=1,+tm_nbuf=2
+# ... the quantizer's row factor in a register, lines only for the small operands (VPU B, QUANT 2
+# and 3: bufm 0x70)
+s8iF OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_cpy=00000900,+tm_nbuf=2,+tm_bufm=70
+s16iF OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3,+tm_cpy=00000900,+tm_nbuf=2,+tm_bufm=70
+# a longer read path on the card's TMEM: the 2-cycle read (completions a cycle late); stream
+# buffers (starts and completions 2 cycles late; sidle: a busy unit's next start is fetched ahead)
+L1 OTPU_SIM_PLUSARGS=+tm_ddly=1
+L2 OTPU_SIM_PLUSARGS=+tm_sdly=2,+tm_ddly=2
+L2i OTPU_SIM_PLUSARGS=+tm_sdly=2,+tm_sidle=1,+tm_ddly=2
