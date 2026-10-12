@@ -1,8 +1,8 @@
 """The fp32 corners on the RTL against the ISA simulator, through the units that compute them:
 the VPU's composite functions on their scaled ranges and on NaN words (the long lanes' slot
 programs and SE's otpu_se_comp), the quantizer's recip on a huge amax and its 0 * inf on a tiny
-one (QST: the bytes and scales land in DRAM), an MM whose partial sums flush to -0 (no pad
-terms in the MXU's isum_4), and VOP ADD / SUB / RSUB on the zero-sign cases (x - x = +0). Each runs the same program on both and compares DRAM and TMEM."""
+one (QST: the bytes and scales land in DRAM), an MM whose products sum to an exact 0 (its sign
+the scales'), and VOP ADD / SUB / RSUB on the zero-sign cases (x - x = +0). Each runs the same program on both and compares DRAM and TMEM."""
 import numpy as np
 import pytest
 
@@ -126,31 +126,28 @@ def test_quantizer_recip_every_exponent_rtl(have_verilator):
     _both(cfg, prog, dram)
 
 
-def test_mm_partials_flushed_to_minus_zero_rtl(have_verilator):
-    """KB = 10: each block's term t_k = (i2f(127) * ws_k) * (1/127); blocks 0..3 and 4..7 are
-    -(2^-126 + 3 ulp) and 2^-126, so every partial of two real terms flushes to -0, and t8, t9
-    are -0. The MXU adds no pad terms: the row sum is -0 (a +0 pad would make it +0)."""
+def test_mm_exact_zero_takes_the_scales_sign_rtl(have_verilator):
+    """MX MM (int8x, KB = 10): element 0 of every block is 1, the weights +1 in blocks 0..4 and
+    -1 in 5..9, so the row's products sum to an exact integer 0 (the column end accumulates
+    integers: no partial sum to flush, no pad term). y = (i2f(0) * Sw) * (Sa * 2^-W) takes the
+    sign of the scales: -0 for the weight row with Sw = -1, +0 for Sw = +1."""
     cfg = Config(S=1, DRAM_BYTES=1 << 20)
     D, KB = cfg.D, 10
-    s = F.mul(F.f32(1.0), F.INV127)
-    t_of = lambda ws: F.mul(F.mul(F.f32(127.0), F.f32(ws)), s)
-    ws_b = F.from_bits(np.uint32(0x00800000))
-    while F.bits(t_of(ws_b)) < 0x00800000:
-        ws_b = F.from_bits(F.bits(ws_b) + np.uint32(1))
-    ws_a = F.from_bits((F.bits(ws_b) + np.uint32(3)) | np.uint32(0x80000000))
-    ws = np.array([ws_a] * 4 + [ws_b] * 4 + [F.f32(-0.0)] * 2, np.float32)
     x = np.zeros(KB * D, np.float32)
     x[np.arange(KB) * D] = 1.0
-    W = np.zeros(KB * D, np.int8)
-    W[np.arange(KB) * D] = 1
+    W = np.zeros((2, KB * D), np.int8)
+    W[:, np.arange(KB) * D] = np.where(np.arange(KB) < 5, 1, -1)
+    srs = 16                                       # Sw, then KB offset bytes (dw = 0), padded
+    sc = np.zeros((2, srs), np.uint8)
+    sc[:, :4] = np.array([[-1.0], [1.0]], np.float32).view(np.uint8)
     dram = np.zeros(cfg.DRAM_BYTES, np.uint8)
     dram[:4 * KB * D] = x.view(np.uint8)
-    dram[0x10000:0x10000 + KB * D] = W.view(np.uint8)
-    dram[0x20000:0x20000 + 4 * KB] = ws.view(np.uint8)
+    dram[0x10000:0x10000 + W.size] = W.reshape(-1).view(np.uint8)
+    dram[0x20000:0x20000 + sc.size] = sc.reshape(-1)
     out = 2 * KB * D
     m = _both(cfg, [I.ld(0, 0, KB * D), I.qact(0, 1, 0, KB, KB * D),
-                    I.mm(0x10000, 0x20000, out, 1, KB, KB * D, 1, 1, 0, 4 * KB), I.halt()], dram)
-    assert int(m.slices[0].tmem[out].view(np.uint32)) == 0x80000000
+                    I.mm(0x10000, 0x20000, out, 2, KB, KB * D, 2, 1, 0, srs), I.halt()], dram)
+    assert [int(v) for v in m.slices[0].tmem[out:out + 2].view(np.uint32)] == [0x80000000, 0]
 
 
 def test_add_sub_zero_signs_rtl(have_verilator):

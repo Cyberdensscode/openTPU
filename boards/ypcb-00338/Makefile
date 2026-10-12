@@ -18,6 +18,7 @@ DDR ?= 1066
 # LANES: VPU lanes / TMEM banks, 8 or 16 (timing only; the host reads it from VERSION)
 # ACT_ROWS: ACT RAM rows, the most rows of one MM (default the target's: 16, the MX build's; the
 #   MXU replays each streamed weight chunk per MCOLS rows; MCOLS: no replay)
+# MXU_E: the MXU's epilogue lanes (timing only; default the target's: 4, MCOLS: full rate)
 # BUILD_ID: the BUILD_ID register (8 hex digits; default: the git commit)
 # PCIE_GEN: 2 (Gen2 x8, xdma_aclk 250 MHz, the default) or 1 (Gen1 x8), from the environment
 ifeq ($(FAST),1)
@@ -29,6 +30,7 @@ MCOLS ?= 4
 VPU_CL ?= 2
 LANES ?= 8
 ACT_ROWS ?=
+MXU_E ?=
 RTL := $(addprefix $(ROOT)/rtl/, vpu/otpu_fp.sv vpu/otpu_fpipe.sv top/otpu_pkg.sv \
   mem/otpu_tmem.sv mem/otpu_actram.sv seq/otpu_seq.sv vpu/otpu_vtree.sv \
   dma/otpu_dma.sv mxu/otpu_mxu.sv tech/xilinx7/otpu_tech_dsp.sv tech/generic/otpu_tech_ram.sv vpu/otpu_quant.sv vpu/otpu_se_comp.sv vpu/otpu_se_tail.sv \
@@ -41,7 +43,7 @@ RTL := $(addprefix $(ROOT)/rtl/, vpu/otpu_fp.sv vpu/otpu_fpipe.sv top/otpu_pkg.s
 # DSP48E1 comes from a lint stub
 MXU_IMPL ?= 2
 LINT := verilator --lint-only -Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNUSEDSIGNAL \
-  -Wno-UNUSEDPARAM -DSYNTHESIS -GMCOLS=$(MCOLS) -GACT_ROWS=$(or $(ACT_ROWS),16) -GVPU_CL=$(VPU_CL) -GLANES=$(LANES) \
+  -Wno-UNUSEDPARAM -DSYNTHESIS -GMCOLS=$(MCOLS) -GACT_ROWS=$(or $(ACT_ROWS),16) -GMXU_E=$(or $(MXU_E),4) -GVPU_CL=$(VPU_CL) -GLANES=$(LANES) \
   -GMXU_IMPL=$(MXU_IMPL) sim/unisim_dsp48e1_stub.sv
 
 .PHONY: lint lint-ld bit impl program program-vivado flash
@@ -53,7 +55,7 @@ lint:
 lint-ld: lint
 
 bit:
-	MCOLS=$(MCOLS) $(if $(ACT_ROWS),ACT_ROWS=$(ACT_ROWS)) VPU_CL=$(VPU_CL) LANES=$(LANES) CORE_MHZ=$(CORE_MHZ) $(if $(BUILD_ID),BUILD_ID=$(BUILD_ID)) ./run_vivado.sh $(DDR)
+	MCOLS=$(MCOLS) $(if $(ACT_ROWS),ACT_ROWS=$(ACT_ROWS)) $(if $(MXU_E),MXU_E=$(MXU_E)) VPU_CL=$(VPU_CL) LANES=$(LANES) CORE_MHZ=$(CORE_MHZ) $(if $(BUILD_ID),BUILD_ID=$(BUILD_ID)) ./run_vivado.sh $(DDR)
 
 impl:
 	STEP=impl ./run_vivado.sh $(DDR)

@@ -45,6 +45,8 @@ make bit MCOLS=2   # 2 MXU columns
 make bit CORE_MHZ=80   # accelerator clock fallback when 100 MHz does not close (800/D MHz, D in 1/8 steps)
 make bit VPU_CL=4  # 4 VPU lanes with exp2/recip/rsqrt (2 by default): ~75% -> ~89% of the
                    # roofline on long-context attention; timing only, programs unchanged
+make bit MXU_E=2   # 2 MXU epilogue lanes (the target's: 4, full rate at MCOLS 4; timing only:
+                   # E 2 made Phi-4-mini / SmolLM3 decode slower than the previous numerics', docs/mx_mxu.md 9)
 make bit LANES=16  # 16 VPU lanes / TMEM banks (the MXU and quantizer stay on 8): Qwen3.5 -4%
                    # cycles at 80% bw, -13% at 100% (simulated). Does not route on the xc7k480t
                    # (measured, MCOLS=4 VPU_CL=2 with the r3-route area cuts: 212K LUT placed,
