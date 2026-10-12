@@ -575,18 +575,19 @@ def gmoe(tmp_path_factory):
 
 def test_tiled_layer_runs_stay_opt_in(gmoe, monkeypatch):
     """The tiled prompt runs' default does not reach a MoE model: with OTPU_TILE unset its
-    expert-major layer runs are today's (Engine.layer_tile off) and its image holds no mask
-    tiles (the layout, and so the expert slots, as before); OTPU_TILE=1 asks for both."""
+    expert-major layer runs are today's (Engine.layer_tile off) and its image holds neither the
+    mask tiles nor the I/O scratch (prefill.tile_scratch: the layout, and so the expert slots,
+    as before); OTPU_TILE=1 asks for them."""
     _, W, spec = gmoe
     cfg = board_config(DRAM_BYTES=1 << 26, ACT_ROWS=16)
     kw = dict(cap=1024, cfg=cfg, rows=1, wformat="fp4", experts=6, layer_major=4,
               expert_major=True)
     monkeypatch.delenv("OTPU_TILE", raising=False)
     a = Engine(spec, W, **kw)
-    assert not a.layer_tile and "amask" not in a.image.lookup
+    assert not a.layer_tile and "amask" not in a.image.lookup and "o" not in a.image.io
     monkeypatch.setenv("OTPU_TILE", "1")
     b = Engine(spec, W, **kw)
-    assert b.layer_tile and "amask" in b.image.lookup
+    assert b.layer_tile and "amask" in b.image.lookup and "o" in b.image.io
 
 
 @pytest.mark.parametrize("wf, T, R", [("int8", 8, 0), ("fp4", 8, 4), ("fp4", 6, 3)])

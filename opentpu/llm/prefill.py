@@ -95,6 +95,16 @@ def layer_tile_flag(t) -> bool:
     return bool(t)
 
 
+def tile_scratch(spec, layer_runs: bool) -> bool:
+    """An image holds the tiled runs' I/O scratch (io "o": the attention's outputs a part at a
+    time, loaded back whole: tiled.py): a dense model's (its tiled prompt runs, the default);
+    a MoE model's only where its family has tiled layer runs (layer_runs) and they are asked for
+    as the image is built (layer_tile_flag), so a MoE image's layout and expert slots stay as
+    they were without them."""
+    moe = getattr(spec, "moe", None) is not None or bool(getattr(spec, "experts", 0))
+    return not moe or (layer_runs and layer_tile_flag(None))
+
+
 def tiling(eng) -> bool:
     """Tiled prompt runs on (opentpu/llm/tiled.py): tile_flag of the engine's tile_runs, for
     an image whose family has a tile kernel, on one slice (tiled.check: a configuration of

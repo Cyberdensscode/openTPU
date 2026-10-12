@@ -906,9 +906,10 @@ class Image(EmbedHost):
         rd = spec.rope_dim
         self.io = {"x": b.alloc(4 * H * R), "cos": b.alloc(2 * rd * R),
                    "sin": b.alloc(2 * rd * R), "gf": b.alloc(4 * H),
-                   "logits": b.alloc(4 * spec.vocab * R),
-                   # a tiled run's attention outputs, a part at a time (tiled.py: OSCR)
-                   "o": b.alloc(4 * cfg.act_rows * self.nq_loc * d)}
+                   "logits": b.alloc(4 * spec.vocab * R)}
+        from .prefill import tile_scratch   # a tiled run's attention outputs, a part at a time
+        if tile_scratch(spec, layer_runs=False):    # (tiled.py; a dense image's)
+            self.io["o"] = b.alloc(4 * cfg.act_rows * self.nq_loc * d)
         self.layer0 = b.next
         self.mats = {"wq": (self.nq_loc * d, H), "wk": (self.nkv_loc * d, H),
                      "wv": (self.nkv_loc * d, H), "wo": (self.h_loc, spec.n_q * d),
@@ -1145,7 +1146,8 @@ class Image(EmbedHost):
             cosr=_tdesc(self.io["cos"], (self.rows, rh)),
             sinr=_tdesc(self.io["sin"], (self.rows, rh)),
             logitsr=_tdesc(self.io["logits"], (self.rows, spec.vocab)),
-            oscr=_tdesc(self.io["o"], (cfg.act_rows, self.nq_loc * d)),
+            oscr=_tdesc(self.io["o"], (cfg.act_rows, self.nq_loc * d)) if "o" in self.io
+            else None,
             head=_qdesc(*self.head, self.v_loc, H, D, self.head_format), v_loc=self.v_loc,
             **_lookup_desc(self.lookup, spec, self.cap))
 
