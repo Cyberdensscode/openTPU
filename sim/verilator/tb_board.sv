@@ -80,7 +80,7 @@ module tb_board;
                .BUILD_ID(BUILD_ID), .DDR_MTS(DDR_MTS), .TRACE_DEPTH(TRACE_DEPTH), .TRACE_QD(TRACE_QD),
                .PQ_WIN(PQ_WIN), .DSTEP(DSTEP), .HOSTCAL(HOSTCAL), .PLATFORM(PLATFORM),
                .ARCH_HASH(ARCH_HASH)) dut (
-    .clk, .rst, .ctl_mrst(1'b0), .calib, .ded, .temp(TEMP), .led,
+    .clk, .clk_f(1'b0), .rst, .ctl_mrst(1'b0), .calib, .ded, .temp(TEMP), .led,
     .i2c_lo, .i2c_pin(~({1'b0, i2c_lo} | i2c_hold)),
     .s_ctl_awaddr(awaddr), .s_ctl_awvalid(awvalid), .s_ctl_awready(awready),
     .s_ctl_wdata(wdata), .s_ctl_wstrb(4'hF), .s_ctl_wvalid(wvalid), .s_ctl_wready(wready),

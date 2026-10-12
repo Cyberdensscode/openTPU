@@ -41,6 +41,7 @@ module otpu_top
   parameter int TMEM_SDM   = -1       // TMEM_TDP: the read ports' RAM sides (otpu_slice)
 ) (
   input  logic          clk,
+  input  logic          clk_f,         // TMEM_PMP 1: 2 x clk, rising with it (otpu_slice)
   input  logic          sys_rst,
   input  logic          rst,
   input  logic [31:0]   rinit [8],     // the run's arguments (R8..R15 at the start)
@@ -133,7 +134,7 @@ module otpu_top
                  .TMEM_RPL(TMEM_RPL), .TMEM_TDP(TMEM_TDP), .TMEM_GST(TMEM_GST),
                  .TMEM_PMP(TMEM_PMP), .TMEM_PRK(TMEM_PRK), .TMEM_SDM(TMEM_SDM))
     u_slice (
-      .clk, .sys_rst, .rst, .rinit, .ld_start, .ld_addr, .ld_n, .ld_busy(ldb[s]),
+      .clk, .clk_f, .sys_rst, .rst, .rinit, .ld_start, .ld_addr, .ld_n, .ld_busy(ldb[s]),
       .a_rdy, .b_rdy, .sw_rdy, .wr_idle, .rd_idle,
       .a_req, .a_we, .a_addr, .a_wdata, .a_be, .a_rvalid, .a_rdata, .a_rdata2,
       .sw_req, .sw_addr, .sw_wdata, .sw_be,

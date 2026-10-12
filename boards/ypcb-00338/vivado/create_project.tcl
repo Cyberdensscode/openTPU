@@ -1,6 +1,6 @@
 # Create the Vivado project for openTPU on the YPCB-00338: the LiteDRAM core
 # (boards/ypcb-00338/litedram/), each channel behind otpu_mem_ch (bd_native.tcl, otpu_fpga_top_ld).
-#   vivado -mode batch -source create_project.tcl -tclargs [DDR_SPEED] [OUT_DIR] [MCOLS] [CORE_MHZ] [BUILD_ID] [VPU_CL] [LANES] [ACT_ROWS] [DSTEP] [MXU] [PLATFORM] [ARCH_HASH] [TMEM_IMPL] [TMEM_RQ]
+#   vivado -mode batch -source create_project.tcl -tclargs [DDR_SPEED] [OUT_DIR] [MCOLS] [CORE_MHZ] [BUILD_ID] [VPU_CL] [LANES] [ACT_ROWS] [DSTEP] [MXU] [PLATFORM] [ARCH_HASH] [TMEM_IMPL] [TMEM_RQ] [TMEM_X]
 # The defaults build MCOLS=4 and the systolic MXU.
 # DDR_SPEED: 1066 only (the LiteDRAM core is generated for DDR3-1066: tools/litedram/gen_core.py).
 # OUT_DIR: default ../../../build/vivado (repository build/).
@@ -29,12 +29,15 @@ set PLATFORM [expr {[llength $argv] > 10 ? [lindex $argv 10] : 1}]
 set ARCH_HASH [expr {[llength $argv] > 11 ? [lindex $argv 11] : 0}]
 if {![regexp {^[0-9a-fA-F]{1,8}$} $ARCH_HASH]} { set ARCH_HASH 0 }
 # TMEM_IMPL: the TMEM (otpu_tmem): 0 a copy per read port (production), 1 banked (three copies;
-# the slice's banked arbiter, docs/tmem_pump.md). Timing only: the programs do not change
+# the slice's banked arbiter, docs/tmem_pump.md), 3 one copy (docs/tmem_nocopy.md; TMEM_X its
+# knobs, tmem_knobs.tcl: by default 2 RAMs a bank pumped at 2x on core_clk2x). Timing only: the
+# programs do not change
 set TMEM_IMPL [expr {[llength $argv] > 12 ? [lindex $argv 12] : 0}]
-if {$TMEM_IMPL ni {0 1}} { error "TMEM_IMPL $TMEM_IMPL: 0 or 1" }
 # TMEM_RQ (TMEM_IMPL 1): the banks' addresses from the requests by priority, not the grants
 set TMEM_RQ [expr {[llength $argv] > 13 ? [lindex $argv 13] : 0}]
 if {$TMEM_RQ ni {0 1}} { error "TMEM_RQ $TMEM_RQ: 0 or 1" }
+set TMEM_X [expr {[llength $argv] > 14 ? [lindex $argv 14] : ""}]
+source $here/tmem_knobs.tcl   ;# TMEM_GEN, CLK2X (bd_native.tcl's core_clk2x)
 if {$BUILD_ID eq ""} {
   if {[catch {exec git -C $root rev-parse HEAD} BUILD_ID]} { set BUILD_ID 0 }
   set BUILD_ID [string range $BUILD_ID 0 7]
@@ -85,19 +88,21 @@ foreach f $rtl {
 set_property verilog_define {SYNTHESIS} [get_filesets sources_1]
 
 # ---- block design
-source $here/bd_native.tcl   ;# sets PCIE_GEN (environment, run_vivado.sh) for the generics
+source $here/bd_native.tcl   ;# sets PCIE_GEN (environment, run_vivado.sh) for the generics; CLK2X
 make_wrapper -files [get_files otpu_bd.bd] -top
 add_files -norecurse [glob $out/otpu.gen/sources_1/bd/otpu_bd/hdl/otpu_bd_wrapper.v]
 set_property top otpu_fpga_top_ld [current_fileset]
-set_property generic "MCOLS=$MCOLS ACT_ROWS=$ACT_ROWS VPU_CL=$VPU_CL LANES=$LANES CORE_KHZ=$CORE_KHZ BUILD_ID=32'h$BUILD_ID DDR_MTS=$DDR_SPEED DSTEP=1'b$DSTEP MXU_IMPL=$MXU_IMPL TMEM_IMPL=$TMEM_IMPL TMEM_RQ=1'b$TMEM_RQ PCIE_GEN=$PCIE_GEN PLATFORM=$PLATFORM ARCH_HASH=32'h$ARCH_HASH" [current_fileset]
+set_property generic "MCOLS=$MCOLS ACT_ROWS=$ACT_ROWS VPU_CL=$VPU_CL LANES=$LANES CORE_KHZ=$CORE_KHZ BUILD_ID=32'h$BUILD_ID DDR_MTS=$DDR_SPEED DSTEP=1'b$DSTEP MXU_IMPL=$MXU_IMPL TMEM_IMPL=$TMEM_IMPL TMEM_RQ=1'b$TMEM_RQ PCIE_GEN=$PCIE_GEN PLATFORM=$PLATFORM ARCH_HASH=32'h$ARCH_HASH$TMEM_GEN" [current_fileset]
 
 # ---- constraints: the board (otpu_top_ld.xdc) and the core's pads, VREF and synchronizers
 # (otpu_litedram.xdc); then, after the IP's constraints, as unmanaged Tcl on the implemented
-# netlist, each otpu_mem_ch's crossings (scoped to the module) and the top's (otpu_top_native.tcl)
+# netlist, each otpu_mem_ch's crossings (scoped to the module) and the top's (otpu_top_native.tcl);
+# with CLK2X the paths between core_clk and core_clk2x (otpu_clk2x.tcl)
 set cons $root/boards/ypcb-00338/constraints
 add_files -fileset constrs_1 -norecurse [list $cons/otpu_top_ld.xdc \
   $root/boards/ypcb-00338/litedram/otpu_litedram.xdc]
 set late [list $cons/otpu_mem_ch.tcl $cons/otpu_top_native.tcl]
+if {$CLK2X} { lappend late $cons/otpu_clk2x.tcl }
 add_files -fileset constrs_1 -norecurse $late
 set_property SCOPED_TO_REF otpu_mem_ch [get_files $cons/otpu_mem_ch.tcl]
 set_property PROCESSING_ORDER LATE [get_files $late]

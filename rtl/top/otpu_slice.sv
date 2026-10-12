@@ -64,15 +64,16 @@ module otpu_slice
                                       //   unit's ports on different RAM ports (TM_SIDE)
   parameter bit TMEM_GST   = 1'b0,    // TMEM_IMPL 3: QUANT 3 and COLL the DMA's guests, as
                                       //   TMEM_IMPL 0's (otpu_tmem GST: one data select)
-  parameter int TMEM_PMP   = 0,       // TMEM_TDP: 2 the pumped RAMs' model at the core clock (a
-                                      //   write takes no read port; otpu_tmem PMP; 1, the RAMs
-                                      //   at 2x, needs a 2x clock the slice does not have)
+  parameter int TMEM_PMP   = 0,       // TMEM_TDP: 1 the RAMs pumped at 2x on clk_f (otpu_tmem
+                                      //   PMP: a write takes no read port), 2 their model at the
+                                      //   core clock (simulation)
   parameter int TMEM_PRK   = 0,       // TMEM_IMPL 3: the read ports' ranks (3 bits a port, port p
                                       //   at bit 3p; 0: PRANK3, below)
   parameter int TMEM_SDM   = -1       // TMEM_TDP: the read ports' RAM sides (bit p: port p on
                                       //   port A; -1: TM_SIDED, below)
 ) (
   input  logic          clk,
+  input  logic          clk_f,      // TMEM_PMP 1: 2 x clk, rising with it (the MMCM's); else unused
   input  logic          sys_rst,
   input  logic          rst,
   input  logic [31:0]   rinit [8],  // the run's arguments: R8..R15 at the start (otpu_seq)
@@ -197,7 +198,6 @@ module otpu_slice
                                         ((NRP'(1) << P_VB) | (NRP'(1) << P_Q3) | (NRP'(1) << P_Q2) |
                                          (NRP'(1) << P_COLL));
   localparam logic [NRP-1:0] TM_SIDE = (TMEM_SDM >= 0) ? NRP'(TMEM_SDM) : TM_SIDED;
-  initial if (TMEM_PMP == 1) $fatal(1, "otpu_slice: TMEM_PMP 1 needs a 2x clock (2: its model)");
   initial if (TMEM_IMPL == 3 && (WPB != 1 || ARB_MASK != TMEM_RPL))
     $fatal(1, "otpu_slice: TMEM_IMPL 3 needs WPB = 1 (WPB %0d), and RPB >= %0d with TMEM_RPL",
            WPB, NRP * LANES);
@@ -368,7 +368,7 @@ module otpu_slice
               .GRP(RGRP), .SBH(TMEM_SBH), .RPL(TMEM_RPL), .RPLM(~(NRP'(1) << P_COLL)),
               .TOPP(P_DMA), .TDP(TMEM_TDP), .SIDE(TM_SIDE), .GST(TMEM_GST),
               .PMP(TMEM_PMP)) u_tmem (
-    .clk, .clk_f(1'b0), .r_en, .r_req(rq_t), .r_addr, .r_data, .w_en, .w_req(wq_en), .w_gnt, .w_addr,
+    .clk, .clk_f, .r_en, .r_req(rq_t), .r_addr, .r_data, .w_en, .w_req(wq_en), .w_gnt, .w_addr,
     .w_data, .blk_x(tm_bx), .blk_s(tm_bs), .lost(tm_lost), .frz(tm_frz), .dump);
   assign coll_rdata = r_data[P_COLL];
   // the units' TMEM requests

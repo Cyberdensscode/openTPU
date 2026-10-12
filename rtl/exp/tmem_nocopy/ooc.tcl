@@ -4,7 +4,8 @@
 #     <WORDS> <NSB> <SBP> <PART> <PERIOD_NS> [SBH] [MMCM] [FAMILY] [ABL] [SYNTHONLY] [GST] [SDM] [PRK]
 # MMCM 1 (VAR 6, P3, and VAR 7, the pumped one copy, always): the core clock (and 2x) from an MMCM
 # on clk (FAMILY 0 7-series, 1
-# UltraScale+), with the pumped copies' multicycle paths (rtl/exp/tmem_pump/ooc.tcl's). ABL: an
+# UltraScale+), with the pumped copies' multicycle paths (P3: rtl/exp/tmem_pump/ooc.tcl's; the one
+# copy: the boards', boards/ypcb-00338/constraints/otpu_clk2x.tcl). ABL: an
 # otpu_tmem ablation (DSEL, CMP, RPL, AMUX: OTPU_TMEM_ABL_*; a LUT breakdown only, the TMEM is
 # wrong with one), "-" none. SYNTHONLY 1: stop after opt_design (utilization only). GST 1: QUANT 3
 # and COLL the DMA's guests (VAR 4 / 5). SDM / PRK: the read ports' RAM sides and ranks (otpu_slice
@@ -49,7 +50,11 @@ if {$mmcm} {
     if {[llength $cf] && $ck eq [get_property NAME $cf]} { lappend pwf $c }
   }
   puts "OTPU_RAMS [llength $rams] OTPU_MCP_PINS [llength $rp] OTPU_MCP_PW [llength $pwf]"
-  if {[llength $rp]} {
+  if {$var == 7} {
+    # the pumped one copy: the boards' own constraints (otpu_clk2x.tcl, by the banks' module; the
+    # counts above for comparison: its read-request pins are OTPU_MCP_PINS)
+    source $root/boards/ypcb-00338/constraints/otpu_clk2x.tcl
+  } elseif {[llength $rp]} {
     set_multicycle_path 2 -setup -end -from $cs -through $rp
     set_multicycle_path 1 -hold -end -from $cs -through $rp
     set_multicycle_path 2 -setup -start -from $rams -to $cs

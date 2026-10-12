@@ -55,7 +55,7 @@ lint:
 lint-ld: lint
 
 bit:
-	MCOLS=$(MCOLS) ACT_ROWS=$(ACT_ROWS) VPU_CL=$(VPU_CL) LANES=$(LANES) CORE_MHZ=$(CORE_MHZ) $(if $(TMEM_IMPL),TMEM_IMPL=$(TMEM_IMPL)) $(if $(TMEM_RQ),TMEM_RQ=$(TMEM_RQ)) $(if $(BUILD_ID),BUILD_ID=$(BUILD_ID)) ./run_vivado.sh $(DDR)
+	MCOLS=$(MCOLS) ACT_ROWS=$(ACT_ROWS) VPU_CL=$(VPU_CL) LANES=$(LANES) CORE_MHZ=$(CORE_MHZ) $(if $(TMEM_IMPL),TMEM_IMPL=$(TMEM_IMPL)) $(if $(TMEM_RQ),TMEM_RQ=$(TMEM_RQ)) $(if $(TMEM_X),TMEM_X=$(TMEM_X)) $(if $(BUILD_ID),BUILD_ID=$(BUILD_ID)) ./run_vivado.sh $(DDR)
 
 impl:
 	STEP=impl ./run_vivado.sh $(DDR)

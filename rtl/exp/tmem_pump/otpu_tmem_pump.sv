@@ -425,76 +425,8 @@ module otpu_tmem_pump #(
 `endif
 endmodule
 
-// One bank of a pumped copy: a true dual-port RAM on clk_f (= 2 x clk, aligned). Even fast edges
-// (the core edges): port A reads ra (rena), port B reads rb (renb). Odd fast edges (mid core
-// cycle): port A writes wd at wa (wv), its output held (NO_CHANGE). qa / qb change only after even
-// edges and hold through the next core cycle. Its hierarchy is kept: the timing contract names its
-// read inputs (ooc.tcl).
-(* keep_hierarchy = "yes" *)
-module otpu_pump_bank #(
-  parameter int    N     = 8192,
-  parameter string STYLE = "block",
-  parameter bit    FW    = 1'b1      // the phase from a fast-domain register (below)
-) (
-  input  logic                 clk,
-  input  logic                 clk_f,
-  input  logic                 wv,
-  input  logic [$clog2(N)-1:0] wa,
-  input  logic [31:0]          wd,
-  input  logic                 rena,
-  input  logic [$clog2(N)-1:0] ra,
-  input  logic                 renb,
-  input  logic [$clog2(N)-1:0] rb,
-  output logic [31:0]          qa,
-  output logic [31:0]          qb
-);
-  // the phase: tog flips at every core edge; tq is its copy a fast edge later. They differ during
-  // a core cycle's first half (the next fast edge is odd) and agree in its second (even next).
-  // FW: ev is a fast-domain register loaded with that at every fast edge (the edge after next's
-  // parity is the opposite of the next's), so no core-domain net reaches the RAM's enables; it
-  // aligns itself at the first fast edge, as tq does.
-  (* keep *) logic tog;
-  (* keep *) logic tq;
-  logic evr;
-  always_ff @(posedge clk) tog <= !tog;
-  always_ff @(posedge clk_f) begin
-    tq <= tog;
-    evr <= tq != tog;
-  end
-  wire ev = FW ? evr : (tq == tog);
-`ifndef SYNTHESIS
-  initial begin tog = 1'b0; tq = 1'b0; evr = 1'b1; end
-`endif
-  wire                 en_a = ev ? rena : wv;
-  wire                 we_a = !ev && wv;
-  wire [$clog2(N)-1:0] ad_a = ev ? ra : wa;
-  wire                 en_b = ev && renb;
-  if (STYLE == "ultra") begin : g_u
-    (* ram_style = "ultra" *) logic [31:0] mem [N];
-    always_ff @(posedge clk_f)
-      if (en_a) begin
-        if (we_a) mem[ad_a] <= wd;
-        else qa <= mem[ad_a];
-      end
-    always_ff @(posedge clk_f)
-      if (en_b) qb <= mem[rb];
-`ifndef SYNTHESIS
-    initial for (int i = 0; i < N; i++) mem[i] = '0;
-`endif
-  end else begin : g_b
-    (* ram_style = "block" *) logic [31:0] mem [N];
-    always_ff @(posedge clk_f)
-      if (en_a) begin
-        if (we_a) mem[ad_a] <= wd;
-        else qa <= mem[ad_a];
-      end
-    always_ff @(posedge clk_f)
-      if (en_b) qb <= mem[rb];
-`ifndef SYNTHESIS
-    initial for (int i = 0; i < N; i++) mem[i] = '0;
-`endif
-  end
-endmodule
+// otpu_pump_bank, one bank of a pumped copy at 2x: rtl/mem/otpu_tmem.sv (the one copy's
+// pumped RAMs, otpu_tmem IMPL 3 PMP 1, build it on the boards)
 
 // One bank of a copy pumped at K = 3 or 4 times the core clock (clk_f = K x clk, aligned): a true
 // dual-port RAM serving 2K - 1 read slots and the write in each core cycle, with the requests

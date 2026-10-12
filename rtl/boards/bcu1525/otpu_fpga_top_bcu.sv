@@ -13,7 +13,8 @@
 //
 // Clocks: each DIMM's 300 MHz clock (clk300_<d>, the bank's LVDS input) on one global buffer feeds
 // that DIMM's core (its MMCM makes sys_clk, 200 MHz, and the PHY's 800 MHz and IDELAYCTRL's 400
-// MHz); clk300_1 (SLR1, with the PCIe block) also feeds the block design's MMCM (core_clk).
+// MHz); clk300_1 (SLR1, with the PCIe block) also feeds the block design's MMCM (core_clk, and
+// core_clk2x at twice it, rising with it, for the TMEM's pumped RAMs: TMEM_PMP 1, bd.tcl CLK2X).
 // xdma_aclk is XDMA's (250 MHz). otpu_mem_ch crosses between core_clk, xdma_aclk and its DIMM's
 // sys_clk.
 // Resets: core_rst from the block design (MMCM lock, PCIe PERST#), xrst from XDMA's axi_aresetn;
@@ -39,6 +40,17 @@ module otpu_fpga_top_bcu #(
   parameter int WIN        = 16,
   parameter int RPB        = 8 * LANES,
   parameter int WPB        = 1,
+  parameter int TMEM_IMPL  = 0,             // TMEM: 0 a copy per read port, 3 one copy
+  parameter bit TMEM_RQ    = 1'b0,          //   (docs/tmem_nocopy.md; create_project.tcl TMEM_X,
+  parameter int TMEM_NSB   = 8,             //   otpu_slice): RAMs a bank, the sub-bank's address
+  parameter int TMEM_SBP   = 3,             //   bit, its hash, replays, true dual-port RAMs, QUANT
+  parameter int TMEM_SBH   = 0,             //   3 and COLL the DMA's guests, the RAMs pumped at 2x
+  parameter bit TMEM_RPL   = 1'b0,          //   (1: on core_clk2x, below), the read ports' ranks
+  parameter bit TMEM_TDP   = 1'b0,          //   and RAM sides
+  parameter bit TMEM_GST   = 1'b0,
+  parameter int TMEM_PMP   = 0,
+  parameter int TMEM_PRK   = 0,
+  parameter int TMEM_SDM   = -1,
   parameter int MXU_IMPL   = 2,
   parameter int MXU_CL     = 16,
   parameter int VPU_CL     = 2,
@@ -180,7 +192,7 @@ module otpu_fpga_top_bcu #(
   end
 
   // ---- the block design
-  logic        core_clk, core_rstn, xdma_aclk, xdma_aresetn, pcie_link_up;
+  logic        core_clk, core_clk2x, core_rstn, xdma_aclk, xdma_aresetn, pcie_link_up;
   logic [9:0]  device_temp;                 // SYSMONE4 die-temperature code (core_clk)
   // control (AXI4-Lite, core_clk)
   logic [31:0] ctl_awaddr, ctl_araddr, ctl_wdata, ctl_rdata;
@@ -237,7 +249,7 @@ module otpu_fpga_top_bcu #(
     .pcie_refclk_clk_p(pcie_refclk_p), .pcie_refclk_clk_n(pcie_refclk_n),
     .pcie_perstn(pcie_perst_n),
     .pcie_mgt_rxp, .pcie_mgt_rxn, .pcie_mgt_txp, .pcie_mgt_txn,
-    .pcie_link_up, .core_clk, .core_rstn, .xdma_aclk, .xdma_aresetn, .device_temp,
+    .pcie_link_up, .core_clk, .core_clk2x, .core_rstn, .xdma_aclk, .xdma_aresetn, .device_temp,
     `BD_LITE(M_AXI_CTL, ctl),
     `BD_MC(0), `BD_MC(1), `BD_MC(2), `BD_MC(3),
     `BD_DMA(0), `BD_DMA(1), `BD_DMA(2), `BD_DMA(3));
@@ -371,6 +383,8 @@ module otpu_fpga_top_bcu #(
     assign dm_awaddr_c[j] = dm_awaddr[j][30:0];
     assign dm_araddr_c[j] = dm_araddr[j][30:0];
   end
+  // the TMEM's RAMs pumped at 2x (TMEM_PMP 1) on core_clk2x (bd.tcl CLK2X); otherwise unused
+  wire clk_f = TMEM_PMP == 1 ? core_clk2x : 1'b0;
   logic [2:0] board_led;
   otpu_bcu_sys #(.S(S), .D(D), .MCOLS(MCOLS), .ACT_ROWS(ACT_ROWS), .ACT_BLOCKS(ACT_BLOCKS),
                  .TMEM_WORDS(TMEM_WORDS), .IMEM_WORDS(IMEM_WORDS), .FIFO_DEPTH(FIFO_DEPTH),
@@ -378,8 +392,10 @@ module otpu_fpga_top_bcu #(
                  .MXU_CL(MXU_CL), .VPU_CL(VPU_CL), .ULANES(ULANES), .TRACE_DEPTH(TRACE_DEPTH),
                  .PQ_WIN(PQ_WIN), .CHASH(CHASH), .DSTEP(DSTEP), .CORE_KHZ(CORE_KHZ),
                  .BUILD_ID(BUILD_ID), .DDR_MTS(DDR_MTS), .PLATFORM(PLATFORM),
-                 .ARCH_HASH(ARCH_HASH)) u_sys (
-    .clk(core_clk), .rst(core_rst), .ctl_mrst(lrs2), .xclk(xdma_aclk), .xrst,
+                 .ARCH_HASH(ARCH_HASH), .TMEM_IMPL(TMEM_IMPL), .TMEM_RQ(TMEM_RQ),
+                 .TMEM_NSB(TMEM_NSB), .TMEM_SBP(TMEM_SBP), .TMEM_SBH(TMEM_SBH), .TMEM_RPL(TMEM_RPL), .TMEM_TDP(TMEM_TDP),
+                 .TMEM_GST(TMEM_GST), .TMEM_PMP(TMEM_PMP), .TMEM_PRK(TMEM_PRK), .TMEM_SDM(TMEM_SDM)) u_sys (
+    .clk(core_clk), .clk_f, .rst(core_rst), .ctl_mrst(lrs2), .xclk(xdma_aclk), .xrst,
     .calib, .ded, .temp({device_temp, 2'b00}), .led(board_led), .i2c_lo,
     .i2c_pin({3'b111, i2c_lvl}),
     .s_ctl_awaddr(ctl_awaddr[11:0]), .s_ctl_awvalid(ctl_awvalid), .s_ctl_awready(ctl_awready),

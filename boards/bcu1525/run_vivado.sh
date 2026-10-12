@@ -4,6 +4,8 @@
 #   S=2 MCOLS=4 VPU_CL=2 LANES=8 ACT_ROWS=MCOLS DSTEP=1   the accelerator (S slices, two DDR4 channels each)
 #   CORE_MHZ=100 (the default: development builds at 100 MHz until the design runs; FAST=1: Vivado's
 #   default strategies)   PCIE_LANES=16|8 (Gen3)   TMEM_URAM=0|1 (the TMEM in UltraRAM)   BUILD_ID
+#   TMEM_IMPL=0|3 TMEM_X=NAME=value,... (3: one copy, by default pumped at 2x on core_clk2x; the
+#   YPCB's vivado/tmem_knobs.tcl)
 #   OUT_DIR   JOBS   STEP=impl   IMPL_STRATEGY   PREFLIGHT=1|0
 # The VU9P is outside Vivado's free tier: the license must cover it, and the Virtex UltraScale+
 # device files must be installed (Vivado's installer, "Virtex UltraScale+"). The preflight
@@ -30,6 +32,8 @@ dstep="${DSTEP:-${T_DSTEP:-1}}"
 core_mhz="${CORE_MHZ:-${T_CORE_MHZ:-100}}"
 platform="${T_PLATFORM:-2}"
 ddr_mts="${T_DDR_MTS:-1600}"
+tmem_impl="${TMEM_IMPL:-0}"
+tmem_x="${TMEM_X:-}"
 arch_hash="$(PYTHONPATH="$root" python3 -m opentpu.target hash bcu1525 MCOLS="$mcols" \
   LANES="$lanes" ACT_ROWS="$act_rows" DSTEP="$dstep" 2>/dev/null || echo 0)"
 build_id="${BUILD_ID:-$(git -C "$root" rev-parse HEAD 2>/dev/null | cut -c1-8)}"
@@ -58,7 +62,7 @@ if [[ "${STEP:-}" == impl ]]; then
   run "$here/vivado/build.tcl" "$out" "$jobs" impl "${IMPL_STRATEGY:-}"
 else
   run "$here/vivado/create_project.tcl" "$out" "$mcols" "$core_mhz" "$build_id" "$vpu_cl" "$lanes" \
-    "$act_rows" "$dstep" "$s" "$platform" "$arch_hash" "$ddr_mts"
+    "$act_rows" "$dstep" "$s" "$platform" "$arch_hash" "$ddr_mts" "$tmem_impl" "$tmem_x"
   run "$here/vivado/build.tcl" "$out" "$jobs" full "${IMPL_STRATEGY:-}"
 fi
 echo "done: $out/otpu.bit"

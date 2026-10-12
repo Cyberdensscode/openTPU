@@ -32,6 +32,15 @@ module otpu_board #(
   parameter int TMEM_IMPL  = 0,         // TMEM: 0 a copy per read port, 1 banked (three copies;
                                          //   otpu_slice: RPB 1, WPB 1)
   parameter bit TMEM_RQ    = 1'b0,      // TMEM_IMPL 1: request-priority bank addresses
+  parameter int TMEM_NSB   = 8,         // TMEM_IMPL 3 (one copy, docs/tmem_nocopy.md): RAMs a bank,
+  parameter int TMEM_SBP   = 3,         //   the sub-bank's word-address bit, its hash, replays,
+  parameter int TMEM_SBH   = 0,         //   true dual-port RAMs, QUANT 3 and COLL the DMA's guests,
+  parameter bit TMEM_RPL   = 1'b0,      //   the RAMs pumped at 2x on clk_f (1), the read ports'
+  parameter bit TMEM_TDP   = 1'b0,      //   ranks and RAM sides (otpu_slice)
+  parameter bit TMEM_GST   = 1'b0,
+  parameter int TMEM_PMP   = 0,
+  parameter int TMEM_PRK   = 0,
+  parameter int TMEM_SDM   = -1,
   parameter int RPB        = (TMEM_IMPL == 1) ? 1 : 8 * LANES,  // every read lane (TMEM is
                                           // replicated per read port): the slice's shallow
                                           // write-mask arbiter
@@ -54,6 +63,7 @@ module otpu_board #(
   parameter logic [31:0] ARCH_HASH = 32'h0  // the target's arch_hash (CFG_HASH)
 ) (
   input  logic         clk,
+  input  logic         clk_f,          // TMEM_PMP 1: 2 x clk, rising with it (the MMCM's); else unused
   input  logic         rst,            // synchronous, active high
   input  logic         ctl_mrst,       // the control master's reset (the SmartConnect's, in clk:
                                        //   PCIe hot reset or link down too): otpu_axil_iso
@@ -281,8 +291,10 @@ module otpu_board #(
                .TMEM_WORDS(TMEM_WORDS), .IMEM_WORDS(IMEM_WORDS), .FIFO_DEPTH(FIFO_DEPTH),
                .LANES(LANES), .WIN(WIN), .RPB(RPB), .WPB(WPB), .MXU_IMPL(MXU_IMPL),
                .MXU_CL(MXU_CL), .VPU_CL(VPU_CL), .ULANES(ULANES), .PQ_WIN(PQ_WIN),
-               .HAS_DSTEP(DSTEP), .TMEM_IMPL(TMEM_IMPL), .TMEM_RQ(TMEM_RQ)) u_slice (
-    .clk, .sys_rst(x_srst[0]), .rst(x_rst[0]), .rinit(x_arg[0]), .ld_start(x_ld_start[0]),
+               .HAS_DSTEP(DSTEP), .TMEM_IMPL(TMEM_IMPL), .TMEM_RQ(TMEM_RQ),
+               .TMEM_NSB(TMEM_NSB), .TMEM_SBP(TMEM_SBP), .TMEM_SBH(TMEM_SBH), .TMEM_RPL(TMEM_RPL), .TMEM_TDP(TMEM_TDP),
+               .TMEM_GST(TMEM_GST), .TMEM_PMP(TMEM_PMP), .TMEM_PRK(TMEM_PRK), .TMEM_SDM(TMEM_SDM)) u_slice (
+    .clk, .clk_f, .sys_rst(x_srst[0]), .rst(x_rst[0]), .rinit(x_arg[0]), .ld_start(x_ld_start[0]),
     .ld_addr(x_ld_addr[0]), .ld_n(x_ld_n[0]),
     .ld_busy(q_ld_busy[0]), .a_rdy, .b_rdy, .sw_rdy, .wr_idle(q_wr_idle[0]),
     .rd_idle(q_rd_idle[0]),
@@ -339,8 +351,10 @@ module otpu_board #(
                  .ACT_ROWS(ACT_ROWS), .TMEM_WORDS(TMEM_WORDS), .IMEM_WORDS(IMEM_WORDS),
                  .FIFO_DEPTH(FIFO_DEPTH), .LANES(LANES), .WIN(WIN), .RPB(RPB), .WPB(WPB),
                  .MXU_IMPL(MXU_IMPL), .MXU_CL(MXU_CL), .VPU_CL(VPU_CL), .ULANES(ULANES),
-                 .PQ_WIN(PQ_WIN), .HAS_DSTEP(DSTEP), .TMEM_IMPL(TMEM_IMPL), .TMEM_RQ(TMEM_RQ)) u_slice (
-      .clk, .sys_rst(x_srst[s]), .rst(x_rst[s]), .rinit(x_arg[s]), .ld_start(x_ld_start[s]),
+                 .PQ_WIN(PQ_WIN), .HAS_DSTEP(DSTEP), .TMEM_IMPL(TMEM_IMPL), .TMEM_RQ(TMEM_RQ),
+                 .TMEM_NSB(TMEM_NSB), .TMEM_SBP(TMEM_SBP), .TMEM_SBH(TMEM_SBH), .TMEM_RPL(TMEM_RPL), .TMEM_TDP(TMEM_TDP),
+                 .TMEM_GST(TMEM_GST), .TMEM_PMP(TMEM_PMP), .TMEM_PRK(TMEM_PRK), .TMEM_SDM(TMEM_SDM)) u_slice (
+      .clk, .clk_f, .sys_rst(x_srst[s]), .rst(x_rst[s]), .rinit(x_arg[s]), .ld_start(x_ld_start[s]),
       .ld_addr(x_ld_addr[s]), .ld_n(x_ld_n[s]),
       .ld_busy(q_ld_busy[s]), .a_rdy, .b_rdy, .sw_rdy, .wr_idle(q_wr_idle[s]),
       .rd_idle(q_rd_idle[s]),
