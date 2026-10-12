@@ -52,6 +52,35 @@ class Blocks:
         self.items = [(t0, n, m) for t0, n, m in items]
 
 
+class RowMasks:
+    """The masked block of query rows packed from several tokens at compile-time positions
+    (a tiled prefill run, opentpu/llm/tiled.py): `keep` [(r0, r1, k)], rows r0 .. r1 - 1 of the
+    score buffer count the block's first k tokens. The buffer is filled with -0, then -inf
+    past each row group's k, and q.K^T is accumulated into it with the row maxima (MM ACC +
+    RMAX), as an Additive tile: s + -0 = s, s + -inf = -inf. A row group with k = 0 sees no
+    token of the block: its scores are all -inf, so its online softmax state passes the block
+    unchanged (m stays, p and the P.V terms are +0, alpha is exactly 1)."""
+
+    def __init__(self, keep):
+        self.keep = [(r0, r1, k) for r0, r1, k in keep]
+
+    def fill(self, out, n: int) -> None:
+        out.set(-0.0)
+        for r0, r1, k in self.keep:
+            if k < n:
+                out[r0:r1, k:n].set(float("-inf"))
+
+
+class TileSeq:
+    """Blocks of a packed query tile (tiled prefill): `full` whole blocks every row sees (the
+    hardware loop's, as a length's), then `items` [(t0, n, mask)] as Blocks' (a mask: RowMasks,
+    or None where every row sees the block whole)."""
+
+    def __init__(self, full: int, items):
+        self.full = full
+        self.items = [(t0, n, m) for t0, n, m in items]
+
+
 def _attend(qh, kv, h, seq_len: int, block: int, scale: float | None = None, raw: bool = False,
             depth: int = 3):
     """Flash attention of the G query rows `qh` [G, d] against KV head h (see _attend_heads);
@@ -91,6 +120,11 @@ class _Head:
         elif isinstance(seq_len, Blocks):            # the list, unrolled
             nfull = 0
             self.blocks = [(t0, n) for t0, n, _ in seq_len.items]
+            self.masks = {t0: m for t0, _, m in seq_len.items if m is not None}
+        elif isinstance(seq_len, TileSeq):           # whole blocks (looped), then the list
+            nfull = seq_len.full
+            self.blocks = [(i * block, block) for i in range(nfull)] + \
+                [(t0, n) for t0, n, _ in seq_len.items]
             self.masks = {t0: m for t0, _, m in seq_len.items if m is not None}
         else:
             nfull, tail = divmod(seq_len, block)
@@ -149,6 +183,10 @@ def _attend_heads(qhs, kv, hs, seq_len: int, block: int, scale: float | None = N
                 row = bk.row(t0, n) if bk.add is None else bk.add
         if isinstance(row, Additive):                   # the mask tile, then q.K^T added
             ol.load(row.tile(st.G, n), out=out)
+            ol.dot(st.qs, st.K[t0:t0 + n, :], acc=out, rowmax=True)
+            return out
+        if isinstance(row, RowMasks):                   # built in place, then q.K^T added
+            row.fill(out, n)
             ol.dot(st.qs, st.K[t0:t0 + n, :], acc=out, rowmax=True)
             return out
         if row is not None:

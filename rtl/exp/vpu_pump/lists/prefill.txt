@@ -1,0 +1,25 @@
+# prefill: 4 rows (the card's R_max) at 544..547, no logits, whole model, fp4 + int8 head
+p_q3 --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none
+p_q3_novop --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none --hack novop
+p_q3_half --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none --hack half
+p_q3_comp1 --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none --hack comp1
+p_lf --model lfm2 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none
+p_lf_novop --model lfm2 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none --hack novop
+p_lf_half --model lfm2 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none --hack half
+p_lf_comp1 --model lfm2 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none --hack comp1
+p_q35 --model qwen35 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none
+p_q35_novop --model qwen35 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none --hack novop
+p_q35_half --model qwen35 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none --hack half
+p_q35_comp1 --model qwen35 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none --hack comp1
+p_q35_nose --model qwen35 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none --hack nose
+p_q35_halfse --model qwen35 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none --hack halfse
+p_q35_half_halfse --model qwen35 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none --hack half,halfse
+# the pumped / MCOLS 8 MXU's rate (dsp-pump's upper bound): what is left is attention and vector work
+p8_q3 --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none --mcols 8
+p8_q3_novop --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none --mcols 8 --hack novop
+p8_q3_half --model qwen3 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none --mcols 8 --hack half
+p8_q35 --model qwen35 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none --mcols 8
+p8_q35_novop --model qwen35 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none --mcols 8 --hack novop
+p8_q35_half --model qwen35 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none --mcols 8 --hack half
+p8_q35_halfse --model qwen35 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none --mcols 8 --hack halfse
+p8_q35_nose --model qwen35 --wformat fp4 --head-format int8 --layers 0 --pos 544 --rows 4 --logits none --mcols 8 --hack nose
