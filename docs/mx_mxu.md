@@ -1292,6 +1292,18 @@ length add; same cycles, and `footprint()` equal to 8b33206e's by a Yosys SAT mi
 and the six new family tests, `test_models_on_board_rtl` 10/10, and `test_rtl` / `test_board` /
 `test_quant_rtl` at `OTPU_MXU_E=4` (283 passed, the MM fuzzers included).
 
+**In production** (2026-10-12, 17:49 on the card host): `deploy_mx_8b33206e` (build 8b33206e,
+host e37709e1: this branch with tiling's default-on tiled prompt runs and expert-major MoE
+prefill), promoted after its qualification: selftest all pass at Gen2 x8; `qual.sh` fast 53 checks
+and Gemma 4 E2B-it's token-exact run 33, no FAIL; otpu-chat on 8 models and chatmoe on the 3
+streamed MoE models (LFM2.5-8B-A1B, Qwen3.5-35B-A3B, gemma-4-26B-A4B-it, the MX pools)
+token-exact against the ISA simulator; the H2C stress with no flag. Against the previous
+production (mt4, 91a9c2d3): decode cycles a token -1.4% to -1.9% on the int8 models, +3.5% on
+Qwen3.5-4B and +5.8% on LFM2-2.6B (their NVFP4 kinds' bytes, section 3.6); the streamed MoE
+models' decode tok/s +7% on the 35B (fp4x6 experts), -6% to -8% on the 26B and -9% to -10% on
+LFM2.5-8B, whose NVFP4 experts are bigger: fewer slots fill the DRAM, so more experts miss. The
+deploy directory's README has the full table.
+
 **QACT's cost** (co-simulation, `tools/perf_qwen.py`, Qwen3-0.6B, 2 layers and the LM head,
 against b370889d's per-block streaming QACT, the MM unchanged):
 
