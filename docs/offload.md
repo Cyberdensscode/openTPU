@@ -3658,7 +3658,8 @@ then not run, because the work wrapped up. When it runs, the plan is:
 
 Status (2026-10-12): session pfB ran this plan on the card (13.15). B was bit for bit with A in
 every run and cut the prefill by 1.91 s on the 35B and 1.78 s on the 26B, so it meets the rule
-above. Expert-major has been the default since (13.15, "The default").
+above. Expert-major has been the default since (13.15, "The default"), for a prompt's calls
+of EM_ROWS new rows or more (13.16).
 
 ### 13.14 The need path on the host (offload-need)
 
@@ -3844,6 +3845,102 @@ The default (since 2026-10-12, after the session):
   decode's misses a token now count a layer-major prompt that made no request (they were null).
 - Only opentpu/host/streamed.py changed, so the image and program keys are the same and the
   image cache's entries still hit.
+- Since 13.16 the default is expert-major only in a prompt's calls of at least EM_ROWS new rows.
+
+### 13.16 Expert-major from a prompt length on (session emdef, EM_ROWS)
+
+Session emdef ran the default on the card on 2026-10-12, 10:17-10:33 by the opentpu clock (the
+lead's run of tools/offload/sessions/emdefault.sh).
+- Card: production deploy_mt4_91a9c2d3 (build 91a9c2d3, register map 4).
+- Hosts: the candidate deploy_em_91a9c2d3 (N, 950ff0c5) against production's (P, 23b68089).
+- The production qual's chatmoe step and otpu-chat by name passed from N, token-exact.
+- Per model a warm-up, then P N N P. Each run was a chatmoe.py chat of three turns: TURNS' two,
+  then lmtime's passage with a question. Every run gave its model's tokens.
+
+TTFT, N - P:
+
+| turn: new tokens (35B / 26B) | 35B pairs, s | 35B mean | 26B pairs, s | 26B mean |
+|:--|:--|--:|:--|--:|
+| 1: 24 / 25 | +0.354, +0.637 | **+0.495** | +0.091, -0.055 | +0.018 |
+| 2: 31 / 31 | +0.296, +0.482 | **+0.389** | -0.509, -0.213 | -0.361 |
+| 3: 163 / 162 | -2.310, -2.113 | -2.211 | -2.164, -2.133 | -2.149 |
+
+- The device time moved with it on the 35B: +0.52, +0.40 and -2.28 s.
+- The 26B's first turn lost the device's -0.27 s on the host: TTFT +0.02 s.
+- The decode after the prompt: 35B +0.13 to +0.18 tok/s, 26B -0.07 to +0.13.
+- Not swapped: the 35B's short turns lose up to half a second.
+
+Why the 35B's short prompts lose:
+- **A turn is two calls.** With state to keep (the 35B's DeltaNet layers; the 26B's sliding
+  rings, 1024 positions and an attention block, shorter than chat's 2048) chat runs a turn's
+  prompt in two prefill_layers calls: up to the snapshot at the reply's start (14.2's turns),
+  then the 4 rows after it, the generation prompt's empty thinking block, which the next turn
+  rolls back over. Each call carries all its fixed costs: an expert run a MoE layer (40 on the
+  35B), need lines, a scratch. The 35B's 24-token turn was 3 token steps and 17 rows, then 4
+  rows; its 31-token turn 27 rows, then 4.
+- **Where needs land.** The needs stream in idle parts while the runs go. pfB's traces (13.15,
+  131 rows) give what each costs:
+
+  | | 35B | 26B |
+  |:--|--:|--:|
+  | layer-major run (A), wall, ms | 4.47 | 8.58 |
+  | A's request: fixed + a miss, ms | 0.50 + 0.82 | 0.47 + 1.59 |
+  | expert-major mixer run (B), wall, ms | 2.35 | 5.62 |
+  | B's idle part (a whole expert), seen to done, ms | 1.06 | 1.89 |
+  | B's needs a layer: landed in the mixer runs / in the expert run | 75 / 62 | 75 / 0.3 |
+  | B's mixer runs / expert run a layer, wall, ms | 156 / 86 | 352 / 123 |
+
+  - At 131 rows the 35B's mixer runs carry half a layer's needs; the expert run waits for the
+    rest, 65 of its 86 ms in parts.
+  - The 26B's mixer runs carry all of them, so its expert run is compute alone.
+- **The short call.**
+  - The 35B's 17-row call has 9 mixer runs a layer, about 21 ms. A layer needs up to about 66
+    experts (P's 2659 layer-major misses in that turn's two calls, over 40 layers), about 70 ms
+    of idle parts.
+  - So most needs land while the expert run waits. Each costs 1.06 ms against a layer-major
+    miss's 0.82, and the expert run adds its fixed costs a layer: its start and halt, its tables,
+    and halt-aware's held parts near its expected end.
+  - What grows with the rows does not cover it at this length: each chosen expert runs once a
+    layer, and more needs hide behind the mixer runs.
+  - The 4-row call is all fixed cost; *about +0.2 s a turn* (estimated, not measured).
+- **The 26B.** Its mixer runs are 2.4 times as long, so its first turn's 21-row call, 11 runs a
+  layer (62 ms), already carries part of its needs, and the turn breaks even with its 4-row call.
+  Its expert-major runs' halts are seen later: an idle part of 1.89 ms is in flight at a mixer
+  run's end (pfB: 0.38 ms a run against 0.14 layer-major).
+- *An estimate of the crossover.* Both arms a layer from these costs, the needs about 0.55 (35B)
+  and 0.6 (26B) of the distinct experts a call's rows choose, and an expert-major call's fixed
+  cost fitted to the three turns (about 4.5 and 6 ms a layer): the 4-row call costs about +0.2 s
+  (35B) and +0.13 s (26B); the 35B's call breaks even at about 33 rows (28-40 within the fit's
+  error), and the 26B's 21-row call already gains on the device.
+
+The threshold (streamed.EM_ROWS):
+- A prefill_layers call runs expert-major only with at least EM_ROWS new rows: Qwen3.5-MoE 48,
+  Gemma 4 MoE 24. Below, it runs as production's: layer-major, pooled, a request a run.
+  - 48 lies above the 35B's estimated crossover.
+  - 24 lies between the 26B's 21-row call (even, with its 4-row call's cost) and its 27-row
+    call (-0.36 s with it).
+- So a turn's 4 rows after its snapshot always run layer-major, and its part before it from 48
+  rows (35B) or 24 (26B).
+- `streamed.gate_expert_major` sets Engine.expert_major for each call and swaps the layer runs'
+  compiled programs per mode: a run's key does not hold the mode, and an expert-major run posts
+  needs where a layer-major one requests its experts. After the call the Engine is expert-major
+  again. eng.em_rows, eng.em_last (the last call's rows and mode) and eng.em_calls tell what ran.
+- `em_rows` overrides it (streamed.engine, chatmoe.py `--em-rows`); 0 runs every call
+  expert-major. An explicit `expert_major=True` (moe_card `--expert-major`) is every call.
+- Only opentpu/host and tools changed: the image and program keys stay.
+- chatmoe.py reports each turn's calls: rows, mode, wall and device seconds, runs, and the
+  server's counts (misses, needs, parts, holds). `--trace` adds each call's runs and the server's
+  timeline.
+
+Session emdef2 (tools/offload/sessions/emdef2.sh; the lead runs it) checks the threshold and
+finds the crossover:
+- Same card, hosts and checks as emdef.
+- Five turns continuing one context: about 24, 31, 49, 80 and 163 new tokens on the 35B (TURNS'
+  two, a question, a request, lmtime's passage with a question).
+- Arms: P (production), N (EM_ROWS), X (`--em-rows 8`: every call but the 4-row ones
+  expert-major). A warm-up (N), then P N X X N P.
+- The swap's rule: N no worse than P at every turn and faster on the long ones. X - P per call
+  length is where EM_ROWS belongs.
 
 ## 14. Chatting with a streamed MoE (otpu-chat)
 
@@ -3916,9 +4013,10 @@ the whole checkpoint) the same experts as this tree packs them. The lists must b
 - **Slots.** As many a layer as fill the DRAM beside the rest of the image (`--experts N` sets
   them), replaced by least decayed use (`--policy lru` for least recently used).
 - **The prompt.** Qwen3.5-MoE and Gemma 4 MoE run it layer by layer in runs of two rows, every
-  slot serving the running layer (13; `--layer-major R`, 0 for token by token). Each MoE layer's
-  experts run once, in one expert run, after the layer's runs have posted them as needs
-  (expert-major, 13.11-13.15). LFM2-MoE runs it token by token.
+  slot serving the running layer (13; `--layer-major R`, 0 for token by token). In a call of at
+  least EM_ROWS new rows (Qwen3.5 48, Gemma 4 24; 13.16) each MoE layer's experts run once, in
+  one expert run, after the layer's runs have posted them as needs (expert-major, 13.11-13.15).
+  LFM2-MoE runs it token by token.
 - **Turns** keep the context as a dense model's do (docs/host.md 6): a later turn rolls back to
   where its rendering and what was fed part and feeds the rest, the recurrent and windowed
   state from the snapshot the turn before took at its reply's start. The slots fill the DRAM,

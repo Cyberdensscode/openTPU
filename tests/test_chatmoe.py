@@ -130,10 +130,11 @@ def test_expert_major_is_the_layer_major_prompts_default(ckpt, formats):
     """streamed.engine's prompt (docs/offload.md 13.15): expert-major wherever it runs layer by
     layer with pooled slots, no layer ahead and room for its needs (Qwen3.5 and Gemma 4 with the
     DRAM filled: 6 layers of 8 slots less a 20-slot scratch, 28 >= 3 x 8), its needs in
-    whole-expert idle parts (NEED_PART); not with 2 slots a layer (12 - 20 < 24: the guarded
-    layers' experts could hold every slot), each layer's own slots, the layer ahead,
-    expert_major=False or a prompt token by token (LFM2's, or layer_major=0), whose idle parts
-    stay Engine's."""
+    whole-expert idle parts (NEED_PART), for the calls of the family's EM_ROWS new rows or more
+    (13.16: em_rows; expert_major=True or em_rows=0: every call); not with 2 slots a layer
+    (12 - 20 < 24: the guarded layers' experts could hold every slot), each layer's own slots,
+    the layer ahead, expert_major=False or a prompt token by token (LFM2's, or layer_major=0),
+    whose idle parts stay Engine's."""
     from opentpu.llm.qwen3 import AHEAD_PART
     fam, d = ckpt
     wf, hf = formats
@@ -141,12 +142,51 @@ def test_expert_major_is_the_layer_major_prompts_default(ckpt, formats):
     def em(experts=0, **kw):
         e = ST.engine(d, CFG, "isa", 256, None, experts=experts, wformat=wf, head_format=hf,
                       **kw)
-        return e.expert_major, e.ahead_part
-    off = (False, AHEAD_PART)
-    assert em() == (off if fam == "lfm2" else (True, ST.NEED_PART))
-    assert em(K) == em(expert_major=False) == off
+        return e.expert_major, e.ahead_part, getattr(e, "em_rows", 0)
+    off = (False, AHEAD_PART, 0)
+    assert em() == (off if fam == "lfm2" else (True, ST.NEED_PART, ST.EM_ROWS[fam]))
+    assert em(K) == em(expert_major=False) == em(K, em_rows=3) == off
     if fam != "lfm2":
         assert em(layer_major=0) == em(pooled=False) == em(layer_ahead=True) == off
+        assert em(expert_major=True) == em(em_rows=0) == (True, ST.NEED_PART, 0)
+        assert em(em_rows=9) == em(expert_major=True, em_rows=9) == (True, ST.NEED_PART, 9)
+
+
+@pytest.mark.parametrize("fam", ["qwen35", "gemma4"])
+def test_expert_major_rows_by_family(fam):
+    """EM_ROWS (docs/offload.md 13.16): the least new rows a call of the family's prompt runs
+    expert-major by default; a family without layer runs has none (0: every call)."""
+    from opentpu.llm import gemma4, lfm2, qwen35
+    spec = object.__new__({"qwen35": qwen35.Spec, "gemma4": gemma4.Spec}[fam])
+    assert ST.em_rows_of(spec) == ST.EM_ROWS[fam] > 0
+    assert ST.em_rows_of(object.__new__(lfm2.Spec)) == 0
+
+
+def test_expert_major_from_its_rows_a_call(ckpt, formats):
+    """The expert-major prompt only in the prefill_layers calls of at least em_rows new rows
+    (streamed.gate_expert_major, docs/offload.md 13.16), layer-major below: with em_rows 6,
+    calls of 6, 5 and 6 rows run expert-major (need lines), layer-major (requests, no need
+    line) and expert-major again, each mode with its own compiled runs (their keys are the
+    same), and each call's logits are those of an engine with every expert resident fed the
+    same tokens token by token, bit for bit. The engine stays expert-major between calls;
+    em_last and em_calls tell what ran."""
+    fam, d = ckpt
+    wf, hf = formats
+    if fam == "lfm2":
+        pytest.skip("LFM2's prompt runs token by token")
+    eng = ST.engine(d, CFG, "isa", 256, None, wformat=wf, head_format=hf, em_rows=6)
+    ref = ST.engine(d, CFG, "isa", 256, None, wformat=wf, head_format=hf, layer_major=0)
+    assert eng.expert_major and eng.em_rows == 6 and eng.em_last is None
+    srv, rng = eng.server, np.random.default_rng(6)
+    for n, em in ((6, True), (5, False), (6, True)):
+        ids = [int(t) for t in rng.integers(10, 1000, n)]
+        lines, seq = srv.need_lines, srv.seq
+        lg = eng.prefill(ids)
+        assert np.array_equal(lg.view(np.uint32), ref.prefill(ids).view(np.uint32)), (n, em)
+        assert eng.em_last == (n, em) and eng.expert_major
+        assert (srv.need_lines > lines) == em and srv.seq > seq
+    assert eng.em_calls == [1, 2] and ref.server.misses == 0
+    assert any(k[0] == "x" for k in eng._layer_runs if isinstance(k, tuple))
 
 
 def test_expert_major_fits_room_for_three_layers_beside_the_scratch():
@@ -205,12 +245,14 @@ def test_the_next_turn_continues_the_context(ckpt, formats, slots, monkeypatch):
     Gemma 4 (prefill_layers; a turn's part up to a snapshot inside it without the head), token
     by token for LFM2. Its reply is that of an engine with every expert resident fed the whole
     conversation at once, bit for bit. With the DRAM filled (slots 0) the prompts are
-    expert-major (the default where it has room, 13.15), with 2 slots a layer not."""
+    expert-major where they have 7 rows or more (em_rows 7, 13.16: the first turn's 7, not
+    the second's 6), with 2 slots a layer never (no room, 13.15)."""
     fam, d = ckpt
     wf, hf = formats
     if fam == "lfm2" and not slots:
         pytest.skip("LFM2's prompt runs token by token")
-    eng = ST.engine(d, CFG, "isa", 256, None, experts=slots, wformat=wf, head_format=hf)
+    eng = ST.engine(d, CFG, "isa", 256, None, experts=slots, wformat=wf, head_format=hf,
+                    em_rows=7)
     assert eng.expert_major == (not slots)
     calls = []
     layers = eng.prefill_layers
@@ -235,7 +277,7 @@ def test_the_next_turn_continues_the_context(ckpt, formats, slots, monkeypatch):
     want = _until_eos([t0] + ref.generate_card(t0, N - 1, stop_ids=[]), eng.spec.eos)
     assert chat._reply == want
     assert (eng.server.misses > 0 or not slots) and ref.server.misses == 0
-    assert slots or eng.server.need_lines > 0
+    assert slots or eng.server.need_lines > 0 and eng.em_calls == [1, 1]
 
 
 def _recording(rec, softcap=None):
@@ -265,7 +307,9 @@ def test_a_streamed_chat_rolls_back_to_the_reply(ckpt, formats, where, slots, mo
     without the head), LFM2 token by token. The snapshots on the host (where: the slots fill
     the card's DRAM, so the device area does not fit) or on the device. The tiny Gemma 4's
     sliding windows hold its whole context (no state to keep: its KV caches go back). With the
-    DRAM filled (slots 0) the prompts are expert-major (13.15)."""
+    DRAM filled (slots 0) the prompts are expert-major from 7 rows a call (em_rows 7, 13.16):
+    each Qwen3.5 turn's part up to the snapshot, not the 6 rows after it (the generation
+    prompt's thinking block), each Gemma 4 turn (one part)."""
     from opentpu.llm import snapshot as SN
     from test_chatkv import MESSAGES, _bits, _greedy, _QwenTok
     fam, d = ckpt
@@ -279,7 +323,7 @@ def test_a_streamed_chat_rolls_back_to_the_reply(ckpt, formats, where, slots, mo
 
     def make(snapshots=0):
         return ST.engine(d, CFG, "isa", 256, None, experts=slots, wformat=wf, head_format=hf,
-                         snapshots=snapshots)
+                         snapshots=snapshots, em_rows=7)
     eng = make(1)
     assert eng.expert_major == (not slots)
     rec, tok = [], _QwenTok()
@@ -298,6 +342,7 @@ def test_a_streamed_chat_rolls_back_to_the_reply(ckpt, formats, where, slots, mo
         assert chat._reply == [x for x in _greedy(ref, want, N) if x not in eng.spec.eos], i
     assert eng.layer_major == (0 if fam == "lfm2" else 2)
     assert eng.server.misses > 0 or not slots
+    assert slots or eng.em_calls == ([3, 3] if stateful else [0, 3])
     ops = [s["op"] for s in eng.snap_stats]             # (a snapshot each turn, restored by
     assert ops == (["snapshot", "restore"] * 3)[:5] if stateful else not ops    # the next)
 
@@ -524,3 +569,23 @@ def test_the_scripted_chat_checks_a_run_against_its_reference(tmp_path, monkeypa
     assert chatmoe.main(argv + ["--check", str(tmp_path / "bad.json")]) == 1
     out = capsys.readouterr().out
     assert "[FAIL]" in out and "turn 2 from token 0" in out
+    # each turn's prompt calls: with 2 slots a layer layer-major (no room for expert-major)
+    assert [(c["rows"], c["em"]) for c in t1["calls"]] == [(6, False)]
+    assert t1["calls"][0]["misses"] == t1["prefill_misses"] and not t1["calls"][0]["need_lines"]
+    assert sum(c["rows"] for c in t2["calls"]) == t2["prompt_tokens"]
+    # the DRAM filled, expert-major from 6 rows a call (--em-rows 6): the first turn's call,
+    # not the second's 4 rows; the same tokens as the 2-slot run's; --trace: each call's
+    # server timeline (need lines, then requests)
+    full = [str(d), "--cfg", str(tmp_path / "cfg.pkl"), "--max-new", "5", "--em-rows", "6",
+            "--turn", "11 22 33 44 55 66", "--turn", "77 88 99",
+            "--trace", str(tmp_path / "trace.json"), "--out", str(tmp_path / "em.json")]
+    assert chatmoe.main(full + ["--check", str(tmp_path / "ref.json")]) == 0
+    r = json.loads((tmp_path / "em.json").read_text())
+    assert r["expert_major"] and r["em_rows"] == 6
+    c1, c2 = (t["calls"] for t in r["turns"])
+    assert [(c["rows"], c["em"]) for c in c1] == [(6, True)] and c1[0]["need_lines"] > 0
+    assert c2 and not any(c["em"] or c["need_lines"] for c in c2)
+    assert "call: 6 rows expert-major" in capsys.readouterr().out
+    tr = json.loads((tmp_path / "trace.json").read_text())["calls"]
+    assert [(c["rows"], c["em"]) for c in tr] == [(c["rows"], c["em"]) for c in c1 + c2]
+    assert "n" in {e[2] for e in tr[0]["events"]} and "d" in {e[2] for e in tr[1]["events"]}

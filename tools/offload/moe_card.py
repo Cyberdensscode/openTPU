@@ -220,6 +220,8 @@ def card(model: str, ref: dict, n: int, experts: int, cap: int, pool: str | None
     t, t_pre = time.time(), time.perf_counter()
     lg = eng.prefill(ids if host_loop else ids[:-1])
     t_end = time.perf_counter()
+    if getattr(eng, "em_last", None) is not None:   # (the default's: from EM_ROWS rows, 13.16)
+        expert_major = eng.em_last[1]
     snap_end, pev, srv.events = snap() if snap else None, srv.events, None
     for o, k, v in undo:                        # the decode as before
         if v is None:
@@ -361,6 +363,7 @@ def card(model: str, ref: dict, n: int, experts: int, cap: int, pool: str | None
                 embed_runs=embed_runs if layer_major else None,
                 layer_ahead=layer_ahead if layer_major else None,
                 expert_major=expert_major if layer_major else None,
+                em_rows=getattr(eng, "em_rows", 0) if layer_major else None,
                 ahead_part=eng.ahead_part if eng.layer_hint or eng.expert_major else None,
                 release_weights=release_weights, willneed=willneed, pool_map=pool_map,
                 legacy_serve=legacy_serve, poll_idle=poll_idle,
@@ -464,7 +467,9 @@ def main():
                          "its runs, its experts in one expert run (Engine expert_major; "
                          "docs/offload.md 13.11, 13.13; the server's need lines and scratch: "
                          "13.14). The default with --layer-major, pooled slots and no "
-                         "--layer-ahead (13.15); --no-expert-major for the layer-major base")
+                         "--layer-ahead (13.15) for a prompt of the family's "
+                         "streamed.EM_ROWS rows or more (13.16); --expert-major for any "
+                         "prompt, --no-expert-major for the layer-major base")
     ap.add_argument("--ahead-part", type=int, metavar="KiB",
                     help="--layer-ahead hint and --expert-major: the KiB an idle poll sends of "
                          "a queued expert (default: expert-major streamed.NEED_PART, 4096, the "
