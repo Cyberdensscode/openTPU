@@ -3662,7 +3662,8 @@ then not run, because the work wrapped up. When it runs, the plan is:
 Status (2026-10-12): session pfB ran this plan on the card (13.15). B was bit for bit with A in
 every run and cut the prefill by 1.91 s on the 35B and 1.78 s on the 26B, so it meets the rule
 above. Expert-major has been the default since (13.15, "The default"), for a prompt's calls
-of EM_ROWS new rows or more (13.16).
+of EM_ROWS new rows or more (13.16), and in production since 2026-10-12 (deploy_em_91a9c2d3,
+session emdef4, 13.16).
 
 ### 13.14 The need path on the host (offload-need)
 
@@ -4045,6 +4046,80 @@ swap, short:
   model of emdef3, and in both emdef2 turns that missed.
 - The summary: each run's TTFT and device time per turn, N - P per pair and of the means, and
   each run's layer-major host ms a miss.
+
+The lead ran emdef4 on 2026-10-12 at 7f815b57 in the balanced order (four pairs). It was
+token-exact, everything passed, and the chatmoe step and otpu-chat exited 0. N - P of the means,
+TTFT, s:
+
+| turn | 35B (N's call) | 35B | 26B (N's call) | 26B | 26B device |
+|:--|:--|--:|:--|--:|--:|
+| 1 | 20 L | -0.006 | 21 E | -0.083 | -0.37 |
+| 2 | 27 L | -0.058 | 27 E | -0.029 | -0.28 |
+| 3 | 45 E | -0.053 | 46 E | -0.883 | -1.31 |
+
+- The layer-major calls' host ms a miss came out even across the arms.
+- With emdef3's long turns (35B -0.89 and -2.33 s, 26B -1.36 and -2.46 s), the rule holds: no
+  turn is worse, and the long ones are much faster.
+- In production since 2026-10-12 16:26 local (15:26:30 by the opentpu clock): deploy_em_91a9c2d3,
+  host 7f815b57, promoted host-only by its promote.sh (scrub and selftest passed on build
+  91a9c2d3, link 5.0 GT/s x8). production-prev is deploy_mt4_91a9c2d3.
+
+### 13.17 The expert run in the co-sim (tools/moe_prefill_cosim.py em)
+
+`moe_prefill_cosim.py em MODEL_DIR --rows ...` co-simulates one MoE layer's expert run
+(compile_expert_run) on a chunk of rows. It uses the RTL with the card's LiteDRAM controllers,
+DDR3-1066, the core at 133.33 MHz and build B's configuration. The image is zeros (config.json
+only), and the DRAM holds the server's words as an expert-major prefill has them once every
+expert its chunk needs has landed:
+- each row's record in the scratch on the first slots, its tail holding the k global ids, the
+  weights and 1 / rms;
+- each expert the rows chose in a pooled slot of its own after the scratch, with its tag set and
+  its directory entry {slot, 1.0};
+- the layer's gbase.
+
+Routing:
+- By default each row takes k distinct experts, uniformly, from `used` of them: the prompts'
+  measured 144 of the 35B's 256 and 75 of the 26B's 128.
+- `--route` takes a router trace's layer-local ids instead.
+- With the defaults the passes match the router traces' windows (13.11): 565 against 564 on the
+  35B at 131 rows, and 515 against 517 on the 26B at 124.
+
+After the run:
+- every used expert's tag must be zero and every (row, rank) output written, or the tool raises;
+- the check fails on the DRAM before the run, and a missing entry stops the run.
+
+The record: passes, cycles, the DRAM bytes by kind (em_bytes, in whole lines), and layer-major's
+passes on the same ids.
+- Its lm2 passes overstate a prompt's, because the synthetic rows are independent.
+- `--isa` runs the ISA simulator: the check, no cycles.
+- `--set KEY=VALUE` overrides the configuration (MCOLS=16, or a branch's fields such as SEQ_WC).
+
+Measured on hwe-bench, 2026-10-12, at 7f815b57 with the harness of dc26103b; every check passed.
+The layer is the first; ms is a layer's expert run.
+
+| model | rows | experts | passes | cycles | ms | ms a row | ms a pass | MB a row (weights) | GB/s |
+|:--|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 35B | 16 | 80 | 89 | 1329816 | 9.97 | 0.623 | 0.1121 | 9.48 (9.30) | 15.2 |
+| 35B | 131 | 144 | 565 | 8425295 | 63.19 | 0.482 | 0.1118 | 7.35 (7.21) | 15.2 |
+| 35B | 512 | 144 | 2081 | 31025443 | 232.70 | 0.454 | 0.1118 | 6.93 (6.79) | 15.2 |
+| 26B | 16 | 64 | 81 | 2557432 | 19.18 | 1.199 | 0.2368 | 17.68 (17.45) | 14.8 |
+| 26B | 124 | 75 | 515 | 16236422 | 121.78 | 0.982 | 0.2365 | 14.50 (14.32) | 14.8 |
+| 26B | 512 | 75 | 2066 | 65124417 | 488.45 | 0.954 | 0.2364 | 14.09 (13.91) | 14.8 |
+
+- The expert run streams at 15.2 GB/s (35B) and 14.8 GB/s (26B): 89 % and 87 % of the two
+  DDR3-1066 channels' 17.06 GB/s.
+  - The experts' weights are 98-99 % of its bytes: an expert, 1.67 MB (35B) or 3.45 MB (26B),
+    each pass.
+  - The rows' inputs and outputs are 0.13-0.23 MB a row; the tables and words under 1 kB.
+- A pass costs the same at every chunk size: 0.112 ms (35B) and 0.236 ms (26B).
+  - That is c(2) (13.11: the expert's FFN alone, 0.100 / 0.210) plus 12 / 27 µs.
+  - The excess grows with the expert's size, so it is the stream's rate, not a fixed cost a pass.
+- Bytes a row against layer-major R = 2 on the traces' routing (840 passes on the 35B's 131-row
+  windows, 767 on the 26B's 124):
+  - 35B: 10.72 MB of expert weights a row, against expert-major's 7.21 (-33 %).
+  - 26B: 21.32 against 14.32 (-33 %).
+- At 16 rows nearly every expert has one or two entries (89 passes for 80 experts on the 35B), so
+  a row costs 1.2-1.3x what it does at 124-131.
 
 ## 14. Chatting with a streamed MoE (otpu-chat)
 
