@@ -11,6 +11,9 @@
 #   ku-v2b  pumped 3 copies, block RAM          ku-v2u  the same in UltraRAM
 #   ku-v1b  otpu_tmem IMPL 1 (3 copies of block RAM at 250 MHz)
 #   ku-v2u300  pumped UltraRAM at 300 / 600 MHz
+# The boards' own parts at 250 / 500 MHz (omarchy has them; opentpu has no UltraScale+ part):
+#   vu9-v2b, vu9-v2u    pumped 3 copies, block RAM / UltraRAM, xcvu9p-fsgd2104-2L-e (BCU1525)
+#   vu47-v2b, vu47-v2u  the same on xcvu47p-fsvh2892-2-e (AWS F2)
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 O=${1:?outdir}; shift
 mkdir -p "$O"
@@ -25,6 +28,8 @@ viv() {   # name args...
 }
 K7="xc7k480tffg1156-2 0"
 KU="xcku5p-ffvb676-2-e 1"
+VU9="xcvu9p-fsgd2104-2L-e 1"
+VU47="xcvu47p-fsvh2892-2-e 1"
 for s in "$@"; do
   case $s in
     k7-v0)   viv $s 0 65536  $K7 block 7.5 8.0 8.0 4 ;;
@@ -38,6 +43,10 @@ for s in "$@"; do
     ku-v2u)  viv $s 2 65536  $KU ultra 4.0 4.0 4.0 2 ;;
     ku-v1b)  viv $s 1 65536  $KU block 4.0 4.0 4.0 2 ;;
     ku-v2u300) viv $s 2 65536 $KU ultra 3.333 4.0 4.0 2 ;;
+    vu9-v2b)  viv $s 2 65536  $VU9 block 4.0 4.0 4.0 2 ;;
+    vu9-v2u)  viv $s 2 65536  $VU9 ultra 4.0 4.0 4.0 2 ;;
+    vu47-v2b) viv $s 2 65536  $VU47 block 4.0 4.0 4.0 2 ;;
+    vu47-v2u) viv $s 2 65536  $VU47 ultra 4.0 4.0 4.0 2 ;;
     *) echo "unknown step $s" >> "$O/progress.txt" ;;
   esac
 done
