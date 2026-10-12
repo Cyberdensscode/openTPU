@@ -7,8 +7,8 @@ the whole checkpoint: in parallel workers on its host, or streamed into a pool o
     python3 tools/offload/pack_pool.py MODEL - send IDS > stream # the experts IDS names (global ids
                                                                   # g = layer * E + e, one a line)
     python3 tools/offload/pack_pool.py MODEL POOL recv < stream  # on the pool's host: write them
-    python3 tools/offload/pack_pool.py MODEL POOL stamp          # give a pool packed before keys
-                                                                  # its key (once it is known current)
+    python3 tools/offload/pack_pool.py MODEL POOL stamp          # a key for a keyless pool
+                                                                  # (once sums shows it current)
     python3 tools/offload/pack_pool.py MODEL POOL info           # its format, layout, packed experts
     python3 tools/offload/pack_pool.py MODEL POOL sums IDS       # sha256 of the pool's records IDS
     python3 tools/offload/pack_pool.py MODEL - sums IDS          # ... of the experts packed now
@@ -22,14 +22,15 @@ offload.to_split): the pool MO.serve packs on demand. The expert format follows 
 formats (OTPU_FORMATS, e.g. experts=fp4) and --wformat; recv needs MODEL only for the slot size
 and the key.
 
-The pool's key, `POOL.key` (moe.pool_key: the quantizer's code, the format, D, the layout and
-the checkpoint's config.json), is written by init and checked by pack, recv (against the key
-send puts first in its stream) and every run that opens the pool (moe.open_pool): a pool packed
-by another quantizer, in another format or from another checkpoint is refused. A pool packed
-before keys has none: it is taken with a warning until `stamp` writes the key of MODEL and
---wformat (the slot size must be theirs; stamp only a pool known to be current). `info` prints
-the key, or for a pool without one its format as its slot size says (int8, or 4-bit: fp4 and
-int4 have the same size).
+The pool's key, `POOL.key` (moe.pool_key: the MXU's numerics, the quantizer's code, the format,
+D, the layout and the checkpoint's config.json), is written by init and checked by pack, recv
+(against the key send puts first in its stream) and every run that opens the pool
+(moe.open_pool): a pool packed for the MXU before MX (key 1), by another quantizer, in another
+format or from another checkpoint is refused. A pool without a key is refused too: one packed
+before keys holds the former MXU's scale words (docs/mx_mxu.md). `stamp` writes the key of
+MODEL and --wformat on a pool without one (the slot size must be theirs; stamp only a pool
+`sums` shows to be this tree's). `info` prints the key, or for a pool without one its format as
+its slot size says (int8, or 4-bit: fp4 and int4 have the same size).
 
 `sums` tells whether a pool is current before it is stamped: the sha256 of the records IDS names
 (a file of global ids, one a line, or a number N: N ids spread over the pool) as the pool holds

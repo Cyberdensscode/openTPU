@@ -1173,7 +1173,6 @@ def device_config(info: dict, **kw):
     name the bitstream's value (ConfigMismatch otherwise). Keyword arguments set other fields
     (DRAM_BYTES)."""
     from opentpu.isasim import board_config
-    from opentpu.target import arch_hash
     for k in ("MCOLS", "LANES"):
         env = os.environ.get(f"OTPU_{k}")
         if env is not None and int(env) != info[k]:
@@ -1199,11 +1198,7 @@ def device_config(info: dict, **kw):
         dev.update(D=info["D"], **{k: c[k] for k in ("S", "TMEM_WORDS", "IMEM_WORDS",
                                                      "ACT_BLOCKS", "DRAM_BYTES")})
     cfg = board_config(**dev)
-    if c and c["hash"] and arch_hash(cfg) != c["hash"]:
-        raise ConfigMismatch(f"the bitstream's CFG_HASH {c['hash']:08x} is not the hash of the "
-                             f"configuration its registers report ({arch_hash(cfg):08x}): the "
-                             f"host and the build disagree on the Config's fields "
-                             f"(opentpu/target.py arch_hash)")
+    check_hash(info, cfg)
     if info["D"] != cfg.D:
         raise ConfigMismatch(f"the bitstream has D={info['D']}, the board configuration "
                              f"D={cfg.D}: not a YPCB-00338 openTPU build")
@@ -1230,10 +1225,40 @@ def config_summary(info: dict) -> str:
     return msg
 
 
+def check_hash(info: dict, cfg=None) -> None:
+    """Raise ConfigMismatch when the bitstream's CFG_HASH (register map 4) is not this host's
+    hash of the configuration its registers report (`cfg`: device_config's, default built
+    here without its environment checks): the host and the build disagree on the Config's
+    fields or on what the hash holds besides them (opentpu/target.py arch_hash), so programs
+    compiled here would compute something else there. Nothing to check before map 4 or with
+    a zero hash."""
+    from opentpu.target import arch_hash
+    c = info.get("cfg")
+    if not c or not c["hash"]:
+        return
+    if cfg is None:
+        from opentpu.isasim import board_config
+        caps = info.get("caps") or {}
+        rows = info.get("act_rows") or 0
+        sizes = {k: c[k] for k in ("S", "TMEM_WORDS", "IMEM_WORDS", "ACT_BLOCKS", "DRAM_BYTES")}
+        cfg = board_config(D=info["D"], MCOLS=info["MCOLS"], LANES=info["LANES"],
+                           PAIR=bool(caps.get("pair")), DSTEP=bool(caps.get("dstep")),
+                           STREAM=bool(caps.get("stream")),
+                           ACT_ROWS=rows if rows > info["MCOLS"] else 0, **sizes)
+    if arch_hash(cfg) != c["hash"]:
+        raise ConfigMismatch(f"the bitstream's CFG_HASH {c['hash']:08x} is not the hash of the "
+                             f"configuration its registers report ({arch_hash(cfg):08x}): the "
+                             f"host and the build disagree on the Config's fields or on what "
+                             f"the hash holds besides them, e.g. the MXU's numerics "
+                             f"(opentpu/target.py arch_hash): load a bitstream of this tree or "
+                             f"run the bitstream's host")
+
+
 def check_fits(cfg, info: dict) -> None:
     """Raise ConfigMismatch unless programs compiled for `cfg` run on the device `info`
-    describes: the same MXU, lanes and ACT RAM rows, and (register map 4) no more slices, TMEM,
-    IMEM, ACT RAM blocks or DRAM than it has."""
+    describes: its CFG_HASH this host's (check_hash), the same MXU, lanes and ACT RAM rows,
+    and (register map 4) no more slices, TMEM, IMEM, ACT RAM blocks or DRAM than it has."""
+    check_hash(info)
     rows = info.get("act_rows") or info["MCOLS"]
     if (info["D"], info["MCOLS"], info["LANES"], rows) != \
             (cfg.D, cfg.MCOLS, cfg.LANES, cfg.act_rows):

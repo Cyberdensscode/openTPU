@@ -59,15 +59,17 @@ from pathlib import Path
 
 import numpy as np
 
+from opentpu import isa as I
 from opentpu import qcache as QC
 from opentpu import quant as Q
+from opentpu.kernels.mlp import down_chunk
 from opentpu.llm import formats as FM
 from opentpu.llm import gemma4 as G
 from opentpu.llm import lfm2 as L2
 from opentpu.llm import load_spec, model_dir
 from opentpu.llm import qwen3 as Q3
 from opentpu.llm import qwen35 as Q35
-from opentpu.llm.qwen3 import _fake_q, _v_parts, rope_tables
+from opentpu.llm.qwen3 import ATTN_BLOCK, _fake_k, _fake_q, _qk, _v_parts, rope_tables
 
 ROOT = Path(__file__).resolve().parent.parent
 HEAD_ROWS = 16384       # LM head rows per pass (quantize_mxu's pieces: the same quantization)
@@ -77,41 +79,66 @@ def family(spec):
     return {Q3.Spec: Q3, L2.Spec: L2, Q35.Spec: Q35}[type(spec)]
 
 
-def _ident(v, d=None):
+def _ident(v, d=None, n=None):
     return v
 
 
 def dequant(a, fmt, D):
-    """A weight as the device holds it, in float64 (None: unquantized): int8 as _fake_w; 4-bit
-    the image cache's DRAM rows and scale words, dequantized (the MXU's arithmetic)."""
+    """A weight as the device holds it, in float64 (None: unquantized): an MXW (quant.fake_w:
+    its values and groups' offsets, MM's sums with an MXAct), the 4-bit formats' quantization
+    through the image cache (opentpu.qcache)."""
     if fmt is None:
         return np.asarray(a, np.float64)
-    if fmt == "int8":
-        return _fake_q(np.asarray(a, np.float64), D)
-    rows, words = QC.quantize_mxu(a, fmt, D)
-    return Q.dequantize_w4(rows[:, :a.shape[1] // 2], words, fmt, D)
+    a = np.asarray(a, np.float32)
+    return Q.fake_w(a, fmt, D, QC.quantize_mxu(a, fmt, D) if fmt in QC.FORMATS else None)
 
 
-def _attend(q, K, v, fq, D, qd, scale):
-    """Causal attention of every row [T, n_q, d] on its query group's K (int8 already) and V
-    [T, n_kv, d]: q quantized per qd-block, V per token, P per D keys with V's scales folded in
-    (emulated_logits' points)."""
+def _down(spec, wf, name, D):
+    """The QACT ranges of a down projection's input (its F chunks: kernels.mlp.down_chunk, one
+    slice), None unquantized."""
+    f = wf(name)
+    return None if f is None else down_chunk(spec.ffn, D, f)
+
+
+def _attend(q, k, v, fq, D, scale, lo=None):
+    """Causal attention of every row [T, n_q, d] on its query group's K and V [T, n_kv, d] as
+    the device reads them (emulated_logits' points; fq _ident: none): q quantized per head row,
+    K as the cache holds it (qwen3._fake_k: ROW at d = D, else an offset per D-block), V per
+    token, P per attention block of ATTN_BLOCK positions with V's scales folded in, against
+    V^T (UNIT: MM's drops of P's groups). lo [T]: each row's first key (a sliding window)."""
     T, nq, _ = q.shape
-    G, Dp = nq // K.shape[1], -(-T // D) * D
-    V, vs = _v_parts(v) if fq is _fake_q else (v, np.ones(v.shape[:2]))
-    causal = np.tri(T, dtype=bool)
+    quant = fq is not _ident
+    G, Tb = nq // k.shape[1], -(-T // ATTN_BLOCK) * ATTN_BLOCK
+    if quant:
+        K, dK = _fake_k(k, D)
+        V, vs = _v_parts(v)
+    else:
+        K, dK, V, vs = k, None, v, np.ones(v.shape[:2])
+    t = np.arange(T)
+    ok = t[None, :] <= t[:, None]
+    if lo is not None:
+        ok &= t[None, :] >= np.asarray(lo)[:, None]
     o = np.zeros((T, nq, V.shape[2]))
     for hq in range(nq):
-        sc = np.where(causal, fq(q[:, hq] / scale, qd) @ K[:, hq // G].T, -np.inf)
+        h = hq // G
+        qq = fq(q[:, hq] / scale, D)
+        sc = _qk(qq, K[:, h], None if dK is None else dK[:, h], D) if quant else qq @ K[:, h].T
+        sc = np.where(ok, sc, -np.inf)
         pp = np.exp(sc - sc.max(1, keepdims=True))
-        ppad = np.zeros((T, Dp))
-        ppad[:, :T] = pp * vs[:, hq // G]
-        o[:, hq] = (fq(ppad, D)[:, :T] @ V[:, hq // G]) / pp.sum(1, keepdims=True)
+        if quant:
+            pf = np.zeros((T, Tb))
+            pf[:, :T] = pp * vs[:, h]
+            vt = np.zeros((Tb, V.shape[2]))
+            vt[:T] = V[:, h]
+            pv = Q.mx_matmul(fq(pf, D, ATTN_BLOCK), vt.T, None, I.MX_W[I.W8], D)
+        else:
+            pv = pp @ V[:, h]
+        o[:, hq] = pv / pp.sum(1, keepdims=True)
     return o
 
 
-def _qwen3(spec, W, i, x, w, fq, c, s, D):
-    """qwen3.emulated_logits' layer i on the rows x [T, H]."""
+def _qwen3(spec, W, i, x, w, fq, c, s, D, wf):
+    """qwen3.emulated_logits' layer i on the rows x [T, H] (wf: a weight's format)."""
     T, d = len(x), spec.head_dim
     p = f"model.layers.{i}."
 
@@ -132,16 +159,18 @@ def _qwen3(spec, W, i, x, w, fq, c, s, D):
         q, k = norm(q, gq), norm(k, gk)
     if i not in spec.nope:
         q, k = rot(q), rot(k)
-    o = _attend(q, fq(k, D), v, fq, D, D, math.sqrt(d))
+    o = _attend(q, k, v, fq, D, math.sqrt(d))
     x = x + fq(o.reshape(T, -1), D) @ w(p + "self_attn.o_proj.weight").T
     h = fq(norm(x, W[p + "post_attention_layernorm.weight"]), D)
     g, u = h @ w(p + "mlp.gate_proj.weight").T, h @ w(p + "mlp.up_proj.weight").T
-    return x + fq((g / (1 + np.exp(-g))) * u, D) @ w(p + "mlp.down_proj.weight").T
+    dn = p + "mlp.down_proj.weight"
+    return x + fq((g / (1 + np.exp(-g))) * u, D, _down(spec, wf, dn, D)) @ w(dn).T
 
 
-def _lfm2(spec, W, i, x, w, fq, c, s, D):
+def _lfm2(spec, W, i, x, w, fq, c, s, D, wf):
     """lfm2.emulated_logits' layer i (a dense one) on the rows x [T, H]."""
     T, d, H, K = len(x), spec.head_dim, spec.hidden, spec.conv_k
+    dk = -(-d // D) * D                         # q and K zero-padded to whole D blocks
     p = f"model.layers.{i}."
 
     def norm(v, g):
@@ -166,21 +195,27 @@ def _lfm2(spec, W, i, x, w, fq, c, s, D):
 
         q = rot(norm(q, W[a + "q_layernorm.weight"]))
         k = rot(norm(k, W[a + "k_layernorm.weight"]))
-        o = _attend(q, fq(k, min(d, D)), v, fq, D, min(d, D), math.sqrt(d))
+        pad = ((0, 0), (0, 0), (0, dk - d))
+        o = _attend(np.pad(q, pad), np.pad(k, pad), v, fq, D, math.sqrt(d))
         x = x + fq(o.reshape(T, -1), D) @ w(a + "out_proj.weight").T
     if spec.is_moe(i):
         raise ValueError("formats_scan: dense models only")
     h = fq(norm(x, W[p + "ffn_norm.weight"]), D)
     g = h @ w(p + "feed_forward.w1.weight").T
     u = h @ w(p + "feed_forward.w3.weight").T
-    return x + fq((g / (1 + np.exp(-g))) * u, D) @ w(p + "feed_forward.w2.weight").T
+    dn = p + "feed_forward.w2.weight"
+    return x + fq((g / (1 + np.exp(-g))) * u, D, _down(spec, wf, dn, D)) @ w(dn).T
 
 
-def _qwen35(spec, W, i, x, w, fq, c, s, D):
+def _qwen35(spec, W, i, x, w, fq, c, s, D, wf):
     """qwen35.emulated_logits' layer i (dense) on the rows x [T, H]; the DeltaNet recurrence
     runs over the rows in order."""
     T, d, eps, K = len(x), spec.head_dim, spec.eps, spec.conv_k
     nh, nk, dk, dv = spec.lin_heads, spec.lin_nk, spec.lin_dk, spec.lin_dv
+    og = 4 if nh % 4 == 0 else 2                # out_proj's QACT ranges (Image.og, one slice)
+    outr = [og * dv] * (nh // og)
+    if og == 4 and nh > 2:
+        outr[-1:] = [2 * dv, 2 * dv]
     p = f"model.layers.{i}."
 
     def g1(n):
@@ -208,7 +243,7 @@ def _qwen35(spec, W, i, x, w, fq, c, s, D):
             S = S + k[t][:, :, None] * delta[:, None, :]
             o[t] = np.einsum("hij,hi->hj", S, q[t])
         o = Q35._norm(o, np.asarray(W[a + "norm.weight"], np.float64), eps) * Q35._silu(z)
-        x = x + fq(o.reshape(T, -1), D) @ w(a + "out_proj.weight").T
+        x = x + fq(o.reshape(T, -1), D, outr) @ w(a + "out_proj.weight").T
     else:
         a = p + "self_attn."
         qg = (h @ w(a + "q_proj.weight").T).reshape(T, spec.n_q, 2 * d)
@@ -217,14 +252,15 @@ def _qwen35(spec, W, i, x, w, fq, c, s, D):
         v = (h @ w(a + "v_proj.weight").T).reshape(T, spec.n_kv, d)
         q = Q35._rot(Q35._norm(q, g1(a + "q_norm.weight"), eps), c, s, spec.rope_dim)
         k = Q35._rot(Q35._norm(k, g1(a + "k_norm.weight"), eps), c, s, spec.rope_dim)
-        o = _attend(q, fq(k, D), v, fq, D, D, math.sqrt(d)) / (1 + np.exp(-gate))
+        o = _attend(q, k, v, fq, D, math.sqrt(d)) / (1 + np.exp(-gate))
         x = x + fq(o.reshape(T, -1), D) @ w(a + "o_proj.weight").T
     if spec.moe is not None:
         raise ValueError("formats_scan: dense models only")
     h = fq(Q35._norm(x, g1(p + "post_attention_layernorm.weight"), eps), D)
     mp = spec.mlp_prefix(p)
     gg, u = h @ w(mp + "gate_proj.weight").T, h @ w(mp + "up_proj.weight").T
-    return x + fq(Q35._silu(gg) * u, D) @ w(mp + "down_proj.weight").T
+    dn = mp + "down_proj.weight"
+    return x + fq(Q35._silu(gg) * u, D, _down(spec, wf, dn, D)) @ w(dn).T
 
 
 LAYER = {Q3: _qwen3, L2: _lfm2, Q35: _qwen35}
@@ -252,8 +288,8 @@ def emulate(spec, W, tokens, variants: dict, D: int = 128, logits: bool = False,
     T = len(tokens)
     shapes = {} if shapes is None else shapes
     x0 = np.asarray(W["model.embed_tokens.weight"][list(tokens)], np.float64)
-    xs = {lab: (_fake_q(x0, D) if f is not None and spec.embed == "int8" else x0)
-          for lab, f in variants.items()}
+    x8 = Q3.gathered_rows(x0, D).astype(np.float64) if spec.embed == "int8" else x0
+    xs = {lab: (x8 if f is not None else x0) for lab, f in variants.items()}
     cs = [rope_tables(spec, p) for p in range(T)]
     c = np.stack([a for a, _ in cs]).astype(np.float64)[:, None, :]
     s = np.stack([b for _, b in cs]).astype(np.float64)[:, None, :]
@@ -270,8 +306,9 @@ def emulate(spec, W, tokens, variants: dict, D: int = 128, logits: bool = False,
 
         for lab, f in variants.items():
             fq = _fake_q if f is not None else _ident
-            wl = (lambda n, f=f: w(n, None if f is None else f(*M.weight_kind(n))))
-            xs[lab] = LAYER[M](spec, W, i, xs[lab], wl, fq, c, s, D)
+            wf = (lambda n, f=f: None if f is None else f(*M.weight_kind(n)))
+            wl = (lambda n, wf=wf: w(n, wf(n)))
+            xs[lab] = LAYER[M](spec, W, i, xs[lab], wl, fq, c, s, D, wf)
         held.clear()
         if log:
             log(f"layer {i + 1}/{spec.layers} ({time.time() - t0:.0f} s)")
@@ -341,14 +378,14 @@ def _head(hs: dict, fmts: dict, chunks, tokens, D: int = 128, logits: bool = Fal
 
 
 def weight_bytes(shapes: dict, fmt, D: int = 128) -> int:
-    """DRAM bytes a token reads of the weights (rows and block scales) under fmt(kind, layer)."""
+    """DRAM bytes a token reads of the weights (rows and scale rows) under fmt(kind, layer)."""
     n = 0
     for (kind, layer), mats in shapes.items():
         if kind == "experts":
             continue
         f = fmt(kind, layer) if kind != "head" else fmt("head")
         for rows, cols in mats.values():
-            n += rows * (Q.row_bytes(cols, f, D) + 4 * (cols // D))
+            n += rows * (Q.row_bytes(cols, f, D) + Q.scale_bytes(cols, f, D))
     return n
 
 
@@ -403,7 +440,8 @@ def _rows(specs: dict, res: dict) -> dict:
 G4KINDS = ("attn", "gateup", "down", "ple")     # a layer's formats (gemma4.layer_formats')
 G4CAP = 2048        # the image whose PLE table format a variant takes (otpu-chat's --cap)
 G4SRC = ("tools/gemma4_quant_eval.py", "opentpu/llm/gemma4.py", "opentpu/quant.py",
-         "opentpu/kernels/gather.py", "opentpu/qcache.py")   # (_g4_run's cache keys)
+         "opentpu/fp32.py", "opentpu/kernels/gather.py", "opentpu/kernels/mlp.py",
+         "opentpu/llm/moe.py", "opentpu/llm/qwen3.py", "opentpu/qcache.py")  # (_g4_run's keys)
 
 
 def _g4q():
@@ -510,7 +548,7 @@ def _g4_bytes(spec, shapes: dict, v, D: int = 128) -> int:
     for f, (rows, cols) in [(fmt(k), s) for k, s in shapes.items()] + \
             [(hf, (spec.vocab, spec.hidden))]:
         cols = -(-cols // D) * D
-        n += rows * (Q.row_bytes(cols, f, D) + 4 * (cols // D))
+        n += rows * (Q.row_bytes(cols, f, D) + Q.scale_bytes(cols, f, D))
     return n
 
 
@@ -529,10 +567,11 @@ def _g4_run(spec, W, ids, specs: dict, D, log, cache=None, head_rows: int = HEAD
         fmts[lab], pfs[lab] = None if hf == "none" else hf, pf
         key = repr((str(getattr(W, "model_dir", "")), spec, list(ids), D, wf, hf, pf,
                     sorted(wmap.items())))
-        f = Path(cache) / f"{hashlib.sha256(key.encode() + src).hexdigest()[:20]}.npy" \
+        f = Path(cache) / f"{hashlib.sha256(key.encode() + src).hexdigest()[:20]}.npz" \
             if cache else None
         if f is not None and f.exists():
-            hs[lab] = np.load(f)
+            with np.load(f) as z:           # the rows and, quantized, their offsets (MXAct)
+                hs[lab] = Q.MXAct.of(z["v"], z["da"] if "da" in z else None)
             continue
         t0 = time.time()
         if f is not None:
@@ -541,8 +580,10 @@ def _g4_run(spec, W, ids, specs: dict, D, log, cache=None, head_rows: int = HEAD
         hs[lab] = E.emulate(spec, W, ids, D, wformat=wf, hf=hf, ple_format=pf, wmap=wmap,
                             hidden=True, ckpt=ck)
         if f is not None:
-            np.save(f"{f}.tmp.npy", hs[lab])
-            os.replace(f"{f}.tmp.npy", f)
+            da = getattr(hs[lab], "da", None)
+            np.savez(f"{f}.tmp.npz", v=np.asarray(hs[lab]).view(np.ndarray),
+                     **({} if da is None else {"da": da}))
+            os.replace(f"{f}.tmp.npz", f)
             if os.path.exists(ck):
                 os.remove(ck)
         if log:
@@ -781,7 +822,7 @@ def main():
     a.add_argument("model")
     a.add_argument("out")
     a.add_argument("--tokens", type=int, default=900)
-    a.add_argument("--fmt", default="fp4", choices=["fp4", "int4"])
+    a.add_argument("--fmt", default="fp4", choices=["fp4", "int4", "nvfp4"])
     a.add_argument("--cache", help="Gemma 4: the head inputs' directory (default OUT.json.xl)")
     a.add_argument("--base", default="", help="formats every variant starts from (the int8 "
                    "row's), e.g. experts=fp4,head=fp4 (the 26B's card)")

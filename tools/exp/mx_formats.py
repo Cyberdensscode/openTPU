@@ -27,6 +27,12 @@ A variant is "WEIGHTS/HEAD/ACTS[/flush]": the layers' weights, the LM head's, th
 and with /flush the window's drops emulated exactly (per 16 elements; zero blocks never drop).
 
     PYTHONPATH=. python3 tools/exp/mx_formats.py MODEL OUT.json [--tokens 2000] VARIANT...
+
+The study ran against formats_scan.py and opentpu/quant.py of the MXU before MX (b370889d's): run
+it from a checkout of that commit. Since the MX packers, formats_scan's own int8 / int4 / fp4 /
+nvfp4 are the MX formats (int8x, int4x, fp4x6, nvfp4r with a8x32 activations, device-faithful
+ranges); tests/test_quant.py holds quant.py's quantizers to this file's w_int8x, w_fp4x(a, 6)
+and w_nvfp4(a, per_row=True), which still import from here.
 """
 from __future__ import annotations
 

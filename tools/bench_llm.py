@@ -59,6 +59,7 @@ sys.path.insert(0, str(ROOT))
 
 from opentpu import quant as Q  # noqa: E402
 from opentpu import rtlsim, simtmp  # noqa: E402
+from opentpu.compiler import k_scale_bytes  # noqa: E402
 from opentpu.isasim import board_config  # noqa: E402
 from opentpu.llm.qwen3 import Image, Spec, rope_tables  # noqa: E402
 
@@ -107,13 +108,14 @@ def roofline(spec: Spec, cfg, rows: list, head_rows: int, bw: int, wformat: str 
     mats = [(spec.n_q * d, H), (spec.n_kv * d, H), (spec.n_kv * d, H), (H, spec.n_q * d),
             (spec.ffn, H), (spec.ffn, H), (H, spec.ffn)]
     params = sum(n * k for n, k in mats)
-    wbytes = sum(n * Q.row_bytes(k, wformat, D) + 4 * n * (k // D) for n, k in mats)
+    wbytes = sum(n * (Q.row_bytes(k, wformat, D) + Q.scale_bytes(k, wformat, D))
+                 for n, k in mats)
     hbytes = spec.vocab * Q.row_bytes(H, head_format or wformat, D) + \
-        4 * spec.vocab * (H // D) if head_rows else 0
+        spec.vocab * Q.scale_bytes(H, head_format or wformat, D) if head_rows else 0
     ctx = {}
     for sq, p in rows:                      # tokens of each sequence's cache read this run
         ctx[sq] = max(ctx.get(sq, 0), p + 1)
-    kv_tok = spec.n_kv * (2 * d + 4 * (d // D) + 4)
+    kv_tok = spec.n_kv * (2 * d + k_scale_bytes(d, D) + 4)
     kvbytes = sum(ctx.values()) * kv_tok
     dram = (spec.layers * (wbytes + kvbytes) + hbytes) / (D * bw / 100)
     macs = spec.layers * len(rows) * params + head_rows * spec.vocab * H + \

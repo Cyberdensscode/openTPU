@@ -90,10 +90,10 @@ def main(argv=None) -> int:
     ap.add_argument("--backend", default="board", choices=["board", "board-sim", "isa"])
     ap.add_argument("--dev", default="/dev/xdma0")
     ap.add_argument("--cap", type=int, default=1024)
-    ap.add_argument("--wformat", default="int8", choices=["int8", "fp4", "int4", "mix"],
+    ap.add_argument("--wformat", default="int8", choices=["int8", "fp4", "int4", "nvfp4", "mix"],
                     help="int8 (default): bit-exact in any split; with PAIR a 4-bit run of "
                          "more than MCOLS / 2 rows sums in another order (docs/prefill.md)")
-    ap.add_argument("--head-format", default=None, choices=["int8", "fp4", "int4"])
+    ap.add_argument("--head-format", default=None, choices=["int8", "fp4", "int4", "nvfp4"])
     ap.add_argument("--turns", type=int, default=len(MESSAGES))
     ap.add_argument("--max-new", type=int, default=24)
     ap.add_argument("--think", action="store_true")

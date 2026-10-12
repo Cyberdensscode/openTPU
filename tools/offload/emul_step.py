@@ -12,7 +12,9 @@ import numpy as np
 from opentpu.llm import load_spec
 from opentpu.llm import moe as MO
 from opentpu.llm.lfm2 import ATTN, CONV, _norm
-from opentpu.llm.qwen3 import LazyWeights, _fake_q, _fake_w, _pv, _v_parts, rope_tables
+from opentpu.kernels.mlp import down_chunk
+from opentpu.llm.qwen3 import (LazyWeights, _fake_k, _fake_q, _fake_w, _pv, _qk, _v_parts,
+                               gathered_rows, rope_tables)
 
 model, hf, cardf = sys.argv[1:4]
 spec = load_spec(model)
@@ -22,6 +24,9 @@ k = card["first_diff"]
 tokens = list(ref["ids"]) + list(ref["tokens"][:k])
 D, wformat, hfmt = 128, "fp4", "int8"
 d, G, H, K = spec.head_dim, spec.n_q // spec.n_kv, spec.hidden, spec.conv_k
+dk = -(-d // D) * D                         # q and K zero-padded to whole D blocks
+CD = down_chunk(spec.ffn, D, wformat)       # the dense down projections' QACT ranges
+CE = MO.ExpertFormat(H, spec.moe.ffn, D, wformat).C     # an expert's
 head = "model.embed_tokens.weight" if spec.tied else "lm_head.weight"
 Wq = {}
 
@@ -44,7 +49,8 @@ state = {i: [np.zeros(H)] * (K - 1) for i, kd in enumerate(spec.kinds) if kd == 
 routes = []
 t0 = time.time()
 for pos, tk in enumerate(tokens):
-    x = w(head)[tk].copy() if spec.tied else np.asarray(W[head][tk], np.float64)
+    x = gathered_rows(np.asarray(W[head][[tk]], np.float32), D)[0].astype(np.float64) \
+        if spec.tied else np.asarray(W[head][tk], np.float64)
     c, s = rope_tables(spec, pos)
 
     def rot(v):
@@ -68,13 +74,15 @@ for pos, tk in enumerate(tokens):
             v = (w(a + "v_proj.weight") @ h).reshape(spec.n_kv, d)
             q = rot(norm(q, W[a + "q_layernorm.weight"]))
             kk = rot(norm(kk, W[a + "k_layernorm.weight"]))
-            Kc[i].append(_fake_q(kk, min(d, D)))
+            Kc[i].append(_fake_k(np.pad(kk, ((0, 0), (0, dk - d))), D))
             Vc[i].append(_v_parts(v))
-            Kh = np.stack(Kc[i], 1)
+            Kh = np.stack([a_ for a_, _ in Kc[i]], 1)
+            dK = None if Kc[i][0][1] is None else np.stack([b_ for _, b_ in Kc[i]], 1)
             Vq, Vs = (np.stack(z, 1) for z in zip(*Vc[i]))
             o = np.zeros((spec.n_q, d))
             for hq in range(spec.n_q):
-                sc = Kh[hq // G] @ _fake_q(q[hq] / math.sqrt(d), min(d, D))
+                sc = _qk(_fake_q(np.pad(q[hq] / math.sqrt(d), (0, dk - d)), D), Kh[hq // G],
+                         None if dK is None else dK[hq // G], D)
                 pp = np.exp(sc - sc.max())
                 o[hq] = _pv(pp, Vq[hq // G], Vs[hq // G], D) / pp.sum()
             x = x + w(a + "out_proj.weight") @ _fake_q(o.reshape(-1), D)
@@ -91,11 +99,11 @@ for pos, tk in enumerate(tokens):
             for e, we in zip(ids, wts):
                 ep = f"{f}experts.{e}."
                 g, u = w(ep + "w1.weight") @ h, w(ep + "w3.weight") @ h
-                x = x + we * (w(ep + "w2.weight") @ _fake_q((g / (1 + np.exp(-g))) * u, D))
+                x = x + we * (w(ep + "w2.weight") @ _fake_q((g / (1 + np.exp(-g))) * u, D, CE))
             continue
         g = w(p + "feed_forward.w1.weight") @ h
         u = w(p + "feed_forward.w3.weight") @ h
-        x = x + w(p + "feed_forward.w2.weight") @ _fake_q((g / (1 + np.exp(-g))) * u, D)
+        x = x + w(p + "feed_forward.w2.weight") @ _fake_q((g / (1 + np.exp(-g))) * u, D, CD)
     print(f"pos {pos} {time.time() - t0:.0f} s", file=sys.stderr, flush=True)
 lo = w(head) @ _fake_q(norm(x, W["model.embedding_norm.weight"]), D)
 top = np.argsort(-lo)[:8]

@@ -29,7 +29,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ..compiler import Affine, vt_tile
+from ..compiler import Affine, k_scale_bytes, vt_tile
 from ..llm import snapshot as SN
 
 STAGING_MAX = 256 << 20     # the staging area's bytes at most (a batch of pages per copy)
@@ -75,7 +75,7 @@ def kv_arrays(image, seq: int = 0) -> list[Array]:
                 out += [Array(k, kv.ps), Array(_static(e["vt"]), kv.d, True),
                         Array(_static(e["vs"]), 4)]
             else:
-                out += [Array(k, kv.d), Array(_static(e["ks"]), 4 * (kv.d // kv.D)),
+                out += [Array(k, kv.d), Array(_static(e["ks"]), k_scale_bytes(kv.d, kv.D)),
                         Array(_static(e["vt"]), kv.d, True), Array(_static(e["vs"]), 4)]
     return out
 

@@ -44,21 +44,21 @@ from .. import qcache as QC
 from .. import quant as Q
 from .. import language as ol
 from .. import isa as I
-from ..compiler import Affine, KVDesc, QTensor, Tensor, current, trace_fit
+from ..compiler import Affine, KVDesc, QTensor, Tensor, current, k_scale_bytes, trace_fit
 from ..isasim import Config
 from ..kernels.layouts import head_parallel_attention_weights
 from ..kernels.lib import rmsnorm
-from ..kernels.mlp import _chunk
+from ..kernels.mlp import _chunk, down_chunk
 from ..host.offload import ExpertServer, Layout
-from ..runtime import quantize_rows
 from . import formats as FM
 from . import generate as G
 from . import moe as MO
 from . import rope_parameters
 from .qwen3 import (OutTokens, RunPos, RunRows, RunWords, _formats, _inputs, _inputs_rows,
                     _amask, _lookup_alloc, _lookup_build, _lookup_desc, _tok_arg, _tokens_arg,
-                    compile_decode)
-from .qwen3 import (ATTN_BLOCK, _attention, _attention_rows, _Bump, _fake_q, _fake_w, _lm_head,
+                    compile_decode, put_head)
+from .qwen3 import (ATTN_BLOCK, _attention, _attention_rows, _Bump, _fake_k, _fake_q, _fake_w,
+                    _qk, gathered_rows, _lm_head,
                     _lm_head_rows, _mlp, _pv, _qdesc, _tdesc, _v_parts, rope_tables, EmbedHost,
                     fill_logits, step_descriptors)
 
@@ -302,10 +302,13 @@ def weight_kind(n: str) -> tuple:
 
 def emulated_logits(spec: Spec, W: dict, tokens, D: int = 128, wformat: str = "int8",
                     head_format: str | None = None, routes: list | None = None,
-                    formats: str | None = None) -> np.ndarray:
+                    formats: str | None = None, S: int = 1) -> np.ndarray:
     """float64 decode with openTPU's quantization points and none of its rounding (as
-    qwen3.emulated_logits); a zero-padded K or q block quantizes like its head_dim values."""
+    qwen3.emulated_logits, on S slices): K and q zero-padded to whole D blocks (the cache's
+    rows, dk), the dense down projections' activations in their F chunks (kernels.mlp.down_chunk)
+    and the experts' in their slot's (moe.ExpertFormat)."""
     d, G, H, K = spec.head_dim, spec.n_q // spec.n_kv, spec.hidden, spec.conv_k
+    dk = -(-d // D) * D
     Wq: dict = {}
 
     head = "model.embed_tokens.weight" if spec.tied else "lm_head.weight"
@@ -320,6 +323,12 @@ def emulated_logits(spec: Spec, W: dict, tokens, D: int = 128, wformat: str = "i
     def norm(v, g):
         return _norm(v, g, spec.eps)
 
+    def pad(v):
+        return np.pad(v, [(0, 0)] * (v.ndim - 1) + [(0, dk - d)])
+
+    def chunk(i):
+        return down_chunk(spec.ffn // S, D, fmt("down", i))
+
     Kc = {i: [] for i, k in enumerate(spec.kinds) if k == ATTN}
     Vc = {i: [] for i in Kc}
     state = {i: [np.zeros(H)] * (K - 1) for i, k in enumerate(spec.kinds) if k == CONV}
@@ -327,7 +336,7 @@ def emulated_logits(spec: Spec, W: dict, tokens, D: int = 128, wformat: str = "i
     for pos, tk in enumerate(tokens):
         x = np.asarray(W["model.embed_tokens.weight"][tk], np.float64)
         if spec.embed == "int8":                    # the int8 embedding rows (Spec.embed)
-            x = _fake_q(x, D)
+            x = gathered_rows(x, D)[0].astype(np.float64)
         c, s = rope_tables(spec, pos)
 
         def rot(v):
@@ -351,13 +360,15 @@ def emulated_logits(spec: Spec, W: dict, tokens, D: int = 128, wformat: str = "i
                 v = (w(a + "v_proj.weight") @ h).reshape(spec.n_kv, d)
                 q = rot(norm(q, W[a + "q_layernorm.weight"]))
                 k = rot(norm(k, W[a + "k_layernorm.weight"]))
-                Kc[i].append(_fake_q(k, min(d, D)))
+                Kc[i].append(_fake_k(pad(k), D))
                 Vc[i].append(_v_parts(v))
-                Kh = np.stack(Kc[i], 1)
+                Kh = np.stack([a for a, _ in Kc[i]], 1)
+                dK = None if Kc[i][0][1] is None else np.stack([b for _, b in Kc[i]], 1)
                 Vq, Vs = (np.stack(z, 1) for z in zip(*Vc[i]))
                 o = np.zeros((spec.n_q, d))
                 for hq in range(spec.n_q):
-                    sc = Kh[hq // G] @ _fake_q(q[hq] / math.sqrt(d), min(d, D))
+                    sc = _qk(_fake_q(pad(q[hq] / math.sqrt(d)), D), Kh[hq // G],
+                             None if dK is None else dK[hq // G], D)
                     pp = np.exp(sc - sc.max())
                     o[hq] = _pv(pp, Vq[hq // G], Vs[hq // G], D) / pp.sum()
                 x = x + w(a + "out_proj.weight") @ _fake_q(o.reshape(-1), D)
@@ -376,11 +387,14 @@ def emulated_logits(spec: Spec, W: dict, tokens, D: int = 128, wformat: str = "i
                 for e, we in zip(ids, wts):
                     ep = f"{f}experts.{e}."
                     g, u = w(ep + "w1.weight") @ h, w(ep + "w3.weight") @ h
-                    x = x + we * (w(ep + "w2.weight") @ _fake_q((g / (1 + np.exp(-g))) * u, D))
+                    ce = MO.ExpertFormat(H, spec.moe.ffn, D, fmt("experts", i)).ranges()
+                    x = x + we * (w(ep + "w2.weight") @ _fake_q((g / (1 + np.exp(-g))) * u, D,
+                                                                 ce))
                 continue
             g = w(p + "feed_forward.w1.weight") @ h
             u = w(p + "feed_forward.w3.weight") @ h
-            x = x + w(p + "feed_forward.w2.weight") @ _fake_q((g / (1 + np.exp(-g))) * u, D)
+            x = x + w(p + "feed_forward.w2.weight") @ _fake_q((g / (1 + np.exp(-g))) * u, D,
+                                                               chunk(i))
         out.append(w(head) @ _fake_q(norm(x, W["model.embedding_norm.weight"]), D))
     return np.array(out)
 
@@ -457,11 +471,11 @@ class Image(EmbedHost):
         self.loc = _place(b, self.plan, lambda k: self.layouts[k[1]].size[_kind(k[0])])
         dk = self.dk
         n_attn = spec.kinds.count(ATTN)
-        head = cap * dk + 4 * cap * (dk // D) + dk * cap + 4 * cap
+        head = cap * dk + cap * k_scale_bytes(dk, D) + dk * cap + 4 * cap
         self.kv_bytes = (n_attn * self.nkv_loc * head                   # KV cache and
                          + (spec.layers - n_attn) * 8 * K * self.h_loc)  # conv state, per sequence
         self.head = (b.alloc(self.v_loc * Q.row_bytes(H, self.head_format, D)),
-                     b.alloc(4 * self.v_loc * (H // D)))
+                     b.alloc(self.v_loc * Q.scale_bytes(H, self.head_format, D)))
         # the int8 embedding rows of the resident decode are the tied int8 head's (S = 1)
         shared = spec.tied and self.head_format == "int8" and S == 1
         if embed_host is None:      # an int8 table of its own on the host by default where its
@@ -496,6 +510,7 @@ class Image(EmbedHost):
         norms and the dense MLP first, at the same offsets in both) and sizes (size)."""
         spec, cfg, cap = self.spec, self.cfg, self.cap
         D, H, d, F_, K = cfg.D, spec.hidden, spec.head_dim, spec.ffn, spec.conv_k
+        sb = lambda k, f: Q.scale_bytes(k, f, D)                        # noqa: E731
         fc, fa, fg, fd = g
         mf = {"win": fc, "wout": fc, "wq": fa, "wk": fa, "wv": fa, "wo": fa, "wg": fg,
               "wu": fg, "wd": fd}
@@ -506,17 +521,17 @@ class Image(EmbedHost):
         # the dense MLP: in every layer block, or for a MoE model (whose MoE layers have none)
         # in a region of its own, one MLP per dense layer (layers 0 .. moe.first - 1)
         mb = lb if mo is None else _Bump()
-        dense = {name: (mb.alloc(n * rb(k, mf[name])), mb.alloc(4 * n * (k // D)))
+        dense = {name: (mb.alloc(n * rb(k, mf[name])), mb.alloc(n * sb(k, mf[name])))
                  for name, (n, k) in mlp.items()}
         dense["wd"] = [(mb.alloc(self.h_loc * rb(dchunk, fd)),
-                        mb.alloc(4 * self.h_loc * (dchunk // D)))
+                        mb.alloc(self.h_loc * sb(dchunk, fd)))
                        for _ in range(F_ // dchunk)]
         ns = SimpleNamespace(mf=mf, dchunk=dchunk)
         if mo is None:
             common.update(dense)
         else:                       # the router (int8 in every format), its bias, j * E
             ns.mlp_ofs, ns.DS = dense, (mb.next + 4095) // 4096 * 4096
-            common.update(router=(lb.alloc(mo.E * H), lb.alloc(4 * mo.E * (H // D))),
+            common.update(router=(lb.alloc(mo.E * H), lb.alloc(mo.E * sb(H, "int8"))),
                           ebias=lb.alloc(4 * mo.E), gbase=lb.alloc(4))
         cb = _Bump(lb.next)
         conv = dict(common, taps=cb.alloc(4 * K * self.h_loc),
@@ -526,9 +541,9 @@ class Image(EmbedHost):
         for kind, bump, L in ((CONV, cb, conv), (ATTN, ab, attn)):
             for name, (n, k) in self.mats[kind].items():
                 if name not in L:
-                    L[name] = (bump.alloc(n * rb(k, mf[name])), bump.alloc(4 * n * (k // D)))
+                    L[name] = (bump.alloc(n * rb(k, mf[name])), bump.alloc(n * sb(k, mf[name])))
         dk = self.dk
-        attn["kv"] = [{"k": ab.alloc(cap * dk), "ks": ab.alloc(4 * cap * (dk // D)),
+        attn["kv"] = [{"k": ab.alloc(cap * dk), "ks": ab.alloc(cap * k_scale_bytes(dk, D)),
                        "vt": ab.alloc(dk * cap), "vs": ab.alloc(4 * cap)}
                       for _ in range(self.nkv_loc)]
         ns.lofs = {CONV: conv, ATTN: attn}
@@ -565,6 +580,14 @@ class Image(EmbedHost):
             for s, p in enumerate(parts):
                 qb.submit(p, fmt, D, lambda q, sc, s=s: (put(s, addr_pair[0], q),
                                                          put(s, addr_pair[1], sc)))
+
+        def put_parts(addrs, parts, fmt, C):
+            """Each slice's rows quantized whole and stored in column parts of C (qwen3's)."""
+            for s, p in enumerate(parts):
+                qb.submit(p, fmt, D, lambda q, sc, s=s: [
+                    (put(s, a0, pq), put(s, a1, ps))
+                    for (a0, a1), (pq, ps) in zip(addrs, Q.column_parts(q, sc, fmt, p.shape[1],
+                                                                         C, D))])
 
         def rows(a, k):
             return [a[s * k:(s + 1) * k] for s in range(S)]
@@ -615,13 +638,9 @@ class Image(EmbedHost):
             for name, hf in (("wg", "w1"), ("wu", "w3")):
                 put_q(tuple(mb + x for x in mofs[name]),
                       rows(W[p + f"feed_forward.{hf}.weight"], self.f_loc), mf[name])
-            C_ = g.dchunk
-            for j, pair in enumerate(mofs["wd"]):
-                put_q((mb + pair[0], mb + pair[1]),
-                      [r[:, j * C_:(j + 1) * C_] for r in rows(W[p + "feed_forward.w2.weight"], n)],
-                      mf["wd"])
-        head = W["model.embed_tokens.weight"] if spec.tied else W["lm_head.weight"]
-        put_q(self.head, rows(head, self.v_loc), self.head_format)
+            put_parts([(mb + a0, mb + a1) for a0, a1 in mofs["wd"]],
+                      rows(W[p + "feed_forward.w2.weight"], n), mf["wd"], g.dchunk)
+        put_head(self, W, qb, put, put_q, rows)     # (and the tied int8 head's gather scales)
         qb.wait()
         if self.lookup:
             _lookup_build(put, S, W, spec, self.cap, self.lookup)
@@ -728,12 +747,11 @@ class Image(EmbedHost):
             for name, (r, k) in self.mats[kind].items():
                 da, sa = lofs[name]
                 fm = mf[name]
-                setattr(ns, name, QTensor(off + da, off + sa, (r, k), Q.row_bytes(k, fm, D),
-                                          4 * (k // D), D, wf=Q.mxu_wf(fm)))
+                setattr(ns, name, QTensor.weight(off + da, off + sa, r, k, fm, D))
             if moe:
                 E = spec.moe.E
                 da, sa = lofs["router"]
-                ns.router = QTensor(off + da, off + sa, (E, H), H, 4 * (H // D), D)
+                ns.router = QTensor.weight(off + da, off + sa, E, H, "int8", D)
                 ns.ebias = Tensor(off + lofs["ebias"], (E,), (1,))
                 ns.gbase = Tensor(off + lofs["gbase"], (1,), (1,))
             else:
@@ -744,17 +762,14 @@ class Image(EmbedHost):
                     for name in ("wg", "wu"):
                         da, sa = mofs[name]
                         fm = mf[name]
-                        setattr(ns, name, QTensor(moff + da, moff + sa, (self.f_loc, H),
-                                                  Q.row_bytes(H, fm, D), 4 * (H // D), D,
-                                                  wf=Q.mxu_wf(fm)))
+                        setattr(ns, name, QTensor.weight(moff + da, moff + sa, self.f_loc, H,
+                                                         fm, D))
                 C = g.dchunk
                 fm = mf["wd"]
-                wf = Q.mxu_wf(fm)
-                rc = Q.row_bytes(C, fm, D)
-                parts = tuple(QTensor(moff + da, moff + sa, (n, C), rc, 4 * (C // D), D, wf=wf)
+                parts = tuple(QTensor.weight(moff + da, moff + sa, n, C, fm, D)
                               for da, sa in mofs["wd"])
-                ns.wd = QTensor(parts[0].data, parts[0].scale, (n, spec.ffn), rc, 4 * (C // D),
-                                D, parts=parts, pw=C, wf=wf)
+                ns.wd = QTensor(parts[0].data, parts[0].scale, (n, spec.ffn), parts[0].rs,
+                                parts[0].srs, D, parts=parts, pw=C, wf=parts[0].wf)
             if kind == CONV:
                 ns.taps = Tensor(off + lofs["taps"], (K, n), (n, 1))
                 ns.state = Tensor(off + lofs["state"], (2 * K, n), (n, 1))     # _ring_rows

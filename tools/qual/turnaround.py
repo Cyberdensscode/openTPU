@@ -42,7 +42,7 @@ TILE = 4 * NS * NS
 
 
 def layout(n_mm: int, n_dma: int) -> dict:
-    rb, sb = Q.row_bytes(H, "fp4", 128), 4 * (H // 128)
+    rb, sb = Q.row_bytes(H, "fp4", 128), Q.scale_bytes(H, "fp4", 128)
     a = {"w": 0, "ws": n_mm * R * rb}
     a["x"] = a["ws"] + n_mm * R * sb
     a["src"] = (a["x"] + 4 * H + MB - 1) // MB * MB
@@ -125,7 +125,8 @@ def turnarounds(board, seconds: float = 30.0, mb: float = 32.0, runs: int | None
         n += 1
     dt = time.time() - t0
     got = board.read(a["dma"], len(want))
-    moved = n * (n_mm * R * (Q.row_bytes(H, "fp4", 128) + 4 * (H // 128)) + (2 * n_dma - 1) * TILE)
+    moved = n * (n_mm * R * (Q.row_bytes(H, "fp4", 128) + Q.scale_bytes(H, "fp4", 128))
+                 + (2 * n_dma - 1) * TILE)
     what = (f"{n} runs in {dt:.1f} s ({moved / 1e9:.1f} GB: fp4 weights beside 64 KiB stores "
             f"and loads)")
     bad = np.nonzero(got != want)[0]

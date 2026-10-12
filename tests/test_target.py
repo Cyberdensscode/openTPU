@@ -161,6 +161,27 @@ def test_device_config_from_the_cfg_registers(no_env):
     info["cfg"]["hash"] ^= 1
     with pytest.raises(ConfigMismatch, match="CFG_HASH"):
         device_config(info)
+    with pytest.raises(ConfigMismatch, match="CFG_HASH"):           # programs built elsewhere
+        check_fits(dataclasses.replace(c2, DRAM_BYTES=1 << 24), info)
+
+
+def test_the_engine_backend_checks_the_hash(no_env):
+    """BoardBackend (the Engine's, otpu-serve's: its Config from llm.device_config, not
+    board.device_config) refuses a bitstream whose CFG_HASH is not this host's hash of the
+    configuration its registers report: one built with other numerics (the MXU before MX
+    against an MX host) would run the programs and compute something else."""
+    import numpy as np
+
+    from opentpu.host.board import BoardBackend
+    t = FakeTransport(devname=None, regmap=4, pair=True, dstep=True, stream=True)
+    cfg = device_config(Board(t).info())
+    small = dataclasses.replace(cfg, DRAM_BYTES=1 << 22)
+    BoardBackend(small, [np.zeros(4096, np.uint8)], transport=t, status=False).close()
+    other = dict(R.cfg(t.cfg_words))
+    other["hash"] ^= 0x10
+    bad = FakeTransport(devname=None, regmap=4, pair=True, dstep=True, stream=True, cfg=other)
+    with pytest.raises(ConfigMismatch, match="CFG_HASH .* numerics"):
+        BoardBackend(small, [np.zeros(4096, np.uint8)], transport=bad, status=False)
 
 
 def test_device_config_before_map_4_is_the_card(no_env):

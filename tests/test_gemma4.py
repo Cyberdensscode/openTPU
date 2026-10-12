@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from opentpu import quant as Q
 from opentpu.compiler import CompileError
 from opentpu.isasim import board_config
 from opentpu.kernels import gather as GA
@@ -225,21 +226,25 @@ def test_host_sampler_caps_as_hf(tiny):
 
 
 def test_emulation_rounds_ties_as_the_device(tmp_path):
-    """A 4-bit LM head's rows (the embedding rows) quantize to int8 with exact ties (fp4 codes
-    3 and 6 make 63.5), at the input of the PLE projection: _fake_q rounds a tie as the
-    device's quantizer does, so every row's int8 values are fp32.quantize's. On one global
-    layer with per-layer inputs, in fp4, emulated_logits is then the ISA simulator's logits to
-    fp32 rounding at every position (with the ties rounded half to even, 6 of the 12 positions
-    were 0.5 to 1% off; Hugging Face's forward with the device's weights, PLE records and
+    """A 4-bit LM head's rows (the embedding rows, gathered) quantize to int8 with exact ties
+    (fp4 codes 3 and 6 under one multiplier make 63.5), at the input of the PLE projection:
+    _fake_q rounds a tie as the device's quantizer does, so every row's int8 values are
+    fp32.quantize_mx's (QACT's: a scale a row, an offset per D/4). On one global layer with
+    per-layer inputs, in fp4, emulated_logits is then the ISA simulator's logits to fp32
+    rounding at every position (with the ties rounded half to even, 6 of the 12 positions were
+    0.5 to 1% off before MX; Hugging Face's forward with the device's weights, PLE records and
     quantizer agrees with the device)."""
     from opentpu import fp32 as F
-    from opentpu.llm.qwen3 import _fake_q, _fake_w
+    from opentpu.kernels import gather as GA
+    from opentpu.llm.qwen3 import _fake_q
     _, W, spec = _model(tmp_path, (F_,), 0)
-    xb = (_fake_w(W["model.embed_tokens.weight"], 128, "fp4") * 16).reshape(1000, -1, 128)
-    s = np.maximum(np.abs(xb).max(-1, keepdims=True), 1e-30) / 127     # (token 0's row: 0)
-    r = xb / s
-    assert (np.abs(r - np.rint(r)) > 0.5 - 1e-9).sum() > 10000
-    assert np.array_equal(np.rint(_fake_q(xb) / s), F.quantize(xb.astype(np.float32))[0])
+    xb = GA.gathered(W["model.embed_tokens.weight"], "fp4").astype(np.float64) * 16
+    q, _, d = F.quantize_mx(xb.astype(np.float32), 32)
+    unit = (np.maximum(np.abs(xb).max(-1, keepdims=True), 1e-30) / 127     # (token 0's row: 0)
+            * np.exp2(-np.repeat(d, 32, -1).astype(np.float64)))
+    r = xb / unit
+    assert (np.abs(r - np.rint(r)) > 0.5 - 1e-9).sum() > 1000
+    assert np.array_equal(np.rint(np.asarray(_fake_q(xb)) / unit), q)
     toks = [int(t) for t in np.random.default_rng(0).integers(0, 1000, 12)]
     eng = Engine(spec, W, cap=1024, cfg=_cfg(), wformat="fp4")
     dev = np.array([eng.step(t) for t in toks])
@@ -716,7 +721,7 @@ def test_formats_scan(tiny, tmp_path, monkeypatch):
             assert np.mean(lg.argmax(1) == lq.argmax(1)) > 0.9, lab
     assert FS._g4_args(spec, specs["head"])[1] == "fp4"
     assert FS._g4_args(spec, specs["mix"])[2]["ple"] == "fp4"
-    assert len(list(tmp_path.glob("*.npy"))) == 4
+    assert len([f for f in tmp_path.glob("*.npz") if ".ckpt" not in f.name]) == 4
     monkeypatch.setattr(FS, "_g4q", lambda: None)               # (no emulate: the cache)
     assert FS._g4_run(spec, W, toks, specs, 128, None, tmp_path, head_rows=256) == rows
 
@@ -724,7 +729,9 @@ def test_formats_scan(tiny, tmp_path, monkeypatch):
     kv = {i for i in range(spec.layers) if f"model.layers.{i}.self_attn.k_proj.weight" in shapes}
     assert kv == set(range(6))
     by = {lab: FS._g4_bytes(spec, shapes, v) for lab, v in specs.items() if v is not None}
-    n8 = sum(r * c * 33 // 32 for r, c in shapes.values()) + 1000 * 256 * 33 // 32
+    n8 = sum(r * (k + Q.scale_bytes(k, "int8")) for r, k in               # int8x's rows
+             ((r, -(-c // 128) * 128) for r, c in shapes.values())) + \
+        1000 * (256 + Q.scale_bytes(256, "int8"))
     assert by["int8"] == n8 > by["mix"] and by["int8"] > by["head"]
     assert FS._g4_spans(spec) == [(0, 2), (3, 5), (6, 8)]
     e2b = replace(spec, kinds=((G.SLIDE,) * 4 + (G.FULL,)) * 7,

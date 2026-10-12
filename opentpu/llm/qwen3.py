@@ -14,8 +14,10 @@ Pieces:
   Engine            runs tokens on a backend (ISA simulator, RTL simulation or the board) and
                     keeps the KV caches in device DRAM between tokens
 
-Weights are int8 with one fp32 scale per 128 inputs (per row); activations are quantized the
-same way on the fly (W8A8). The residual stream, norms, RoPE and softmax are fp32.
+Weights are in an MXU format (int8 or 4-bit: an fp32 scale per row and power-of-two offsets per
+128 inputs under it, opentpu/quant.py); activations are quantized on the fly to int8 with an
+fp32 scale per row and a power-of-two offset per 32 (QACT), and every MM sums each output as one
+exact integer (docs/mx_mxu.md). The residual stream, norms, RoPE and softmax are fp32.
 """
 from __future__ import annotations
 
@@ -36,7 +38,7 @@ from .. import qcache as QC
 from .. import quant as Q
 from .. import language as ol
 from ..compiler import (Affine, CompileError, DevVar, KVDesc, QTensor, RunVar, Tensor, arg_words,
-                        current, trace_fit)
+                        current, k_scale_bytes, trace_fit)
 from . import formats as FM
 from . import generate as G
 from . import rope_parameters
@@ -46,10 +48,11 @@ from ..kernels.attention import Additive, Bucket, _attend_heads
 from ..kernels.layouts import head_parallel_attention_weights
 from ..host.offload import BackendDram, RowLayout, RowServer
 from ..kernels import mailbox as MB
-from ..kernels.gather import dequant_row, gather_row, onehot, onehot_blocks
+from ..kernels import gather as GA
+from ..kernels.gather import gather_row, onehot, onehot_blocks
 from ..kernels.gather import operand as gather_operand
 from ..kernels.lib import rmsnorm, rope, rope_rows, sigmoid, softcap
-from ..kernels.mlp import _chunk, swiglu_down
+from ..kernels.mlp import _chunk, down_chunk, swiglu_down
 from ..runtime import ALIGN
 
 
@@ -77,8 +80,8 @@ class Spec:
     rope_scale: float = 1.0   # factor on cos and sin (LongRoPE's attention factor)
     ctx: int = 0              # the most positions the model takes (LongRoPE: its short
     #                           factors' range; Phi-3: its sliding window; 0: no limit)
-    embed: str = "f32"        # the embedding rows: fp32, or "int8" (per D block, as the tied
-    #                           int8 LM head holds them: the device gathers them from it,
+    embed: str = "f32"        # the embedding rows: fp32, or "int8" (the MXU's int8, as the
+    #                           tied int8 LM head holds them: the device gathers them from it,
     #                           kernels.gather.gather_row)
     formats: str = ""         # weight formats per kind over the image's wformat (KINDS)
     mix: str = ""             # the recommended mix (wformat "mix": formats.named, MIXES)
@@ -366,13 +369,14 @@ def _lookup_alloc(b: "_Bump", spec, cap: int, block: int = None, D: int = 128,
     """DRAM for the device-side inputs of a run-time position (RunPos): every token's embedding
     row, the RoPE cos / sin rows of every position, and the attention mask table
     (attention.Bucket: cap entries +inf, then a block of -inf). The embedding rows are fp32
-    (flushed, as the host writes them), or with spec.embed "int8" int8 with a scale per D block
-    (kernels.gather.gather_row, with its one-hot operand for M MXU columns): the LM head's
-    rows when `head` (its data and scale addresses) is given -- a tied int8 head whole on one
-    slice -- else a table of their own, or with `embed_host` a slot of `rows` of them that the
-    host fills from the table it keeps (embed_record: each row's int8 data, then its scale
-    words) and a mailbox for the generate loop's requests (opentpu.host.offload.RowLayout).
-    A dense model's image also holds the prompt runs' additive mask tiles (amask_table)."""
+    (flushed, as the host writes them), or with spec.embed "int8" the MXU's int8 rows and their
+    gather scales, an fp32 per D block (kernels.gather.gather_row, with its one-hot operand for
+    M MXU columns): the LM head's rows when `head` (its data and scale addresses) is given -- a
+    tied int8 head whole on one slice; its gather scales beside its scale rows -- else a table
+    of their own, or with `embed_host` a slot of `rows` of them that the host fills from the
+    table it keeps (embed_record: each row's int8 data, then its gather scales) and a mailbox
+    for the generate loop's requests (opentpu.host.offload.RowLayout). A dense model's image
+    also holds the prompt runs' additive mask tiles (amask_table)."""
     block = block or ATTN_BLOCK
     half = len(rope_tables(spec, 0)[0])
     V, H = spec.vocab, spec.hidden
@@ -380,15 +384,17 @@ def _lookup_alloc(b: "_Bump", spec, cap: int, block: int = None, D: int = 128,
         raise ValueError("embed_host: the model's int8 embedding table of its own (Spec.embed "
                          "int8, not the tied int8 head's rows)")
     if getattr(spec, "embed", "f32") == "int8":
-        if head is not None:
-            emb = {"embed_q": head, "own": False}
+        if head is not None:            # the head's rows, gather scales of their own
+            emb = {"embed_q": (head[0], b.alloc(V * Q.gather_scale_bytes(H, "int8", D))),
+                   "own": False, "head_gsc": True}
         elif embed_host:
             rec = embed_record(H, D)
             slot = b.alloc(rows * rec)
             emb = {"embed_q": (slot, slot + H), "own": False, "host": True, "rec": rec,
                    "rows": rows, "mbox": b.alloc(RowLayout.WORDS)}
         else:
-            emb = {"embed_q": (b.alloc(V * H), b.alloc(4 * V * (H // D))), "own": True}
+            emb = {"embed_q": (b.alloc(V * H), b.alloc(V * Q.gather_scale_bytes(H, "int8", D))),
+                   "own": True}
         emb.update(onehot=b.alloc(4 * M * onehot_blocks(D, M, "int8") * D), M=M)
     else:
         emb = {"embed": b.alloc(4 * V * H)}
@@ -419,6 +425,21 @@ def _amask(lk: dict):
     return lk["amask"], 4 * lk["amask_M"] * (lk["block"] + 1)
 
 
+def put_head(img, W, qb, put, put_q, rows) -> None:
+    """An image build's LM head (put_q of its slices' rows), and where the resident decode's
+    int8 embedding rows are the tied int8 head's (_lookup_alloc: head_gsc, one slice) their
+    gather scales beside it (quant.gather_scales of the head's scale rows)."""
+    spec, D = img.spec, img.cfg.D
+    head = W["model.embed_tokens.weight"] if spec.tied else W["lm_head.weight"]
+    lk = img.lookup
+    if lk.get("head_gsc"):
+        qb.submit(head, img.head_format, D, lambda q, sc: (
+            put(0, img.head[0], q), put(0, img.head[1], sc),
+            put(0, lk["embed_q"][1], Q.gather_scales(sc, "int8", spec.hidden, D))))
+    else:
+        put_q(img.head, rows(head, img.v_loc), img.head_format)
+
+
 def _lookup_build(put, S: int, W: dict, spec, cap: int, lk: dict) -> None:
     cs = [rope_tables(spec, p) for p in range(cap)]
     z = np.concatenate([np.full(cap, np.inf, np.float32), np.full(lk["block"], -np.inf,
@@ -426,7 +447,9 @@ def _lookup_build(put, S: int, W: dict, spec, cap: int, lk: dict) -> None:
     if "embed" in lk:
         e = F.ftz(np.asarray(W["model.embed_tokens.weight"], np.float32))
     elif lk["own"]:
-        eq, es = Q.quantize_mxu(W["model.embed_tokens.weight"], "int8", lk["D"])
+        tab = W["model.embed_tokens.weight"]
+        eq, es = Q.quantize_mxu(tab, "int8", lk["D"])
+        es = Q.gather_scales(es, "int8", tab.shape[1], lk["D"])
     elif lk.get("host"):                    # the host's table, in the slot's record format
         lk["store"] = embed_store(W["model.embed_tokens.weight"], lk["D"])
     for s in range(S):
@@ -452,14 +475,14 @@ def _lookup_desc(lk: dict, spec, cap: int) -> dict:
          "sin_t": _tdesc(lk["sin_t"], (cap, lk["half"])), "zmask": lk["zmask"]}
     if "embed" in lk:
         d["embed"] = _tdesc(lk["embed"], (spec.vocab, spec.hidden))
-    elif lk.get("host"):        # the slot: rows of records (the int8 row, then its scales)
+    elif lk.get("host"):        # the slot: rows of records (the int8 row, its gather scales)
         a, sa = lk["embed_q"]
         d["embed_q"] = QTensor(Affine(a), Affine(sa), (lk["rows"], spec.hidden), lk["rec"],
                                lk["rec"], lk["D"], wf=Q.mxu_wf("int8"))
         d["embed_mbox"] = mbox = lk["mbox"]
         d["post_token"] = lambda tok: MB.post(mbox, tok)    # the generate loop's request
-    else:
-        d["embed_q"] = _qdesc(*lk["embed_q"], spec.vocab, spec.hidden, lk["D"])
+    else:                       # the table's rows and their gather scales (kernels.gather)
+        d["embed_q"] = GA.table(*lk["embed_q"], spec.vocab, spec.hidden, "int8", lk["D"])
     if "embed" not in lk:
         M, D = lk["M"], lk["D"]
         d["onehot"] = _tdesc(lk["onehot"], (M, onehot_blocks(D, M, "int8") * D))
@@ -468,9 +491,10 @@ def _lookup_desc(lk: dict, spec, cap: int) -> dict:
 
 
 def embed_record(H: int, D: int) -> int:
-    """Bytes of one int8 embedding row in a host-filled slot (embed_host): its H int8 values,
-    then its H / D scale words (the LM head's format, quant.quantize_mxu), whole MXU chunks."""
-    return -(-(H + 4 * (H // D)) // ALIGN) * ALIGN
+    """Bytes of one int8 embedding row in a host-filled slot (embed_host): its H int8 values
+    (the MXU's int8, quant.quantize_mxu), then its gather scales (an fp32 per D block,
+    quant.gather_scales), whole MXU chunks."""
+    return -(-(H + Q.gather_scale_bytes(H, "int8", D)) // ALIGN) * ALIGN
 
 
 def embed_store(table, D: int) -> np.ndarray:
@@ -478,11 +502,12 @@ def embed_store(table, D: int) -> np.ndarray:
     (embed_record): [V, record bytes] uint8, quantized as the on-card table would be."""
     V, H = table.shape
     out = np.zeros((V, embed_record(H, D)), np.uint8)
+    gb = Q.gather_scale_bytes(H, "int8", D)
     for r0 in range(0, V, Q.QUANT_ROWS):
         q, sc = Q.quantize_mxu(np.asarray(table[r0:r0 + Q.QUANT_ROWS], np.float32), "int8", D)
         n = len(q)
         out[r0:r0 + n, :H] = np.asarray(q).view(np.uint8).reshape(n, H)
-        out[r0:r0 + n, H:H + 4 * (H // D)] = np.asarray(sc).view(np.uint8).reshape(n, -1)
+        out[r0:r0 + n, H:H + gb] = Q.gather_scales(sc, "int8", H, D).view(np.uint8).reshape(n, gb)
     return out
 
 
@@ -538,11 +563,9 @@ class Embedding:
 
 
 def gathered_rows(rows, D: int) -> np.ndarray:
-    """The values kernels.gather.gather_row gives for these fp32 rows [n, K] held as int8 per D
-    block (quant.quantize_mxu, as the LM head is stored): [n, K], bit for bit."""
-    rows = np.atleast_2d(np.asarray(rows, np.float32))
-    q, sc = Q.quantize_mxu(rows, "int8", D)
-    return np.stack([dequant_row(q[i], sc[i], "int8", D) for i in range(len(rows))])
+    """The values kernels.gather.gather_row gives for these fp32 rows [n, K] held in the MXU's
+    int8 (quant.quantize_mxu, as the LM head is stored): [n, K], bit for bit."""
+    return GA.gathered(rows, "int8", D)
 
 
 def _tok_arg(image, tok) -> dict:
@@ -644,23 +667,32 @@ def reference_logits(spec: Spec, W: dict, tokens) -> np.ndarray:
     return x @ head.T
 
 
-def _fake_q(x, D: int = 128):
-    """int8 quantize-dequantize per (row, D-block) of the last axis (numerics of QACT/QST). A
-    value within 2^-31 of a rounding tie rounds as the device's quantizer rounds it in fp32
-    (fp32.quantize: x * 127 recip(amax)), not as float64 noise has it: a block whose values
-    have exact ratios has exact ties (a 4-bit row: codes 3 and 6 make 63.5; a flash block's
-    attention output is an integer vector times a scalar, _pv)."""
-    sh = x.shape
-    xb = x.reshape(*sh[:-1], sh[-1] // D, D)
-    a = np.abs(xb).max(-1, keepdims=True)
-    s = np.where(a == 0, 1, a / 127)
-    r = xb / s
-    q = np.rint(r)
-    tie = np.abs(r - q) > 0.5 - 2.0 ** -31
-    if tie.any():
-        b = tie.any(-1)
-        q[b] = np.where(tie[b], F.quantize(xb[b].astype(np.float32), axis=-1)[0], q[b])
-    return (np.clip(q, -127, 127) * s).reshape(sh)
+def _fake_q(x, D: int = 128, n: int | None = None):
+    """QACT's quantization of the rows of x (the last axis), in float64: per row an fp32 scale
+    and a power-of-two offset per D/4 (quant.fake_act), over ranges of n columns (one QACT
+    each; default the whole row: the down projection's chunks are ranges of their own). An
+    MXAct: a weight's @ (an MXW, _fake_w) leaves out what MM's window drops. A value within
+    2^-31 of a rounding tie rounds as the device's quantizer rounds it in fp32, not as float64
+    noise has it: a row whose values have exact ratios has exact ties (a 4-bit row: codes 3 and
+    6 make 63.5; a flash block's attention output is an integer vector times a scalar, _pv)."""
+    return Q.fake_act(x, D, n)
+
+
+def _fake_k(k, D: int = 128):
+    """K rows [..., d] as the KV cache holds them (QST, compiler.KVDesc.k): at d = D one fp32
+    scale a row (ROW, read by MM RSC), else an int8 scale row (an offset per D-block). (values,
+    the groups' offsets dw per D/8 or None) -- q.K^T's streamed operand, mx_matmul's."""
+    if k.shape[-1] == D:
+        return np.asarray(Q.fake_act(k, D, row=True)).view(np.ndarray), None
+    a = Q.fake_act(k, D, g=D)
+    return np.asarray(a).view(np.ndarray), a.da
+
+
+def _qk(qq, K, dw, D: int = 128):
+    """The scores q.K^T of a query row qq (an MXAct, _fake_q) against K rows [T, d] (_fake_k's
+    values, dw [T, d / (D/8)] or None): MM's sums with the int8 window's drops."""
+    return Q.mx_matmul(qq, K, None if dw is None else np.asarray(dw).reshape(len(K), -1),
+                       I.MX_W[I.W8], D)
 
 
 def _v_parts(v):
@@ -670,22 +702,35 @@ def _v_parts(v):
     return np.clip(np.rint(v / np.where(a == 0, 1, a / 127)), -127, 127), a[..., 0] / 127
 
 
-def _pv(pp, Vq, vs, D: int = 128):
-    """P.V as the device's flash attention takes it (kernels/attention.py _attend_heads): the
-    softmax numerators pp [T] times V's row scales vs [T] (folded in by QACT CSCALE), int8 per D
-    tokens, against V's int8 values Vq [T, d]."""
+def _pv(pp, Vq, vs, D: int = 128, block: int | None = None, start: int = 0):
+    """P.V as the device's flash attention takes it (kernels/attention.py _attend_heads): per
+    attention block of `block` tokens (ATTN_BLOCK) the softmax numerators pp [T] times V's row
+    scales vs [T] (folded in by QACT CSCALE), quantized as one QACT (the last block padded with
+    zeros to whole D blocks), against V's int8 values Vq [T, d] (V^T streamed UNIT: MM's drops
+    of P's groups more than 16 octaves below the block's largest). start: the first key's
+    position (a sliding window's: the blocks are the cache's, from position 0, its first one
+    masked before the window: zeros there, the QACT's groups at the block's offsets)."""
+    block = block or ATTN_BLOCK
     T = len(pp)
-    ppad = np.zeros(-(-T // D) * D)
-    ppad[:T] = pp * vs
-    return _fake_q(ppad, D)[:T] @ Vq
+    out = 0.0
+    t0 = 0
+    while t0 < T:
+        o = (start + t0) % block                    # the segment's place in its block
+        n = min(block - o, T - t0)
+        npad = -(-(o + n) // D) * D
+        seg = np.zeros(npad)
+        seg[o:o + n] = pp[t0:t0 + n] * vs[t0:t0 + n]
+        vt = np.zeros((npad, Vq.shape[-1]))
+        vt[o:o + n] = Vq[t0:t0 + n]
+        out = out + Q.mx_matmul(_fake_q(seg, D), vt.T, None, I.MX_W[I.W8], D)
+        t0 += n
+    return out
 
 
 def _fake_w(a, D: int, fmt: str = "int8"):
-    """A weight matrix as the device holds it, in float64: int8 per (row, D-block) (_fake_q) or
-    the 4-bit formats of opentpu/quant.py."""
-    if fmt == "int8":
-        return _fake_q(np.asarray(a, np.float64), D)
-    return Q.quantize_w4(a, fmt, D)[2].astype(np.float64)
+    """A weight matrix as the device holds it, in float64 (quant.quantize_mxu in format fmt,
+    dequantized): an MXW, whose @ with an MXAct (_fake_q) sums as MM does."""
+    return Q.fake_w(np.asarray(a, np.float32), fmt, D)
 
 
 KINDS = ("attn", "mlp", "gateup", "down", "head")     # the weight kinds of a formats string
@@ -707,11 +752,15 @@ def weight_kind(n: str) -> tuple:
 
 
 def emulated_logits(spec: Spec, W: dict, tokens, D: int = 128, wformat: str = "int8",
-                    head_format: str | None = None, formats: str | None = None) -> np.ndarray:
-    """float64 decode that applies openTPU's quantization points but none of its rounding:
-    int8 (or 4-bit: `wformat`, `head_format`, `formats` as in Image) weights, int8 matmul
-    inputs per D-block, int8 K (per token, D-block) and V (per token), int8 P (per D tokens)
-    with V's per-token scales folded in (_pv). Separates quantization error from kernel bugs."""
+                    head_format: str | None = None, formats: str | None = None,
+                    S: int = 1) -> np.ndarray:
+    """float64 decode that applies openTPU's quantization points but none of its rounding: the
+    weights in their MXU formats (`wformat`, `head_format`, `formats` as in Image), every MM
+    input quantized as QACT does on S slices (the card's 1; the design's 2: a row scale and
+    offsets per D/4; the down projection's in its F chunks, kernels.mlp.down_chunk of a slice's
+    F), int8 K (per token: ROW at d = D, else an offset per D-block) and V (per token), P per
+    attention block with V's per-token scales folded in (_pv), and MM's window's drops.
+    Separates quantization error from kernel bugs."""
     d, G = spec.head_dim, spec.n_q // spec.n_kv
     Wq: dict = {}
     head = "model.embed_tokens.weight" if spec.tied else "lm_head.weight"
@@ -722,6 +771,9 @@ def emulated_logits(spec: Spec, W: dict, tokens, D: int = 128, wformat: str = "i
         if n not in Wq:
             Wq[n] = _fake_w(W[n], D, fmt(*weight_kind(n)))
         return Wq[n]
+
+    def chunk(i):
+        return down_chunk(spec.ffn // S, D, fmt("down", i))
 
     def norm(v, g):
         return (v / np.sqrt(np.mean(v * v, -1, keepdims=True) + spec.eps)) * g
@@ -734,7 +786,7 @@ def emulated_logits(spec: Spec, W: dict, tokens, D: int = 128, wformat: str = "i
     for pos, tk in enumerate(tokens):
         x = np.asarray(W["model.embed_tokens.weight"][tk], np.float64)
         if spec.embed == "int8":                    # the int8 embedding rows (Spec.embed)
-            x = _fake_q(x, D)
+            x = gathered_rows(x, D)[0].astype(np.float64)
         c, s = rope_tables(spec, pos)
 
         def rot(v):
@@ -752,20 +804,23 @@ def emulated_logits(spec: Spec, W: dict, tokens, D: int = 128, wformat: str = "i
                 q, k = norm(q, qk[i][0]), norm(k, qk[i][1])
             if i not in spec.nope:
                 q, k = rot(q), rot(k)
-            Kc[i].append(_fake_q(k, D))
+            Kc[i].append(_fake_k(k, D))
             Vc[i].append(_v_parts(v))
-            K = np.stack(Kc[i], 1)
+            K = np.stack([a for a, _ in Kc[i]], 1)
+            dK = None if Kc[i][0][1] is None else np.stack([b for _, b in Kc[i]], 1)
             Vq, Vs = (np.stack(z, 1) for z in zip(*Vc[i]))
             o = np.zeros((spec.n_q, d))
             for hq in range(spec.n_q):
-                sc = K[hq // G] @ _fake_q(q[hq] / math.sqrt(d), D)
+                sc = _qk(_fake_q(q[hq] / math.sqrt(d), D), K[hq // G], None if dK is None
+                         else dK[hq // G], D)
                 pp = np.exp(sc - sc.max())
                 o[hq] = _pv(pp, Vq[hq // G], Vs[hq // G], D) / pp.sum()
             x = x + w(p + "self_attn.o_proj.weight") @ _fake_q(o.reshape(-1), D)
             h = _fake_q(norm(x, W[p + "post_attention_layernorm.weight"]), D)
             g = w(p + "mlp.gate_proj.weight") @ h
             u = w(p + "mlp.up_proj.weight") @ h
-            x = x + w(p + "mlp.down_proj.weight") @ _fake_q((g / (1 + np.exp(-g))) * u, D)
+            x = x + w(p + "mlp.down_proj.weight") @ _fake_q((g / (1 + np.exp(-g))) * u, D,
+                                                             chunk(i))
         out.append(w(head) @ _fake_q(norm(x, W["model.norm.weight"]), D))
     return np.array(out)
 
@@ -788,8 +843,7 @@ class _Bump:
 
 
 def _qdesc(daddr: int, saddr: int, n: int, k: int, D: int, fmt: str = "int8") -> QTensor:
-    return QTensor(Affine(daddr), Affine(saddr), (n, k), Q.row_bytes(k, fmt, D), 4 * (k // D), D,
-                   wf=Q.mxu_wf(fmt))
+    return QTensor.weight(daddr, saddr, n, k, fmt, D)
 
 
 def _tdesc(addr: int, shape) -> Tensor:
@@ -872,10 +926,12 @@ class Image(EmbedHost):
             if spec.nope:
                 L["rg"] = lb.alloc(8)
             for name, (n, k) in self.mats.items():
-                L[name] = (lb.alloc(n * rb(k, mf[name])), lb.alloc(4 * n * (k // D)))
-            L["wd"] = [(lb.alloc(self.h_loc * rb(C, mf["wd"])), lb.alloc(4 * self.h_loc * (C // D)))
+                L[name] = (lb.alloc(n * rb(k, mf[name])),
+                           lb.alloc(n * Q.scale_bytes(k, mf[name], D)))
+            L["wd"] = [(lb.alloc(self.h_loc * rb(C, mf["wd"])),
+                        lb.alloc(self.h_loc * Q.scale_bytes(C, mf["wd"], D)))
                        for _ in range(F_ // C)]
-            L["kvs"] = [[{"k": lb.alloc(cap * d), "ks": lb.alloc(4 * cap * (d // D)),
+            L["kvs"] = [[{"k": lb.alloc(cap * d), "ks": lb.alloc(cap * k_scale_bytes(d, D)),
                           "vt": lb.alloc(d * cap), "vs": lb.alloc(4 * cap)}
                          for _ in range(self.nkv_loc)] for _ in range(batch)]
             L["kv"] = L["kvs"][0]
@@ -899,10 +955,10 @@ class Image(EmbedHost):
                 for e in range(len(unit)):
                     self.loc[first + it * len(unit) + e] = (base, us, it, offs[e])
             b.next = base + reps * us
-        head = cap * d + 4 * cap * (d // D) + d * cap + 4 * cap   # k, k scales, v^T, v scales
+        head = cap * d + cap * k_scale_bytes(d, D) + d * cap + 4 * cap   # k, k scales, v^T, v's
         self.kv_bytes = spec.layers * self.nkv_loc * head         # per sequence
         self.head = (b.alloc(self.v_loc * Q.row_bytes(H, self.head_format, D)),
-                     b.alloc(4 * self.v_loc * (H // D)))
+                     b.alloc(self.v_loc * Q.scale_bytes(H, self.head_format, D)))
         # the int8 embedding rows of the resident decode are the tied int8 head's (S = 1)
         shared = spec.tied and self.head_format == "int8" and S == 1
         if embed_host is None:      # dense: the int8 table stays on the card (the Engine moves
@@ -937,6 +993,15 @@ class Image(EmbedHost):
                 qb.submit(p, fmt, D, lambda q, sc, s=s: (put(s, addr_pair[0], q),
                                                          put(s, addr_pair[1], sc)))
 
+        def put_parts(addrs, parts, fmt, C):
+            """Each slice's rows quantized whole and stored in column parts of C (compiler
+            QTensor parts: each part's scale rows the rows' Sw and its blocks' offsets)."""
+            for s, p in enumerate(parts):
+                qb.submit(p, fmt, D, lambda q, sc, s=s: [
+                    (put(s, a0, pq), put(s, a1, ps))
+                    for (a0, a1), (pq, ps) in zip(addrs, Q.column_parts(q, sc, fmt, p.shape[1],
+                                                                         C, D))])
+
         def rows(a, n):
             return [a[s * n:(s + 1) * n] for s in range(S)]
 
@@ -969,13 +1034,10 @@ class Image(EmbedHost):
             put_q(Lo["wo"], rows(wo, self.h_loc), mf["wo"])
             put_q(Lo["wg"], rows(W[p + "mlp.gate_proj.weight"], self.f_loc), mf["wg"])
             put_q(Lo["wu"], rows(W[p + "mlp.up_proj.weight"], self.f_loc), mf["wu"])
-            C = self.dchunks[mf["wd"]]
-            for j, pair in enumerate(lofs["wd"]):
-                put_q((base + pair[0], base + pair[1]),
-                      [r[:, j * C:(j + 1) * C] for r in rows(W[p + "mlp.down_proj.weight"],
-                                                              self.h_loc)], mf["wd"])
-        head = W["model.embed_tokens.weight"] if spec.tied else W["lm_head.weight"]
-        put_q(self.head, rows(head, self.v_loc), self.head_format)
+            put_parts([(base + x, base + y) for x, y in lofs["wd"]],
+                      rows(W[p + "mlp.down_proj.weight"], self.h_loc), mf["wd"],
+                      self.dchunks[mf["wd"]])
+        put_head(self, W, qb, put, put_q, rows)
         qb.wait()
         if self.lookup:
             _lookup_build(put, S, W, spec, self.cap, self.lookup)
@@ -1058,16 +1120,13 @@ class Image(EmbedHost):
             for name, (n, k) in self.mats.items():
                 da, sa = lofs[name]
                 fm = mf[name]
-                setattr(ns, name, QTensor(off + da, off + sa, (n, k), Q.row_bytes(k, fm, D),
-                                          4 * (k // D), D, wf=Q.mxu_wf(fm)))
+                setattr(ns, name, QTensor.weight(off + da, off + sa, n, k, fm, D))
             fm = mf["wd"]
             C, n = self.dchunks[fm], self.h_loc
-            wf = Q.mxu_wf(fm)
-            rc = Q.row_bytes(C, fm, D)
-            parts = tuple(QTensor(off + da, off + sa, (n, C), rc, 4 * (C // D), D, wf=wf)
+            parts = tuple(QTensor.weight(off + da, off + sa, n, C, fm, D)
                           for da, sa in lofs["wd"])
-            ns.wd = QTensor(parts[0].data, parts[0].scale, (n, spec.ffn), rc, 4 * (C // D), D,
-                            parts=parts, pw=C, wf=wf)
+            ns.wd = QTensor(parts[0].data, parts[0].scale, (n, spec.ffn), parts[0].rs,
+                            parts[0].srs, D, parts=parts, pw=C, wf=parts[0].wf)
             ns.kvs = [KVDesc({sid + j * cfg.S: {k: off + v for k, v in r.items()}
                               for j, r in enumerate(heads)}, self.cap, d, D, cfg.S, sid)
                       for heads in lofs["kvs"]]

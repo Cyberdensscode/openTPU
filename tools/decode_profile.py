@@ -199,9 +199,9 @@ def main(argv=None):
     ap.add_argument("--fake-no-args", action="store_true",
                     help="--backend fake: a bitstream without run arguments (CAPS bit25)")
     ap.add_argument("--json")
-    ap.add_argument("--wformat", default="int8", choices=["int8", "fp4", "int4", "mix"],
+    ap.add_argument("--wformat", default="int8", choices=["int8", "fp4", "int4", "nvfp4", "mix"],
                     help="weight format of the layers (docs/quant.md)")
-    ap.add_argument("--head-format", default=None, choices=["int8", "fp4", "int4"],
+    ap.add_argument("--head-format", default=None, choices=["int8", "fp4", "int4", "nvfp4"],
                     help="weight format of the LM head (default: --wformat)")
     ap.add_argument("--card-loop", action="store_true",
                     help="the decode loop on the card (Engine.generate_card)")

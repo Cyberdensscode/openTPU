@@ -2,8 +2,9 @@
 the RTL simulator next to Hugging Face transformers running the same checkpoint in fp32 on the
 CPU with openTPU's quantization, and (--against) next to a second device.
 
-    python3 tools/validate.py [--model qwen3|lfm2|qwen35|gemma4|DIR] [--wformat int8|int4|fp4|mix]
-                              [--head-format int8|int4|fp4] [--formats SPEC]
+    python3 tools/validate.py [--model qwen3|lfm2|qwen35|gemma4|DIR]
+                              [--wformat int8|int4|fp4|nvfp4|mix]
+                              [--head-format int8|int4|fp4|nvfp4] [--formats SPEC]
                               [--backend isa|rtl|board] [--against isa|rtl|board|RUN.npz]
                               [--cfg board|design|CFG.pkl] [--resident] [--tokens 16] [--chat]
                               [--weights-only] [--no-fp32] [--no-golden] [--min-top1 F]
@@ -14,13 +15,20 @@ The golden ("W+A"): the Hugging Face model with every matmul weight the device s
 by the values the device multiplies (the model image's quantize_mxu in the format the image
 gives that weight: --wformat, --head-format, --formats or OTPU_FORMATS; dequantized as the MXU
 reads it), the embedding rows the device's, and the activations rounded where the device
-rounds them, by its quantizer (fp32.quantize: int8 per 128-block, scale amax * (1/127),
-rounding by 127 * recip(amax)): every nn.Linear's input, and in attention as _attend_heads
-does, q * log2(e) / sqrt(d) and K per head and 128-block, V per head and token, and P V as V's
-int8 values against the numerators 2^(s - max) times V's per-token scales, rounded per 128
-keys. --weights-only quantizes the weights only ("W"); the fp32 golden (the checkpoint, Hugging
-Face's eager attention) is there for context unless --no-fp32. Gemma 4 (E2B, E4B): the formats
-are the device image's (they follow the card's fit: the PLE table and, for an int8 image that
+rounds them, by its quantizer (fp32.quantize_mx: int8 under a row scale amax * (1/127) and a
+power-of-two offset per D/4, rounding by 127 * recip(amax) 2^d, one QACT a range): every
+nn.Linear's input (a down projection's in its F chunks, a DeltaNet out_proj's per head group:
+act_ranges), and in attention as _attend_heads does, q * log2(e) / sqrt(d) per head row, K as
+the cache holds it (a scale per token and head; past d = D an offset per D-block), V per head
+and token, and P V as V's int8 values against the numerators 2^(s - max) times V's per-token
+scales, quantized per attention block of keys. Those products are taken in float64 and
+rounded to fp32 after, as the MXU sums exactly and rounds each output once (fp32 sums of
+operands whose offsets spread lose bits). The MXU's window drops (a product's two offsets more
+than W octaves apart: docs/mx_mxu.md) are in the golden's attention (q K, P V: attention_drops),
+not in its projections. --weights-only quantizes the weights only ("W"); the fp32 golden (the
+checkpoint, Hugging Face's eager attention) is there for context unless --no-fp32. Gemma 4
+(E2B, E4B): the formats are the device image's (they follow the card's fit: the PLE table
+and, for an int8 image that
 does not fit, some layers in 4-bit), the embedding rows the LM head's in the head's format (the
 device gathers them from the head), the per-layer embeddings the device's PLE records, and the
 logits compared after the soft cap (the device's are before it). Hugging Face loads the language
@@ -104,17 +112,102 @@ def quant_parts(x, g: int) -> tuple:
 
 
 def fake_quant(x, g: int):
-    """x quantized as quant_parts and dequantized: q * s in fp32, the values the MXU multiplies."""
+    """x quantized as quant_parts and dequantized: q * s in fp32 (V's values times its scale)."""
     q, s = quant_parts(x, g)
     n = q.shape[-1]
     return (q * s.repeat_interleave(g, -1)[..., :n]).to(x.dtype)
 
 
+def mx_quant(x, D: int = 128, n=None, g: int | None = None, row: bool = False,
+             offsets: bool = False):
+    """x (a torch tensor) quantized along its last axis as QACT / QST quantize it
+    (fp32.quantize_mx) and dequantized: in ranges of n columns (one QACT each; default the
+    whole axis; a sequence: the ranges' widths; the axis zero-padded to their sum) a scale S,
+    a power-of-two offset d per g (QACT: D/4, the default; QST: D; none in ROW mode) and the
+    int8 values q: q * S * 2^-d in fp32, the values the MXU multiplies. offsets: also each
+    element's d (a torch int tensor of x's shape), for the MM's window (attention_drops)."""
+    import torch
+
+    from opentpu import fp32 as F
+    a = x.detach().to(torch.float32).cpu().numpy()
+    K = a.shape[-1]
+    g = D // 4 if g is None else g
+    widths = [K] if n is None else [n] * -(-K // n) if isinstance(n, int) else list(n)
+    W_ = sum(widths)
+    a = np.pad(a, [(0, 0)] * (a.ndim - 1) + [(0, W_ - K)]).reshape(-1, W_)
+    out, off, c = np.empty_like(a), np.zeros(a.shape, np.int32), 0
+    for w in widths:
+        gg = min(g, w)
+        q, s, d = F.quantize_mx(np.ascontiguousarray(a[:, c:c + w]), gg, row)
+        off[:, c:c + w] = np.repeat(d.astype(np.int32), gg, axis=1)
+        u = s[:, None] * np.ldexp(np.float32(1), -off[:, c:c + w])
+        out[:, c:c + w] = q.astype(np.float32) * u.astype(np.float32)
+        c += w
+    out = torch.from_numpy(np.ascontiguousarray(
+        out.reshape(*x.shape[:-1], W_)[..., :K])).to(x.dtype)
+    if not offsets:
+        return out
+    return out, torch.from_numpy(np.ascontiguousarray(off.reshape(*x.shape[:-1], W_)[..., :K]))
+
+
+def attention_drops(q, dq, k, dk, D: int = 128, W: int = 16):
+    """q k^T as the MXU sums it with its window: the int8 product of a q group (D/4 channels,
+    offset dq) and a key's channels (K's offset dk: its D-block's, 0 for a K row of one
+    scale) is left out where dq + dk > W (int8: 16; docs/mx_mxu.md, quant.mx_matmul). q, dq
+    [..., Tq, d], k, dk [..., Tk, d] (dk None: 0)."""
+    import torch
+    g = D // 4
+    d = q.shape[-1]
+    if d % g:
+        return q @ k.transpose(-1, -2)
+    ng = d // g
+    dqg = dq[..., ::g]                                              # [..., Tq, ng]
+    if dk is None:
+        if int(dqg.max()) <= W:
+            return q @ k.transpose(-1, -2)
+        return (q * (dq <= W).to(q.dtype)) @ k.transpose(-1, -2)
+    dkg = dk[..., ::g]                                              # [..., Tk, ng]
+    if int(dqg.max()) + int(dkg.max()) <= W:
+        return q @ k.transpose(-1, -2)
+    qg = q.reshape(*q.shape[:-1], ng, g)
+    kg = k.reshape(*k.shape[:-1], ng, g)
+    part = torch.einsum("...qnc,...knc->...qkn", qg, kg)
+    keep = (dqg[..., :, None, :] + dkg[..., None, :, :]) <= W
+    return (part * keep.to(part.dtype)).sum(-1)
+
+
+def act_ranges(spec, name: str, fmt: str, K: int, D: int = 128, S: int = 1):
+    """The QACT ranges of the input of checkpoint weight `name` (K columns, in format fmt) on
+    S slices: a down projection's F chunks (kernels.mlp.down_chunk of a slice's F; Gemma 4's
+    gemma4.Image.dchunk of its padded width), a Qwen3.5 DeltaNet out_proj's head groups
+    (qwen35.emulated_logits'); None: the whole row."""
+    from opentpu.kernels.mlp import down_chunk
+    if _gemma4(spec):
+        if ".mlp.down_proj." not in name:
+            return None
+        from opentpu.llm import gemma4 as G4
+        fp_ = G4._ffn_pad(K, fmt, D)
+        C = G4._mlp_chunk(fp_, D, D if fmt == "int8" else 2 * D)
+        return [C] * (fp_ // C)
+    if name.endswith(("mlp.down_proj.weight", "feed_forward.w2.weight")):
+        C = down_chunk(K // S, D, fmt)
+        return [C] * (K // C)
+    if name.endswith("linear_attn.out_proj.weight"):
+        nl, dv = spec.lin_heads // S, spec.lin_dv
+        og = 4 if nl % 4 == 0 else 2
+        r = [og * dv] * (nl // og)
+        if og == 4 and nl > 2:
+            r[-1:] = [2 * dv, 2 * dv]
+        return r * S
+    return None
+
+
 def device_weight(w, fmt: str, D: int = 128) -> np.ndarray:
     """The values the MXU multiplies for a weight matrix w [N, K] in `fmt` (int8, int4, fp4):
     the image's quantize_mxu (opentpu.qcache, as the images' builds), dequantized as the MXU
-    reads it; fp32 [N, K]. Quantization is per row and K-block, so a whole checkpoint matrix
-    gives the values of the row and column parts the images place."""
+    reads it, rounded to fp32 [N, K]. Quantization is per row (the column parts the images
+    place are slices of their whole rows' quantization: quant.column_parts), so a whole
+    checkpoint matrix gives the values of the row and column parts the images place."""
     from opentpu import qcache as QC
     from opentpu import quant as Q
     w = np.asarray(w, np.float32)
@@ -126,20 +219,16 @@ def device_weight(w, fmt: str, D: int = 128) -> np.ndarray:
     out = np.empty((N, Kp), np.float32)
     for r in range(0, N, Q.QUANT_ROWS):
         e = min(N, r + Q.QUANT_ROWS)
-        if fmt == "int8":
-            qq = q[r:e].view(np.int8).reshape(e - r, Kp // D, D).astype(np.float32)
-            out[r:e] = (qq * s[r:e].view(np.float32)[..., None]).reshape(e - r, Kp)
-        else:
-            out[r:e] = Q.dequantize_w4(q[r:e, :Kp // 2], s[r:e], fmt, D)
+        out[r:e] = Q.dequantize_mxu(q[r:e], s[r:e], fmt, Kp, D)
     return out[:, :K]
 
 
 def embed_rows(table, spec, D: int = 128) -> np.ndarray:
     """The embedding rows the device computes with (qwen3.Embedding, for the whole table):
     the fp32 rows, or with spec.embed "int8" the int8 rows as the device's gather dequantizes
-    them (kernels.gather.dequant_blocks, bit for bit)."""
+    them (kernels.gather.gathered, bit for bit)."""
     from opentpu import quant as Q
-    from opentpu.kernels.gather import dequant_blocks
+    from opentpu.kernels.gather import gathered
     t = np.asarray(table, np.float32)
     if getattr(spec, "embed", "f32") != "int8":
         return t
@@ -147,9 +236,7 @@ def embed_rows(table, spec, D: int = 128) -> np.ndarray:
     V, H = t.shape
     for r in range(0, V, Q.QUANT_ROWS):
         e = min(V, r + Q.QUANT_ROWS)
-        q, s = Q.quantize_mxu(t[r:e], "int8", D)
-        out[r:e] = dequant_blocks(q.view(np.int8).reshape(-1, D), s.view(np.float32).reshape(-1),
-                                  "int8", D).reshape(e - r, H)
+        out[r:e] = gathered(t[r:e], "int8", D)
     return out
 
 
@@ -169,7 +256,7 @@ def image_formats(img) -> dict:
     """What the golden takes from the device's model image: the LM head's format and, for
     Gemma 4, whose formats follow the card's fit (gemma4.Image), each layer's (attention,
     gate / up, down, its PLE gate and projection), the PLE projection's and the PLE table's."""
-    out = {"head": img.head_format}
+    out = {"head": img.head_format, "S": img.cfg.S}
     if hasattr(img, "ple_format"):
         out.update(layers=[list(f) for f in img.lf], ple_proj=img.pformat,
                    ple_table=img.ple_format)
@@ -249,6 +336,8 @@ class Golden:
         self.formats = {}                   # checkpoint weight -> its format
         self._lin = []                      # (module, the checkpoint's weight, the device's)
         self._wide = {}                     # module -> its kept weight, during an fp32 call
+        self._ranges = {}                   # module -> its input's QACT ranges (act_ranges)
+        S = (image or {}).get("S", 1)
         dev = {}
         for n, m in model.named_modules():
             if not isinstance(m, torch.nn.Linear):
@@ -265,8 +354,10 @@ class Golden:
             self._lin.append((m, w32, dev[name]))
             m.weight = dev[name]
             self.formats[name] = f
+            self._ranges[m] = act_ranges(spec, name, f, w.shape[1], D, S)
             m.register_forward_pre_hook(self._pre)
             m.register_forward_hook(self._post)
+            m.forward = lambda x, m=m, f=m.forward: self._linear(m, x) if self.act else f(x)
         e = emb.weight
         if self.gemma:
             e = dev["lm_head.weight"]
@@ -331,20 +422,34 @@ class Golden:
         return x if sc is None else x * sc.float()
 
     def _pre(self, mod, args):
-        """Before a Linear: a weight kept in bf16 widened for the call (exact), and with the
-        activations quantized its input quantized."""
+        """Before a Linear: a weight kept in bf16 widened for the call (exact)."""
         import torch
         if mod.weight.dtype != torch.float32:
             self._wide[mod] = mod.weight
             mod.weight = torch.nn.Parameter(mod.weight.float(), False)
-        if self.act:
-            return (fake_quant(args[0], self.D),) + tuple(args[1:])
         return None
 
     def _post(self, mod, args, out):
         if mod in self._wide:
             mod.weight = self._wide.pop(mod)
         return None
+
+    def _linear(self, mod, x):
+        """A Linear with the activations quantized: its input quantized (one QACT a range) and
+        the product taken in float64 (a few hundred MB of the weight at a time), rounded to
+        fp32 after: the MXU sums exactly and rounds each output once (docs/isa.md MM), where
+        fp32 sums of operands whose offsets spread lose bits."""
+        import torch
+        x = mx_quant(x, self.D, self._ranges.get(mod)).double()
+        w, b = mod.weight, mod.bias
+        out = torch.empty(*x.shape[:-1], w.shape[0], dtype=torch.float32)
+        step = max(1, (1 << 26) // max(1, w.shape[1]))
+        for r in range(0, w.shape[0], step):
+            y = x @ w[r:r + step].double().T
+            if b is not None:
+                y = y + b[r:r + step].double()
+            out[..., r:r + step] = y.float()
+        return out
 
     def _per_layer(self, input_ids, inputs_embeds=None):
         """Gemma 4's get_per_layer_inputs, [B, T, layers, P]: the checkpoint's PLE rows times
@@ -372,11 +477,13 @@ class Golden:
 
     def _attention(self, module, q, k, v, mask, scaling=None, dropout=0.0, **kw):
         """softmax(q k^T * scaling + mask) v; with the activations quantized, the device's
-        flash attention (kernels/attention.py _attend_heads): q * scaling * log2(e) and K in
-        int8 per head and min(d, D)-block, V per head with one scale per token, and P V as the
-        int8 values of V against the numerators 2^(s - max) times V's scales (folded in, QACT
-        CSCALE), quantized per D keys, divided by the numerators' unquantized sum.
-        Otherwise the model's own eager attention."""
+        flash attention (kernels/attention.py _attend_heads): q * scaling * log2(e) quantized
+        per head row (QACT), K as the cache holds it (QST: a scale per token and head, past d =
+        D an offset per D-block; LFM2's 64 a row of its own), V per head with one scale per
+        token, and P V as the int8 values of V against the numerators 2^(s - max) times V's
+        scales (folded in, QACT CSCALE), quantized per attention block of keys (qwen3.ATTN_BLOCK,
+        from position 0: a sliding window's are the cache's), divided by the numerators'
+        unquantized sum. Otherwise the model's own eager attention."""
         import torch
         if not self.act:
             t = type(module).__module__
@@ -384,21 +491,25 @@ class Golden:
                 self._eager[t] = importlib.import_module(t).eager_attention_forward
             return self._eager[t](module, q, k, v, mask, scaling=scaling, dropout=0.0, **kw)
         from opentpu.language import LOG2E
-        d = q.shape[-1]
+        from opentpu.llm.qwen3 import ATTN_BLOCK
+        d, D = q.shape[-1], self.D
         scaling = d ** -0.5 if scaling is None else scaling
-        g = min(d, self.D)
         # the device's scores are in log2 units: q times log2(e) * scaling (one fp32 product),
         # then exp2
-        q = fake_quant(q * torch.tensor(LOG2E * scaling, dtype=torch.float32), g)
-        k = fake_quant(k, g)
+        q, dq = mx_quant(q * torch.tensor(LOG2E * scaling, dtype=torch.float32), D,
+                         offsets=True)
+        k, dk = mx_quant(k, D, g=D, row=d <= D, offsets=True)
         vq, vs = quant_parts(v, d)                          # [B, Hkv, T, d], [B, Hkv, T, 1]
         G = q.shape[1] // k.shape[1]
-        k, vq, vs = (t.repeat_interleave(G, 1) for t in (k, vq, vs))
-        s = q @ k.transpose(2, 3)
+        k, dk, vq, vs = (t.repeat_interleave(G, 1) for t in (k, dk, vq, vs))
+        # (the MXU's sums exact: float64, then fp32)
+        s = attention_drops(q.double(), dq, k.double(), None if d <= D else dk, D).float()
         if mask is not None:
             s = s + mask[..., :k.shape[2]]
         p = torch.exp2(s - s.amax(-1, keepdim=True))
-        o = (fake_quant(p * vs[..., 0][:, :, None, :], self.D) @ vq) / p.sum(-1, keepdim=True)
+        pq, dp = mx_quant(p * vs[..., 0][:, :, None, :], D, ATTN_BLOCK, offsets=True)
+        o = (((pq * (dp <= 16).to(pq.dtype)).double() @ vq.double()).float()    # (V^T: UNIT)
+             / p.sum(-1, keepdim=True))
         return o.transpose(1, 2).contiguous(), None
 
     def logits(self, ids) -> np.ndarray:
@@ -749,8 +860,8 @@ def _main(argv=None) -> int:
     ap.add_argument("prompts", nargs="*", default=PROMPTS)
     ap.add_argument("--model", default="qwen3",
                     help=f"{' or '.join(MODELS)} (models/<name>), or a checkpoint directory")
-    ap.add_argument("--wformat", default="int8", choices=["int8", "int4", "fp4", "mix"])
-    ap.add_argument("--head-format", default=None, choices=["int8", "int4", "fp4"])
+    ap.add_argument("--wformat", default="int8", choices=["int8", "int4", "fp4", "nvfp4", "mix"])
+    ap.add_argument("--head-format", default=None, choices=["int8", "int4", "fp4", "nvfp4"])
     ap.add_argument("--formats", help="per-kind weight formats (OTPU_FORMATS, "
                     "opentpu/llm/formats.py), e.g. mlp=fp4")
     ap.add_argument("--backend", default="isa", choices=["isa", "rtl", "board"])

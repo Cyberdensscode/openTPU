@@ -294,9 +294,9 @@ def main(argv=None) -> int:
     r.add_argument("--workload", default="mlp-small",
                    help="--sim: a kernel workload of `lens list`, or qwen-tiny")
     r.add_argument("--open", action="store_true", help="open the app afterwards")
-    r.add_argument("--wformat", default="int8", choices=["int8", "fp4", "int4", "mix"],
+    r.add_argument("--wformat", default="int8", choices=["int8", "fp4", "int4", "nvfp4", "mix"],
                    help="weight format of the layers (docs/quant.md)")
-    r.add_argument("--head-format", default=None, choices=["int8", "fp4", "int4"],
+    r.add_argument("--head-format", default=None, choices=["int8", "fp4", "int4", "nvfp4"],
                    help="weight format of the LM head (default: --wformat)")
     for c in PASS:
         sub.add_parser(c, help=f"-> python -m opentpu.lens {c}")

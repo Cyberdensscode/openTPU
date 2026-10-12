@@ -37,7 +37,7 @@ def _entry(d, W):
     return Path(d) / k[:2] / f"{k}.npz"
 
 
-@pytest.mark.parametrize("fmt", ["fp4", "int4"])
+@pytest.mark.parametrize("fmt", ["fp4", "int4", "nvfp4"])
 def test_cached_result_is_the_quantizers(cache, fmt):
     W = _w(0)
     want = Q.quantize_mxu(W, fmt, 128)
@@ -49,7 +49,7 @@ def test_cached_result_is_the_quantizers(cache, fmt):
     assert len(_entries(cache)) == 1
 
 
-def test_key_follows_content_format_and_d():
+def test_key_follows_content_format_d_and_numerics(monkeypatch):
     W = _w(1)
     k = qcache.key(W, "fp4", 128)
     assert qcache.key(W.copy(), "fp4", 128) == k
@@ -61,6 +61,12 @@ def test_key_follows_content_format_and_d():
     assert qcache.key(W, "int4", 128) != k
     assert qcache.key(W, "fp4", 64) != k
     assert qcache.key(W.reshape(192, 128), "fp4", 128) != k         # the shape
+    assert qcache.key(W, "nvfp4", 128) != k
+    monkeypatch.setattr(Q, "MX_NUMERICS", "pre-mx")                 # the MXU's numerics
+    monkeypatch.setattr(qcache, "_SRC", None)
+    assert qcache.key(W, "fp4", 128) != k
+    monkeypatch.undo()
+    assert qcache.key(W, "fp4", 128) == k
 
 
 def test_off_small_and_int8_are_not_cached(cache, monkeypatch):
@@ -112,7 +118,7 @@ def test_damaged_entry_is_quantized_again(cache):
         assert np.array_equal(z["q"], q)
 
 
-@pytest.mark.parametrize("fmt", ["fp4", "int4", "int8"])
+@pytest.mark.parametrize("fmt", ["fp4", "int4", "int8", "nvfp4"])
 def test_quantize_rows_is_the_quantizers(fmt, monkeypatch):
     """quantize_rows, the quantizer on PIECE elements' rows at a time, gives the whole matrix's
     result bit for bit (rows of one piece, of several, a short last piece; scale ties and

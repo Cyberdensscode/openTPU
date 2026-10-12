@@ -83,23 +83,39 @@ def test_vop_hazard_is_detected():
 
 
 def test_mm_matches_integer_math():
+    """MM, docs/isa.md: one exact integer per output, each group's products shifted by
+    W - dw - da (the groups past the window left out), then (i2f(acc) Sw) (Sa 2^-W), bit for
+    bit (int8: W 16, a dw byte per block, QACT's groups of D/4)."""
     cfg = Config(S=1, D=32)
     rng = np.random.default_rng(0)
-    x = f(rng.standard_normal((3, 64)))
+    x = f(rng.standard_normal((3, 64)) * np.repeat(np.exp2(rng.integers(-14, 1, (3, 8))), 8, 1))
     w = rng.integers(-127, 128, (5, 64)).astype(np.int8)
-    ws = f(rng.uniform(0.01, 0.1, (5, 2)))
+    sw = f(rng.uniform(0.01, 0.1, 5))
+    dw = rng.integers(0, 12, (5, 2)).astype(np.uint8)
+    srows = np.zeros((5, 8), np.uint8)                       # Sw, then a dw byte per block
+    srows[:, :4] = sw.view(np.uint8).reshape(5, 4)
+    srows[:, 4:6] = dw
     dram = np.zeros(8192, np.uint8)
     dram[:768] = x.view(np.uint8).reshape(-1)
     dram[1024:1024 + 320] = w.view(np.uint8).reshape(-1)
-    dram[2048:2048 + 40] = ws.view(np.uint8).reshape(-1)
+    dram[2048:2048 + 40] = srows.reshape(-1)
     prog = [I.ld(0, 0, 192), I.qact(0, 3, 0, 2, 64), I.mm(1024, 2048, 256, 5, 2, 64, 5, 3, 0, 8),
             I.halt()]
     s = run1(prog, dram, cfg)
     y = s.tget(256 + np.arange(15)).reshape(3, 5)
-    q, sx = F.quantize(x.reshape(3, 2, 32), axis=2)
-    exact = np.einsum("jki,nki,nk,jk->jn", q.astype(np.float64), w.reshape(5, 2, 32),
-                      ws.astype(np.float64), sx.astype(np.float64))
-    assert np.allclose(y, exact, rtol=1e-5, atol=1e-5)
+    q, sa, da = F.quantize_mx(x, 8)
+    acc = np.zeros((3, 5), np.int64)
+    dropped = 0
+    for k in range(2):
+        for b in range(4):
+            g = slice(32 * k + 8 * b, 32 * k + 8 * b + 8)
+            c = q[:, g].astype(np.int64) @ w[:, g].astype(np.int64).T          # [3, 5]
+            sh = 16 - dw[None, :, k].astype(np.int64) - da[:, 4 * k + b, None].astype(np.int64)
+            acc += np.where(sh >= 0, c << np.maximum(sh, 0), 0)
+            dropped += int((sh < 0).sum())
+    want = F.mul(F.mul(acc.astype(np.float64).astype(np.float32), sw[None, :]),
+                 F.mul(sa[:, None], f(2.0 ** -16)))
+    assert dropped and np.array_equal(y, want)
 
 
 def test_gather_two_slices():

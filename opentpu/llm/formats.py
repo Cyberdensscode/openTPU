@@ -2,7 +2,12 @@
 docs/gemma4_e4b.md). A model's weights are in its image's `wformat`, except where a formats
 string says otherwise:
 
-    "kind=fmt,kind@a-b=fmt,..."     fmt: int8, int4 or fp4; a..b: checkpoint layers (a: one)
+    "kind=fmt,kind@a-b=fmt,..."     fmt: int8, int4, fp4 or nvfp4; a..b: checkpoint layers
+                                    (a: one)
+
+The formats are the MX MXU's (docs/mx_mxu.md, opentpu/quant.py): int8 is int8x, int4 int4x,
+fp4 fp4x6 (E2M1 with 6-bit multipliers of power-of-two group scales), nvfp4 NVIDIA's NVFP4
+(E2M1 with an E4M3 scale per 16 elements, as a power-of-two shift and a 3-bit mantissa).
 
 A rule with a range wins over one without, and among equals the first one in the string. Each
 model names the kinds it has (Gemma 4: attn, mlp, gateup, down, ple, head, experts; Qwen3 and
@@ -13,14 +18,14 @@ caller, else the OTPU_FORMATS environment variable, else the model's own default
 
 The Qwen3 / Llama-like, LFM2 and Qwen3.5 models also have a named choice, wformat "mix": int8
 with the model's recommended formats string (Spec.mix, from MIXES: docs/formats.md), unless
-the caller or OTPU_FORMATS gives one. wformat int8, int4 and fp4 stay uniform. wformat "auto"
-(otpu-chat's default, auto()) is "mix" where the model has a mix, else int8.
+the caller or OTPU_FORMATS gives one. wformat int8, int4, fp4 and nvfp4 stay uniform. wformat
+"auto" (otpu-chat's default, auto()) is "mix" where the model has a mix, else int8.
 """
 from __future__ import annotations
 
 import os
 
-FORMATS = ("int8", "int4", "fp4")
+FORMATS = ("int8", "int4", "fp4", "nvfp4")
 MIX = "mix"                 # the named choice: int8 with the model's mix (Spec.mix)
 AUTO = "auto"               # "mix" where the model has one, else int8 (otpu-chat's default)
 
@@ -80,7 +85,7 @@ def rules(formats: str | None, kinds, default: str = "", unranged=("head",)) -> 
         hi = hi if dash else lo
         if kind not in kinds or fmt not in FORMATS or (at and kind in unranged) or \
                 (at and not (lo.isdigit() and hi.isdigit() and int(lo) <= int(hi))):
-            raise ValueError(f"weight format {item!r}: kind[@a-b]=int8|int4|fp4")
+            raise ValueError(f"weight format {item!r}: kind[@a-b]=int8|int4|fp4|nvfp4")
         out.append((kind, int(lo) if at else 0, int(hi) if at else 1 << 30, bool(at), fmt))
     return out
 
