@@ -4162,6 +4162,49 @@ The ISA check:
   - an MXU that takes them at the stream's rate (dsp-pump's MCOLS 16 with ACT_ROWS 64,
     mx_mxu.md 10).
 
+The balance point (em_capacity.py, the same windows; no new RTL). The model:
+- A pass of m entries takes max(S, c(m)).
+  - S is its expert's stream: the co-sim's pass at C = 2, 0.112 ms (35B) and 0.237 ms (26B).
+  - c(m) = ceil(m / 2) x c(2) / x on an MXU x times today's, with c(2) = 0.100 and 0.210 ms
+    (13.11). The measured c(4) and c(8) are within 3 % and 7 % of this.
+- Each window's actual passes are counted, the part-filled last ones included.
+- At C = 2 it reproduces the co-sim: 0.481 / 0.984 ms a row.
+
+ms is a layer's expert run, per prompt row:
+
+| model | rows | C | MB a row | ms a row, today | ms a row, MXU 4x |
+|:--|--:|--:|--:|--:|--:|
+| 35B | 131 | 2 | 7.19 | 0.481 | 0.481 |
+| 35B | 131 | 4 | 4.16 | 0.438 | 0.278 |
+| 35B | 131 | 8 | 2.72 | 0.436 | 0.182 |
+| 35B | 131 | 32 | 1.87 | 0.435 | 0.163 |
+| 35B | 512 | 2 | 6.85 | 0.459 | 0.459 |
+| 35B | 512 | 4 | 3.61 | 0.413 | 0.241 |
+| 35B | 512 | 8 | 2.00 | 0.412 | 0.134 |
+| 35B | 512 | 32 | 0.85 | 0.411 | 0.115 |
+| 26B | 124 | 2 | 14.34 | 0.984 | 0.984 |
+| 26B | 124 | 4 | 7.76 | 0.883 | 0.532 |
+| 26B | 124 | 8 | 4.52 | 0.880 | 0.310 |
+| 26B | 124 | 32 | 2.32 | 0.878 | 0.265 |
+| 26B | 512 | 2 | 13.95 | 0.957 | 0.957 |
+| 26B | 512 | 4 | 7.15 | 0.853 | 0.490 |
+| 26B | 512 | 8 | 3.75 | 0.852 | 0.257 |
+| 26B | 512 | 32 | 1.25 | 0.851 | 0.223 |
+
+- Today the stream and the MXU meet at C = 2.2 (35B) and 2.3 (26B), so the expert run is nearly
+  balanced as it is.
+  - A C = 4 kernel still pays on the card: -9 to -11 % of the run's time, and the bytes nearly
+    halved (less contention with the link's H2C writes, 13.11).
+  - Beyond 4 the run is compute-bound: the time stays put while the bytes keep falling.
+- An MXU 4x faster (MCOLS 16) meets the stream at C = 8.9 and 9.0.
+  - C = 8 then cuts the run by 62-73 %, C = 32 by 66-77 %.
+  - At 124-131 rows little is left past C = 8. Most experts' one pass is stream-bound (140 x
+    0.112 ms, 0.12 ms a row on the 35B), and only the popular ones are compute-bound.
+- In general the stream and the MXU meet at C* = 2 S x / c(2). For passes of 32 or 64 rows to
+  stay stream-bound, the MXU must take an expert's 32 or 64 rows in its stream time: about 14x or
+  29x today's MXU against today's DRAM. That is the MXU-to-DRAM ratio MoE prefill wants from an
+  ASIC.
+
 ## 14. Chatting with a streamed MoE (otpu-chat)
 
 otpu-chat runs the three MoE models bigger than the card's 4 GiB. Their experts stream from a pool
