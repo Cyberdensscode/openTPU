@@ -16,9 +16,10 @@ misses.
 (programs, run_args): programs one per slice (a list of Instr, or its assembled words, as the
 compile worker processes give them), or a tuple of such lists (a split generate program's parts);
 run_args the programs' arguments (RunVar, coefficient) or None. On disk each program is its
-assembled words; a program read back is the words decoded, one list per slice whatever the form
-it was compiled in (Instr.decode: no comments or kernel source frames, which only the profilers
-read; they compile their own programs).
+assembled words; a program read back is the words decoded, one compiler.Program per slice
+whatever the form it was compiled in (Instr.decode: no comments or kernel source frames, which
+only the profilers read; they compile their own programs), with run_args (each RunVar's name and
+bound) as its own.
 
 An Engine uses the cache with prog_cache (default: enabled(), OTPU_PROG_CACHE set and not 0).
 Tests leave it off: they patch kernels' module constants, which the key does not see. The disk
@@ -42,7 +43,7 @@ from pathlib import Path
 import numpy as np
 
 from . import isa as I
-from .compiler import RunVar
+from .compiler import Program, RunVar
 
 CAP_BYTES = 2 << 30             # the disk cache's size (OTPU_PROG_CACHE_GB overrides)
 FREE_FLOOR = 20 << 30           # free disk a write must leave
@@ -192,7 +193,7 @@ def _store(d: Path, f: Path, v) -> None:
                                            np.uint32)
     meta = {"split": split, "kinds": kinds, "S": [len(p) if k == "i" else 1
                                                   for p, k in zip(parts, kinds)],
-            "ra": None if ra is None else [[v_.name, int(c)] for v_, c in ra]}
+            "ra": None if ra is None else [[v_.name, int(c), v_.bound] for v_, c in ra]}
     f.parent.mkdir(parents=True, exist_ok=True)
     if shutil.disk_usage(f.parent).free - sum(a.nbytes for a in arrs.values()) < FREE_FLOOR:
         return
@@ -212,14 +213,17 @@ def _load(f: Path):
                 ws = [z[f"p{j}_{s}"] for s in range(S)]
                 parts.append([[I.Instr.decode(w[i:i + 8]) for i in range(0, len(w), 8)]
                               for w in ws])
+            ra = None if meta["ra"] is None else [(RunVar(r[0], *r[2:]), r[1])
+                                                  for r in meta["ra"]]
         os.utime(f)                     # recently used (the eviction order)
     except FileNotFoundError:
         return None
     except Exception:                   # a damaged entry: compile again
         f.unlink(missing_ok=True)
         return None
+    # each slice's program with its arguments and their bounds (opentpu.waits bounds them)
+    parts = [[Program(p, ra or ()) for p in part] for part in parts]
     progs = tuple(parts) if meta["split"] else parts[0]
-    ra = None if meta["ra"] is None else [(RunVar(n), c) for n, c in meta["ra"]]
     return progs, ra
 
 
