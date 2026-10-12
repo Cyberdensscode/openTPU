@@ -950,9 +950,10 @@ class Image:
                            # the decode loop's area
                            "gen": G.alloc(b, spec, cap, block, cfg.IMEM_WORDS)}
             # the prompt runs' mask tiles, ends then starts (Additive); a MoE model's for its
-            # tiled layer runs (OTPU_TILE as the image is built: tiled.compile_layer_tile)
-            from .prefill import tile_flag
-            if not spec.experts or (self.prefill_rows and tile_flag(None)):
+            # tiled layer runs, opt-in (OTPU_TILE=1 as the image is built: layer_tile_flag,
+            # tiled.compile_layer_tile)
+            from .prefill import layer_tile_flag
+            if not spec.experts or (self.prefill_rows and layer_tile_flag(None)):
                 self.lookup.update(amask=b.alloc(2 * amask_table(block, cfg.MCOLS).nbytes),
                                    amask_M=cfg.MCOLS)
         self.offload = None

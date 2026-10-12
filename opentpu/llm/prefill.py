@@ -18,11 +18,12 @@ model take the same split, so their logits are the same bit for bit. Where today
 (compile_rows) would fit more rows in a bucket than its prompt run, a prompt that reaches the
 bucket takes today's route (covers).
 
-Tiled runs (opentpu/llm/tiled.py, docs/tiled_prefill.md), opt-in: with the engine's tile_runs on
-(or OTPU_TILE=1 where the engine does not say), a bucket's P and L runs are tile_run's programs
-of up to T rows (_probe_tile: whole passes of MCOLS up to ACT_ROWS and the image's rows, every
-run a prompt can ask for in the bucket fitting TMEM and IMEM), each weight streamed once a run;
-a bucket where no tile fits takes today's prompt runs. MTP's M runs stay today's.
+Tiled runs (opentpu/llm/tiled.py, docs/tiled_prefill.md), on by default (off with the engine's
+tile_runs False, or OTPU_TILE=0 where the engine does not say: tile_flag): a bucket's P and L
+runs are tile_run's programs of up to T rows (_probe_tile: whole passes of MCOLS up to ACT_ROWS
+and the image's rows, every run a prompt can ask for in the bucket fitting TMEM and IMEM), each
+weight streamed once a run; a bucket where no tile fits takes today's prompt runs. MTP's M runs
+stay today's.
 """
 from __future__ import annotations
 
@@ -75,10 +76,22 @@ def supported(eng) -> bool:
 
 
 def tile_flag(t) -> bool:
-    """Tiled prompt runs asked for: t (an engine's tile_runs), or where it is None OTPU_TILE
-    (off by default; in the reference cache's key: tools/qual/refs.py env_key)."""
+    """Tiled prompt runs asked for: t (an engine's tile_runs), or where it is None OTPU_TILE:
+    on unless it is 0 (unset or empty: the default, on; in the reference cache's key as it is
+    set: tools/qual/refs.py env_key). Their bits are today's prompt runs' (docs/tiled_prefill.md
+    11)."""
     if t is None:
-        t = os.environ.get("OTPU_TILE", "") not in ("", "0")
+        t = os.environ.get("OTPU_TILE", "").strip() != "0"
+    return bool(t)
+
+
+def layer_tile_flag(t) -> bool:
+    """A MoE model's tiled expert-major layer runs asked for (Engine.layer_tile, with
+    expert_major), and so its image's mask tiles as it is built: opt-in, not the prompt runs'
+    default. t (an engine's tile_runs) True, or where it is None OTPU_TILE set and not 0. They
+    go with the expert-major switch (docs/offload.md 13.11), which ships on its own."""
+    if t is None:
+        t = os.environ.get("OTPU_TILE", "").strip() not in ("", "0")
     return bool(t)
 
 

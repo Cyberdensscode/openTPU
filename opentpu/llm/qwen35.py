@@ -792,12 +792,13 @@ class Image(EmbedHost):
                           and getattr(spec, "embed", "f32") == "int8" and spec.moe is not None)
         if embed_host and not lookup:
             raise ValueError("embed_host needs the image's lookup tables (lookup=True)")
-        from .prefill import tile_flag      # (a MoE model's mask tiles: its tiled layer runs,
+        # (a MoE model's mask tiles: its tiled layer runs, opt-in: OTPU_TILE=1 as it is built)
+        from .prefill import layer_tile_flag
         self.lookup = _lookup_alloc(b, spec, cap, D=D, head=self.head if shared else None,
                                     M=cfg.MCOLS, embed_host=bool(embed_host),
                                     rows=self.grows,                # (layer 0's R rows)
-                                    imem=cfg.IMEM_WORDS,            # OTPU_TILE as it is built)
-                                    masks=bool(self.prefill_rows) and tile_flag(None)) \
+                                    imem=cfg.IMEM_WORDS,
+                                    masks=bool(self.prefill_rows) and layer_tile_flag(None)) \
             if lookup else {}
         if lookup and spec.mtp:     # the MTP loop's chain area (opentpu/llm/mtp.py)
             from .mtp import gen_alloc
