@@ -466,6 +466,36 @@ def test_tiled_expert_major_layer_runs(gmoe, monkeypatch, wf, T, R):
         t = int(np.argmax(ga))
 
 
+@pytest.mark.parametrize("act, T, li", [(4, 4, 1), (16, 8, 5)])
+def test_tiled_expert_major_layer_run_on_rtl(gmoe, monkeypatch, have_verilator, act, T, li):
+    """A tiled expert-major layer run on the RTL with the board's memory path (DRAM and TMEM as
+    the ISA simulator's): a sliding layer's 4 rows on the card's ACT RAM (4 rows), a global
+    one's 8 on ACT_ROWS 16, at position 300 of the tiny Gemma 4 MoE after a 300-token prompt,
+    from chunk row 3 (its records as the prompt left them), every need served."""
+    from opentpu import rtlsim
+    from opentpu.compiler import arg_words
+    from opentpu.llm.qwen3 import RunPos
+    _, W, spec = gmoe
+    monkeypatch.setenv("OTPU_TILE", "1")
+    cfg = board_config(DRAM_BYTES=1 << 26, ACT_ROWS=act)
+    eng = Engine(spec, W, cap=1024, cfg=cfg, rows=1, wformat="fp4", experts=6, layer_major=T,
+                 expert_major=True)
+    toks = [int(t) for t in np.random.default_rng(300).integers(0, 1000, 301)]
+    eng.prefill(toks[:300])
+    img = eng.image
+    progs, ra = tiled.compile_layer_tile(img, li, 300 // 256 + 1, T, 256)
+    args = arg_words(ra, dict(RunPos.values(toks[300], 300, 1, 256), row=3))
+    dram = eng.backend.machine.slices[0].dram.copy()
+    served = img.offload.served
+    dram[served:served + 4] = np.frombuffer(np.float32(1e6).tobytes(), np.uint8)
+    m = Machine(cfg, progs, [dram.copy()], args=args).run()
+    drams, tmems, _ = rtlsim.run(cfg, progs, [dram.copy()], uarch=rtlsim.BOARD_UARCH, axi=True,
+                                 boot=True, args=args)
+    n = img.nbytes
+    assert np.array_equal(drams[0][:n], m.slices[0].dram[:n])
+    assert np.array_equal(tmems[0], m.slices[0].tmem)
+
+
 def test_reference_key_tells_tiled_runs():
     """tools/qual/refs.py: OTPU_TILE is in a reference's key (env_key: the hashed sources read
     it), so a tiled qual's references are its own."""
