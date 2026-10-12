@@ -93,6 +93,13 @@ CLIs' `--wformat` take `nvfp4` too. `tools/quant_eval.py` (Hugging Face in fp32)
   (qcache also `quant.MX_NUMERICS`): no entry of the MXU before MX is read. Expert pools carry
   key 2 with `numerics` (`moe.pool_key`); a key 1 pool or one without a key is refused with how
   to repack it (`tools/offload/pack_pool.py`), never misread.
+- **Accuracy.** `tools/formats_scan.py ppl` (the device's quantization points and ranges, the
+  window's drops) on Qwen3-0.6B over docs/mx_mxu.md 3.3's 2000 tokens (docs/isa.md before MX:
+  `--ids`), paired dKL against ee8f118d's int8 (hwe-bench and the Mac, 2026-10-12): MX int8
+  -0.28 (0.04), ppl 42.30; MX fp4 (head int8) +15.65 (0.43), ppl 47.34, -0.35 (0.36) against
+  ee8f118d's fp4 (+15.995, 46.27, as 3.3). 3.3's study has -0.41 and +15.52 (0.42): this code
+  quantizes K at d = D under one row scale (QST ROW), P per attention block with V's scales
+  folded in and the down projection per F chunk, where the study took a8x32 everywhere.
 
 ### Checkpoint imports
 
