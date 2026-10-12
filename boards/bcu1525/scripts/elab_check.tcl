@@ -17,7 +17,7 @@ set bad 0
 foreach c {u_sys/u_board/u_slice u_sys/u_board/u_mem {u_sys/g_ch[0].u_ch} {u_sys/g_ch[1].g_sll.u_tx}
            u_ld0 {g_csr[0].u_iso} {u_sys/u_board/g_slice[1].u_slice} {u_sys/u_board/g_slice[1].u_mem}
            {u_sys/g_ch[2].u_ch} {u_sys/g_ch[3].g_sll.u_tx} u_ld3 {g_csr[3].u_iso} u_bd
-           u_sys/u_board/u_ctrl u_sys/u_board/u_coll u_sys/u_board/g_trace.u_trace u_sys/u_board/u_iso
+           u_sys/u_board/u_ctrl u_sys/u_board/g_coll.u_coll u_sys/u_board/g_trace.u_trace u_sys/u_board/u_iso
            {u_sys/g_ch[1].u_ch} {u_sys/g_ch[1].g_sll.u_rx} {u_sys/g_ch[3].u_ch}
            {u_sys/g_ch[3].g_sll.u_rx} u_ld1 u_ld2 {g_csr[1].u_iso} {g_csr[2].u_iso}
            {g_bufg[1].u_bufg} u_sys/u_board/g_xs.u_chub {u_sys/u_board/g_xs.g_x[0].g_pf.u_pf_tx}

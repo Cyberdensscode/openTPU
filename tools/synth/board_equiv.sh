@@ -23,7 +23,7 @@ BB="--blackboxed-module otpu_slice --blackboxed-module otpu_native_dram --blackb
     --blackboxed-module otpu_trace"
 G="-G MCOLS=4 -G ACT_ROWS=4 -G MXU_IMPL=2 -G VPU_CL=2 -G ULANES=8 -G PLATFORM=1 $*"
 LIB=$(echo $LIB); BB=$(echo $BB)    # one line each: a newline ends a yosys command
-CUT="expose -evert otpu_board/c:u_slice otpu_board/c:u_mem otpu_board/c:u_coll otpu_board/c:*u_trace"
+CUT="expose -evert otpu_board/c:u_slice otpu_board/c:u_mem otpu_board/c:*u_coll otpu_board/c:*u_trace"
 PREP="hierarchy -top otpu_board; proc; memory; flatten; $CUT; opt_clean"
 $Y -m slang -p "
 read_slang $LIB $d/old_ctrl.sv $d/old_board.sv --top otpu_board $G $BB -DSYNTHESIS --allow-use-before-declare

@@ -6,10 +6,12 @@ register is 32 bits. The control block decodes 12 address bits (4 KiB; the map r
 the 64 KiB BAR). Reads answer a few cycles after the address (the data path is registered);
 undefined offsets read 0xDEADBEEF.
 
-## Register map (version 4)
+## Register map (version 5)
 
 The version 1 registers keep their offsets. Version 3 adds one free-running counter,
-MXU_STARVE (0x160); everything else is as in version 2. A version 2 bitstream reads 0xDEADBEEF
+MXU_STARVE (0x160); everything else is as in version 2. Version 5 adds CAPS2 (0x05C), since
+CAPS is full; a version 4 bitstream reads 0xDEADBEEF there, and the host takes every CAPS2
+capability as present on it. A version 2 bitstream reads 0xDEADBEEF
 at 0x160, so the host reads the counters its REGMAP has (`opentpu/host/regs.py`, `counters()`).
 
 DDR_MTS (0x054) came later without a version bump, because CAPS bit3 announces it. On a
@@ -32,14 +34,15 @@ DDR3 speed as unknown.
 | 0x030 | SW_WR | RO | scalar (QST) write requests taken (run) |
 | 0x034 | B_STALL | RO | cycles a port B request waited (run) |
 | 0x038 | SCRATCH | RW | host bring-up test |
-| 0x03C | REGMAP | RO | register map version (4; 3 before the CFG_* registers, 2 before MXU_STARVE) |
-| 0x040 | CAPS | RO | bit0 trace buffer present, bit1 temperature present, bit2 I2C pins present, bit3 DDR_MTS present, bit4 the MXU runs 4-bit weights (docs/quant.md), bit5 column reuse: MM PAIR / QACT DUP (docs/isa.md), bit6 DSTEP: the DMA's DeltaNet head step (docs/isa.md), bit7 CHASH: the hashed channel interleave, [15:8] log2(trace depth), [23:16] log2(P/Q window cycles), bit24 ACT_ROWS present, bit25 run arguments ARG0..7 (docs/isa.md), bit26 STREAM: the stream engine runs STREAM's hardware subset (docs/stream.md, docs/isa.md), bit27 reserved for HOSTCAL: LiteDRAM controllers, calibrated by the host through BAR0 0x10000 (branch litedram-int), bit28 proposed for the flash controller (docs/flash.md, a draft), bit29 MX: the MX numerics (MM's exact accumulation with power-of-two block scales, QACT / QST's row scale and offsets; docs/isa.md, docs/mx_mxu.md; set by every bitstream since: this tree's host refuses a bitstream without it with ConfigMismatch, opentpu/host/board.py check_numerics in device_config and check_fits (BoardBackend), and a host of the previous numerics refuses an MX bitstream by its CFG_HASH), bit30 reserved for GEN: the decode loop's instructions RLD, VOP ARGMAX, HALT CHAIN (docs/isa.md, docs/autodecode.md; branch autodecode), bit31 WAITW: the DMA waits for a word the host writes (docs/isa.md; branch waitw). CAPS is then full: a new flag (the flash draft's reboot) needs a second capability register |
+| 0x03C | REGMAP | RO | register map version (5; 4 before CAPS2, 3 before the CFG_* registers, 2 before MXU_STARVE) |
+| 0x040 | CAPS | RO | bit0 trace buffer present, bit1 temperature present, bit2 I2C pins present, bit3 DDR_MTS present, bit4 the MXU runs 4-bit weights (docs/quant.md), bit5 column reuse: MM PAIR / QACT DUP (docs/isa.md), bit6 DSTEP: the DMA's DeltaNet head step (docs/isa.md), bit7 CHASH: the hashed channel interleave, [15:8] log2(trace depth), [23:16] log2(P/Q window cycles), bit24 ACT_ROWS present, bit25 run arguments ARG0..7 (docs/isa.md), bit26 STREAM: the stream engine runs STREAM's hardware subset (docs/stream.md, docs/isa.md), bit27 reserved for HOSTCAL: LiteDRAM controllers, calibrated by the host through BAR0 0x10000 (branch litedram-int), bit28 proposed for the flash controller (docs/flash.md, a draft), bit29 MX: the MX numerics (MM's exact accumulation with power-of-two block scales, QACT / QST's row scale and offsets; docs/isa.md, docs/mx_mxu.md; set by every bitstream since: this tree's host refuses a bitstream without it with ConfigMismatch, opentpu/host/board.py check_numerics in device_config and check_fits (BoardBackend), and a host of the previous numerics refuses an MX bitstream by its CFG_HASH), bit30 reserved for GEN: the decode loop's instructions RLD, VOP ARGMAX, HALT CHAIN (docs/isa.md, docs/autodecode.md; branch autodecode), bit31 WAITW: the DMA waits for a word the host writes (docs/isa.md; branch waitw). CAPS is then full: new flags go to CAPS2 (0x05C, register map 5; the flash draft's reboot among them) |
 | 0x044 | CORE_KHZ | RO | accelerator clock in kHz (a build parameter; the host turns cycles into time with it) |
 | 0x048 | BUILD_ID | RO | a build parameter: the first 8 hex digits of the git commit |
 | 0x04C | TEMP | RO | bit31 valid, [11:0] the XADC die-temperature code (from the block design's XADC; °C = code × 503.975 / 4096 − 273.15). Valid once the XADC has reported a non-zero code (bitstreams before fix-board: also once channel 0 is calibrated, a MIG builds' leftover) |
 | 0x050 | SNAP | W / R | write (any value): latch every free-running counter into its shadow at once; read: number of snapshots taken |
 | 0x054 | DDR_MTS | RO | a build parameter: the DDR3 data rate the MIGs were generated for, in MT/s (800, 1066, 1300, ...; `make bit DDR=`). Valid when CAPS bit3 is set |
 | 0x058 | ACT_ROWS | RO | a build parameter: the ACT RAM rows, the most rows of one MM (`make bit ACT_ROWS=`; docs/isa.md). Valid when CAPS bit24 is set; otherwise MCOLS |
+| 0x05C | CAPS2 | RO | (version 5) bit0 GATHER: the collective unit runs GATHER. Always set at S > 1; a one-slice build with `COLL_GATHER=0` (`make bit`, otpu_board's parameter) runs BAR alone (`otpu_coll_bar`): a GATHER there moves no data and raises ERROR, and the host refuses to load a program with one (`Board.load_program`: `NoGather`). The compiler emits GATHER only at S > 1 |
 | 0x060 + 4k | ARG0..ARG7 | R / W | the run's arguments: R8..R15 of the sequencer at the start of every run (docs/isa.md "Arguments"); reset 0, kept across runs. Present when CAPS bit25 is set |
 | 0x080 | CFG_SLICES | RO | (version 4: the configuration of the target the build came from, docs/targets.md) slices S |
 | 0x084 | CFG_TMEM | RO | TMEM words per slice |
@@ -132,7 +135,8 @@ equals the run's CYCLES.
 
 The trace buffer records the slice's trace events -- the lines the simulator prints with `+trace`
 (`opentpu/profile.py`) -- as 64-bit records in a ring of DEPTH records (board: 16384, CAPS
-[15:8]). `opentpu/hwtrace.py` turns the records back into those lines
+[15:8]; `TRACE_DEPTH=0 ./run_vivado.sh` builds the YPCB bitstream without it: CAPS bit0 clear,
+32 RAMB36, ~2.3K LUT and ~3.9K FF back). `opentpu/hwtrace.py` turns the records back into those lines
 (`records_to_trace(records, sid=0)`, `ring_order(raw, count, depth)`).
 
 | Offset | Name | Access | Meaning |

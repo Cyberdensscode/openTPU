@@ -414,14 +414,18 @@ def run(a, t, dev: str, sim: bool) -> tuple[list[Row], list[str]]:
 
         def ro_sane():
             i = ctx["info"]
+            c2 = i["regmap"] >= R.CAPS2_SINCE
             v = t.reg_read_many([R.R_ID, R.R_VERSION, R.R_REGMAP, R.R_CAPS, R.R_CORE_KHZ,
-                                 R.R_BUILD_ID, R.R_STATUS, 0xFFC])
+                                 R.R_BUILD_ID, R.R_STATUS, 0xFFC] + ([R.R_CAPS2] if c2 else []))
             bad = []
             if i["MCOLS"] not in (2, 4) or i["LANES"] not in (8, 16):
                 bad.append(f"VERSION {v[1]:#x}")
             if i["regmap"] >= 2:
-                if v[2] not in (2, 3, 4):
+                if v[2] not in (2, 3, 4, 5):
                     bad.append(f"REGMAP {v[2]}")
+                if c2 and (v[8] & ~R.CAP2_GATHER or not v[8] & R.CAP2_GATHER
+                           and (i.get("cfg") or {}).get("S", 1) > 1):
+                    bad.append(f"CAPS2 {v[8]:#x}")      # reserved bits, or no GATHER at S > 1
                 if not 10_000 <= v[4] <= 300_000:
                     bad.append(f"CORE_KHZ {v[4]}")
                 if i["caps"]["trace"] and not 8 <= (v[3] >> 8 & 0xFF) <= 16:
@@ -519,7 +523,9 @@ def run(a, t, dev: str, sim: bool) -> tuple[list[Row], list[str]]:
         print("isa", flush=True)
         caps = (ctx["info"] or {}).get("caps") or {}
         gen, waitw = bool(caps.get("gen")), bool(caps.get("waitw"))
-        for group, name, prog in (op_checks(ctx["cfg"], gen, waitw) if ctx["cfg"] else []):
+        gather = ((ctx["info"] or {}).get("caps2") or {}).get("gather", True)
+        for group, name, prog in (op_checks(ctx["cfg"], gen, waitw, gather) if ctx["cfg"]
+                                  else []):
             d.check("isa", name, lambda prog=prog: run_demo(b, ctx["cfg"], prog, img)[:2],
                     core, group)
         if waitw and ctx["cfg"]:        # the host's writes during the run (tools/qual/waitw.py)
@@ -661,8 +667,8 @@ def cycle_check(b, t, info, sim: bool) -> tuple:
 
 
 def soak(b, cfg, img, n: int) -> tuple:
-    progs = [(name, p) for _, name, p in op_checks(cfg)] + [("demo", None),
-                                                          ("masked", masked_program())]
+    progs = [(name, p) for _, name, p in op_checks(cfg, gather=b.gather)] + \
+        [("demo", None), ("masked", masked_program())]
     fails = {}
     for k in range(n):
         for name, p in progs:

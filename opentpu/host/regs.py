@@ -8,6 +8,7 @@ register tied off). Version 3 adds the MXU_STARVE counter; a version 2 bitstream
 0xDEADBEEF there, so the host reads only counters(regmap). Version 4 adds the configuration
 registers CFG_* (0x80..0x9C: the target the bitstream was built from, opentpu/target.py), from
 which the host builds its Config (board.device_config); before it, the YPCB-00338's values.
+Version 5 adds CAPS2 (0x5C: CAPS is full); before it every capability CAPS2 names is present.
 """
 from __future__ import annotations
 
@@ -66,6 +67,22 @@ CAP_MX = 1 << 29
 CAP_GEN = 1 << 30
 CAP_WAITW = 1 << 31              # WAITW: the DMA waits for a word the host writes (docs/isa.md)
 TEMP_VALID = 1 << 31
+
+# ---- version 5: a second capability register (CAPS is full)
+CAPS2_SINCE, R_CAPS2 = 5, 0x5C
+# CAPS2 bit0: the collective unit runs GATHER. Always at S > 1; a one-slice bitstream built
+# without it (otpu_board COLL_GATHER = 0, docs/infra_hunt.md 5) runs BAR alone and raises ERROR
+# on a GATHER, and the host refuses to load a program with one (Board.load_program). Every
+# bitstream before version 5 has GATHER.
+CAP2_GATHER = 1
+
+
+def caps2(v: int | None) -> dict:
+    """CAPS2's value -> its capabilities; None (a register map before 5): all present."""
+    if v is None:
+        return {"gather": True}
+    return {"gather": bool(v & CAP2_GATHER)}
+
 
 # ---- version 4: the configuration (otpu_ctrl CFG_*; docs/targets.md)
 CFG_SINCE = 4

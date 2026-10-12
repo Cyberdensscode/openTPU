@@ -156,7 +156,9 @@ module otpu_mem_ch #(
   localparam int ASW = $clog2(ARD);        // read slots
   localparam int XSW = $clog2(XRD);
   localparam int TW  = 2 + ASW;            // read tag: {read-modify-write, xdma, slot}
-  initial if (ARD + XRD + 1 > 128) $fatal(1, "otpu_mem_ch: ARD + XRD reads in flight exceed the tag FIFO");
+  // the read tags' FIFO per port: every read in flight (ARD + XRD and a read-modify-write's), a
+  // power of two (128 at the board's ARD 64, XRD 16)
+  localparam int TGD = 2 ** $clog2(ARD + XRD + 1);
   initial if (XRD > ARD) $fatal(1, "otpu_mem_ch: XRD > ARD (the tag's slot)");
 
   function automatic logic [CW-1:0] b2g(input logic [CW-1:0] b);
@@ -572,7 +574,7 @@ module otpu_mem_ch #(
       .rdata(c_wdata_data[p]));
     assign c_wdata_we[p] = '1;
 
-    otpu_sfifo #(.W(TW), .DEPTH(128)) u_tag (.clk(uclk), .rst(urq),
+    otpu_sfifo #(.W(TW), .DEPTH(TGD)) u_tag (.clk(uclk), .rst(urq),
       .wvalid(go && (!we || rmw) && tp == 1'(p)), .wready(tg_wr[p]),
       .wdata({rmw, pick_x, pick_x ? ASW'(x_seq) : a_seq}), .rvalid(tg_rv[p]),
       .rready(c_rdata_valid[p]), .rdata(tg_rd[p]));

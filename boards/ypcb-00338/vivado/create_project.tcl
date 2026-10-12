@@ -31,6 +31,16 @@ set ARCH_HASH [expr {[llength $argv] > 11 ? [lindex $argv 11] : 0}]
 # MXU_E: the MXU's epilogue lanes (timing only; the target's [uarch] MXU_E, 0: MCOLS / 2)
 set MXU_E [expr {[llength $argv] > 12 ? [lindex $argv 12] : 4}]
 if {![regexp {^[0-9a-fA-F]{1,8}$} $ARCH_HASH]} { set ARCH_HASH 0 }
+# TRACE_DEPTH (environment, run_vivado.sh): the trace buffer's records, a power of two; 0 leaves
+# it out (CAPS trace bit 0: 32 RAMB36, ~2.3K LUT, ~3.9K FF; docs/infra_hunt.md)
+set TRACE_DEPTH [expr {[info exists ::env(TRACE_DEPTH)] && $::env(TRACE_DEPTH) ne "" ? $::env(TRACE_DEPTH) : 16384}]
+if {![regexp {^[0-9]+$} $TRACE_DEPTH] || ($TRACE_DEPTH != 0 && ($TRACE_DEPTH & ($TRACE_DEPTH - 1)))} {
+  error "TRACE_DEPTH $TRACE_DEPTH: a power of two, or 0"
+}
+# COLL_GATHER (environment, run_vivado.sh): 0 builds the collective unit without GATHER (BAR
+# alone: CAPS2 bit0 = 0; the host refuses GATHER programs; docs/infra_hunt.md 5)
+set COLL_GATHER [expr {[info exists ::env(COLL_GATHER)] && $::env(COLL_GATHER) ne "" ? $::env(COLL_GATHER) : 1}]
+if {$COLL_GATHER ni {0 1}} { error "COLL_GATHER $COLL_GATHER: 0 or 1" }
 if {$BUILD_ID eq ""} {
   if {[catch {exec git -C $root rev-parse HEAD} BUILD_ID]} { set BUILD_ID 0 }
   set BUILD_ID [string range $BUILD_ID 0 7]
@@ -40,7 +50,7 @@ if {![regexp {^[0-9a-fA-F]{1,8}$} $BUILD_ID]} { set BUILD_ID 0 }
 # divider steps of its 800 MHz VCO), for the CORE_KHZ register
 set VCO 800
 set CORE_KHZ [expr {round($VCO * 1000.0 / (round(double($VCO) / $CORE_MHZ * 8) / 8.0))}]
-puts "CORE_KHZ $CORE_KHZ, BUILD_ID $BUILD_ID, MXU_IMPL $MXU_IMPL, PLATFORM $PLATFORM, ARCH_HASH $ARCH_HASH"
+puts "CORE_KHZ $CORE_KHZ, BUILD_ID $BUILD_ID, MXU_IMPL $MXU_IMPL, PLATFORM $PLATFORM, ARCH_HASH $ARCH_HASH, TRACE_DEPTH $TRACE_DEPTH, COLL_GATHER $COLL_GATHER"
 
 create_project -force otpu $out -part xc7k480tffg1156-2
 # The block design's IP synthesis (minutes: xdma above all) in a cache shared by every build on
@@ -85,7 +95,7 @@ source $here/bd_native.tcl   ;# sets PCIE_GEN (environment, run_vivado.sh) for t
 make_wrapper -files [get_files otpu_bd.bd] -top
 add_files -norecurse [glob $out/otpu.gen/sources_1/bd/otpu_bd/hdl/otpu_bd_wrapper.v]
 set_property top otpu_fpga_top_ld [current_fileset]
-set_property generic "MCOLS=$MCOLS ACT_ROWS=$ACT_ROWS VPU_CL=$VPU_CL LANES=$LANES CORE_KHZ=$CORE_KHZ BUILD_ID=32'h$BUILD_ID DDR_MTS=$DDR_SPEED DSTEP=1'b$DSTEP MXU_IMPL=$MXU_IMPL MXU_E=$MXU_E PCIE_GEN=$PCIE_GEN PLATFORM=$PLATFORM ARCH_HASH=32'h$ARCH_HASH" [current_fileset]
+set_property generic "MCOLS=$MCOLS ACT_ROWS=$ACT_ROWS VPU_CL=$VPU_CL LANES=$LANES CORE_KHZ=$CORE_KHZ BUILD_ID=32'h$BUILD_ID DDR_MTS=$DDR_SPEED DSTEP=1'b$DSTEP MXU_IMPL=$MXU_IMPL MXU_E=$MXU_E PCIE_GEN=$PCIE_GEN PLATFORM=$PLATFORM ARCH_HASH=32'h$ARCH_HASH TRACE_DEPTH=$TRACE_DEPTH COLL_GATHER=1'b$COLL_GATHER" [current_fileset]
 
 # ---- constraints: the board (otpu_top_ld.xdc) and the core's pads, VREF and synchronizers
 # (otpu_litedram.xdc); then, after the IP's constraints, as unmanaged Tcl on the implemented

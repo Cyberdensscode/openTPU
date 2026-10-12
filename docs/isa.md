@@ -503,3 +503,9 @@ register), `rows`, `cols`, `drs`, `seg`.
 `drs = w5`, `seg = w6` (words). For every slice `s`, every `r < rows`, `c < cols`:
 `T_all[dst + s*seg + r*drs + c] = T_s[src + r*srs + c]` is written into every slice's TMEM.
 The source and destination ranges must not overlap.
+
+GATHER is optional at S = 1, where it is a TMEM copy the compiler never emits
+(`opentpu.language.all_gather` returns its input): a one-slice bitstream built with
+`COLL_GATHER=0` runs BAR alone and clears CAPS2 bit0 (docs/observability.md). There a GATHER
+moves no data and raises ERROR, and the host refuses to load a program with one
+(`Board.load_program` raises `NoGather`).

@@ -47,6 +47,8 @@ module otpu_board #(
   parameter bit CHASH       = 1'b1,    // hashed channel interleave (otpu_native_dram; CAPS bit7)
   parameter bit DSTEP       = 1'b1,    // the DMA's DSTEP datapath (CAPS bit6; 0 leaves it out)
   parameter bit HOSTCAL     = 1'b0,    // the host calibrates the DDR3 controllers (CAPS bit27: LiteDRAM)
+  parameter bit COLL_GATHER = 1'b1,    // 0 (S = 1 only): the collective unit runs BAR alone, no
+                                       // GATHER (otpu_coll_bar; CAPS2 bit0 = 0, docs/infra_hunt.md 5)
   parameter int PLATFORM    = 0,       // the target's platform id (CFG_PLATFORM; opentpu/target.py)
   parameter logic [31:0] ARCH_HASH = 32'h0  // the target's arch_hash (CFG_HASH)
 ) (
@@ -199,6 +201,7 @@ module otpu_board #(
   otpu_ctrl #(.D(D), .MCOLS(MCOLS), .ACT_ROWS(ACT_ROWS), .LANES(LANES), .CORE_KHZ(CORE_KHZ), .BUILD_ID(BUILD_ID),
               .DDR_MTS(DDR_MTS), .TRACE_DEPTH(TRACE_DEPTH), .PQ_WIN(PQ_WIN), .HAS_TEMP(1'b1),
               .HAS_I2C(HAS_I2C), .CHASH(CHASH), .DSTEP(DSTEP), .HOSTCAL(HOSTCAL),
+              .COLL_GATHER(COLL_GATHER),
               .LDP(S > 1 ? 2 + 2 * XR : 2),  // LOAD to a slice's busy and back
               // each slice on its two channels' 2 GiB each (otpu_native_dram): 4 GiB
               .S(S), .TMEM_WORDS(TMEM_WORDS), .IMEM_WORDS(IMEM_WORDS), .ACT_BLOCKS(ACT_BLOCKS),
@@ -255,7 +258,8 @@ module otpu_board #(
   // the run's status from every slice
   assign ld_busy = |sl_ld_busy;
   assign halted  = &sl_halted;
-  assign error   = |sl_error;
+  logic  coll_gerr;                    // a GATHER on the BAR-only collective unit (COLL_GATHER 0)
+  assign error   = |sl_error || coll_gerr;
   assign wait_to = |sl_wait_to;
   assign wr_idle = &sl_wr_idle;
   assign rd_idle = &sl_rd_idle;
@@ -303,10 +307,19 @@ module otpu_board #(
   always @(posedge clk)
     if (coll_rst && |coll_req) $fatal(1, "otpu_board: a collective request in reset");
 `endif
-  otpu_coll #(.S(S), .LANES(LANES)) u_coll (
-    .clk, .rst(coll_rst), .req(coll_req), .cmds(coll_cmds), .gnt(coll_gnt), .ack(coll_ack),
-    .r_en(coll_ren), .r_addr(coll_raddr), .r_data(coll_rdata),
-    .w_en(coll_wen), .w_addr(coll_waddr), .w_data(coll_wdata));
+  initial if (S > 1 && !COLL_GATHER) $fatal(1, "otpu_board: COLL_GATHER 0 needs S = 1");
+  if (COLL_GATHER) begin : g_coll
+    otpu_coll #(.S(S), .LANES(LANES)) u_coll (
+      .clk, .rst(coll_rst), .req(coll_req), .cmds(coll_cmds), .gnt(coll_gnt), .ack(coll_ack),
+      .r_en(coll_ren), .r_addr(coll_raddr), .r_data(coll_rdata),
+      .w_en(coll_wen), .w_addr(coll_waddr), .w_data(coll_wdata));
+    assign coll_gerr = 1'b0;
+  end else begin : g_coll_bar
+    otpu_coll_bar #(.S(S), .LANES(LANES)) u_coll (
+      .clk, .rst(coll_rst), .req(coll_req), .cmds(coll_cmds), .gnt(coll_gnt), .ack(coll_ack),
+      .r_en(coll_ren), .r_addr(coll_raddr), .r_data(coll_rdata),
+      .w_en(coll_wen), .w_addr(coll_waddr), .w_data(coll_wdata), .gerr(coll_gerr));
+  end
 
   // ---- memory: the native adapter
   // port A's held beats go where the host may have written: between runs, a load, a WAITW

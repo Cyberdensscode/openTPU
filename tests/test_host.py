@@ -96,6 +96,36 @@ def test_v3_info_snapshot_and_rates():
                                           / 0.01 / 1e9)
 
 
+def test_caps2_gather_and_the_load_refusal():
+    """Register map 5's CAPS2 bit0 (GATHER): a one-slice bitstream built without it (otpu_board
+    COLL_GATHER 0) runs BAR alone, so the host refuses to load a program with a GATHER there,
+    and loads it on one with GATHER or with a register map before 5 (every older bitstream has
+    it). The ISA checks leave GATHER out on such a bitstream."""
+    from opentpu.host.board import NoGather
+    from opentpu.host.opchecks import op_checks
+    gather = I.assemble([I.gather(0, 256, 4, 64, 256, 64, 0), I.halt()])
+    bar = I.assemble([I.bar(), I.halt()])
+    b = Board(FakeTransport(devname=None, regmap=5, gather=False))
+    assert b.info()["caps2"] == {"gather": False} and not b.gather
+    with pytest.raises(NoGather, match="instruction 0"):
+        b.load_program(4096, gather)
+    with pytest.raises(NoGather, match="slice 0"):
+        b.load_program(4096, [gather])
+    b.load_program(4096, bar)                           # BAR runs on the BAR-only unit
+    assert b.t.reg_read(R.R_PROG_N) == 2
+    for t in (FakeTransport(devname=None, regmap=5), FakeTransport(devname=None, regmap=4),
+              FakeTransport(devname=None)):
+        ok = Board(t)
+        assert ok.gather and ok.info()["caps2"] == {"gather": True}
+        ok.load_program(4096, gather)
+        assert t.reg_read(R.R_PROG_N) == 2
+    cfg = board_config()
+    names = {n for g, n, _ in op_checks(cfg)}
+    assert "GATHER" in names
+    assert names - {n for g, n, _ in op_checks(cfg, gather=False)} == {"GATHER"}
+    assert R.caps2(None) == {"gather": True} and R.caps2(0) == {"gather": False}
+
+
 def test_ddr_rate(monkeypatch, capsys):
     """DDR_MTS (CAPS bit3) names the DDR3 speed in smi's DDR3 row and the config lines; a
     bitstream without it (the bit clear, 0xDEADBEEF at 0x54) shows plain "DDR3"."""
