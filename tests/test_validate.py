@@ -328,6 +328,33 @@ def test_golden_weights_are_the_images(fmt):
     assert V.Golden(m, spec, "int8", fmt).formats["lm_head.weight"] == fmt
 
 
+@pytest.mark.parametrize("fmt", ["int8", "fp4", "nvfp4"])
+def test_the_golden_drops_what_mms_window_drops(fmt):
+    """The golden's projections leave out the groups MM's window drops (drop_groups: an input
+    group's offset da and a weight group's dw adding up to more than the format's W), as
+    quant.mx_matmul does: rows with an activation outlier 2^12 over the rest drop groups in
+    4-bit (W 11; int8's 16 keeps them here)."""
+    from opentpu import quant as Q
+    from opentpu.isa import MX_W, WFORMATS
+    rng = np.random.default_rng(3)
+    D, N, K = 128, 48, 512
+    w = rng.standard_normal((N, K)).astype(np.float32)
+    w[:, :64] *= 8                                       # weight groups at offsets 0 .. 3
+    x = rng.standard_normal((6, K)).astype(np.float32)
+    x[1, 5] = x[4, 300] = 4096.0                         # two rows with an outlier
+    wv, dw = V.device_weight(w, fmt, D, offsets=True)
+    xq, dx = V.mx_quant(torch.from_numpy(x), D, offsets=True)
+    xd, wd = xq.double(), torch.from_numpy(wv)
+    y = V.drop_groups(xd @ wd.double().T, xd, dx, wd, torch.from_numpy(dw), MX_W[WFORMATS[fmt]], D)
+    want = Q.mx_matmul(Q.MXAct.of(xd.numpy(), dx.numpy()[:, ::D // 8]), wv.astype(np.float64),
+                       dw, MX_W[WFORMATS[fmt]], D)
+    assert np.allclose(y.numpy(), want, rtol=0, atol=1e-9)
+    plain = (xd @ wd.double().T).numpy()
+    dropped = np.abs(y.numpy() - plain).max(1) > 0
+    assert dropped.tolist() == ([False, True, False, False, True, False] if fmt != "int8"
+                                else [False] * 6)
+
+
 def test_golden_takes_the_devices_k_smoothing():
     """Qwen3's K outliers planted (k_norm gains 60 on two RoPE pairs, their q gains 0.01, as
     test_qwen3's): the device smooths K's channels into the q_norm / k_norm gains
