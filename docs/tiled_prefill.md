@@ -384,8 +384,8 @@ at MCOLS 8: 107 / 175 (R = 16) / 214 (T = 16).
 
 Layer-major prefill with expert-major MoE (docs/offload.md 13.11-13.13, merged, off by default)
 runs each MoE layer of a chunk (up to 512 rows, the rows in DRAM records) as mixer runs of R = 2
-rows, then one expert run that buckets the chunk's R k entries by expert and makes passes of two
-rows of one expert. That is the tiled run's structure with the MoE layer's tile being "the
+rows, then one expert run that buckets the chunk's R k entries by expert and makes passes of up
+to C rows of one expert (C = 4 on the card: docs/offload.md 13.18). That is the tiled run's structure with the MoE layer's tile being "the
 rows that chose this expert": the rows live in DRAM between the phases (3.3's spill), each pass
 loads its rows, quantizes them and streams the expert once. Tiling generalizes it in two places:
 

@@ -1062,12 +1062,34 @@ def test_an_expert_runs_timeout_names_where_its_needs_stand(tiny, monkeypatch):
         a.prefill(toks)
 
 
-@pytest.mark.parametrize("R,skew,wformat,b", [(2, False, "int8", False), (1, False, "int8", False),
-                                             (2, True, "fp4", True), (2, False, "fp4", True)])
-def test_expert_major_prefill_is_bit_exact(tiny, R, skew, wformat, b, monkeypatch):
+@pytest.mark.parametrize("kw,wf,C,S", [
+    (dict(MCOLS=4, PAIR=True), "fp4", 4, 2),        # the card: 2 rows at the stream's rate, 4
+    (dict(MCOLS=4), "fp4", 4, 0),                   # at twice its MXU time; a short pass of 2
+    (dict(MCOLS=4, PAIR=True), "int8", 4, 0),
+    (dict(MCOLS=4, PAIR=True, ACT_ROWS=2), "fp4", 2, 0),
+    (dict(MCOLS=8, PAIR=True), "fp4", 8, 4),
+    (dict(MCOLS=16, ACT_ROWS=64, PAIR=True), "fp4", 16, 8),
+    (dict(MCOLS=16, ACT_ROWS=64, PAIR=True), "int8", 32, 16)])
+def test_em_pass_rows_from_the_configuration(kw, wf, C, S):
+    """moe.em_pass_rows: an expert-major pass's entries C from the configuration alone (docs/
+    offload.md 13.18), the least time an entry (an expert's stream a pass, or the MXU's time
+    when longer), the fewest on a tie; em_short_rows: the most below C at a lower MXU cost (an
+    expert's last pass when it has that few left)."""
+    from opentpu.isasim import Config
+    from opentpu.llm import moe as MO
+    cfg = Config(**kw)
+    assert MO.em_pass_rows(cfg, wf) == C and MO.em_short_rows(cfg, wf, C) == S
+    assert MO.em_pass_order(cfg, wf)[0] == C and len(MO.em_pass_order(cfg, wf)) == cfg.act_rows
+
+
+@pytest.mark.parametrize("R,skew,wformat,b,C", [
+    (2, False, "int8", False, None), (1, False, "int8", False, None),
+    (2, True, "fp4", True, None), (2, False, "fp4", True, None),
+    (2, True, "fp4", True, 2), (2, False, "fp4", True, 3), (2, False, "int8", False, 1)])
+def test_expert_major_prefill_is_bit_exact(tiny, R, skew, wformat, b, C, monkeypatch):
     """Expert-major MoE in the layer-major prefill (Engine(expert_major=True), docs/offload.md
     13.11): each layer's runs route their rows, post the experts they chose as need lines and
-    run the shared expert; then one expert run a layer (the bucketing into passes of two
+    run the shared expert; then one expert run a layer (the bucketing into passes of up to C
     entries of one expert, each pass waiting on its directory entry); the next layer's runs and
     the head sum the outputs. The logits, the DeltaNet states and windows and the KV cache,
     and the decode steps after, equal token by token's bit for bit: 40 tokens, the first 3
@@ -1076,9 +1098,11 @@ def test_expert_major_prefill_is_bit_exact(tiny, R, skew, wformat, b, monkeypatc
     left for end_prefill; the scratch the first slots), the embedding rows from the host's
     table. skew: a router that knows expert 0 alone (its other rows zero), so experts 0 / 1 / 2
     take every row: long runs of passes of one expert. b: build B's PAIR, DSTEP and STREAM (a
-    pass's two rows one MM's)."""
+    pass's rows one MM's). C: the passes' entries (Engine.em_pass; None: the configuration's,
+    4 here, with a short pass of 2 at PAIR, docs/offload.md 13.18): each row's math the same,
+    only grouped otherwise, so every C equals token by token's."""
     from opentpu.llm import qwen35 as Q35
-    from opentpu.llm.moe import em_record, em_slots
+    from opentpu.llm.moe import em_pass_rows, em_record, em_slots
     monkeypatch.setattr(Q35, "PREFILL_CHUNK", 24)
     spec, W = _untied(tiny)
     if skew:
@@ -1091,6 +1115,8 @@ def test_expert_major_prefill_is_bit_exact(tiny, R, skew, wformat, b, monkeypatc
     a, ref = (Engine(spec, W, cap=256, cfg=cfg, rows=1, resident=True, experts=6,
                      wformat=wformat, **kw)
               for kw in ({"layer_major": R, "expert_major": True}, {}))
+    assert em_pass_rows(cfg, wformat) == 4
+    a.em_pass = C
     sc = _scratch(a.server, monkeypatch)
     toks = [int(t) for t in np.random.default_rng(11).integers(0, 1000, 40)]
     la, lb = a.prefill(toks), ref.prefill(toks)
@@ -1104,6 +1130,8 @@ def test_expert_major_prefill_is_bit_exact(tiny, R, skew, wformat, b, monkeypatc
     assert srv.need_lines == len(KINDS) * runs
     assert srv.needs_landed == srv.needs_queued > 0 and srv.drained == 0
     assert not srv.scratch_slots and not srv.expert_major
+    assert {k for k in a._layer_runs if k[0] == "x"} == \
+        {("x", li) + ((C,) if C else ()) for li in range(len(KINDS))}
     dram = [e.backend.machine.slices[0].dram[img.layer0:img.head[0]] for e in (a, ref)]
     assert np.array_equal(*dram)
     t = int(np.argmax(la))

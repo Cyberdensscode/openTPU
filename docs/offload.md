@@ -4205,6 +4205,91 @@ ms is a layer's expert run, per prompt row:
   29x today's MXU against today's DRAM. That is the MXU-to-DRAM ratio MoE prefill wants from an
   ASIC.
 
+### 13.18 Passes of C entries (moe.em_pass_rows)
+
+The expert run's bucketing closes a pass at C entries of one expert, not two. Each pass loads,
+norms and quantizes up to C rows, streams its expert once and stores the rows' outputs. C comes
+from the configuration alone; there are no per-model constants.
+
+The rule (moe.em_pass_order, em_pass_rows):
+- A pass of m entries costs max(EM_RHO, em_mxu_cost(m)) MXU cycles per chunk of the expert's
+  weights: the stream, or the MXU when that takes longer.
+  - EM_RHO = 1.12: the stream's cycles per chunk on the card (17.07 / 15.2 GB/s, 13.17).
+  - em_mxu_cost(m): 4-bit weights with PAIR and 2 m <= MCOLS take 1; other 4-bit passes take
+    2 ceil(m / MCOLS); int8 takes ceil(m / MCOLS).
+- C is the m <= ACT_ROWS with the least cost per entry, the fewest rows on a tie. Any EM_RHO in
+  (1, 2) gives the same order. This is 13.17's C* = 2 S x / c(2), rounded to what the MXU's
+  rows allow.
+  - The card (MCOLS 4, PAIR, ACT_ROWS 4): C = 4. Two rows cost the stream (1.12 / 2 = 0.56 an
+    entry); four cost twice the MXU's cycle (2 / 4 = 0.5).
+  - MCOLS 16 with ACT_ROWS >= 16, 4-bit: C = 16. int8 at MCOLS 4: C = 4. int8 at MCOLS 16,
+    ACT_ROWS 64: C = 32.
+
+Short passes (moe.em_short_rows):
+- An expert's last pass holds n mod C entries. On the card a pass of 1-2 rows costs half the MXU
+  time of 3-4 (PAIR).
+- S is the largest m below C with a lower MXU cost: 2 on the card; 0 when every size below C
+  costs as much as C (no PAIR, int8).
+- The bucketing marks an expert's last pass short when it holds 1 .. S entries. The pass loop
+  then runs the S-row body or the C-row body: two hardware loops whose counts (0 or 1) come
+  from the flag.
+- Without it, the 35B's 131-row layer would pay c(4) on its ~326 passes of 1-2 entries, about
+  C = 2's time (13.17's model).
+
+The kernel (moe.moe_expert_run(..., C, S)):
+- The pass table's rows hold C + 2 words: the expert, the short flag, then C entries.
+- Opening a pass fills all C entries with its first. A part-filled pass therefore loads and
+  stores its first row again: the same output to the same place.
+- Instructions: the 35B's run takes 189, the 26B's 234 (C = 2's kernel: 106 and 128).
+- TMEM: the rows are normed into one [C, H] tile a row at a time.
+  - Normed whole, the 26B's 4 x 2816 rows did not fit: 43,276 of 65,472 words in use.
+  - compile_expert_run tries the rule's order and takes the first (C, S) that fits. The 26B
+    fits (4, 2) but not (4, 0).
+
+Choosing C (an A/B, a co-sim):
+- Engine.em_pass; streamed.engine(em_pass=); chatmoe.py --em-pass; moe_prefill_cosim.py em
+  --em-pass.
+- The expert run's key is then ("x", layer, C).
+- There is no environment variable. OTPU_* variables key the program and image caches
+  (progcache.keyed_env), so an A/B on one would rebuild the image.
+
+Bit for bit:
+- Each row's math is unchanged; only the rows are grouped differently.
+- On the MX MXU (mx-column, docs/mx_mxu.md) each output is one exact integer sum before the
+  shared fp32 epilogue, and PAIR changes no bit. So the outputs equal C = 2's word for word.
+- On the MXU before MX they would not: a PAIR MM's fp32 sums rounded differently from a plain
+  one's. A pass of 4 runs without PAIR, a pass of 2 with it.
+- Checked on the ISA simulator with random rows, gains and expert weights
+  (`moe_prefill_cosim.py em --isa --random --compare 2`, the same DRAM through both programs).
+  Every case had 0 differing words, and the ISA's passes (its WAITWs) matched the bucketing.
+
+| model | rows | C, S | passes | output words |
+|:--|--:|:--|--:|--:|
+| tiny Qwen3.5-MoE | 7 | 4, 2 | 15 | 7,168 |
+| tiny Qwen3.5-MoE | 40 | 4, 2 | 46 | 40,960 |
+| tiny Qwen3.5-MoE, prefix 3, seed 5 | 40 | 4, 2 | 47 | 40,960 |
+| tiny Qwen3.5-MoE (--em-pass 3) | 40 | 3, 2 | 62 | 40,960 |
+| tiny Qwen3.5-MoE (--em-pass 1, against 4) | 9 | 1, 0 | 36 | 9,216 |
+| tiny Gemma 4 MoE | 3 | 4, 2 | 9 | 3,072 |
+| tiny Gemma 4 MoE | 33 | 4, 2 | 38 | 33,792 |
+| Qwen3.5-35B-A3B | 131 | 4, 2 | 320 | 2,146,304 |
+| gemma-4-26B-A4B-it | 124 | 4, 2 | 272 | 2,793,472 |
+| Qwen3.5-35B-A3B, prose trace | 131 | 4, 2 | 350 | - |
+| gemma-4-26B-A4B-it, prose trace | 124 | 4, 2 | 282 | - |
+
+The tests:
+- test_em_pass_rows_from_the_configuration: the rule on seven configurations.
+- test_expert_major_prefill_is_bit_exact (Qwen3.5-MoE) and
+  test_moe_expert_major_prefill_is_bit_exact (Gemma 4) compare against token-by-token decoding
+  at the configuration's C (4) and at C = 1, 2 and 3. They cover the logits, the states, the KV
+  cache and the decode steps after.
+
+The card A/B: tools/offload/sessions/emc1.sh (not run yet). On the MX host it runs C = 2 (A,
+--em-pass 2) against the configuration's C = 4 (B) in ABBA x 4 order, plus L: the same engine
+with every call layer-major (--em-rows 100000), twice. The turns are emdef2's three and a fourth
+of about 130 new tokens. Per pair it reports TTFT, device time, and the decode hit rate and
+MB/token: does expert-major's slot fill after the prompt cost decode hits?
+
 ## 14. Chatting with a streamed MoE (otpu-chat)
 
 otpu-chat runs the three MoE models bigger than the card's 4 GiB. Their experts stream from a pool

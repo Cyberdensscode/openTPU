@@ -1903,13 +1903,14 @@ def _worker_decode(blocks: int, lo: int):
 def layer_programs(image, key, block: int, hint: bool = False, em: bool = False):
     """Engine.prefill_layers' run of `key`: (layer (-1: the embed run), blocks, rows,
     embedded), (layer, None, rows, True, compile-time position), (layer, blocks, rows, True,
-    "tile") (an expert-major run tiled: Engine.layer_tile), ("x", layer) (an expert run) or
+    "tile") (an expert-major run tiled: Engine.layer_tile), ("x", layer) (an expert run; ("x",
+    layer, C): of passes of C entries, Engine.em_pass) or
     "head" -> (programs, run_args); hint: a layer's run ends with the next MoE layer's hint
     (Engine's layer_ahead "hint"); em: expert-major (Engine's expert_major)."""
     if key == "head":
         return image.compile_prefill_head(**({"em": True} if em else {}))
-    if key[0] == "x":
-        return image.compile_expert_run(key[1])
+    if key[0] == "x":                       # (("x", layer, C): passes of C entries)
+        return image.compile_expert_run(*key[1:])
     if key[-1] == "tile":
         from . import tiled as TL
         return TL.compile_layer_tile(image, key[0], key[1], key[2], block)
@@ -2262,6 +2263,8 @@ class Engine:
         self.layer_hint = layer_ahead == "hint"     # (the runs' own guess of them: hints)
         self.ahead_part = AHEAD_PART        # (with them: an idle poll's part, begin_prefill's)
         self.expert_major = bool(expert_major)      # (a layer's experts in one run a chunk)
+        self.em_pass = None                 # (its passes' entries; None: the configuration's,
+                                            # moe.em_pass_rows, docs/offload.md 13.18)
         self._layer_runs: dict = {}
         self._layer_next: dict = {}         # their compiles in the worker processes: Futures
         if self.layer_major and not (getattr(self.image, "prefill_rows", 0) and self.device_inputs
@@ -2821,7 +2824,8 @@ class Engine:
                                      part[i:i + n] if gather else None))
                     i += n
                 if em and li >= mo.first:               # the layer's expert run
-                    runs.append((("x", li), {"rows": len(part), "entries": len(part) * mo.k},
+                    runs.append((("x", li) + ((self.em_pass,) if self.em_pass else ()),
+                                 {"rows": len(part), "entries": len(part) * mo.k},
                                  None))
             chunks.append((part, runs))
             p0 += len(part)

@@ -271,21 +271,26 @@ def em_ids(rows: int, k: int, E: int, used: int, seed: int, route=None) -> np.nd
     return np.stack([rng.choice(pool, k, replace=False) for _ in range(rows)])
 
 
-def em_passes(ids: np.ndarray, E: int) -> tuple:
-    """(passes, distinct experts): the bucketing's passes of two entries of one expert."""
+def em_passes(ids: np.ndarray, E: int, C: int = 2, S: int = 0) -> tuple:
+    """(passes, distinct experts, rows loaded): the bucketing's passes of up to C entries of one
+    expert. A pass loads and stores C rows (a part-filled one repeats its first entry), and an
+    expert's last pass S when it has 1 .. S entries (the short pass, moe.em_short_rows)."""
     c = np.bincount(ids.reshape(-1), minlength=E)
-    return int(((c + 1) // 2).sum()), int((c > 0).sum())
+    p, r = -(-c // C), c % C
+    short = (r > 0) & (r <= S)
+    return int(p.sum()), int((c > 0).sum()), int((p * C - short * (C - S)).sum())
 
 
-def em_bytes(ids: np.ndarray, passes: int, fb: int, H: int) -> dict:
+def em_bytes(ids: np.ndarray, passes: int, loads: int, fb: int, H: int) -> dict:
     """The expert run's DRAM traffic by kind, in bytes of whole 64-byte lines: each pass streams
-    its expert (fb), reads its two rows' X and 1 / rms, writes their two outputs, reads its
-    directory entry and zeroes its slot's tag; the tables read each row's ids."""
+    its expert (fb), reads its rows' X and 1 / rms and writes their outputs (`loads` rows in
+    all: em_passes), reads its directory entry and zeroes its slot's tag; the tables read each
+    row's ids."""
     def ln(b):
         return -(-b // 64) * 64
     rows, k = ids.shape
-    return dict(weights=passes * fb, rows_in=passes * 2 * (ln(4 * H) + 64),
-                rows_out=passes * 2 * ln(4 * H), tables=rows * ln(4 * k), words=passes * 2 * 64)
+    return dict(weights=passes * fb, rows_in=loads * (ln(4 * H) + 64),
+                rows_out=loads * ln(4 * H), tables=rows * ln(4 * k), words=passes * 2 * 64)
 
 
 def lm_passes(ids: np.ndarray, R: int = 2) -> int:
@@ -293,9 +298,11 @@ def lm_passes(ids: np.ndarray, R: int = 2) -> int:
     return sum(len(np.unique(ids[r:r + R])) for r in range(0, len(ids), R))
 
 
-def em_dram(img, li: int, ids: np.ndarray):
+def em_dram(img, li: int, ids: np.ndarray, seed=None):
     """(DRAM, the experts' slots): the zero image with the words the expert run of layer li
-    reads once every expert its chunk needs has landed (the module docstring)."""
+    reads once every expert its chunk needs has landed (the module docstring). seed: random
+    data instead of zeros (the rows' X and 1 / rms, the layer's gains, each used expert's
+    weights packed into its slot), for compare's bit-for-bit check."""
     from opentpu.compiler import Affine as Af
     dsc = img.descriptors(0)
     dev, lw, Lo = dsc.moe_dev, dsc.layer(li), img.offload
@@ -307,23 +314,44 @@ def em_dram(img, li: int, ids: np.ndarray):
         dram[addr:addr + a.nbytes] = a.view(np.uint8).reshape(-1)
 
     put(Af.of(lw.gbase.base).const, np.float32([li * E]))       # the layer's j * E
+    rng = None if seed is None else np.random.default_rng(seed)
+    if rng is not None:
+        for gn in ("g_post", "g_exp"):
+            if getattr(lw, gn, None) is not None:
+                put(Af.of(getattr(lw, gn).base).const,
+                    (0.5 + rng.random(H)).astype(np.float32))
     tail = 4 * H * (k + 2)
     for r in range(rows):
         a = dev.em_base + r * dev.em_rec
+        if rng is not None:
+            put(a, rng.standard_normal(H).astype(np.float32))   # X
         put(a + 4 * H, np.full(k * H, EM_SENT, np.float32))     # OUT: the run writes them
         put(a + tail, (li * E + ids[r]).astype(np.float32))     # global ids
         put(a + tail + 4 * k, np.full(k, 1.0 / k, np.float32))  # weights
-        put(a + tail + 8 * k, np.float32([1.0]))                # 1 / rms
+        put(a + tail + 8 * k, np.float32([1.0 if rng is None else 0.5 + rng.random()]))
     scratch = len(MO.em_slots(Lo, rows * dev.em_rec))
     used, slots = np.unique(ids), Lo.all_slots()
     if scratch + len(used) > len(slots):
         raise ValueError(f"{scratch} scratch slots and {len(used)} experts: the image has "
                          f"{len(slots)} slots")
     es = slots[scratch:scratch + len(used)]
+    f = dev.fmt
     for e, a in zip(used, es):
+        if rng is not None:                                     # its weights
+            w = [0.05 * rng.standard_normal(sh).astype(np.float32)
+                 for sh in ((f.F0, H), (f.F0, H), (H, f.F0))]
+            put(a, f.pack(*w))
         put(Lo.dir + 8 * (li * E + int(e)), np.array([a, 0x3F800000], np.uint32))  # {slot, 1.0}
         put(a + Lo.tag, np.uint32([1]))                         # landed
     return dram, es
+
+
+def em_outputs(after, img, rows: int, k: int) -> np.ndarray:
+    """The records' OUT rows [rows, k, H] (the expert run's outputs), as uint32 bits."""
+    dev = img.descriptors(0).moe_dev
+    H, w = dev.fmt.H, after.view(np.uint32)
+    return np.stack([w[(dev.em_base + r * dev.em_rec + 4 * H) // 4:][:k * H].reshape(k, H)
+                     for r in range(rows)])
 
 
 def em_check(after, img, li: int, ids: np.ndarray, es) -> None:
@@ -367,23 +395,25 @@ def cmd_em(a):
     used = a.used or EM_USED[kind]
     for rows in [int(x) for x in a.rows.split(",")]:
         ids = em_ids(rows, mo.k, mo.E, used, a.seed, a.route)
-        passes, distinct = em_passes(ids, mo.E)
+        distinct = em_passes(ids, mo.E)[1]
         L = img.offload
         need = len(MO.em_slots(L, rows * MO.em_record(s.hidden, mo.k))) + distinct
         n = max(mo.k, -(-need // len(L.slots)))     # slots a layer: the scratch and every expert
         s, img = model_image(kind, M, spec, prefix, "moe", 1, cfg, a.cap, experts=n)
-        progs, ra = img.compile_expert_run(li)
+        progs, ra = img.compile_expert_run(li, a.em_pass)
+        C, S = img.em_pass                          # (the pass's entries, a short pass's)
+        passes, _, loads = em_passes(ids, mo.E, C, S)
         args = arg_words(ra, {"rows": rows, "entries": rows * mo.k})
-        dram, es = em_dram(img, li, ids)
+        dram, es = em_dram(img, li, ids, a.seed if a.random else None)
         fb = img.fmt.nbytes
         rec = dict(model=Path(a.model).name, layer=li, rows=rows, k=mo.k, E=mo.E,
-                   used=distinct, entries=rows * mo.k, passes=passes,
+                   used=distinct, entries=rows * mo.k, C=C, S=S, passes=passes,
                    instructions=len(progs[0]), slots=n, image_mib=round(img.nbytes / 2**20),
                    cfg={**{k_: getattr(cfg, k_) for k_ in ("MCOLS", "LANES", "PAIR", "DSTEP",
                                                             "STREAM")}, **over},
                    expert_mib=round(passes * fb / 2**20, 1),
                    dram_bound_ms=round(passes * (fb + 16 * s.hidden) / 14.1e9 * 1e3, 3))
-        mv = em_bytes(ids, passes, fb, s.hidden)
+        mv = em_bytes(ids, passes, loads, fb, s.hidden)
         lm = lm_passes(ids)
         rec.update(bytes=mv, bytes_a_row=round(sum(mv.values()) / rows),
                    weight_bytes_a_row=round(mv["weights"] / rows), lm2_passes=lm,
@@ -408,6 +438,16 @@ def cmd_em(a):
             rec.update(cycles=st["cycles"], ms=round(st["cycles"] / (MHZ * 1e3), 3),
                        ms_a_pass=round(st["cycles"] / (MHZ * 1e3) / max(passes, 1), 4))
         em_check(after, img, li, ids, es)
+        if a.compare:                   # the same DRAM through passes of a.compare entries
+            p2, _ = img.compile_expert_run(li, a.compare)
+            m2 = Machine(cfg, p2, [dram], args).run(max_steps=1 << 34)
+            o1 = em_outputs(after, img, rows, mo.k)
+            o2 = em_outputs(m2.slices[0].dram[:len(dram)], img, rows, mo.k)
+            rec.update(compare=a.compare, differing_words=int((o1 != o2).sum()),
+                       nonzero_words=int((o1 != 0).sum()))
+            if (o1 != o2).any():
+                raise AssertionError(f"{int((o1 != o2).sum())} output words differ from passes "
+                                     f"of {a.compare}")
         rec.update(check="ok", sim_s=round(time.time() - t))
         print(json.dumps(rec), flush=True)
 
@@ -449,6 +489,12 @@ def main():
     m.add_argument("--set", action="append", help="board configuration KEY=VALUE (repeat)")
     m.add_argument("--isa", action="store_true", help="the ISA simulator (the check, no cycles)")
     m.add_argument("--profile", action="store_true", help="per place: cycles (stderr)")
+    m.add_argument("--random", action="store_true", help="random rows, gains and experts "
+                   "(seeded by --seed) instead of zeros")
+    m.add_argument("--compare", type=int, default=0, help="with --isa: also run passes of this "
+                   "many entries on the same DRAM; the outputs must be equal")
+    m.add_argument("--em-pass", type=int, default=None, help="entries a pass (default: the "
+                   "configuration's, moe.em_pass_rows)")
     a = ap.parse_args()
     {"rows": cmd_rows, "expert": cmd_expert, "layer": cmd_layer, "em": cmd_em}[a.cmd](a)
 

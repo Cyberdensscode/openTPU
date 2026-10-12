@@ -429,8 +429,9 @@ def test_moe_layer_major_prefill_is_bit_exact(moe, wf, R, monkeypatch):
         t = int(np.argmax(ga))
 
 
-@pytest.mark.parametrize("wf,R", [("int8", 2), ("fp4", 1), ("fp4", 2)])
-def test_moe_expert_major_prefill_is_bit_exact(moe, wf, R, monkeypatch):
+@pytest.mark.parametrize("wf,R,C", [("int8", 2, None), ("fp4", 1, None), ("fp4", 2, None),
+                                    ("fp4", 2, 2), ("int8", 2, 3)])
+def test_moe_expert_major_prefill_is_bit_exact(moe, wf, R, C, monkeypatch):
     """Expert-major MoE in the layer-major prefill (Engine(expert_major=True), docs/offload.md
     13.11) on Gemma 4: each layer's runs route their rows, post the experts they chose as need
     lines and run the dense MLP beside (normed, to the rows' records); then one expert run a
@@ -438,12 +439,14 @@ def test_moe_expert_major_prefill_is_bit_exact(moe, wf, R, monkeypatch):
     the dense MLP's, the post-FFN norm and the layer scalar). The logits, the KV cache and the
     decode steps after equal token by token's bit for bit: 40 tokens in chunks of 24 and 16
     rows, 6 slots a layer behind the ExpertServer (each need landing while an expert run waits
-    on its entry, none left for end_prefill)."""
+    on its entry, none left for end_prefill). C: the passes' entries (Engine.em_pass; None:
+    the configuration's, docs/offload.md 13.18)."""
     from test_qwen35_moe import _scratch
     monkeypatch.setattr(G, "PREFILL_CHUNK", 24)
     toks = [int(t) for t in np.random.default_rng(13).integers(0, 1000, 40)]
     a = _moe_engine(moe, wformat=wf, experts=6, layer_major=R, expert_major=True)
     b = _moe_engine(moe, wformat=wf, experts=6)
+    a.em_pass = C
     sc = _scratch(a.server, monkeypatch)
     la, lb = a.prefill(toks), b.prefill(toks)
     assert a.pos == b.pos == len(toks)
