@@ -3658,7 +3658,7 @@ then not run, because the work wrapped up. When it runs, the plan is:
 
 Status (2026-10-12): session pfB ran this plan on the card (13.15). B was bit for bit with A in
 every run and cut the prefill by 1.91 s on the 35B and 1.78 s on the 26B, so it meets the rule
-above. Expert-major is still off by default until the lead's commit turns it on.
+above. Expert-major has been the default since (13.15, "The default").
 
 ### 13.14 The need path on the host (offload-need)
 
@@ -3821,15 +3821,20 @@ Where the time goes (each arm's mean of its two runs; prefill_time and the prefi
   26B's B). `pre` counts the prompt's requests, and 0 reads as token by token. Not fixed here.
 
 The rule (13.13): B becomes the 35B and 26B prefill default only if both models gain and the 35B
-gains at least 0.5 s. **B meets it**: every pair is negative, and the 35B gains 1.91 s. The default
-did not change in this session. The proposed change, for the lead:
-- streamed.engine: expert_major on wherever the prefill is layer-major with pooled slots
-  (Qwen3.5-MoE, Gemma 4 MoE; LFM2-MoE stays token by token);
-- whole-expert need parts (ahead_part 4 MiB, as measured; AHEAD_PART's 1 MiB was never measured
-  with needs);
-- moe_card: `--expert-major` as the default, with an option for the layer-major base;
-- before the switch: chatmoe gemma4-26b token-exact with it on (two turns: the second prefill
-  continues the context), and test_chatmoe.
+gains at least 0.5 s. **B meets it**: every pair is negative, and the 35B gains 1.91 s.
+
+The default (since 2026-10-12, after the session):
+- streamed.engine (otpu-chat, otpu-serve, chatmoe, moe_card): `expert_major=None` turns it on
+  wherever the prompt is layer-major with pooled slots and no layer-ahead, that is for
+  Qwen3.5-MoE and Gemma 4 MoE. LFM2-MoE's prompt stays token by token.
+- What turns it off: `expert_major=False` (moe_card `--no-expert-major`), each layer's own slots
+  (`--per-layer-slots`), `--layer-ahead`, or `--layer-major 0`.
+- Its needs go in whole-expert idle parts: `streamed.NEED_PART`, 4 MiB, as this session ran.
+  `--ahead-part` overrides it; the hints keep qwen3.AHEAD_PART's 1 MiB.
+- moe_card: `--expert-major` is the default with `--layer-major R`. `prefill_requests` and the
+  decode's misses a token now count a layer-major prompt that made no request (they were null).
+- Only opentpu/host/streamed.py changed, so the image and program keys are the same and the
+  image cache's entries still hit.
 
 ## 14. Chatting with a streamed MoE (otpu-chat)
 
@@ -3902,8 +3907,9 @@ the whole checkpoint) the same experts as this tree packs them. The lists must b
 - **Slots.** As many a layer as fill the DRAM beside the rest of the image (`--experts N` sets
   them), replaced by least decayed use (`--policy lru` for least recently used).
 - **The prompt.** Qwen3.5-MoE and Gemma 4 MoE run it layer by layer in runs of two rows, every
-  slot serving the running layer (13; `--layer-major R`, 0 for token by token). LFM2-MoE runs it
-  token by token.
+  slot serving the running layer (13; `--layer-major R`, 0 for token by token). Each MoE layer's
+  experts run once, in one expert run, after the layer's runs have posted them as needs
+  (expert-major, 13.11-13.15). LFM2-MoE runs it token by token.
 - **Turns** keep the context as a dense model's do (docs/host.md 6): a later turn rolls back to
   where its rendering and what was fed part and feeds the rest, the recurrent and windowed
   state from the snapshot the turn before took at its reply's start. The slots fill the DRAM,

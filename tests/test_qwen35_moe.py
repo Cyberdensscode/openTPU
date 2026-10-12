@@ -934,11 +934,13 @@ def test_moe_card_writes_the_prompts_timeline(tiny, tmp_path, monkeypatch, ahead
 
 
 def test_moe_card_runs_the_expert_major_prefill(tiny, tmp_path, monkeypatch):
-    """tools/offload/moe_card.py --layer-major 2 --expert-major --ahead-part 2048 --prefill-trace
-    (ISA; docs/offload.md 13.13): the prompt's timeline holds the embed runs, each MoE layer's
-    runs then its expert run (key ("x", layer)), the head last; no request in the prompt, a need
-    line a layer run ("n" events), every need landed during the expert runs (none drained), each
-    in one idle-poll part ("p" events: --ahead-part is more than a slot)."""
+    """tools/offload/moe_card.py --layer-major 2 --ahead-part 2048 --prefill-trace (ISA; docs/
+    offload.md 13.13), expert-major by default (13.15): the prompt's timeline holds the embed
+    runs, each MoE layer's runs then its expert run (key ("x", layer)), the head last; no request
+    in the prompt, a need line a layer run ("n" events), every need landed during the expert runs
+    (none drained), each in one idle-poll part ("p" events: --ahead-part is more than a slot).
+    The decode's misses a token are counted from its first step after the prompt's (none in the
+    prompt's requests is not a token by token prompt)."""
     import json
     import pickle
     import runpy
@@ -959,9 +961,9 @@ def test_moe_card_runs_the_expert_major_prefill(tiny, tmp_path, monkeypatch):
     (tmp_path / "ref.json").write_text(json.dumps({"ids": ids, "tokens": []}))
     tr, out = tmp_path / "tr.json", tmp_path / "out.json"
     monkeypatch.setattr(sys, "argv", [
-        "moe_card.py", str(m), "--check", str(tmp_path / "ref.json"), "-n", "1", "--cap", "256",
+        "moe_card.py", str(m), "--check", str(tmp_path / "ref.json"), "-n", "2", "--cap", "256",
         "--cfg", str(tmp_path / "cfg.pkl"), "--experts", str(2 * K), "--layer-major", "2",
-        "--expert-major", "--ahead-part", "2048", "--prefill-trace", str(tr), "--out", str(out)])
+        "--ahead-part", "2048", "--prefill-trace", str(tr), "--out", str(out)])
     runpy.run_path(str(Path(__file__).resolve().parents[1] / "tools" / "offload" / "moe_card.py"),
                    run_name="__main__")
     r, t = json.loads(out.read_text()), json.loads(tr.read_text())
@@ -974,7 +976,9 @@ def test_moe_card_runs_the_expert_major_prefill(tiny, tmp_path, monkeypatch):
     runs = li.count(0)                                          # a layer's runs (2 rows each)
     for j in range(len(KINDS)):                                 # its expert run right after
         assert keys[max(i for i, k in enumerate(keys) if k[0] == j) + 1] == ["x", j]
-    assert not t["requests"] and pt["requests"] == 0 and r["prefill_requests"] is None
+    assert not t["requests"] and pt["requests"] == 0 and r["prefill_requests"] == 0
+    assert r["misses_per_token_decode"] is not None and len(r["misses_per_token"]) == 2
+    assert len(r["misses_per_request_decode"]) == len(KINDS)    # (the second step's)
     assert r["expert_major"] and r["ahead_part"] == 2 << 20 and pt["ahead"] is None
     assert all(e[2] in "np" for e in t["events"])              # need lines, idle parts
     nd = pt["need"]

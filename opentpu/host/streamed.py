@@ -14,9 +14,10 @@ layer runs or steps, the card's decode loop, a host-sampled step).
 The settings default to the ones measured best on the card (docs/offload.md 10-13): the slots
 filling the DRAM, replaced by decayed use; the prompt layer by layer in runs of two rows with
 every slot serving the running layer (Qwen3.5-MoE, Gemma 4 MoE; LFM2-MoE's prompt runs token
-by token); a request's disk reads queued at once; the idle parts read ahead and halt-aware; the
-checkpoint's pages given back once the image is written. `defaults(spec)` holds each family's
-weight formats.
+by token), each MoE layer's experts in one expert run, streamed as needs in whole-expert idle
+parts (expert-major, 13.15); a request's disk reads queued at once; the idle parts read ahead
+and halt-aware; the checkpoint's pages given back once the image is written. `defaults(spec)`
+holds each family's weight formats.
 
 A pool is checked before the image is built (check_pool): it must exist, have this image's
 layout and key (moe.pool_key: the quantizer's code, the format, D, the layout, the checkpoint),
@@ -30,6 +31,7 @@ from dataclasses import replace
 from pathlib import Path
 
 LAYER_MAJOR = 2         # the prompt's rows a layer run (docs/offload.md 13.7: R = 2, pooled)
+NEED_PART = 4 << 20     # expert-major's idle-poll part: a whole expert (13.15's A/B ran 4 MiB)
 DEFAULT = "default"     # engine's pool: the checkpoint's own (default_pool)
 IDLE_PARTS = ("v1", "ra", "halt", "v2")      # ExpertServer's idle parts (13.12)
 # each family's weight formats on the card (wformat, head_format, formats): 4-bit experts with
@@ -119,7 +121,7 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
            formats: str | None = None, embed: str | None = None,
            embed_host: bool | None = None, hints: bool | None = None,
            layer_major: int | None = None, pooled: bool = True, embed_runs: bool = False,
-           layer_ahead=None, expert_major: bool = False, ahead_part: int | None = None,
+           layer_ahead=None, expert_major: bool | None = None, ahead_part: int | None = None,
            idle_parts: str = "v2", willneed: bool = True, pool_map: bool = True,
            release_weights: bool = True, create: bool = False, W=None, **kw):
     """The Engine of the MoE checkpoint at `model` on `backend` ("isa", or a backend factory
@@ -134,7 +136,9 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
     an untied embedding table on the host (None: the image's choice, a MoE's own table there);
     hints: the router's prefetch hints (None: the Spec's, off); layer_major: the prompt layer
     by layer in runs of that many rows (None: LAYER_MAJOR where the image has layer runs, else
-    0, token by token), pooled / embed_runs / layer_ahead / expert_major / ahead_part: Engine's;
+    0, token by token), pooled / embed_runs / layer_ahead / expert_major / ahead_part: Engine's
+    (expert_major None: on wherever the prompt is layer-major with pooled slots and no
+    layer_ahead, docs/offload.md 13.15; ahead_part None: NEED_PART with it, else Engine's);
     idle_parts: ExpertServer's read ahead and halt-aware parts (IDLE_PARTS); willneed: a
     request's disk reads queued at once (PoolFile.willneed); pool_map, release_weights:
     Engine's. create: a missing pool is made and each expert packed on its first use (else
@@ -167,6 +171,8 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
         ekw.update(layer_major=layer_major, pooled=pooled, embed_runs=embed_runs)
         if layer_ahead:                         # the next layer's experts during a layer's runs
             ekw.update(layer_ahead=layer_ahead)
+        if expert_major is None:                # (the default since session pfB, 13.15)
+            expert_major = pooled and not layer_ahead
         if expert_major:                        # a layer's experts in one run a chunk
             ekw.update(expert_major=True)
     kw.setdefault("rows", 1)
@@ -178,6 +184,8 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
     if eng.layer_ahead and not (pooled and hasattr(srv, "ahead_layer")):
         raise ValueError("layer_ahead needs pooled slots and a server that streams ahead "
                          "(ExpertServer.ahead_layer)")
+    if ahead_part is None and eng.expert_major:     # (the needs: a whole expert a part)
+        ahead_part = NEED_PART
     if ahead_part:                              # (the hints' and needs' idle-poll part)
         eng.ahead_part = ahead_part
     srv.policy = policy                         # the slots' replacement

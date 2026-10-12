@@ -294,6 +294,11 @@ to card and 0.84-1.00 GB/s card to host; omarchy measured 1.42 and 1.16 GB/s.
   reboot keeps it.
 - **Commands**: the `otpu-*` commands are on `PATH` through symlinks in `~/.local/bin` to
   `~/otpu-venv/bin`.
+- **Card trees**: a tree copied to opentpu for a card session, or a deploy's `host/`, needs
+  `targets/` beside `opentpu/`. Since the multi-target work, `opentpu.target` reads the card's
+  target from `targets/ypcb-00338.toml`. Without it the selftest's config stage fails with
+  `TargetError: no target 'ypcb-00338'` (session pfB's first launch, 2026-10-12). A tree for
+  `qual.sh` also needs its `models` link (below).
 
 The host path is slower there. Wall numbers from the two PCs are not comparable; section 5
 compares them per token.

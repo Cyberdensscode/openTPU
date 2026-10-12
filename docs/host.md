@@ -630,7 +630,8 @@ otpu-chat --backend board --model lfm2-8b --pool /data/lfm8b.bin  # a pool elsew
   when it is missing, of another model or format, or stale (its key).
 - `--wformat auto` takes the formats each model ran with on the card. The slots fill the DRAM
   (`--experts`), replaced by least decayed use (`--policy`). Qwen3.5-35B and Gemma 4 26B run
-  their prompts layer by layer (`--layer-major`).
+  their prompts layer by layer (`--layer-major`), each MoE layer's experts in one expert run
+  (expert-major, offload.md 13.15).
 - Each turn's line adds the reply's expert hits, MB streamed a token and the prompt's misses.
   The status line shows the first two, and the panel and `/stats` the slots.
 - The card's loop decodes when it takes the sampling (top-k 1 to 64). LFM2.5-8B-A1B's

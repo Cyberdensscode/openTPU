@@ -126,6 +126,25 @@ def test_streamed_defaults_are_the_cards_runs():
         Path("models/Qwen3.5-35B-A3B/pool-fp4.bin")
 
 
+def test_expert_major_is_the_layer_major_prompts_default(ckpt, formats):
+    """streamed.engine's prompt (docs/offload.md 13.15): expert-major wherever it runs layer by
+    layer with pooled slots and no layer ahead (Qwen3.5 and Gemma 4), its needs in whole-expert
+    idle parts (NEED_PART); not with each layer's own slots, the layer ahead, expert_major=False
+    or a prompt token by token (LFM2's, or layer_major=0), whose idle parts stay Engine's."""
+    from opentpu.llm.qwen3 import AHEAD_PART
+    fam, d = ckpt
+    wf, hf = formats
+
+    def em(**kw):
+        e = ST.engine(d, CFG, "isa", 256, None, experts=K, wformat=wf, head_format=hf, **kw)
+        return e.expert_major, e.ahead_part
+    off = (False, AHEAD_PART)
+    assert em() == (off if fam == "lfm2" else (True, ST.NEED_PART))
+    assert em(expert_major=False) == off
+    if fam != "lfm2":
+        assert em(layer_major=0) == em(pooled=False) == em(layer_ahead=True) == off
+
+
 def test_a_chat_turn_is_moe_cards_run(ckpt, formats, tmp_path):
     """A greedy chat turn on the streamed engine (the chat's template, its prefill, the first
     token picked from the prefill's logits, then the card's decode loop) gives
@@ -167,6 +186,7 @@ def test_the_next_turn_continues_the_context(ckpt, formats, monkeypatch):
     fam, d = ckpt
     wf, hf = formats
     eng = ST.engine(d, CFG, "isa", 256, None, experts=K, wformat=wf, head_format=hf)
+    assert eng.expert_major == (fam != "lfm2")      # (the default: 13.15)
     calls = []
     layers = eng.prefill_layers
     monkeypatch.setattr(eng, "prefill_layers", lambda t, logits=True: calls.append(
