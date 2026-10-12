@@ -3827,6 +3827,15 @@ The default (since 2026-10-12, after the session):
 - streamed.engine (otpu-chat, otpu-serve, chatmoe, moe_card): `expert_major=None` turns it on
   wherever the prompt is layer-major with pooled slots and no layer-ahead, that is for
   Qwen3.5-MoE and Gemma 4 MoE. LFM2-MoE's prompt stays token by token.
+- It also needs room for its needs (`streamed.expert_major_fits`). While layer j runs, the server
+  takes no victim from layers j - 1, j and j + 1, whose experts can hold up to 3 E slots. So the
+  pooled slots, less the scratch of the largest chunk (the image's 512 prefill rows), must be at
+  least 3 E.
+  - The card, from its layouts: the 35B has 1720 - 26 = 1694 slots at chat's KV capacity and
+    1654 at moe_card's, against 768; the 26B has 540 - 17 = 523, against 384.
+  - With fewer slots the prompt stays layer-major. The first version of this default had no such
+    check, and the gate failed 12 chat tests: the tiny models' 2 slots a layer met "no slot
+    outside layers [j - 1, j, j + 1]".
 - What turns it off: `expert_major=False` (moe_card `--no-expert-major`), each layer's own slots
   (`--per-layer-slots`), `--layer-ahead`, or `--layer-major 0`.
 - Its needs go in whole-expert idle parts: `streamed.NEED_PART`, 4 MiB, as this session ran.

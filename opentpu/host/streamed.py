@@ -69,6 +69,19 @@ def fit_experts(spec, cfg, cap: int, image=None, **kw) -> int:
     return min(spec.moe.E, (cfg.DRAM_BYTES - L.slots[0][0]) // (L.layers * L.pitch))
 
 
+def expert_major_fits(spec, image, experts: int) -> bool:
+    """Whether expert-major's needs always find a slot (docs/offload.md 13.14, 13.15): while
+    layer j runs, the server takes no victim from layers j - 1, j and j + 1, whose experts hold
+    at most 3 E slots, so the pooled slots less the scratch of the largest chunk (the image's
+    prefill rows, a record each) must be at least 3 E. The card's: 35B 1720 - 26 at chat's KV
+    capacity (1680 - 26 at moe_card's) against 768, 26B 540 - 17 against 384; a tiny test
+    model's 2 slots a layer are not (12 - 20 against 24)."""
+    from opentpu.llm.moe import em_record
+    L = image.offload
+    scratch = -(-image.prefill_rows * em_record(spec.hidden, spec.moe.k) // L.pitch)
+    return L.layers * experts - scratch >= 3 * L.E
+
+
 def default_pool(model_dir, efmt: str) -> Path:
     """Where a checkpoint's pool goes by default: in its directory, pool-<the experts'
     format>.bin (with its .packed, .format and .key beside it)."""
@@ -137,8 +150,9 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
     hints: the router's prefetch hints (None: the Spec's, off); layer_major: the prompt layer
     by layer in runs of that many rows (None: LAYER_MAJOR where the image has layer runs, else
     0, token by token), pooled / embed_runs / layer_ahead / expert_major / ahead_part: Engine's
-    (expert_major None: on wherever the prompt is layer-major with pooled slots and no
-    layer_ahead, docs/offload.md 13.15; ahead_part None: NEED_PART with it, else Engine's);
+    (expert_major None: on wherever the prompt is layer-major with pooled slots, no
+    layer_ahead and room for its needs, expert_major_fits, docs/offload.md 13.15; ahead_part
+    None: NEED_PART with it, else Engine's);
     idle_parts: ExpertServer's read ahead and halt-aware parts (IDLE_PARTS); willneed: a
     request's disk reads queued at once (PoolFile.willneed); pool_map, release_weights:
     Engine's. create: a missing pool is made and each expert packed on its first use (else
@@ -172,7 +186,7 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
         if layer_ahead:                         # the next layer's experts during a layer's runs
             ekw.update(layer_ahead=layer_ahead)
         if expert_major is None:                # (the default since session pfB, 13.15)
-            expert_major = pooled and not layer_ahead
+            expert_major = pooled and not layer_ahead and expert_major_fits(spec, img, experts)
         if expert_major:                        # a layer's experts in one run a chunk
             ekw.update(expert_major=True)
     kw.setdefault("rows", 1)
