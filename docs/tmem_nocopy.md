@@ -21,8 +21,9 @@ without WAITC (section 6.5). A board builds it with `TMEM_IMPL=3`, the 2x clock 
 design's MMCM (section 10). The user chose the
 single copy over P3 (2026-10-12), and copies are out for the ASIC this core is for. What is left is
 one RAM port's traffic: QUANT's data reads against the MXU's. Placement has done what it can;
-fewer consumers (QUANT fed from the drain, `dataflow`) would cut the remaining conflicts to a
-quarter (section 6.6).
+fewer consumers remove the rest. In `dataflow`'s co-simulation, with the VPU's softmax numerators
+fused away and QUANT fed from the drain, the replays fall 98-99% and the single copy costs nothing:
+-0.00% at 4 rows, -0.15% at 8 rows and MCOLS 8 (section 6.6).
 
 ## 1. Why the TMEM has copies
 
@@ -526,6 +527,30 @@ bank comes within 0.3% on average. That is the `dataflow` study's quantize-on-dr
 VPU-to-QUANT path; it takes consumers off TMEM, which is the direction the ASIC wants anyway (each
 TMEM read is SRAM energy and port time).
 
+**Measured with feedback (`dataflow`, `docs/dataflow.md` 5.3).** The `dataflow` study co-simulated
+the pick (`r2pgRs`, b5d6bcef) against today's TMEM (`i0`) on Qwen3-0.6B, 2 layers, with the same
+programs under its fusion transforms. The modes:
+- *base*: the programs as compiled;
+- *AS*, *ASB*: the fused VOPs as spans, by class;
+- *ASB,Q*: also every QACT as a 1-row, 1-block QACT, standing in for quantize-on-drain;
+- *C*: every VOP spanned.
+
+| run | mode | `i0` cycles | the copy's cost | replays (MXU / Q / VA / VB / Q2) |
+|---|---|---:|---:|---|
+| 4 rows, MCOLS 4 | base | 372,383 | +1.12% | 12,632 (3,084 / 3,115 / 1,484 / 409 / 4,540) |
+| 4 rows, MCOLS 4 | ASB | 350,081 | +0.27% | 2,966 (471 / 152 / 18 / 3 / 2,322) |
+| 4 rows, MCOLS 4 | ASB,Q | 344,742 | -0.00% | 200 (98 / 86 / 14 / 2 / 0) |
+| 8 rows, MCOLS 8 | base | 502,925 | +1.66% | 29,631 (6,552 / 8,944 / 3,582 / 1,146 / 9,407) |
+| 8 rows, MCOLS 8 | ASB | 452,188 | +0.24% | 6,252 (1,108 / 250 / 19 / 18 / 4,857) |
+| 8 rows, MCOLS 8 | ASB,Q | 444,438 | -0.15% | 237 (115 / 106 / 12 / 4 / 0) |
+
+The single copy then costs nothing. With the fold and quantize-on-drain (*ASB,Q*) the replays fall
+98-99%. Fusing the softmax numerators out of the VPU (*AS* to *ASB*) removes VPU A's and VPU B's
+replays and most of the MXU's and QUANT's. QUANT 2's go with quantize-on-drain: they are QACT's
+scale operand, QUANT's own input. Spanning every VOP but leaving the QACTs (*C*) keeps +0.4-0.5%,
+the QUANT traffic. So the screen's lever holds with feedback: take QUANT's inputs off TMEM and port
+B has nothing left to lose.
+
 ### 6.7 With the MX column
 
 The pick in the MX column's tree: mx-column 4406fbed (the MX MXU, E 4) merged with this branch at
@@ -665,8 +690,9 @@ nangate45, 38% of the core): 16 macros, about 1.35 mm2, before the conflict logi
 - **The port-B finding** is what is left to solve: most of the replays come from one RAM port
   (QUANT's data and the MXU), so one copy does not fail for want of read slots; the operands are
   badly placed across them. Sides s placed them as well as two ports allow; the rest is fewer
-  consumers (section 6.6: QUANT's inputs off TMEM leave a quarter of the conflicts), the `dataflow`
-  study.
+  consumers. The no-feedback screen leaves a quarter of the conflicts with QUANT's inputs off TMEM.
+  `dataflow`'s co-simulation of its fold with quantize-on-drain cuts the replays 98-99%, and the
+  copy then costs nothing (section 6.6).
 - **Integration** (the MCOLS 8 tree: WAITC v2, MX E 4, the collective stub at S = 1):
   1. **The 2x clock (on this branch).** `clk_f` runs from both board tops through `otpu_native_sys`
      / `otpu_bcu_sys`, `otpu_board` (and `otpu_top` in simulation) and `otpu_slice` to `otpu_tmem`;

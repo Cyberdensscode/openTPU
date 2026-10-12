@@ -128,3 +128,6 @@ r2pgRm OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=2 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1 OTPU_TME
 # the pick (r2pgRs) with its RAMs pumped on a real 2x clock (tb_top's clk_f, TMEM_PMP 1) and the
 # default RAM sides (Q and VA on port A, as SDM 12): its cycles and results are r2pgRs's
 r2pgRs1 OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=2 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1 OTPU_TMEM_TDP=1 OTPU_TMEM_GST=1 OTPU_TMEM_PMP=1
+# the ASIC form at 2 RAMs a bank with the pumped TMEM's sides (QUANT and VPU A on port A; r2xgR: the
+# writes' port A light, the old sides): two-port RAMs at the core clock, a write taking port A
+r2xgRs OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=2 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1 OTPU_TMEM_TDP=1 OTPU_TMEM_GST=1 OTPU_TMEM_SDM=12
