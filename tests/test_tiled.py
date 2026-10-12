@@ -1,14 +1,23 @@
 """Tiled prefill (opentpu/llm/tiled.py, docs/tiled_prefill.md): a run of T rows, every weight
 chunk streamed once for all of them and the attention's rows packed MCOLS / G to an MM, against
-today's prefill runs of MCOLS rows over the same tokens on the ISA simulator: the KV cache, every
-layer block and the last row's logits bit for bit."""
+today's prefill runs over the same tokens on the ISA simulator: the KV cache, every layer block
+and the last row's logits bit for bit, where their 4-bit MMs pair alike (PAIR). Tiled prompt
+runs (prefill.py's tile mode) of every dense family against today's prompt runs: Qwen3, the
+Llama-likes (SmolLM3, Phi-4-mini's shape), LFM2, Qwen3.5."""
+import dataclasses
+import sys
+from pathlib import Path
+
 import numpy as np
 import pytest
 
 from opentpu import isa as I
 from opentpu.isasim import Machine, board_config
+from opentpu.llm import prefill as PF
 from opentpu.llm import tiled
 from opentpu.llm.qwen3 import Engine, Spec, rope_tables
+
+sys.path.insert(0, str(Path(__file__).parent))
 
 torch = pytest.importorskip("torch")
 transformers = pytest.importorskip("transformers")
@@ -128,6 +137,147 @@ def test_tile_on_rtl(tiny, have_verilator, mcols, wformat, act_rows, T):
     dram = eng.backend.machine.slices[0].dram.copy()
     _put(dram, _inputs(eng, toks[p0:], p0, T))
     progs = tiled.compile_tile(eng.image, p0, T, logit_rows=[T - 1])
+    m = Machine(cfg, progs, [dram.copy()]).run()
+    drams, tmems, _ = rtlsim.run(cfg, progs, [dram.copy()], uarch=rtlsim.BOARD_UARCH, axi=True,
+                                 boot=True)
+    n = eng.image.nbytes
+    assert np.array_equal(drams[0][:n], m.slices[0].dram[:n])
+    assert np.array_equal(tmems[0], m.slices[0].tmem)
+
+
+# ------------------------------------------------------------------ tiled prompt runs
+def _family(case, tmp_path_factory):
+    """(W, spec, cfg, engine kwargs) of a tiny model of each family (test_prefill's, and
+    test_llama's Llama-likes read back from their checkpoints)."""
+    if case in ("smollm3", "phi3"):
+        import test_llama as TLL
+        from opentpu.llm import load_spec
+        from opentpu.llm.qwen3 import load_weights
+        torch.manual_seed(0)
+        m = {"smollm3": TLL._smollm3, "phi3": TLL._phi3}[case]().float().eval()
+        with torch.no_grad():
+            for n, p in m.named_parameters():
+                if "norm" in n:
+                    p.copy_(1 + 0.1 * torch.randn_like(p))
+        path = tmp_path_factory.mktemp(case)
+        m.save_pretrained(path)
+        return load_weights(path), load_spec(path), board_config(DRAM_BYTES=1 << 26), {}
+    from test_prefill import _model
+    return _model(case)
+
+
+def _prompt_engines(case, mcols, act, R, tmp_path_factory, pair=None):
+    """Two engines of the case's model with prompt runs, MCOLS and ACT_ROWS as given and the
+    image's rows act: tiled (a) and today's held to R rows a run (b)."""
+    W, spec, cfg, kw = _family(case, tmp_path_factory)
+    cfg = dataclasses.replace(cfg, MCOLS=mcols, ACT_ROWS=act)
+    if pair is not None:
+        cfg = dataclasses.replace(cfg, PAIR=pair)
+    a = Engine(spec, W, cap=512, cfg=cfg, rows=act, resident=True, prompt_runs=True, **kw)
+    a.tile_runs = True
+    b = Engine(spec, W, cap=512, cfg=cfg, rows=act, resident=True, prompt_runs=True, **kw)
+    b.tile_runs = False
+    b._prompt_rmax = {k: (R, True) for k in range(3)}
+    return spec, a, b
+
+
+def _dram_but_scratch(eng, P):
+    """Each slice's DRAM but the runs' own words (test_prefill._drams), the I/O area's logits
+    rows (an L run writes its last row's: row T - 1 or R - 1) and Qwen3.5's per-row scratch
+    gr / on (the last run's rows)."""
+    from test_prefill import _drams
+    io, n = eng.image.io, eng.image.nbytes
+    out = []
+    for d in _drams(eng, P):
+        d = d[:n].copy()
+        d[io["logits"]:io["logits"] + 4 * eng.image.rows * eng.spec.vocab] = 0
+        if "gr" in io:
+            d[io["gr"]:io["gr"] + 4 * 2 * eng.image.nl * eng.image.grows] = 0
+            d[io["on"]:io["on"] + 4 * 4 * eng.spec.lin_dv * eng.image.grows] = 0
+        out.append(d)
+    return out
+
+
+@pytest.mark.parametrize("case, mcols, P1, P2, R, T", [
+    ("qwen3", 4, 250, 20, 8, 16),   # 2 rows a packed tile (G = 2), across the bucket's end
+    ("qwen3", 2, 37, 30, 4, 16),    # MCOLS = G: a row a tile
+    ("qwen3", 8, 37, 30, 8, 16),    # 4 rows a tile
+    ("smollm3", 4, 37, 30, 8, 16),  # no q / k norms, layers without RoPE (G = 4: a row a tile)
+    ("phi3", 4, 37, 30, 8, 16),     # G = 3, RoPE on 96 of 128 dimensions, LongRoPE
+    ("phi3", 8, 37, 30, 8, 16),     # 2 rows of 3 heads a tile
+    ("lfm2", 4, 250, 20, 8, 16),    # convolution blocks by channel parts, 64-wide heads
+    ("kh8", 4, 250, 20, 4, 8),      # Qwen3.5: gated attention, DeltaNet rows (16 rows: TMEM)
+    ("kh16", 4, 37, 30, 4, 8),      # 16 DeltaNet heads
+])
+def test_tiled_prompt_runs_are_todays(tmp_path_factory, case, mcols, P1, P2, R, T):
+    """Two prompts (a chat's turns, the second from where the first left) through tiled prompt
+    runs of T rows and through today's of R: the last logits and every slice's DRAM (KV caches,
+    DeltaNet states and windows, LFM2's rings) bit for bit; today's runs at MCOLS 4 do not pair
+    (int8 weights)."""
+    r = np.random.default_rng(P1)
+    p1, p2 = ([int(t) for t in r.integers(0, 1000, n)] for n in (P1, P2))
+    spec, a, b = _prompt_engines(case, mcols, 16, R, tmp_path_factory)
+    got = [a.prefill(p1), a.prefill(p2)]
+    assert set(a._prompt_tile.values()) == {T}
+    assert max(s["rows"] for s in a.stats) == T
+    keys = {k[0] for k in a._prompt_progs}
+    assert "prompt tile" in keys
+    want = [b.prefill(p1), b.prefill(p2)]
+    assert max(s["rows"] for s in b.stats) == R
+    for x, y in zip(got, want):
+        assert np.array_equal(x.view(np.uint32), y.view(np.uint32))
+    assert all(np.array_equal(x, y) for x, y in zip(_dram_but_scratch(a, P1 + P2),
+                                                    _dram_but_scratch(b, P1 + P2)))
+
+
+@pytest.mark.parametrize("pair, P1, P2, same", [
+    (True, 36, 24, True),       # today's runs of 4 (and 3) rows, the tile's of 8: none pairs
+    (True, 250, 20, False),     # today's 2-row runs (at the bucket's end, the prompt's) pair
+    (False, 250, 20, True),     # the same without PAIR: bit for bit
+])
+def test_tiled_prompt_runs_pair_rounding(tmp_path_factory, pair, P1, P2, same):
+    """4-bit Qwen3.5: a tiled run and today's differ exactly where one of them pairs (a run of
+    at most MCOLS / 2 rows: a paired MM sums each even K block into the odd one first) -- the
+    tile's 8 rows never pair, today's 2-row runs do; without PAIR they are the same bits."""
+    r = np.random.default_rng(P1)
+    p1, p2 = ([int(t) for t in r.integers(0, 1000, n)] for n in (P1, P2))
+    _, a, b = _prompt_engines("fp4", 4, 16, 4, tmp_path_factory, pair=pair)
+    got = [a.prefill(p1), a.prefill(p2)]
+    want = [b.prefill(p1), b.prefill(p2)]
+    eq = all(np.array_equal(x, y) for x, y in zip(_dram_but_scratch(a, P1 + P2),
+                                                  _dram_but_scratch(b, P1 + P2)))
+    eq = eq and all(np.array_equal(x, y) for x, y in zip(got, want))
+    assert eq == same
+    if not same:
+        assert any(s["rows"] <= 2 for s in b.stats)
+        assert all(np.abs(x - y).max() < 1e-3 * np.abs(y).max() for x, y in zip(got, want))
+
+
+@pytest.mark.parametrize("case, act, p0", [
+    ("qwen3", 4, 300),          # the card's ACT RAM (4 rows): a whole block, then the masked one
+    ("lfm2", 16, 200),          # 16 rows: replayed MMs, the convolution's channel parts
+    ("kh8", 16, 300),           # Qwen3.5: DeltaNet rows (DSTEP), gated attention
+])
+def test_tiled_prompt_run_on_rtl(tmp_path_factory, have_verilator, case, act, p0):
+    """A tiled prompt run (an L run, at a run-time position from the state's words, its tokens
+    from out[]) on the RTL with the board's memory path: DRAM and TMEM as the ISA simulator's,
+    on the card's MXU (MCOLS 4) with its own ACT RAM of 4 rows and with 16."""
+    from opentpu import rtlsim
+    W, spec, cfg, kw = _family(case, tmp_path_factory)
+    cfg = dataclasses.replace(cfg, MCOLS=4, ACT_ROWS=act)
+    eng = Engine(spec, W, cap=512, cfg=cfg, rows=act, resident=True, prompt_runs=True, **kw)
+    eng.tile_runs = True
+    toks = [int(t) for t in np.random.default_rng(p0).integers(0, 1000, p0 + act)]
+    eng.prefill(toks[:p0])
+    T = PF.r_max(eng, p0 // eng.block + 1)
+    assert T == min(act, 8 if case == "kh8" else act)
+    progs, names = PF.programs(eng, p0, T, "L")
+    PF.write_tokens(eng, p0, toks[p0:p0 + T])
+    g, w = eng.image.lookup["gen"], PF.words(eng, names, p0, T)
+    for a, b in PF._ranges(sorted(w)):
+        eng.backend.write(0, g["state"] + 4 * a, np.array([w[i] for i in range(a, b)],
+                                                          np.float32))
+    dram = eng.backend.machine.slices[0].dram.copy()
     m = Machine(cfg, progs, [dram.copy()]).run()
     drams, tmems, _ = rtlsim.run(cfg, progs, [dram.copy()], uarch=rtlsim.BOARD_UARCH, axi=True,
                                  boot=True)

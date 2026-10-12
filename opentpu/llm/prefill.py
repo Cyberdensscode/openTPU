@@ -17,9 +17,16 @@ program: Phi-4-mini's mix takes 3 rows in bucket 1, 1 in bucket 16). Plain and M
 model take the same split, so their logits are the same bit for bit. Where today's prefill
 (compile_rows) would fit more rows in a bucket than its prompt run, a prompt that reaches the
 bucket takes today's route (covers).
+
+Tiled runs (opentpu/llm/tiled.py, docs/tiled_prefill.md), opt-in: with the engine's tile_runs on
+(or OTPU_TILE=1 where the engine does not say), a bucket's P and L runs are tile_run's programs
+of up to T rows (_probe_tile: whole passes of MCOLS up to ACT_ROWS and the image's rows, every
+run a prompt can ask for in the bucket fitting TMEM and IMEM), each weight streamed once a run;
+a bucket where no tile fits takes today's prompt runs. MTP's M runs stay today's.
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 
@@ -29,6 +36,7 @@ from .. import isa as I
 from .. import progcache as PC
 from ..compiler import CompileError
 from . import generate as G
+from . import tiled as TL
 from .qwen3 import RUN_WORDS
 
 
@@ -66,22 +74,35 @@ def supported(eng) -> bool:
             and (not host or getattr(img, "prompt_host_rows", False)))
 
 
-def programs(eng, p: int, R: int, kind: str, hidden: bool = False, slot: int = 0):
+def tiling(eng) -> bool:
+    """Tiled prompt runs on (opentpu/llm/tiled.py): the engine's tile_runs, or where it has
+    none OTPU_TILE (off by default), for an image whose family has a tile kernel."""
+    t = getattr(eng, "tile_runs", None)
+    if t is None:
+        t = os.environ.get("OTPU_TILE", "") not in ("", "0")
+    return bool(t) and TL.family(eng.image) is not None
+
+
+def programs(eng, p: int, R: int, kind: str, hidden: bool = False, slot: int = 0,
+             tile: bool | None = None):
     """The run's (programs, the state words it reads) (kept by the engine; through its
     program cache): the programs, or on the card (runs_words) the program assembled once, so
     a run of another program loads its words, not an assembly of them (3-5 ms a run; MTP's
     rows and M runs alternate). hidden, slot: MTP's rows (their hidden stored, the states'
-    slot); M's take neither."""
+    slot); M's take neither. tile: a tiled run (True), today's (False), or the bucket's
+    choice (None: tiled where tiling is on and a tile fits the bucket)."""
     done = eng.__dict__.setdefault("_prompt_progs", {})
-    what, blocks, compile = _what(eng, p, R, kind, hidden, slot)
+    what, blocks, compile = _what(eng, p, R, kind, hidden, slot, tile)
     with _lock(eng):
         if what not in done:
             done[what] = _prepared(eng, what, blocks, *eng.cached(what, compile))
     return done[what]
 
 
-def _what(eng, p: int, R: int, kind: str, hidden: bool = False, slot: int = 0):
-    """A run's (program cache key, bucket (0: compile-time positions), compile())."""
+def _what(eng, p: int, R: int, kind: str, hidden: bool = False, slot: int = 0,
+          tile: bool | None = None):
+    """A run's (program cache key, bucket (0: compile-time positions), compile()); tile as
+    programs'."""
     img, block = eng.image, eng.block
     if kind == "M":
         hidden, slot = False, 0
@@ -91,6 +112,11 @@ def _what(eng, p: int, R: int, kind: str, hidden: bool = False, slot: int = 0):
         what = ("prompt", kind, R, "at", p, hidden, slot)
     else:
         blocks = p // block + 1
+        if tile is None:
+            tile = kind != "M" and tiling(eng) and _tile_fit(eng, blocks) > 0
+        if tile and kind != "M":
+            what = ("prompt tile", kind, R, blocks, hidden, slot)
+            return what, blocks, lambda: TL.compile_tile_run(img, blocks, R, kind, block, **kw)
         what = ("prompt", kind, R, blocks, hidden, slot)
     return what, blocks, lambda: img.compile_prompt_run(blocks, R, kind, block, **kw)
 
@@ -118,7 +144,11 @@ def r_max(eng, blocks: int = 1) -> int:
     compiled and fitting IMEM (kept by the engine). MTP's runs take the same R_max (their
     programs must fit it), so plain and MTP prefills of a model split alike. With the engine's program cache the answer is kept there
     too (progcache.fact), so a new process does not try the larger R again (the 4B's R = 4,
-    traced until TMEM runs out)."""
+    traced until TMEM runs out). Tiling on: the bucket's tile rows where a tile fits it."""
+    if blocks and tiling(eng):
+        T = _tile_fit(eng, blocks)
+        if T:
+            return T
     return _fit(eng, blocks)[0]
 
 
@@ -128,7 +158,9 @@ def covers(eng, p0: int, P: int) -> bool:
     more often and run no more often (docs/prefill.md 7); else Engine.prefill_chunks and
     MTPDecoder.prefill take today's route for the prompt."""
     P = min(P, eng.cap)                 # (past the cache: the route's own error)
-    return all(_fit(eng, b)[1] for b in range(p0 // eng.block + 1, (P - 1) // eng.block + 2))
+    tile = tiling(eng)
+    return all((tile and _tile_fit(eng, b) > 0) or _fit(eng, b)[1]
+               for b in range(p0 // eng.block + 1, (P - 1) // eng.block + 2))
 
 
 def _fit(eng, blocks: int):
@@ -165,14 +197,14 @@ def _probe(eng, blocks: int) -> list:
         n = _whole_passes(n - 1, mc)
     kinds = _kinds(eng)
     for i, R in enumerate(sizes):
-        if all(_fits(lambda: programs(eng, p, r, k, h)) for r in range(R, 0, -1)
+        if all(_fits(lambda: programs(eng, p, r, k, h, tile=False)) for r in range(R, 0, -1)
                for k, h in kinds for p in ps):
             break
     else:
         raise CompileError(f"no prompt run fits bucket {blocks}")
 
     def cost(r):                    # a run of r rows without logits, its programs
-        what, _, compile = _what(eng, ps[0], r, "P")
+        what, _, compile = _what(eng, ps[0], r, "P", tile=False)
         return eng.cached(what, compile)[0]
     R = prefer_rows(img, R, cost)
     if i == 0 or not blocks:
@@ -180,6 +212,50 @@ def _probe(eng, blocks: int) -> list:
     up = sizes[i - 1]               # today's next larger size: fits, and would take more rows?
     return [R, not _fits(lambda: _today(eng, ps[0], up)) or
             prefer_rows(img, up, lambda r: _today(eng, ps[0], r, logits=False)) <= R]
+
+
+def _tile_fit(eng, blocks: int) -> int:
+    """The tile rows of bucket `blocks` (_probe_tile; 0: none fits), kept by the engine and
+    the program cache."""
+    done = eng.__dict__.setdefault("_prompt_tile", {})
+    with _lock(eng):
+        if blocks not in done:
+            what = ("prompt tile fit", blocks)
+            done[blocks] = int(PC.fact(eng.layout, what, lambda: _probe_tile(eng, blocks))
+                               if eng.prog_cache else _probe_tile(eng, blocks))
+        return done[blocks]
+
+
+def _probe_tile(eng, blocks: int) -> int:
+    """The rows T of a tiled run in bucket `blocks` (from conv_k - 1): the largest of the sizes
+    up to ACT_ROWS, the image's rows and the bucket's room (whole passes of MCOLS above
+    MCOLS rows, as _probe's) at which every run a prompt can ask for in the bucket fits (_kinds
+    at every R <= T: tiled P and L, today's M), then an odd T's T - 1 where PAIR makes it
+    cheaper a row (prefer_rows' rule: PREFER_MARGIN less MXU time a row); 0 where none fits."""
+    from .qwen3 import PREFER_MARGIN, _whole_passes, mxu_time
+    img, block, mc = eng.image, eng.block, eng.image.cfg.MCOLS
+    p = max((blocks - 1) * block, conv_k(eng) - 1)
+    room = min(img.rows, img.cfg.act_rows, img.cap - p, block - p % block)
+    if room <= 0:
+        return 0
+    n, sizes = _whole_passes(room, mc), []
+    while n:
+        sizes.append(n)
+        n = _whole_passes(n - 1, mc)
+    kinds = _kinds(eng)
+    for T in sizes:
+        if all(_fits(lambda: programs(eng, p, r, k, h, tile=k != "M")) for r in range(T, 0, -1)
+               for k, h in kinds):
+            break
+    else:
+        return 0
+    if T >= 3 and T % 2:
+        def cost(r):
+            what, _, compile = _what(eng, p, r, "P", tile=True)
+            return mxu_time(eng.cached(what, compile)[0]) / r
+        if cost(T - 1) <= (1 - PREFER_MARGIN) * cost(T):
+            T -= 1
+    return T
 
 
 def _kinds(eng) -> list:
