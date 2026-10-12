@@ -189,6 +189,7 @@ def test_waitc_rtl_matches_isa(have_verilator, monkeypatch, S, boot):
     from opentpu.runtime import compile_kernel, run
     from test_kernels import attn_args
     monkeypatch.setitem(rtlsim.UARCH, "SEQ_WC", 1)
+    monkeypatch.setitem(rtlsim.UARCH, "WIN", 16)          # the card's window (WAITC: 16)
     monkeypatch.setitem(rtlsim.MEMORY, "BOOT", boot)
     monkeypatch.setenv("OTPU_WAITS", "1")
     args, want = attn_args(np.random.default_rng(7), Hq=8, Hkv=2, T=100)
@@ -229,7 +230,7 @@ def test_waitc_rtl_vpu_out_of_order(have_verilator, monkeypatch, n_after):
     # the held VOP n_after + 1 back (none past 15: it has completed), the 3rd last
     assert vm(w, len(prog) - 3) == ((1 << n_after) if n_after < 15 else 0) | 0b100
     m = Machine(cfg, [prog], [img.copy()]).run()
-    drams, tmems, _ = rtlsim.run(cfg, [prog], [img.copy()], uarch={"SEQ_WC": 1})
+    drams, tmems, _ = rtlsim.run(cfg, [prog], [img.copy()], uarch={"SEQ_WC": 1, "WIN": 16})
     assert np.array_equal(tmems[0], m.slices[0].tmem)
     assert np.array_equal(drams[0], m.slices[0].dram)
 
@@ -247,6 +248,6 @@ def test_waitc_rtl_hazard_stress(have_verilator, monkeypatch, seed):
     prog = _hazard_program(rng, cfg)
     imgs = _images(rng, 1)
     m = Machine(cfg, [prog], [i.copy() for i in imgs]).run()
-    drams, tmems, _ = rtlsim.run(cfg, [prog], [i.copy() for i in imgs], uarch={"SEQ_WC": 1})
+    drams, tmems, _ = rtlsim.run(cfg, [prog], [i.copy() for i in imgs], uarch={"SEQ_WC": 1, "WIN": 16})
     assert np.array_equal(tmems[0], m.slices[0].tmem)
     assert np.array_equal(drams[0], m.slices[0].dram)

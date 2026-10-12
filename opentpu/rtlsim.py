@@ -296,7 +296,10 @@ def _run(cfg, programs: list, images: list, dram_lat: int = 8, max_cycles: int =
     # reads them into the sidecar, docs/isa.md "Wait counts"), else from +hz_sync
     nins = [len(p) // 8 for p in progs]
     sync_arg: list = []
-    if os.environ.get("OTPU_WAITS") and {**UARCH, **(uarch or {})}.get("SEQ_WC"):
+    ua = {**UARCH, **(uarch or {})}
+    if ua.get("SEQ_WC") and ua.get("WIN", 16) > 16:
+        raise ValueError("SEQ_WC (otpu_seq WAITC) needs WIN <= 16: 4-bit counts, a 15-bit VPU mask")
+    if os.environ.get("OTPU_WAITS") and ua.get("SEQ_WC"):
         from . import waits as W
         for s in range(cfg.S):
             wst: dict = {}

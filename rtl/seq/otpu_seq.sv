@@ -1439,6 +1439,9 @@ module otpu_seq
 
 `ifndef SYNTHESIS
   initial if (WIN > 32) $fatal(1, "otpu_seq: the trace events hold 32 window slots");
+  // WAITC: a count of 4 bits and the VPU mask of 15 name a unit's 15 last instructions; an
+  // in-order unit's 16th last has completed only if the window holds no more than 16
+  initial if (WAITC && WIN > 16) $fatal(1, "otpu_seq: WAITC needs WIN <= 16 (%0d)", WIN);
   string dir;
   logic [31:0] init_w [IMEM_WORDS];
   initial begin
