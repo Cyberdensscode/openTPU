@@ -293,3 +293,27 @@ def test_nope_is_one_loop_body(tiny):
     n = [len(dataclasses.replace(spec, nope=nope).image(cfg, 256).compile_step(9)[0])
          for nope in ((3,), (1, 3, 5, 7))]
     assert n[0] == n[1]
+
+
+@pytest.mark.parametrize("resident", [False, True], ids=["per-position", "resident"])
+def test_tiny_token_on_board_rtl(have_verilator, tiny, resident):
+    """A token after a 39-token prefill on the Verilator RTL through the board's memory path
+    (AXI adapter, boot loader) equals the ISA simulator bit for bit, logits and the whole DRAM
+    image, with the per-position programs and resident: SmolLM3's layers with and without RoPE,
+    Phi-4-mini's fused projections, partial RoPE and LongRoPE (fp4 layers, int8 LM head)."""
+    from opentpu import rtlsim
+    from opentpu.llm.rtl_backend import RtlBackend
+    name, _, spec, W = tiny
+    toks = [int(t) for t in np.random.default_rng(5).integers(0, 1000, 40)]
+    eng = Engine(spec, W, cap=256, cfg=board_config(DRAM_BYTES=1 << 26), wformat="fp4",
+                 head_format="int8", resident=resident)
+    assert eng.resident == resident
+    eng.prefill(toks[:-1])
+    n, isa = eng.image.nbytes, eng.backend
+    rtl = RtlBackend(eng.cfg, [s.dram[:n] for s in isa.machine.slices],
+                     uarch=rtlsim.BOARD_UARCH, axi=True, boot=True)
+    want = eng.step(toks[-1])
+    eng.backend, eng.pos = rtl, eng.pos - 1
+    got = eng.step(toks[-1])
+    assert np.array_equal(want.view(np.uint32), got.view(np.uint32)), name
+    assert np.array_equal(isa.machine.slices[0].dram[:n], rtl.drams[0][:n]), name
