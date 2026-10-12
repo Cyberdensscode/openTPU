@@ -117,8 +117,7 @@ module otpu_native_dram #(
   input  logic [31:0]       a_wdata_x,
   input  logic [3:0]        a_be_x,
   output logic              a_rvalid,
-  output logic [31:0]       a_rdata,
-  output logic [31:0]       a_rdata2,   // the word at a_addr ^ 1 (the other half of its 8-byte pair)
+  output logic [255:0]      a_rdata,    // the aligned 32 bytes holding word a_addr (half a beat)
   output logic              sw_rdy,
   input  logic              sw_req,
   input  logic [31:0]       sw_addr,    // word address
@@ -539,8 +538,7 @@ module otpu_native_dram #(
   // MXU's scale FIFO block RAM in one cycle)
   always_ff @(posedge clk) begin
     a_rvalid <= !rst && a_out;
-    a_rdata <= a_src[32 * aoh.idx +: 32];
-    a_rdata2 <= a_src[32 * (aoh.idx ^ 4'd1) +: 32];
+    a_rdata <= a_src[256 * aoh.idx[3] +: 256];
   end
 
   // the tag FIFO writes its tail every cycle too (the slot is not live unless the FIFO is full),

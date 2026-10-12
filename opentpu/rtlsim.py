@@ -166,12 +166,14 @@ UARCH = {"WIN": 32, "RPB": 4, "WPB": 2}
 BOARD_UARCH = _target.sim_uarch(_target.current())
 if os.environ.get("OTPU_UARCH") == "board":
     UARCH = dict(BOARD_UARCH)
-# MXU dot-product implementation (timing only): the 2D systolic array, as the board builds it
-# (weights hop column to column; docs/mxu_systolic.md); OTPU_MXU=tree the adder tree,
-# OTPU_MXU=cascade the DSP cascade chains (OTPU_MXU_CL products per chain).
-UARCH["MXU_IMPL"] = {"tree": 0, "cascade": 1}.get(os.environ.get("OTPU_MXU", "systolic"), 2)
-if UARCH["MXU_IMPL"] == 1:
-    UARCH["MXU_CL"] = int(os.environ.get("OTPU_MXU_CL", "16"))
+# The MXU: the MX column's 2D systolic array, as the board builds it (weights hop column to
+# column; docs/mxu_systolic.md, docs/mx_mxu.md), the only dot product (OTPU_MXU=systolic, the
+# only value). OTPU_MXU_E: its epilogue lanes (otpu_mxu E; timing only, 0: MCOLS / 2).
+if os.environ.get("OTPU_MXU", "systolic") != "systolic":
+    raise ValueError("OTPU_MXU: the systolic MXU is the only one")
+UARCH["MXU_IMPL"] = 2
+if os.environ.get("OTPU_MXU_E"):
+    UARCH["MXU_E"] = int(os.environ["OTPU_MXU_E"])
 # VPU lanes with the composite functions (exp2, recip, rsqrt; timing only): OTPU_VPU_CL=4
 if os.environ.get("OTPU_VPU_CL"):
     UARCH["VPU_CL"] = int(os.environ["OTPU_VPU_CL"])
@@ -350,6 +352,10 @@ def _run(cfg, programs: list, images: list, dram_lat: int = 8, max_cycles: int =
             drams[s][at:at + 4 * len(progs[s])] = 0
     tmems = [_read_hex(tmp / f"tmem_{s}.hex", cfg.TMEM_WORDS) for s in range(cfg.S)]
     stats = {"cycles": cycles, "instructions": icounts}
+    # per slice, the MXU's scale reads: port A line requests, and those that fetched a row's Sw
+    # alone (otpu_mxu xs_*)
+    stats["mxu_scale"] = [{"areq": int(a), "sw": int(w)} for a, w in
+                          re.findall(r"MXSCALE s\d+ areq=(\d+) sw=(\d+)", out)]
     if error_ok:
         stats["error"] = bool(err)
     if axi:

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import re
 import sys
 import time
 from collections import defaultdict
@@ -333,6 +334,18 @@ def main():
     for c, d in enumerate(st.get("axi_detail", [])):
         print(f"  ch{c}: port A reads {d['ar_a']}, DDR3 row opens {d['row_miss']}, "
               f"read-modify-writes {d['rmw']} (port A / QST {d['rmw_a']})")
+    # the MXU's scale reads (otpu_mxu): 32-byte line requests, and those for a row's Sw alone
+    # (its Sw in neither its first advance's line nor the previous row's last); per MM from the
+    # MXS lines (in issue order = the MMs' dispatch order)
+    xs = st.get("mxu_scale") or []
+    if xs:
+        nmm = sum(1 for r in p.recs if r.op == I.MM and r.slice == 0)
+        print(f"MXU scale lines: {xs[0]['areq']} requests ({xs[0]['areq'] / max(1, nmm):.1f} per "
+              f"MM), {xs[0]['sw']} for a row's Sw alone "
+              f"({100 * xs[0]['sw'] / max(1, xs[0]['areq']):.1f}%)")
+    mxs = [tuple(map(int, m)) for m in re.findall(r"^MXS0 a=(\d+) sw=(\d+)", st["trace"], re.M)]
+    mms = sorted((r for r in p.recs if r.op == I.MM and r.slice == 0), key=lambda r: r.idx)
+    per_mm = dict(zip((r.idx for r in mms), mxs)) if len(mxs) == len(mms) else {}
     # useful-bytes roofline: weights + their fp32 block scales + KV + activations, at D bytes
     # per cycle (both channels at 100%)
     D = cfg.D
@@ -371,7 +384,7 @@ def main():
               f"VPU {v['VPU']:9d}  MXU {v['MXU']:9d}")
     if a.gaps:
         _gap_table(p, progs, pb, D * a.bw / 100)
-    ph = defaultdict(lambda: [0, 0, 0])
+    ph = defaultdict(lambda: [0, 0, 0, 0, 0])
     for r in p.recs:
         if r.op != I.MM or r.end < 0:
             continue
@@ -379,9 +392,14 @@ def main():
         ph[k][0] += 1
         ph[k][1] += r.portb
         ph[k][2] += r.end - max(r.start, r.release)
-    print("MM by source: count, chunks, release->end cycles")
+        if r.slice == 0 and r.idx in per_mm:
+            ph[k][3] += per_mm[r.idx][0]
+            ph[k][4] += per_mm[r.idx][1]
+    print("MM by source: count, chunks, release->end cycles"
+          + (", scale lines, of them Sw alone" if per_mm else ""))
     for k, v in sorted(ph.items(), key=lambda x: -x[1][1])[:20]:
-        print(f"  {k:50s} {v[0]:6d} {v[1]:9d} {v[2]:9d}")
+        print(f"  {k:50s} {v[0]:6d} {v[1]:9d} {v[2]:9d}"
+              + (f" {v[3]:9d} {v[4]:9d}" if per_mm else ""))
     g = p.mxu_gaps(0)
     print(f"MXU prologue {g['prologue']} epilogue {g['epilogue']} "
           f"gaps {sum(b - a for a, b, _ in g['gaps'])}")

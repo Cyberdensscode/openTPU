@@ -1,3 +1,4 @@
+// Needs b370889d's tree: otpu_colend is no longer in rtl/tech (the MX column's otpu_mxce replaced it).
 // EXPERIMENTAL (docs/mx_mxu.md): the out-of-context baseline for mx_top: today's MXU datapath
 // (otpu_mxu IMPL 2) from the chunk and the ACT rows to the read-modify-write lanes, in the same
 // surroundings as mx_top (inputs and outputs registered, no issuer, no chunk / scale FIFOs, no

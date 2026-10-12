@@ -30,9 +30,9 @@
 // DDR3 port names are the LiteDRAM core's (ddram0_*, ddram1_*), so its XDC places them.
 module otpu_fpga_top_ld #(
   parameter int MCOLS = 4,                  // MXU columns (activation rows per weight chunk)
-  parameter int ACT_ROWS = MCOLS,           // ACT RAM rows (> MCOLS: MM replay, one weight pass)
+  parameter int ACT_ROWS = 16,              // ACT RAM rows (> MCOLS: MM replay, one weight pass)
   parameter int VPU_CL = 2,                 // VPU lanes with the composite functions (exp2, ...)
-  parameter int MXU_IMPL = 2,               // MXU dot product: 2 systolic (docs/mxu_systolic.md), 0 adder tree
+  parameter int MXU_IMPL = 2,               // MXU dot product: 2 systolic (docs/mxu_systolic.md), the only one
   parameter int LANES = 8,                  // VPU lanes / TMEM banks (8 or 16)
   parameter int ULANES = 8,                 // TMEM lanes of the MXU and the quantizer
   parameter int CORE_KHZ = 100000,          // core_clk as the block design makes it (CORE_KHZ register)

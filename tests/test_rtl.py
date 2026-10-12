@@ -58,6 +58,13 @@ def test_design_size_block_128_rtl(have_verilator):
 
 # ------------------------------------------------------------------------------------ fuzzing
 DATA, INT8, SCALES, SCALES4, SCRATCH = 0, 16384, 49152, 57344, 65536
+# MX scale rows (docs/isa.md "Weight formats") at a fixed pitch, so that an MM may start at any
+# row and any block k0: int8x (Sw, a dw byte a block), int4x / fp4x6 (Sw, a reserved word, a
+# word a block), NVFP4 (Sw, three reserved words, eight E4M3 bytes a block)
+SC8, SC4, SCNV = 0xC0000, 0xD0000, 0xE0000
+MX_PITCH = {I.W8: 64, I.W4I: 64, I.W4F: 64, I.WNV: 128}
+MX_BASE = {I.W8: SC8, I.W4I: SC4, I.W4F: SC4, I.WNV: SCNV}
+MX_BLOCKS = {I.W8: 60, I.W4I: 14, I.W4F: 14, I.WNV: 14}       # blocks a row holds
 
 
 def _images(rng, S):
@@ -70,8 +77,53 @@ def _images(rng, S):
         img[INT8:INT8 + 32768] = rng.integers(-127, 128, 32768).astype(np.int8).view(np.uint8)
         img[SCALES:SCALES + 4096] = rng.uniform(0.01, 0.1, 1024).astype(np.float32).view(np.uint8)
         img[SCALES4:SCALES4 + 4096] = _scale_words(1024).view(np.uint8)
+        for wf in (I.W8, I.W4I, I.WNV):
+            rows = _mx_scale_rows(wf, 0x10000 // MX_PITCH[wf])
+            img[MX_BASE[wf]:MX_BASE[wf] + rows.size] = rows.reshape(-1)
         imgs.append(img)
     return imgs
+
+
+def _mx_scale_rows(wf, n, seed=0):
+    """n MX scale rows of format wf at MX_PITCH: Sw of either sign in [0.01, 0.1), offsets dw
+    from 0 to past the shift window (most small), random multipliers / E4M3 scales; a separate
+    generator, as _scale_words."""
+    r = np.random.default_rng(seed + 10 * wf)
+    P, KBr = MX_PITCH[wf], MX_BLOCKS[wf]
+    rows = np.zeros((n, P), np.uint8)
+    sw = (r.uniform(0.01, 0.1, n) * r.choice([-1, 1], n)).astype(np.float32)
+    rows[:, :4] = sw[:, None].view(np.uint8)
+    dw = np.where(r.random((n, KBr)) < 0.8, r.integers(0, 6, (n, KBr)),
+                  r.integers(0, 20, (n, KBr)))
+    if wf == I.W8:
+        rows[:, 4:4 + KBr] = dw
+    elif wf == I.WNV:
+        rows[:, 16:16 + 8 * KBr] = r.integers(0, 0x80, (n, 8 * KBr))
+    else:
+        m = r.integers(0, 64, (n, KBr, 4))
+        word = (dw | sum(m[:, :, b] << (8 + 6 * b) for b in range(4))).astype(np.uint32)
+        rows[:, 8:8 + 4 * KBr] = word.view(np.uint8).reshape(n, -1)
+    return rows
+
+
+def _mx_scales(rng, wf, N, KB, pair, unit):
+    """An MM's scale fields (ssa, srs, k0, rsc): RSC rows (Sw alone, the fp32 SCALES) a quarter
+    of the time when it may, else MX rows at a random row and block k0 (PAIR: even)."""
+    if not unit and wf != I.WNV and rng.integers(4) == 0:
+        srs = 4 * int(rng.integers(1, 3))
+        return SCALES + 4 * int(rng.integers(0, (4096 - N * srs) // 4)), srs, 0, True
+    P = MX_PITCH[wf]
+    srs = P * int(rng.integers(1, 3))
+    ssa = MX_BASE[wf] + P * int(rng.integers(0, (0x10000 - N * srs) // P))
+    k0 = int(rng.integers(0, MX_BLOCKS[wf] - KB - 1))
+    if pair:
+        k0 &= ~1
+    return ssa, srs, k0, False
+
+
+def _qst_scale_bytes(rows, KB, row):
+    """QST's scale rows: ROW the word S a row, else S and ceil(KB/4) words of d bytes."""
+    return 4 * rows if row else rows * (4 + 4 * -(-KB // 4))
 
 
 def _scale_words(n, seed=0):
@@ -85,8 +137,8 @@ def _scale_words(n, seed=0):
 
 
 def _wf(rng):
-    """A random MM weight format: int8 half the time, else int4 or E2M1."""
-    return [I.W8, I.W4I, I.W4F][int(rng.choice([0, 0, 1, 2]))]
+    """A random MM weight format: int8x half the time, else int4x, fp4x6 or NVFP4."""
+    return [I.W8, I.W4I, I.W4F, I.WNV][int(rng.choice([0, 0, 0, 1, 2, 3]))]
 
 
 def _random_program(rng, cfg: Config, n_ops=40):
@@ -139,21 +191,18 @@ def _random_program(rng, cfg: Config, n_ops=40):
             dup = 2 * M <= cfg.MCOLS and rng.integers(3) == 0
             prog.append(I.qact(pick_src(M * srs), M, ab, KB, srs, row=bool(rng.integers(2)),
                                cscale=cs, rscale=rsc, dup=dup))
-            if dup and rng.integers(2):
-                M *= 2                            # the MM reads the copies too
             N = int(rng.integers(1, 24))
             wf = _wf(rng)
+            # with DUP the MM reads the copies too (2M rows), or pairs them (PAIR, 4-bit: rows
+            # M..2M-1 must be row j's copies, one Sa a row)
+            pair = dup and wf != I.W8 and rng.integers(2) == 0
+            if dup and not pair and rng.integers(2):
+                M *= 2
             rb = KB * D if wf == I.W8 else -(-KB // 2) * D           # 4-bit: two blocks a chunk
             rs = rb + D * int(rng.integers(0, 2))
             sa = INT8 + D * int(rng.integers(0, (32768 - N * rs) // D + 1))   # D aligned
-            # PAIR (column reuse): its scale pairs are 8-byte aligned; rows M..2M-1 may hold
-            # a DUP copy or whatever an earlier QACT left
-            pair = wf != I.W8 and 2 * M <= cfg.MCOLS and rng.integers(2 if dup else 4) == 0
-            al = 8 if pair else 4
-            srs_s = al * -(-4 * KB // al) + al * int(rng.integers(0, 2))
-            ssa = (SCALES if wf == I.W8 else SCALES4) + \
-                al * int(rng.integers(0, (4096 - N * srs_s) // al))
             unit = bool(rng.integers(2))
+            ssa, srs_s, k0, rsc_ = _mx_scales(rng, wf, N, KB, pair, unit)
             reuse = [o for o in mm_outs if o[1:] == (M, N)]
             if reuse and rng.integers(2):
                 out, acc = reuse[0][0], True
@@ -163,7 +212,8 @@ def _random_program(rng, cfg: Config, n_ops=40):
             small = M <= cfg.MCOLS                  # RMAX and ASCALE need M <= MCOLS
             asc = pick_src(M) if (small and unit and acc and rng.integers(2)) else None
             prog.append(I.mm(sa, ssa, out, N, KB, rs, N, M, ab, srs_s, unit=unit, acc=acc,
-                             rmax=small and bool(rng.integers(2)), ascale=asc, wf=wf, pair=pair))
+                             rmax=small and bool(rng.integers(2)), ascale=asc, wf=wf, pair=pair,
+                             k0=k0, rsc=rsc_))
             src.append((out, M * N))
         elif kind == "qst":
             rows, KB = int(rng.integers(1, 4)), int(rng.integers(1, 4))
@@ -174,7 +224,7 @@ def _random_program(rng, cfg: Config, n_ops=40):
             row = bool(rng.integers(2))
             prog.append(I.qst(pick_src(rows * srs), scratch, sdst, rows, KB,
                               srs, drs, es, row=row, half=row and bool(rng.integers(2))))
-            scratch = sdst + 4 * rows * KB + 64
+            scratch = sdst + _qst_scale_bytes(rows, KB, row) + 64
             scratch = (scratch + 3) // 4 * 4
         elif kind == "ldst":
             n = int(rng.integers(1, 64))
@@ -193,7 +243,7 @@ def _random_program(rng, cfg: Config, n_ops=40):
             rows, cols = int(rng.integers(1, 4)), int(rng.integers(1, 20))
             dst = fresh(rows * cols * cfg.S)
             prog.append(I.gather(pick_src(rows * cols), dst, rows, cols, cols, cols * cfg.S, cols))
-        assert nxt < cfg.TMEM_WORDS and scratch < (1 << 20)
+        assert nxt < cfg.TMEM_WORDS and scratch < SC8
     prog.append(I.halt())
     return prog
 
@@ -223,7 +273,7 @@ def test_fuzz_two_slices(have_verilator, seed):
         assert np.array_equal(tmems[s], m.slices[s].tmem), f"slice {s} TMEM"
 
 
-@pytest.mark.parametrize("mcols,rows,seed", [(2, 8, 0), (2, 8, 1), (4, 8, 2), (2, 6, 3),
+@pytest.mark.parametrize("mcols,rows,seed", [(2, 8, 0), (2, 8, 1), (4, 8, 5), (2, 6, 3),
                                               (4, 16, 4)])
 def test_fuzz_mm_replay(have_verilator, mcols, rows, seed):
     """ACT RAM rows beyond the MXU columns (ACT_ROWS): an MM of M > MCOLS rows replays each
@@ -300,33 +350,33 @@ def _hazard_program(rng, cfg: Config, n_ops=60):
             dup = 2 * M <= cfg.MCOLS and rng.integers(3) == 0
             prog.append(I.qact(region(M * srs), M, ab, KB, srs, row=bool(rng.integers(2)),
                                cscale=cs, rscale=rsc, dup=dup))
-            if dup and rng.integers(2):
-                M *= 2                            # the MM reads the copies too
             N = int(rng.integers(1, 20))
             wf = _wf(rng)
+            # the MM reads this QACT's blocks (one Sa a row): its copies too, or PAIR
+            pair = dup and wf != I.W8 and rng.integers(2) == 0
+            if dup and not pair and rng.integers(2):
+                M *= 2
             rs = KB * D if wf == I.W8 else -(-KB // 2) * D
             sa = SCR + D * int(rng.integers(0, 4096 // D))                   # D aligned
-            pair = wf != I.W8 and 2 * M <= cfg.MCOLS and rng.integers(2 if dup else 4) == 0
-            al = 8 if pair else 4                 # PAIR: 8-byte aligned scale pairs
-            ssa = (SCALES if wf == I.W8 else SCALES4) + al * int(rng.integers(0, 1024 // al))
             ors = N + int(rng.integers(0, 2))
             out = region(M * ors + M)
             unit, acc = bool(rng.integers(2)), bool(rng.integers(2))
             asc = region(M) if (unit and acc and rng.integers(2)) else None
-            prog.append(I.mm(sa, ssa, out, N, KB, rs, ors, M, int(rng.integers(0, 8)),
-                             al * -(-4 * KB // al), unit=unit, acc=acc, rmax=bool(rng.integers(2)),
-                             ascale=asc, wf=wf, pair=pair))
+            ssa, srs_s, k0, rsc_ = _mx_scales(rng, wf, N, KB, pair, unit)
+            prog.append(I.mm(sa, ssa, out, N, KB, rs, ors, M, ab, srs_s, unit=unit, acc=acc,
+                             rmax=bool(rng.integers(2)), ascale=asc, wf=wf, pair=pair, k0=k0,
+                             rsc=rsc_))
         elif kind == "qst":
             rows, KB = int(rng.integers(1, 3)), int(rng.integers(1, 3))
             es = int(rng.integers(1, 3))
             drs = KB * D * es
             dst = SCR + 4 * int(rng.integers(0, 2048))
             span = (rows - 1) * drs + (KB * D - 1) * es + 1
+            row = bool(rng.integers(2))
             while True:                           # data and scales of one QST must not overlap
                 sdst = SCR + 4 * int(rng.integers(0, 2048))
-                if sdst + 4 * rows * KB <= dst or sdst >= dst + span:
+                if sdst + _qst_scale_bytes(rows, KB, row) <= dst or sdst >= dst + span:
                     break
-            row = bool(rng.integers(2))
             prog.append(I.qst(region(rows * KB * D), dst, sdst, rows, KB, KB * D, drs, es,
                               row=row, half=row and bool(rng.integers(2))))
         elif kind == "ld":

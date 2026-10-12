@@ -16,7 +16,7 @@ module otpu_native_sys #(
   parameter int MCOLS = 2,
   parameter int ACT_ROWS = MCOLS,
   parameter int VPU_CL = 2,
-  parameter int MXU_IMPL = 0,            // MXU dot product: 0 adder tree, 2 systolic
+  parameter int MXU_IMPL = 2,            // MXU dot product: 2 systolic (the only one)
   parameter int LANES = 8,
   parameter int ULANES = 8,
   parameter int CORE_KHZ = 100000,
