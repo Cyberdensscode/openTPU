@@ -51,7 +51,9 @@ module otpu_tmem_pump #(
                                            // (otpu_tmem RQ; the slice's TMEM_RQ arbiter)
   parameter logic [NRP-1:0][2:0] PRANK = '0,
   parameter string STYLE = "block",        // the banks' ram_style ("block", "ultra")
-  parameter bit    BYP   = 1'b0            // keep otpu_tmem's bypass (redundant here: see below)
+  parameter bit    BYP   = 1'b0,           // keep otpu_tmem's bypass (redundant here: see below)
+  parameter bit    FW    = 1'b1            // the write stage and the phase in the fast domain
+                                           // (below; 0: both in the core domain, as first built)
 ) (
   input  logic                                clk,
   input  logic                                clk_f,
@@ -150,17 +152,42 @@ module otpu_tmem_pump #(
           end
   end
 
-  // ---- the registered write stage (otpu_tmem): lands at the next cycle's odd fast edge here
+  // ---- the registered write stage (otpu_tmem): lands at the next cycle's odd fast edge here.
+  // FW: its registers are on clk_f, loaded at the even fast edges only (the core edges, where
+  // otpu_tmem loads them): the same values at the same instants, but their inputs then cross from
+  // the core domain in two fast periods (like the read addresses) and only one-level fast-domain
+  // paths reach the RAMs. The even edges come from a phase of its own (pw_ev, as the banks').
   (* max_fanout = 16 *) logic [LANES-1:0]         pw_v;
   (* max_fanout = 16 *) logic [LANES-1:0][IW-1:0] pw_a;
   (* max_fanout = 16 *) logic [LANES-1:0][31:0]   pw_d;
   logic [LANES-1:0][31:0]                         pd;
-  always_ff @(posedge clk) begin
-    pw_v <= bw_v;
-    pw_a <= bw_a;
-    pw_d <= bw_d;
-    if (BYP) pd <= pw_d;
+  if (FW) begin : g_fw
+    (* keep *) logic wtog;
+    (* keep *) logic wtq;
+    (* max_fanout = 32 *) logic pw_ev;
+    always_ff @(posedge clk) wtog <= !wtog;
+    always_ff @(posedge clk_f) begin
+      wtq <= wtog;
+      pw_ev <= wtq != wtog;          // the next fast edge is even
+    end
+    always_ff @(posedge clk_f)
+      if (pw_ev) begin
+        pw_v <= bw_v;
+        pw_a <= bw_a;
+        pw_d <= bw_d;
+      end
+`ifndef SYNTHESIS
+    initial begin wtog = 1'b0; wtq = 1'b0; pw_ev = 1'b1; end
+`endif
+  end else begin : g_sw
+    always_ff @(posedge clk) begin
+      pw_v <= bw_v;
+      pw_a <= bw_a;
+      pw_d <= bw_d;
+    end
   end
+  always_ff @(posedge clk)
+    if (BYP) pd <= pw_d;
 `ifndef SYNTHESIS
   initial pw_v = '0;
 `endif
@@ -254,7 +281,7 @@ module otpu_tmem_pump #(
     localparam int HB = host_on(2 * c + 1);
     for (genvar b = 0; b < LANES; b++) begin : g_bank
       logic [31:0] qa, qb;
-      otpu_pump_bank #(.N(BD), .STYLE(STYLE)) u_pb (
+      otpu_pump_bank #(.N(BD), .STYLE(STYLE), .FW(FW)) u_pb (
         .clk, .clk_f, .wv(pw_v[b]), .wa(pw_a[b]), .wd(pw_d[b]),
         .rena(HA >= 0 ? h_en[HA < 0 ? 0 : HA][b] : 1'b0), .ra(h_a[HA < 0 ? 0 : HA][b]),
         .renb(HB >= 0 ? h_en[HB < 0 ? 0 : HB][b] : 1'b0), .rb(h_a[HB < 0 ? 0 : HB][b]),
@@ -344,7 +371,8 @@ endmodule
 (* keep_hierarchy = "yes" *)
 module otpu_pump_bank #(
   parameter int    N     = 8192,
-  parameter string STYLE = "block"
+  parameter string STYLE = "block",
+  parameter bit    FW    = 1'b1      // the phase from a fast-domain register (below)
 ) (
   input  logic                 clk,
   input  logic                 clk_f,
@@ -360,13 +388,20 @@ module otpu_pump_bank #(
 );
   // the phase: tog flips at every core edge; tq is its copy a fast edge later. They differ during
   // a core cycle's first half (the next fast edge is odd) and agree in its second (even next).
+  // FW: ev is a fast-domain register loaded with that at every fast edge (the edge after next's
+  // parity is the opposite of the next's), so no core-domain net reaches the RAM's enables; it
+  // aligns itself at the first fast edge, as tq does.
   (* keep *) logic tog;
   (* keep *) logic tq;
+  logic evr;
   always_ff @(posedge clk) tog <= !tog;
-  always_ff @(posedge clk_f) tq <= tog;
-  wire ev = (tq == tog);
+  always_ff @(posedge clk_f) begin
+    tq <= tog;
+    evr <= tq != tog;
+  end
+  wire ev = FW ? evr : (tq == tog);
 `ifndef SYNTHESIS
-  initial begin tog = 1'b0; tq = 1'b0; end
+  initial begin tog = 1'b0; tq = 1'b0; evr = 1'b1; end
 `endif
   wire                 en_a = ev ? rena : wv;
   wire                 we_a = !ev && wv;

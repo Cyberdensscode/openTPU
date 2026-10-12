@@ -27,14 +27,25 @@ foreach {t c} [list slow $cs fast $cf] {
 # The pumped banks' contract (otpu_tmem_pump): their read inputs are sampled on the even fast edges
 # only (a whole core period from clk_s), and their RAM outputs change only after even edges (a
 # whole core period into clk_s). The write stage and the phase reach the RAMs in one fast period.
+# With FW (the default) the write stage's registers are on clk_f, loaded at even edges only: their
+# inputs from clk_s get a core period too (the phase registers, outside pw_*, keep one).
 set rams [get_cells -quiet -hierarchical -filter {REF_NAME =~ RAMB* || REF_NAME =~ URAM*}]
 set rp [get_pins -quiet -hierarchical -filter {NAME =~ *u_pb/ra[*] || NAME =~ *u_pb/rb[*] || NAME =~ *u_pb/rena || NAME =~ *u_pb/renb}]
-puts "OTPU_RAMS [llength $rams] OTPU_MCP_PINS [llength $rp]"
+set pwf {}
+foreach c [get_cells -quiet -hierarchical -filter {NAME =~ *u_tmem/pw_* && IS_SEQUENTIAL}] {
+  set ck [get_clocks -quiet -of_objects [get_pins -quiet -of_objects $c -filter {IS_CLOCK}]]
+  if {[llength $cf] && $ck eq [get_property NAME $cf]} { lappend pwf $c }
+}
+puts "OTPU_RAMS [llength $rams] OTPU_MCP_PINS [llength $rp] OTPU_MCP_PW [llength $pwf]"
 if {[llength $rp]} {
   set_multicycle_path 2 -setup -end -from $cs -through $rp
   set_multicycle_path 1 -hold -end -from $cs -through $rp
   set_multicycle_path 2 -setup -start -from $rams -to $cs
   set_multicycle_path 1 -hold -start -from $rams -to $cs
+}
+if {[llength $pwf]} {
+  set_multicycle_path 2 -setup -end -from $cs -to $pwf
+  set_multicycle_path 1 -hold -end -from $cs -to $pwf
 }
 report_utilization -file $out/util_synth.txt
 opt_design
