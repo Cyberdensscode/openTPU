@@ -2,7 +2,8 @@
 # EXPERIMENTAL (docs/seq_vpu.md): the study's Vivado out-of-context runs, one after another
 # (through a host's ~/otpu-build/slot.sh). Usage, from the tree:
 #   rtl/exp/seq_vpu/run_ooc.sh <outdir> [step ...]
-# Steps (all on xc7k480tffg1156-2 at 7.5 ns, the card's parameters):
+# Steps (on xc7k480tffg1156-2 at 7.5 ns, the card's parameters; OTPU_PART / OTPU_PERIOD: another
+# part / period in ns):
 #   seq          otpu_seq as built, placed and routed
 #   seq_s        otpu_seq as built, synthesis only (the ablations' reference)
 #   seq_nohaz    ablation: no hazard check (footprints, their storage and the compares pruned)
@@ -24,7 +25,7 @@ viv() {   # name top impl generics defines [sources]
   echo "START $n $(date '+%F %T')" >> "$O/progress.txt"
   local t0=$(date +%s)
   (cd "$O" && timeout 7200 vivado -mode batch -nojournal -log "$O/$n.log" -source "$T" \
-     -tclargs "$O/$n" "$1" 7.5 "$2" "$3" "$4" "${5:-}" > "$O/$n.out" 2>&1)
+     -tclargs "$O/$n" "$1" "${OTPU_PERIOD:-7.5}" "$2" "$3" "$4" "${5:-}" > "$O/$n.out" 2>&1)
   echo "DONE $n rc=$? $(( $(date +%s) - t0 ))s" >> "$O/progress.txt"
   grep -h "^OTPU_" "$O/$n.out" | grep -v OTPU_GROUP | sed "s/^/$n /" >> "$O/progress.txt"
 }

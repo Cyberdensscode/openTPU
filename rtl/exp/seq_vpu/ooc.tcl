@@ -1,6 +1,7 @@
 # EXPERIMENTAL (docs/seq_vpu.md): out-of-context synthesis (and optionally implementation) of one
-# module on the YPCB's part, with an area breakdown: Vivado's hierarchy, and the flat cells grouped
-# by the RTL name they carry (registers by their signal, LUTs and carries by the net they drive).
+# module on the YPCB's part (OTPU_PART: another), with an area breakdown: Vivado's hierarchy, and
+# the flat cells grouped by the RTL name they carry (registers by their signal, LUTs and carries by
+# the net they drive).
 #   vivado -mode batch -nojournal -source rtl/exp/seq_vpu/ooc.tcl -tclargs \
 #     <out> <top> <PERIOD_NS> <impl 0|1> <generics k=v,...|-> <defines D1,D2|-> [extra sources ,]
 # Prints OTPU_UTIL / OTPU_WNS / OTPU_PATH / OTPU_GROUP lines (OTPU_GROUP name lut ff carry dsp).
@@ -11,7 +12,7 @@ set impl [lindex $argv 3]
 set gens [lindex $argv 4]
 set defs [lindex $argv 5]
 set extra [expr {[llength $argv] > 6 ? [lindex $argv 6] : ""}]
-set part "xc7k480tffg1156-2"
+set part [expr {[info exists ::env(OTPU_PART)] ? $::env(OTPU_PART) : "xc7k480tffg1156-2"}]
 set root [file normalize [file join [file dirname [info script]] ../../..]]
 file mkdir $out
 
