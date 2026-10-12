@@ -291,6 +291,26 @@ def _run(cfg, programs: list, images: list, dram_lat: int = 8, max_cycles: int =
         img = np.asarray(images[s], np.uint8)
         imgs.append(np.concatenate([img, np.zeros(-len(img) % 4, np.uint8)]))
         progs.append(np.asarray(words, "<u4"))
+    # EXPERIMENTAL (docs/seq_vpu.md): OTPU_WAITS, the compiler's wait entries (opentpu.waits)
+    # for otpu_seq WAITC: in DRAM after the program's last chunk, 64 bits each (boot: the loader
+    # reads them into the sidecar, docs/isa.md "Wait counts"), else from +hz_sync
+    nins = [len(p) // 8 for p in progs]
+    sync_arg: list = []
+    if os.environ.get("OTPU_WAITS") and {**UARCH, **(uarch or {})}.get("SEQ_WC"):
+        from . import waits as W
+        for s in range(cfg.S):
+            wst: dict = {}
+            ww = W.wait_counts(programs[s], cfg.D, cfg.S, stats=wst,
+                               args=run_args if os.environ["OTPU_WAITS"] == "args" else None)
+            print(f"waits: slice {s}: {len(ww)} instructions, {wst['visits']} visits, "
+                  f"{len(wst['widened'])} loops widened, {wst['unreached']} unreached",
+                  flush=True)
+            if boot:
+                pad = np.zeros(-len(progs[s]) % (cfg.D // 4), "<u4")
+                progs[s] = np.concatenate([progs[s], pad, ww.astype("<u8").view("<u4")])
+            else:
+                W.sync_file(ww, tmp / f"sync_{s}.txt")
+                sync_arg.append(f"+hz_sync_s{s}={tmp / f'sync_{s}.txt'}")
     # boot: every slice's program right after the largest image (one loader address), or, if
     # there is no room, above the machine's DRAM (the simulated DRAM is then doubled)
     at = -(-max(len(i) for i in imgs) // cfg.D) * cfg.D
@@ -329,17 +349,7 @@ def _run(cfg, programs: list, images: list, dram_lat: int = 8, max_cycles: int =
     args += [x.replace("%n", str(_SIM_RUNS))
              for x in _re.split(r"[\s,]+", os.environ.get("OTPU_SIM_PLUSARGS", "")) if x]
     _SIM_RUNS += 1
-    if os.environ.get("OTPU_WAITS") and {**UARCH, **(uarch or {})}.get("SEQ_WC"):
-        from . import waits as W
-        if cfg.S != 1:
-            raise ValueError("OTPU_WAITS: one slice (one +hz_sync file)")
-        wst: dict = {}
-        words = W.wait_counts(programs[0], cfg.D, cfg.S, stats=wst,
-                              args=run_args if os.environ["OTPU_WAITS"] == "args" else None)
-        W.sync_file(words, tmp / "sync_0.txt")
-        print(f"waits: {len(words)} instructions, {wst['visits']} visits, "
-              f"{len(wst['widened'])} loops widened, {wst['unreached']} unreached", flush=True)
-        args += [f"+hz_sync={tmp / 'sync_0.txt'}"]
+    args += sync_arg
     args += [f"+arg{k}={int(v) & 0xFFFFFFFF}" for k, v in enumerate(run_args or [])]
     if again:
         args += [f"+runs={1 + len(again)}"] + (["+reload"] if reload else [])
@@ -352,7 +362,7 @@ def _run(cfg, programs: list, images: list, dram_lat: int = 8, max_cycles: int =
     if ldc:                            # the first of a plusarg wins: the caller's
         args += ldc_plusargs(ldc, MEMORY["LDC_MHZ"])
     if boot:
-        args += ["+boot", f"+boot_addr={at}", f"+boot_n={max(len(p) for p in progs) // 8}"]
+        args += ["+boot", f"+boot_addr={at}", f"+boot_n={max(nins)}"]
     r = run_sim(args, timeout=3600)
     out = r.stdout + r.stderr
     import re

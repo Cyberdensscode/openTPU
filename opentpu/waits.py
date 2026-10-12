@@ -1,30 +1,37 @@
-"""Wait counts: the compiler's half of the sequencer's explicit dependencies (otpu_seq WAITC;
+"""Wait entries: the compiler's half of the sequencer's explicit dependencies (otpu_seq WAITC;
 docs/isa.md "Wait counts", docs/seq_vpu.md).
 
 With WAITC the sequencer computes no footprints and compares no ranges. Each instruction carries a
-32-bit wait word beside it: seven 4-bit counts, k_j in bits [4j+3:4j]. k_j = k > 0 holds the
-instruction until the k-th last instruction of unit U(j) before it (in program order) has
-completed, and with it every older one of that unit (each unit completes in order); k = 0 waits
-for nothing on U(j).
-  j = 0..4: unit j (DMA, MXU, QUANT, VPU, COLL), before the instruction starts (an MM: before its
-            release, when it reads the ACT RAM and writes TMEM);
-  j = 5, 6: an MM's stream start (its DRAM reads): the DMA's and the quantizer's counts over DRAM
-            conflicts only.
-An instruction's own unit needs no count (each unit starts in order and, but the VPU, finishes an
-instruction before the next touches memory); the VPU's own count is kept. A producer 16 or more
-instructions of its unit back has completed: an incomplete one holds a window slot, and so does
-each younger instruction of its unit, and the window has 16 slots. So 4 bits are exact.
+64-bit wait entry beside it: a word of seven 4-bit counts, k_j in bits [4j+3:4j], and a word with
+the VPU mask in bits [14:0].
+  count k_j = k > 0 holds the instruction until the k-th last instruction of unit U(j) before it
+  (in program order) has completed, and with it every older one of that unit (DMA, MXU, QUANT and
+  COLL start and complete in order); k = 0 waits for nothing on U(j).
+    j = 0, 1, 2, 4: unit j (DMA, MXU, QUANT, COLL), before the instruction starts (an MM: before
+                    its release, when it reads the ACT RAM and writes TMEM);
+    j = 5, 6:       an MM's stream start (its DRAM reads): the DMA's and the quantizer's counts
+                    over DRAM conflicts only;
+    j = 3:          unused (0): the VPU's is the mask.
+  VPU mask bit r - 1 holds the instruction until the r-th last VPU instruction before it has
+  completed (r = 1..15). The VPU starts its oldest ready instruction, so they complete out of
+  order: the mask names each producer, not the nearest and all older.
+An in-order unit's own count is not needed (it starts in order and finishes an instruction before
+the next touches memory); the VPU's own producers are in its mask. A producer 16 or more of its
+unit back has completed: for an in-order unit an incomplete one holds a window slot, and so does
+each younger one of its unit (the window has 16 slots); the sequencer dispatches a VPU
+instruction only once the one 15 before it has completed. So 4-bit counts and a 15-bit mask are
+exact.
 
-wait_counts() computes the words from the program alone, conservatively: an abstract execution of
-the program (registers as intervals, the run's arguments R8..R15 and every RLD unknown unless
-given), each instruction's footprint the otpu_pkg footprint() of every value its registers may
-hold, and per unit the last 15 instructions' footprints, joined where paths meet (a loop's exits,
-a count the program does not know). A pc's count is the smallest over all its visits. Loops the
-budget cannot run (or whose count is unknown beyond CAP iterations) run on widened registers to a
-fixed point, which covers every later iteration.
+wait_counts() computes the entries from the program alone, conservatively: an abstract execution
+of the program (registers as intervals, the run's arguments R8..R15 and every RLD unknown unless
+given or bounded), each instruction's footprint the otpu_pkg footprint() of every value its
+registers may hold, and per unit the last 15 instructions' footprints, joined where paths meet (a
+loop's exits, a count the program does not know). A pc's count is the smallest over all its
+visits, its mask the union. Loops the budget cannot run (or whose count is unknown beyond CAP
+iterations) run on widened registers to a fixed point, which covers every later iteration.
 
-verify() checks words against a concrete execution (the ISA simulator's): every conflict
-otpu_pkg conflict() finds with an older instruction that may still be running is waited for.
+Checker checks entries against a concrete execution (the ISA simulator's): every conflict otpu_pkg
+conflict() finds with an older instruction that may still be running is waited for.
 """
 from __future__ import annotations
 
@@ -41,7 +48,8 @@ U_DMA, U_MXU, U_Q, U_VPU, U_COLL = 0, 1, 2, 3, 4
 NUNITS, NW = 5, 7
 WIN = 16
 KMAX = WIN - 1                    # ranks a count names; older producers have completed
-DEFAULT = 0x0111_1111             # a pc never reached: wait for every unit's last instruction
+VMASK = 0x7FFF                    # the VPU mask: the last 15 VPU instructions
+DEFAULT = 0x0111_0111 | (VMASK << 32)  # a pc never reached: every unit's last, the VPU's 15
 UNIT = {I.LD: U_DMA, I.ST: U_DMA, I.DSTEP: U_DMA, I.STREAM: U_DMA, I.WAITW: U_DMA,
         I.MM: U_MXU, I.QACT: U_Q, I.QST: U_Q, I.VOP: U_VPU,
         I.BAR: U_COLL, I.GATHER: U_COLL, I.RLD: U_COLL}
@@ -52,24 +60,27 @@ MAXR = 12                         # ranges a joined footprint keeps per (space, 
 
 
 # ------------------------------------------------------------------------- values (intervals)
-def _add(v, imm):
-    lo, hi = v[0] + (imm & M32), v[1] + (imm & M32)
-    if (lo >> 32) != (hi >> 32):
+# A register's values: an interval [lo, hi] of integers taken mod 2^32, lo in [0, 2^32) and
+# hi < lo + 2^32 (hi >= 2^32: the interval wraps, [lo, 2^32) and [0, hi - 2^32]); TOP: any.
+def _norm(lo, hi):
+    if hi - lo >= M32:
         return TOP
-    return (lo & M32, hi & M32)
+    k = lo >> 32
+    return (lo - (k << 32), hi - (k << 32))
 
 
-def _mulc(v, c):
-    """v * c mod 2^32 (RLD MUL with a constant factor)."""
-    if v[0] == v[1]:
-        x = (v[0] * c) & M32
-        return (x, x)
-    lo, hi = v[0] * c, v[1] * c
-    return (lo, hi) if hi <= M32 else TOP
+def _add(v, imm):
+    return _norm(v[0] + (imm & M32), v[1] + (imm & M32))
 
 
 def _hull(a, b):
-    return (min(a[0], b[0]), max(a[1], b[1]))
+    lo, hi = min(a[0], b[0]), max(a[1], b[1])
+    return TOP if hi - lo >= M32 else (lo, hi)
+
+
+def _span(v):
+    """The values as one interval within [0, 2^32) (a wrapped one: all of it)."""
+    return v if v[1] <= M32 else TOP
 
 
 # ------------------------------------------------------------------------- footprints
@@ -83,18 +94,19 @@ class Fp:
 
 
 def _mk(sp, base, ln):
-    """otpu_pkg mk() over every value of the base: [lo, hi) clamped to the last byte."""
+    """otpu_pkg mk() over every value of the base: [lo, hi) clamped to the last byte; a list of
+    ranges (two when the base's values wrap)."""
     ln &= M32
     if ln == 0:
-        return None
-    return (sp, base[0], min(base[1] + ln, M32))
+        return []
+    lo, hi = base
+    if hi <= M32:
+        return [(sp, lo, min(hi + ln, M32))]
+    return [(sp, lo, M32), (sp, 0, min(hi - (1 << 32) + ln, M32))]
 
 
-def _beats(r):
-    if r is None:
-        return None
-    sp, lo, hi = r
-    return (sp, lo & ~63, hi | 63)
+def _beats(rs):
+    return [(sp, lo & ~63, hi | 63) for sp, lo, hi in rs]
 
 
 def _p(a, w):
@@ -144,7 +156,7 @@ def footprint(ins: I.Instr, R, D: int = 128, S: int = 1) -> Fp:
     elif op == I.STREAM:
         wr.append(_mk(SP_DRAM, w[1], 4 * 256 * 256)); wr.append(_mk(SP_DRAM, w[2], 4 * 256 * 256))
         wr.append(_mk(SP_TMEM, w[6], 256))
-        rd.append(_mk(SP_TMEM, (c[0] & 0xFFFF, c[0] & 0xFFFF), 8))
+        rd.append(_mk(SP_TMEM, ((c[0] & 0xFFFF,) * 2), 8))
         rd.append(_mk(SP_TMEM, w[3], 4 * 256)); rd.append(_mk(SP_TMEM, w[4], 256))
         rd.append(_mk(SP_TMEM, w[5], (c[0] >> 16) + 1))
     elif op == I.DSTEP:
@@ -221,7 +233,7 @@ def footprint(ins: I.Instr, R, D: int = 128, S: int = 1) -> Fp:
         rd.append(_mk(SP_TMEM, w[0], 1))
     elif op == I.WAITW:
         wr.append(_mk(SP_DRAM, (0, 0), M32)); wr.append(_mk(SP_TMEM, w[1], 1))
-    return Fp(False, tuple(x for x in rd if x), tuple(x for x in wr if x))
+    return Fp(False, tuple(x for rs in rd for x in rs), tuple(x for rs in wr for x in rs))
 
 
 def _ov(a, b):
@@ -319,6 +331,7 @@ class _Pass:
         self.prog, self.D, self.S = prog, D, S
         self.rld = rld or {}
         self.kmin = np.full((len(prog), NW), KMAX + 1, np.int64)
+        self.vmask = np.zeros(len(prog), np.int64)
         self.seen = np.zeros(len(prog), bool)
         self.visits = 0
         self.budget = budget
@@ -351,17 +364,19 @@ class _Pass:
         km = self.kmin[pc]
         for j in range(NW):
             uj = WUNIT[j]
-            if j >= NUNITS and op != I.MM:
+            if (j >= NUNITS and op != I.MM) or uj == u or uj == U_VPU:
                 continue
-            if uj == u and u != U_VPU:
-                continue
-            h = st.H[uj]
-            for i, e in enumerate(h):
+            for i, e in enumerate(st.H[uj]):
                 if i + 1 >= km[j]:
                     break
                 if conflict(fp, e, dram_only=j >= NUNITS):
                     km[j] = i + 1
                     break
+        m = int(self.vmask[pc])
+        for i, e in enumerate(st.H[U_VPU]):
+            if not m >> i & 1 and conflict(fp, e):
+                m |= 1 << i
+        self.vmask[pc] = m
         H = list(st.H)
         H[u] = (fp,) + H[u][:KMAX - 1]
         R = st.R
@@ -387,7 +402,7 @@ class _Pass:
     def loop(self, at, lo, hi, st: _State) -> _State | None:
         ins = self.prog[at]
         self.visits += 1
-        cnt = _add((0, 0) if ins.ra == 0 else st.R[ins.ra], ins.w[1])
+        cnt = _span(_add((0, 0) if ins.ra == 0 else st.R[ins.ra], ins.w[1]))
         clo, chi = cnt
         exits = st if clo == 0 else None
         cap = CAP if clo != chi else chi
@@ -426,21 +441,41 @@ class _Pass:
         return exits
 
 
+def arg_ranges(run_args) -> dict:
+    """{register: values} of a program's run-time arguments (compiler.Builder.run_args: argument
+    k, c * var, in R15 - k): c * [0, var.bound) where the variable has a bound, else any."""
+    out = {}
+    for k, (v, c) in enumerate(run_args or []):
+        bound = getattr(v, "bound", None)
+        if bound:
+            lo, hi = sorted((0, int(c) * (int(bound) - 1)))
+            out[15 - k] = _norm(lo, hi)
+    return out
+
+
 def wait_counts(prog: list, D: int = 128, S: int = 1, args=None, rld: dict | None = None,
-                budget: int = BUDGET, stats: dict | None = None) -> np.ndarray:
-    """The wait words of a program (uint32 per instruction). args: the run's arguments if known
-    (R8..R15; default unknown), rld: {pc: (lo, hi)} the values an RLD may load (default
-    unknown). stats: filled with the visits and the loops run on widened registers."""
+                budget: int = BUDGET, stats: dict | None = None,
+                run_args=None) -> np.ndarray:
+    """The wait entries of a program (uint64 per instruction: the counts' word, the VPU mask's
+    word above it). args: the run's arguments if known (R8..R15); else run_args (default: the
+    program's own, compiler.Program.run_args) bounds those whose variable has a bound, and the
+    others are unknown. rld: {pc: (lo, hi)} the values an RLD may load (default unknown).
+    stats: filled with the visits and the loops run on widened registers."""
     R = [(0, 0)] * 8 + [TOP] * 8
     if args is not None:
         a = list(args) + [0] * (8 - len(args))
         R = [(0, 0)] * 8 + [(int(x) & M32,) * 2 for x in a[:8]]
+    else:
+        for r, v in arg_ranges(run_args if run_args is not None
+                               else getattr(prog, "run_args", None)).items():
+            R[r] = v
     p = _Pass(prog, D, S, rld, budget)
     p.block(0, len(prog), _State(R, ((),) * NUNITS))
-    k = np.where(p.kmin > KMAX, 0, p.kmin).astype(np.uint32)
-    words = np.zeros(len(prog), np.uint32)
+    k = np.where(p.kmin > KMAX, 0, p.kmin).astype(np.uint64)
+    words = p.vmask.astype(np.uint64) << np.uint64(32)
     for j in range(NW):
-        words |= k[:, j] << np.uint32(4 * j)
+        if WUNIT[j] != U_VPU:
+            words |= k[:, j] << np.uint64(4 * j)
     for pc, ins in enumerate(prog):
         if ins.op in UNIT and not p.seen[pc]:
             words[pc] = DEFAULT
@@ -450,22 +485,29 @@ def wait_counts(prog: list, D: int = 128, S: int = 1, args=None, rld: dict | Non
     return words
 
 
-def counts(word: int) -> list:
-    return [(int(word) >> (4 * j)) & 15 for j in range(NW)]
+def counts(entry: int) -> list:
+    """An entry's seven counts (k_3 is 0: the VPU's is the mask)."""
+    return [(int(entry) >> (4 * j)) & 15 for j in range(NW)]
+
+
+def vmask(entry: int) -> int:
+    """An entry's VPU mask: bit r - 1, the r-th last VPU instruction."""
+    return (int(entry) >> 32) & VMASK
 
 
 def sync_file(words, path) -> None:
-    """otpu_seq's +hz_sync file: lines 'pc k0 .. k6 n' (n unused)."""
+    """otpu_seq's +hz_sync file: lines 'pc k0 .. k6 n mask' (n unused)."""
     with open(path, "w") as f:
         for pc, w in enumerate(words):
-            f.write(f"{pc} " + " ".join(str(x) for x in counts(w)) + " 0\n")
+            f.write(f"{pc} " + " ".join(str(x) for x in counts(w)) + f" 0 {vmask(w)}\n")
 
 
 # ------------------------------------------------------------------------- checking
 class Checker:
-    """Checks wait words on a concrete execution: feed it each unit instruction as it issues in
-    program order (pc, the registers then). A conflict with an older instruction of another
-    unit (or the VPU's own) within KMAX of its unit that the counts do not wait for raises."""
+    """Checks wait entries on a concrete execution: feed it each unit instruction as it issues
+    in program order (pc, the registers then). A conflict with an older instruction of another
+    unit (or a VPU instruction's with an older one) within KMAX of its unit that the entry does
+    not wait for raises."""
 
     def __init__(self, prog, words, D: int = 128, S: int = 1):
         self.prog, self.words, self.D, self.S = prog, words, D, S
@@ -480,11 +522,17 @@ class Checker:
         R = [(int(x) & M32,) * 2 for x in regs]
         fp = footprint(ins, R, self.D, self.S)
         k = counts(self.words[pc])
+        m = vmask(self.words[pc])
+        for i, (e, epc) in enumerate(self.H[U_VPU]):
+            if not m >> i & 1 and conflict(fp, e):
+                raise AssertionError(
+                    f"waits: pc {pc} ({I.OPNAMES.get(ins.op)}) VPU mask {m:#06x} misses the "
+                    f"{i + 1}-th last VPU instruction (pc {epc})")
         for j in range(NW):
             uj = WUNIT[j]
-            if (j >= NUNITS and ins.op != I.MM) or (uj == u and u != U_VPU):
+            if (j >= NUNITS and ins.op != I.MM) or uj == u or uj == U_VPU:
                 continue
-            for i, (e, epc) in enumerate(self.H[uj][:KMAX]):
+            for i, (e, epc) in enumerate(self.H[uj]):
                 if conflict(fp, e, dram_only=j >= NUNITS):
                     if k[j] == 0 or k[j] > i + 1:
                         raise AssertionError(

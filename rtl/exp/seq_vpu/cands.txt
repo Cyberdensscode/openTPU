@@ -29,6 +29,11 @@ w12 OTPU_SIM_PLUSARGS=+hz_win=12
 # ---- (a) explicit dependencies: in-order units (exact dependencies = per-instance wait counts),
 # then per-pc wait counts from the oracle (what a compiler without loop peeling would emit)
 ino OTPU_SIM_PLUSARGS=+hz_ino=1 HZLOG=1
+# one unit at a time in order (the exact dependencies): DMA, QUANT, VPU, QUANT and VPU
+inod OTPU_SIM_PLUSARGS=+hz_inom=1
+inoq OTPU_SIM_PLUSARGS=+hz_inom=4
+inov OTPU_SIM_PLUSARGS=+hz_inom=8
+inoqv OTPU_SIM_PLUSARGS=+hz_inom=12
 wc OTPU_SIM_PLUSARGS=+hz_ino=1 WC=1 HZLOG=1
 # fewer bits a count: 2-bit fields (k clamped to 3), one bit a unit (k clamped to 1: wait for
 # all of the unit's older instructions)
@@ -44,10 +49,25 @@ wcr OTPU_SEQ_WC=1 SYNC=1 HZLOG=1
 wcr1 OTPU_SEQ_WC=1 OTPU_SIM_PLUSARGS=+hz_kclamp=1 SYNC=1
 # the resident decode's counts from position 544 at 700 (lists/resident.txt)
 wcx OTPU_SEQ_WC=1 SYNCFROM=dr_q3
-# the compiler's counts (opentpu.waits: from the program alone, the run's arguments unknown;
-# wcca: known), the RTL's check that they cover every conflict on the window
-wcc OTPU_SEQ_WC=1 OTPU_WAITS=1 HZLOG=1
-wcca OTPU_SEQ_WC=1 OTPU_WAITS=args
+# earlier designs, run on the trees that had them (OTPU_WC_OOO is gone): the compiler's counts
+# with every unit in order (8f6b749e: wcc, the run's arguments unknown; wcca: known), and with
+# the VPU out of order on a completion watermark (wcv)
+wcc OTPU_SEQ_WC=1 OTPU_WAITS=1 HZLOG=1 OTPU_WC_OOO=0
+wcca OTPU_SEQ_WC=1 OTPU_WAITS=args OTPU_WC_OOO=0
+wcv OTPU_SEQ_WC=1 OTPU_WAITS=1 HZLOG=1
+# WAITC as built: the VPU starts its oldest ready instruction and the others wait for its
+# producers by a mask; the compiler's entries (opentpu.waits: from the program alone, the run's
+# arguments bounded by their variables, compiler.Program; wcma: known), the RTL's check that
+# they cover every conflict on the window
+wcm OTPU_SEQ_WC=1 OTPU_WAITS=1 HZLOG=1
+wcma OTPU_SEQ_WC=1 OTPU_WAITS=args
+# where WAITC's cost is: the oracle's counts with the DMA and the quantizer in order and the VPU
+# out of order (wc5), a VPU producer's dependencies exact instead of its count for every consumer
+# (wcvx1), for a VPU consumer only (wcvx2), for the other units' consumers only (wcvx3)
+wc5 OTPU_SIM_PLUSARGS=+hz_inom=5 WC=1
+wcvx1 OTPU_SIM_PLUSARGS=+hz_inom=5,+hz_wcvx=1 WC=1 HZLOG=1
+wcvx2 OTPU_SIM_PLUSARGS=+hz_inom=5,+hz_wcvx=2 WC=1
+wcvx3 OTPU_SIM_PLUSARGS=+hz_inom=5,+hz_wcvx=3 WC=1
 # per-unit queues instead of the shared window (caps per unit: DMA, MXU, QUANT, VPU, COLL)
 inoq4 OTPU_SIM_PLUSARGS=+hz_ino=1,+hz_uq=4:4:4:4:2
 wcq4 OTPU_SIM_PLUSARGS=+hz_ino=1,+hz_uq=4:4:4:4:2 WC=1

@@ -39,11 +39,13 @@ module otpu_seq
   parameter int WIN        = 16,
   parameter bit STREAMS    = 1'b1,    // the stream engine (otpu_slice HAS_SS); 0: DSTEP and STREAM
                                       //   are illegal instructions (ERROR), not a wait for SE
-  // EXPERIMENTAL (docs/seq_vpu.md): WAITC 1 takes the dependencies from wait counts the compiler
-  // writes beside each instruction (a sidecar word per instruction: 4 bits per unit, k = 0 no
-  // wait, else wait until the unit's k-th last instruction before this one has completed; and
-  // the MM's stream start's k for the DMA and the quantizer) instead of comparing footprints:
-  // no footprints, no range compares, every unit in order. 0: today's scoreboard.
+  // EXPERIMENTAL (docs/seq_vpu.md, docs/isa.md "Wait counts"): WAITC 1 takes the dependencies
+  // from a wait entry the compiler writes beside each instruction instead of comparing
+  // footprints: per in-order unit (DMA, MXU, QUANT, COLL) a 4-bit count k (0: no wait, else
+  // until the unit's k-th last instruction before this one has completed; and the MM's stream
+  // start's k for the DMA and the quantizer), and for the VPU, which starts its oldest ready
+  // instruction, a mask of the VPU instructions 1..15 back it waits for. No footprints, no range
+  // compares. 0: today's scoreboard.
   parameter bit WAITC      = 1'b0
 ) (
   input  logic                clk,
@@ -67,10 +69,11 @@ module otpu_seq
   input  logic                im_we,
   input  logic [31:0]         im_row,
   input  logic [D*8-1:0]      im_data,
-  // WAITC: the wait counts' write port (a row of D / 32 sidecar words)
+  // WAITC: the wait entries' write port (the loader: a row of 4 64-bit entries as they are in
+  // DRAM, instructions 4 * sc_row .. 4 * sc_row + 3)
   input  logic                sc_we,
   input  logic [31:0]         sc_row,
-  input  logic [D-1:0]        sc_data
+  input  logic [255:0]        sc_data
 );
   localparam int SW = $clog2(WIN);
   localparam int IPR = D / 32;                   // instructions per IMEM row
@@ -257,7 +260,8 @@ module otpu_seq
   //   +hz_win=N            N window slots used;  +hz_uq=a:b:c:d:e: at most that many slots per
   //                        unit (DMA, MXU, QUANT, VPU, COLL; 0: no cap): per-unit queues
   //   +hz_ino=1            every unit starts its instructions in program order (as the MXU and the
-  //                        collective unit do today)
+  //                        collective unit do today);  +hz_inom=M: only the units of mask M (bit u:
+  //                        unit u; 1 DMA, 4 QUANT, 8 VPU)
   //   +hz_rob=1            window slots are freed in program order (a reorder buffer)
   //   +hz_wc=FILE          with +hz_ino: the dependencies from per-pc wait counts (FILE, written by
   //                        +hz_kout) instead of the ranges: wait until at most k_u - 1 of the
@@ -265,13 +269,16 @@ module otpu_seq
   //   +hz_kout=FILE        write the wait counts: per pc and unit, the least rank (1 = the unit's
   //                        last instruction) of an older instruction it conflicts with, over the
   //                        pc's dynamic instances (the compiler's static view, no loop peeling)
+  //   +hz_wcvx=X           with +hz_wc: a VPU producer's dependencies exact (the ranges) instead
+  //                        of its count: X = 1 for every consumer, 2 for a VPU consumer only (the
+  //                        VPU<-VPU case), 3 for the other units' consumers only
   //   +hz_kclamp=K         with +hz_wc: each count clamped to K (fewer bits a field: K = 1 is a
   //                        bit per unit, "wait for all its older instructions")
   //   +hz_kc=1             the oracle on the window's (coarsened) footprints: a compiler that
   //                        knows the ranges only to the granules of +hz_tg / +hz_dg
   //   +hz_log=FILE         hazard statistics at the end of the run (stall cycles by unit and by
   //                        what they wait for, dependencies by class and kind, rank histograms)
-  int  hz_tg = 0, hz_dg = 0, hz_win = 0, hz_kclamp = 0;
+  int  hz_tg = 0, hz_dg = 0, hz_win = 0, hz_kclamp = 0, hz_inom = 0, hz_wcvx = 0;
   bit  hz_rh = 0, hz_dh = 0, hz_ino = 0, hz_rob = 0, hz_wc = 0, hz_cs = 0, hz_kc = 0;
   int  hz_uq [NUNITS];
   initial begin
@@ -280,10 +287,14 @@ module otpu_seq
     void'($value$plusargs("hz_dg=%d", hz_dg));
     void'($value$plusargs("hz_win=%d", hz_win));
     void'($value$plusargs("hz_kclamp=%d", hz_kclamp));
+    void'($value$plusargs("hz_wcvx=%d", hz_wcvx));
     hz_kc = $test$plusargs("hz_kc=1");
     hz_rh = $test$plusargs("hz_rh=1");
     hz_dh = $test$plusargs("hz_dh=1");
     hz_ino = $test$plusargs("hz_ino=1");
+    void'($value$plusargs("hz_inom=%d", hz_inom));
+    if (hz_inom != 0) hz_ino = 1'b1;
+    else if (hz_ino) hz_inom = (1 << U_DMA) | (1 << U_Q) | (1 << U_VPU);
     hz_rob = $test$plusargs("hz_rob=1");
     for (int u = 0; u < NUNITS; u++) hz_uq[u] = 0;
     if ($value$plusargs("hz_uq=%s", s))
@@ -385,38 +396,60 @@ module otpu_seq
       ir_v <= 1'b1;
     end
   end
-  // WAITC: the sidecar RAM of wait counts, read beside IMEM (the same rows, D / 32 words)
-  logic [31:0] ir_sync;           // the wait counts of the instruction at pc
+  // WAITC: the sidecar RAM of wait entries, read beside IMEM: rows of 4 entries of SWW bits
+  // (the counts' 28, the VPU mask's 15; 1024 x 172 bits for a 4096-instruction IMEM: five
+  // RAMB36). The loader writes a row from 4 entries as they are in DRAM (64 bits each: the
+  // counts' word, then the mask's)
+  localparam int SWW = 43;
+  localparam int NSROW = IMEM_WORDS / 32;
+  localparam int SRW = $clog2(NSROW);
+  logic [SWW-1:0] ir_sync;        // the wait entry of the instruction at pc
   if (WAITC) begin : g_sync
-    logic [D-1:0] srow;
-    otpu_ram_1r1w #(.W(D), .N(NROW), .STYLE("auto"), .ZERO(1'b0)) u_sync (
-      .clk, .we(sc_we), .wa(RW'(sc_row)), .wd(sc_data), .re(fe), .ra(RW'(fa_n / IPR)),
-      .rd(srow));
-    always_ff @(posedge clk) if (!rst && ld) ir_sync <= srow[32 * (fa % IPR) +: 32];
+    logic [4*SWW-1:0] srow, sc_pk;
+    logic         sc_off;         // simulation: +hz_sync's entries stay (the loader's are dropped)
+`ifdef SYNTHESIS
+    assign sc_off = 1'b0;
+`endif
+    always_comb
+      for (int e = 0; e < 4; e++)
+        sc_pk[SWW * e +: SWW] = {sc_data[64 * e + 32 +: 15], sc_data[64 * e +: 28]};
+    otpu_ram_1r1w #(.W(4 * SWW), .N(NSROW), .STYLE("auto"), .ZERO(1'b0)) u_sync (
+      .clk, .we(sc_we && !sc_off), .wa(SRW'(sc_row)), .wd(sc_pk), .re(fe),
+      .ra(SRW'(fa_n / 4)), .rd(srow));
+    always_ff @(posedge clk) if (!rst && ld) ir_sync <= srow[SWW * (fa % 4) +: SWW];
 `ifndef SYNTHESIS
-    // simulation: the wait counts from +hz_sync=FILE (lines "pc k0 .. k6 n", +hz_kout's form:
-    // the compiler's insertion emulated by the oracle), each clamped to +hz_kclamp; an
-    // instruction the file does not name waits for every unit's last instruction (k = 1)
+    // simulation: the wait entries from +hz_sync_s<SID>=FILE or +hz_sync=FILE (lines "pc k0 ..
+    // k6 n [mask]": opentpu.waits' with the VPU mask; +hz_kout's, the oracle's, without: the
+    // mask is then the VPU instructions k3 .. 15 back), each count clamped to +hz_kclamp; an
+    // instruction the file does not name waits for every unit's last instruction and the
+    // VPU's 15. With a file the loader's entries (boot, HALT CHAIN) are dropped
     initial begin
-      string fn;
-      int fd, pc, r, n, kc;
+      string fn, ln;
+      int fd, pc, r, n, kc, mk;
       int k [7];
       kc = 0;
+      fn = "";
       void'($value$plusargs("hz_kclamp=%d", kc));
-      for (int rr = 0; rr < NROW; rr++)
-        for (int w = 0; w < IPR; w++) u_sync.g_auto.mem[rr][32 * w +: 32] = 32'h0111_1111;
-      if ($value$plusargs("hz_sync=%s", fn)) begin
+      for (int rr = 0; rr < NSROW; rr++)
+        for (int w = 0; w < 4; w++) u_sync.g_auto.mem[rr][SWW * w +: SWW] = {15'h7fff, 28'h111_1111};
+      if (!$value$plusargs($sformatf("hz_sync_s%0d=%%s", SID), fn))
+        void'($value$plusargs("hz_sync=%s", fn));
+      sc_off = (fn != "");
+      if (fn != "") begin
         fd = $fopen(fn, "r");
         if (fd == 0) $fatal(1, "otpu_seq: +hz_sync=%s: cannot open", fn);
-        while (!$feof(fd)) begin
-          r = $fscanf(fd, "%d %d %d %d %d %d %d %d %d\n", pc, k[0], k[1], k[2], k[3], k[4],
-                      k[5], k[6], n);
+        while ($fgets(ln, fd) != 0) begin
+          mk = -1;
+          r = $sscanf(ln, "%d %d %d %d %d %d %d %d %d %d", pc, k[0], k[1], k[2], k[3], k[4],
+                      k[5], k[6], n, mk);
           if (r >= 8 && pc >= 0 && pc < IMEM_WORDS / 8) begin
-            logic [31:0] wd;
+            logic [SWW-1:0] wd;
             wd = '0;
             for (int j = 0; j < 7; j++)
               wd[4 * j +: 4] = 4'((kc > 0 && k[j] > kc) ? kc : (k[j] > 15) ? 15 : k[j]);
-            u_sync.g_auto.mem[pc / IPR][32 * (pc % IPR) +: 32] = wd;
+            if (r >= 10) wd[28 +: 15] = 15'(mk);
+            else if (k[3] > 0) wd[28 +: 15] = 15'h7fff << ((k[3] > 15 ? 15 : k[3]) - 1);
+            u_sync.g_auto.mem[pc / 4][SWW * (pc % 4) +: SWW] = wd;
           end
         end
         $fclose(fd);
@@ -474,12 +507,13 @@ module otpu_seq
   fp_t         q_fp;             // Q's footprint ranges (otpu_pkg form)
   fps_t        c_fp;
   logic        have_free;
-  wire         c_go = c_v && have_free;
+  logic        wc_hold;          // WAITC: a VPU instruction waits for the one 15 back
+  wire         c_go = c_v && have_free && !wc_hold;
   wire         q_adv = !c_v || c_go;            // Q hands its instruction to C
   wire         s_adv = !q_v || q_adv;           // S hands its instruction to Q
   // P hands its instruction to S (WAITC: to C, no footprint stages)
   wire         p_adv = WAITC ? (!c_v || c_go) : (!s_v || s_adv);
-  logic [31:0] p_sync, c_sync;                  // WAITC: the instruction's wait counts
+  logic [SWW-1:0] p_sync, c_sync;               // WAITC: the instruction's wait entry
   wire         r_take = !p_v || p_adv;          // P can take the instruction at R
   wire         pipe_empty = !p_v && !s_v && !q_v && !c_v;
   // R retires a control instruction this cycle (NOP, HALT, LI, ADDI, a LOOP's second cycle)
@@ -526,21 +560,34 @@ module otpu_seq
     if (WAITC) begin ndep = '0; ndepd = '0; end   // the wait counts instead (w_all, w_dram)
   end
 
-  // ---- WAITC: per unit, its instructions dispatched (wd_n) and completed (wc_n), and per slot
-  // the counts its waits need: wait j (j < NUNITS: unit j; 5, 6: the DMA's and the quantizer's
-  // for an MM's stream start) holds until wc_n of its unit reaches wt (its producer's index + 1;
-  // the counters wrap, so the test is on the sign of the difference: a slot's target stays
-  // within WIN of the count). The unit's own wait is ignored except the VPU's: every unit starts
-  // in order, and all but the VPU complete in order too.
+  // ---- WAITC: per unit, its instructions dispatched (wd_n) and, the in-order units, completed
+  // (wc_n: each completes its instructions in program order); per slot the counts its waits
+  // need: wait j (j < NUNITS: unit j; 5, 6: the DMA's and the quantizer's for an MM's stream
+  // start) holds until wc_n of its unit reaches wt (its producer's index + 1; the counters wrap,
+  // so the test is on the sign of the difference: a slot's target stays within WIN of the
+  // count). The unit's own wait is ignored: the unit starts in order. The VPU starts its oldest
+  // ready instruction and completes them out of order: a slot's VPU producers are a mask over
+  // the VPU instructions outstanding (vout, by index mod 16), cleared as each completes. A VPU
+  // instruction is dispatched once the one 15 before it has completed (wc_hold), so at most 15
+  // are outstanding and a mask of 15 names every one a later instruction may wait for.
   localparam int CW = 8;
   localparam int NWT = NUNITS + 2;
   logic [CW-1:0]    wd_n [NUNITS], wc_n [NUNITS];
+  logic [15:0]      vout;                     // VPU instructions outstanding (index mod 16)
+  logic [15:0]      vpend [WIN];              // a slot's VPU producers still outstanding
+  logic [3:0]       vix [WIN];                // a VPU slot's index mod 16
+  logic [15:0]      v_fin;                    // the VPU's completion this cycle (index mod 16)
   logic [CW-1:0]    wt [WIN][NWT];
   logic [NWT-1:0]   wv [WIN];
   logic [WIN-1:0]   w_all, w_dram;            // the slot's waits (all / the stream's) are met
   function automatic int wunit(input int j);
     return (j < NUNITS) ? j : (j == NUNITS) ? U_DMA : U_Q;
   endfunction
+  always_comb begin
+    v_fin = '0;
+    if (udone[U_VPU]) v_fin[vix[uq[U_VPU][uq_h[U_VPU][SW-1:0]]]] = 1'b1;
+    wc_hold = WAITC && c_unit == U_VPU && vout[4'(wd_n[U_VPU] + 1'b1)];
+  end
   always_comb
     for (int i = 0; i < WIN; i++) begin
       logic [NWT-1:0] ok;
@@ -549,7 +596,7 @@ module otpu_seq
         df = wc_n[wunit(j)] - wt[i][j];
         ok[j] = !wv[i][j] || !df[CW-1];
       end
-      w_all[i] = &ok[NUNITS-1:0];
+      w_all[i] = &ok[NUNITS-1:0] && vpend[i] == '0;
       w_dram[i] = ok[NUNITS] && ok[NUNITS+1];
     end
 
@@ -661,13 +708,15 @@ module otpu_seq
       else    // cand already requires readiness
         can_start[u] = cand_any[u] && urdy[u] && !ustart[u];
     end
-    // WAITC: every unit considers its oldest instruction only (the wait counts suppose it)
+    // WAITC: the VPU starts its oldest ready instruction (its waits met), the others their
+    // oldest only
     if (WAITC)
       for (int u = 0; u < NUNITS; u++)
         if (u != U_MXU && u != U_COLL) begin
           logic [WIN-1:0] c2;
           start_slot[u] = '0;
-          for (int i = 0; i < WIN; i++) c2[i] = sv[i] && !sstarted[i] && soh[i][u];
+          for (int i = 0; i < WIN; i++)
+            c2[i] = sv[i] && !sstarted[i] && soh[i][u] && (u != U_VPU || w_all[i]);
           for (int i = 0; i < WIN; i++) begin
             sel[u][i] = c2[i] && (older[i] & c2) == '0;
             if (sel[u][i]) start_slot[u] |= SW'(i);
@@ -680,7 +729,7 @@ module otpu_seq
     // MXU and the collective unit do
     if (hz_ino)
       for (int u = 0; u < NUNITS; u++)
-        if (u != U_MXU && u != U_COLL) begin
+        if (u != U_MXU && u != U_COLL && hz_inom[u]) begin
           logic [WIN-1:0] c2, r2;
           start_slot[u] = '0;
           for (int i = 0; i < WIN; i++) begin
@@ -773,6 +822,7 @@ module otpu_seq
       for (int i = 0; i < 8; i++) R[8 + i] <= rinit[i];
       for (int u = 0; u < NUNITS; u++) begin uq_h[u] <= '0; uq_t[u] <= '0; end
       for (int u = 0; u < NUNITS; u++) begin wd_n[u] <= '0; wc_n[u] <= '0; end
+      vout <= '0;
       for (int i = 0; i < WIN; i++) sdep[i] <= '0;
 `ifndef SYNTHESIS
       sdone <= '0;
@@ -823,16 +873,27 @@ module otpu_seq
       end
 `endif
 `ifndef SYNTHESIS
-      // WAITC: the wait counts cover every dependency conflict() finds on the window (a slot
-      // of the same unit, but the VPU, needs none: it started first)
+      // WAITC: the wait entry covers every dependency conflict() finds on the window (a slot
+      // of the same unit, but the VPU, needs none: it started first); a VPU slot is at most 15
+      // back
       if (WAITC && c_go) begin
         for (int i = 0; i < WIN; i++)
           if (sv[i] && !fin[i]) begin
             int ui;
             ui = 0;
             for (int u = 0; u < NUNITS; u++) if (soh[i][u]) ui = u;
+            if (ui == U_VPU) begin
+              logic [CW-1:0] rk;
+              rk = wd_n[U_VPU] - sidx[i];
+              if (rk == 0 || rk > 15)
+                $fatal(1, "otpu_seq: WAITC: pc %0d: VPU slot %0d (pc %0d) %0d back", c_pc, i,
+                       spc[i], rk);
+              if (conflict(c_ref, sfp_ref[i]) && !c_sync[28 + int'(rk) - 1])
+                $fatal(1, "otpu_seq: WAITC: pc %0d's VPU mask %h misses slot %0d (pc %0d, %0d back)",
+                       c_pc, c_sync[28 +: 15], i, spc[i], rk);
+            end
             for (int j = 0; j < NWT; j++)
-              if (wunit(j) == ui && !(ui == int'(c_unit) && ui != U_VPU) &&
+              if (wunit(j) == ui && ui != int'(c_unit) && ui != U_VPU &&
                   ((j < NUNITS) ? conflict(c_ref, sfp_ref[i]) :
                    c_cmd.op == OP_MM && conflict_dram(c_ref, sfp_ref[i]))) begin
                 logic [3:0] k;
@@ -872,7 +933,11 @@ module otpu_seq
         end
 `endif
       for (int u = 0; u < NUNITS; u++) if (udone[u]) uq_h[u] <= uq_h[u] + 1;
-      for (int u = 0; u < NUNITS; u++) if (WAITC && udone[u]) wc_n[u] <= wc_n[u] + 1'b1;
+      if (WAITC) begin
+        for (int u = 0; u < NUNITS; u++) if (udone[u] && u != U_VPU) wc_n[u] <= wc_n[u] + 1'b1;
+        vout <= (vout & ~v_fin) | ((c_go && c_unit == U_VPU) ? 16'(1) << wd_n[U_VPU][3:0] : '0);
+        for (int i = 0; i < WIN; i++) vpend[i] <= vpend[i] & ~v_fin;
+      end
       // readiness (for the profiler: when did the dependencies clear)
       for (int i = 0; i < WIN; i++)
         if (sv[i] && !sready[i] && (WAITC ? w_all[i] : sdep[i] == '0)) begin
@@ -907,12 +972,19 @@ module otpu_seq
         sdepd[free_slot] <= ndepd;
         sfp[free_slot] <= c_fp;
         if (WAITC) begin
+          logic [15:0] m;
           for (int j = 0; j < NWT; j++) begin
             logic [3:0] k;
             k = c_sync[4 * j +: 4];
-            wv[free_slot][j] <= k != 0 && !(wunit(j) == int'(c_unit) && c_unit != U_VPU);
+            wv[free_slot][j] <= k != 0 && wunit(j) != int'(c_unit) && wunit(j) != U_VPU;
             wt[free_slot][j] <= wd_n[wunit(j)] - CW'(k) + 1'b1;
           end
+          // the VPU mask: bit r - 1 names the VPU instruction r back (index wd_n - r)
+          m = '0;
+          for (int r = 1; r < 16; r++)
+            if (c_sync[28 + r - 1]) m[4'(wd_n[U_VPU] - CW'(r))] = 1'b1;
+          vpend[free_slot] <= m & vout & ~v_fin;
+          vix[free_slot] <= 4'(wd_n[c_unit]);
           wd_n[c_unit] <= wd_n[c_unit] + 1'b1;
         end
 `ifndef SYNTHESIS
@@ -1149,6 +1221,13 @@ module otpu_seq
           if (u == int'(c_unit) && u != U_VPU) begin k = 0; kd = 0; end   // started first
           wc_dep[i] = k != 0 && y >= k - 1;
           wc_depd[i] = (c_cmd.op == OP_MM) ? (kd != 0 && y >= kd - 1) : wc_dep[i];
+          if (u == U_VPU && (hz_wcvx == 1 || (hz_wcvx == 2 && c_unit == U_VPU) ||
+                             (hz_wcvx == 3 && c_unit != U_VPU))) begin
+            logic [1:0] cf;
+            cf = conf_s(c_fp, sfp[i]);
+            wc_dep[i] = cf[1];
+            wc_depd[i] = cf[0];
+          end
         end
   end
 

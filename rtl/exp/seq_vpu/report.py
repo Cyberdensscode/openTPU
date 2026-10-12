@@ -39,7 +39,7 @@ def runs(out: Path) -> dict:
         js = [j for j in js if "cycles" in j]
         if js:
             for j in js:
-                row = wl if len(js) == 1 else f"{wl}#{j.get('layer', j.get('prefix'))}"
+                row = wl if len(js) == 1 else f"{wl}#{j.get('prefix', j.get('layer'))}"
                 res[(row, cand)] = (int(j["cycles"]), bad)
             continue
         m = re.search(r"^\S.*?: (\d+) cycles, roofline", t, re.M)

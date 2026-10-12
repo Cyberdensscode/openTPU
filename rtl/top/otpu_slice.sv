@@ -139,6 +139,9 @@ module otpu_slice
   logic urel;
   logic im_we;
   logic [31:0] im_row;
+  logic sc_we;                    // SEQ_WC: the loader's sidecar row (wait entries)
+  logic [31:0] sc_row;
+  logic [255:0] sc_data;
   seq_ev_t sq_ev;
   logic        srst;              // the sequencer's and the units' reset: rst, a CHAIN reload, or
                                   //   a WAITW timeout (to_err)
@@ -150,8 +153,7 @@ module otpu_slice
     .clk, .rst(srst), .ucmd, .ustart, .urel, .urdy, .udone, .halted(sq_halted), .error(sq_err),
     .icount(sq_icount), .ev(sq_ev), .rinit, .rl_v, .rl_val, .ch_req(sq_ch), .ch_addr(sq_cha),
     .ch_n(sq_chn), .im_we, .im_row, .im_data(b_rdata),
-    // the wait counts' loader port: not wired yet (simulation loads them, +hz_sync)
-    .sc_we(1'b0), .sc_row('0), .sc_data('0));
+    .sc_we, .sc_row, .sc_data);
 
   // ---- HALT CHAIN: reload IMEM from the chained program's address, the units held in reset.
   // A WAITW timeout (dma_err) stops the slice until rst: to_err holds the sequencer and the
@@ -185,19 +187,29 @@ module otpu_slice
   end
 
   // ---- program loader (see the top): ld_go once the DRAM had no read in flight; ld_ch: a HALT
-  // CHAIN reload (rst stops it). While busy the loader has port B to itself
+  // CHAIN reload (rst stops it). While busy the loader has port B to itself.
+  // SEQ_WC (docs/isa.md "Wait counts"): the program's wait entries follow its instructions in
+  // DRAM (from the next chunk on, 64 bits per instruction), and the loader reads them into the
+  // sequencer's sidecar RAM after the instructions, 4 entries a row: each chunk is read D / 32
+  // times, each read writing one row (its 256-bit part), so no chunk is held
   localparam int IPR = D / 32;
-  logic [31:0] ld_rows, ld_iss, ld_cmp, ld_a;
+  logic [31:0] ld_rows, ld_tot, ld_iss, ld_cmp, ld_a;
   logic        ld_go, ld_ch;
-  wire ld_req = ld_busy && ld_go && ld_iss < ld_rows;
+  wire ld_req = ld_busy && ld_go && ld_iss < ld_tot;
   wire [31:0] ld_n_s = ld_start ? ld_n : c_n;
-  assign im_we  = ld_busy && ld_go && b_rvalid;
+  wire        ld_wt = SEQ_WC && ld_cmp >= ld_rows;     // this read is a row of wait words
+  wire [31:0] ld_sr = ld_cmp - ld_rows;                 // its sidecar row
+  assign im_we  = ld_busy && ld_go && b_rvalid && !ld_wt;
   assign im_row = ld_cmp;
+  assign sc_we  = ld_busy && ld_go && b_rvalid && ld_wt;
+  assign sc_row = ld_sr;
+  assign sc_data = b_rdata[256 * (ld_sr % IPR) +: 256];
   always_ff @(posedge clk) begin
     if (sys_rst) begin
       ld_busy <= 1'b0;
     end else if (ld_start || (c_ld && !ld_busy)) begin
       ld_rows <= (ld_n_s + IPR - 1) / IPR;
+      ld_tot <= (ld_n_s + IPR - 1) / IPR + (SEQ_WC ? (ld_n_s + 3) / 4 : 0);
       ld_iss <= '0; ld_cmp <= '0;
       ld_a <= (ld_start ? ld_addr : c_addr) >> 2;
       ld_busy <= (ld_n_s != 0);
@@ -209,11 +221,12 @@ module otpu_slice
       else begin
         if (ld_req && b_rdy) begin
           ld_iss <= ld_iss + 1;
-          ld_a <= ld_a + D / 4;
+          // the next chunk; a chunk of wait words after its D / 32 reads
+          if (ld_iss < ld_rows || (ld_iss - ld_rows) % IPR == IPR - 1) ld_a <= ld_a + D / 4;
         end
         if (b_rvalid) begin
           ld_cmp <= ld_cmp + 1;
-          if (ld_cmp + 1 == ld_rows) ld_busy <= 1'b0;
+          if (ld_cmp + 1 == ld_tot) ld_busy <= 1'b0;
         end
       end
     end

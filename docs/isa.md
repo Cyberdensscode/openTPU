@@ -465,6 +465,64 @@ stays set, CYCLES counts, ICOUNT adds the programs' instructions up); the host s
 The reload is the program loader's DRAM read of the new program, once per chained program. The decode loop's program of an attention
 bucket chains to the next bucket's.
 
+### Wait counts (WAITC builds)
+
+A build with `otpu_seq` WAITC (`SEQ_WC`, EXPERIMENTAL, docs/seq_vpu.md) does not find the
+dependencies between instructions itself: each instruction carries a 64-bit **wait entry** that
+says which older instructions it waits for. The machine model does not change: a program whose
+wait entries are correct runs as if every instruction completed before the next started, the
+units overlapping wherever the waits allow. A wrong wait entry is a wrong program (its results
+are undefined), like an out-of-range address.
+
+**Semantics.** An entry is two words: the counts' word, seven 4-bit counts `k_j = w0[4j+3:4j]`
+(bits 28..31 are 0), and the VPU mask's word, `vmask = w1[14:0]` (bits 15..31 are 0). The units
+are U0 DMA (`LD ST DSTEP STREAM WAITW`), U1 MXU (`MM`), U2 quantizer (`QACT QST`), U3 VPU
+(`VOP`), U4 collective (`BAR GATHER RLD`); control instructions (`NOP HALT LI ADDI LOOP`) have
+no entry that matters.
+- `k_j > 0`, j = 0, 1, 2, 4: the instruction does not start (an `MM`: is not released to read
+  the ACT RAM and write TMEM) until the `k_j`-th last instruction of unit Uj before it in program
+  order has completed, and with it every older instruction of Uj. These units start their
+  instructions in program order and complete them in order.
+- `k_5`, `k_6`: the same for an `MM`'s weight stream (its DRAM reads), on U0 and U2.
+- `k_3` is 0: the VPU's waits are the mask. Bit `r - 1` of `vmask` (r = 1..15): the instruction
+  does not start (an `MM`: is not released) until the r-th last `VOP` before it has completed.
+  The VPU starts the oldest of its instructions whose waits are met, so `VOP`s complete out of
+  order: the mask names each `VOP` the instruction depends on (a `VOP`'s own included), not the
+  nearest and all older.
+- `k_j = 0`: no wait on that unit; an instruction's own unit needs none, except the VPU's (its
+  mask): the DMA, the MXU, the quantizer and the collective unit start their instructions in
+  order and finish one's memory accesses before the next one's begin.
+- Nothing past 15 is ever needed. On a unit that starts in order, an instruction 16 or more
+  instructions of its unit back has completed: the sequencer's window holds 16 instructions,
+  and that one and its 15 younger ones of the unit would all hold one. A `VOP` is dispatched
+  only once the `VOP` 15 before it has completed, so the 16th last `VOP` has completed too.
+
+A correct wait entry waits, for every older instruction that may still run and whose footprint
+(the TMEM, DRAM and ACT RAM ranges it may read or write: `otpu_pkg` `footprint()`) conflicts
+with this instruction's (a read after a write, a write after a read, a write after a write,
+across units too), for that instruction (a `VOP`) or that one or a younger one of its unit
+(the other units). `BAR` conflicts with everything; `WAITW` writes all of DRAM.
+
+**Encoding.** The wait entries are not part of the 8-word instruction. A program image for a
+WAITC build is its instructions, padded to the next chunk (`D` bytes), then one 64-bit entry
+per instruction (the counts' word, then the mask's); the loader (RUN, `HALT CHAIN`) reads them
+into the sequencer's sidecar RAM after the instructions (`ld_n`, `R[rb]` count instructions,
+as before).
+
+**Compiler.** `opentpu/waits.py` `wait_counts(program)` computes them from the program alone:
+an abstract execution with the registers as intervals (the run's arguments bounded by their
+variables where the program says so, every RLD value unknown), each instruction's footprint
+over every value its registers may hold, and per unit the last 15 instructions' footprints,
+joined where paths can meet (a loop's exits, a count the program does not know); a pc's count
+is the smallest over all its visits, its mask the union. It is conservative: an unknown address
+conflicts with every address of its space.
+
+**ISA simulator.** `isasim` runs programs as before and ignores wait entries (they cannot change
+a correct program's result). With `OTPU_WAITS_CHECK=1` it checks each program's
+`wait_counts()` against the run: every conflict with an older instruction that may still be
+running must be waited for (`waits.Checker`). The RTL simulation checks the same in
+`otpu_seq` (`$fatal` on a conflict on the window that no count or mask bit covers).
+
 ### GATHER
 
 All slices must execute a `GATHER` with the same `dst` (the address `R[rb]+w2`, through any

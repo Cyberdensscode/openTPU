@@ -255,7 +255,7 @@ module otpu_vpu
     int n;
     n = is_reduce(func) ? 1 : comp_f(func) ? vt_comp : vt_ew;
     iss_thr = (n <= 1) || (vt_c % n == 0) || filling;
-    red_thr = (vt_red <= 1) || (vt_r % vt_red == 0);
+    red_thr = (vt_red <= 1) || !red_act || (vt_r % vt_red == 0);
   end
   always @(posedge clk) begin
     if (en && issuing) vt_c <= vt_c + 1;
