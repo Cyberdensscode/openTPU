@@ -7,6 +7,7 @@
 #   k7-v2  pumped, 3 copies (IMPL 0's slots)    k7-v3  pumped, 2 copies (4 banked slots)
 #   k7-v4  pumped, 1 copy (2 banked slots)      k7-v2x2  k7-v2 at 2x the words (128K)
 #   k7-v0x2  otpu_tmem IMPL 0 at 128K words (the BRAM count it would take)
+#   k7-v2-150  k7-v2 with the core at 150 MHz, the pumped copies at 300 (the margin)
 # xcku5p-ffvb676-2-e (the UltraScale+ stand-in), the core at 250 MHz, the pumped copies at 500:
 #   ku-v2b  pumped 3 copies, block RAM          ku-v2u  the same in UltraRAM
 #   ku-v1b  otpu_tmem IMPL 1 (3 copies of block RAM at 250 MHz)
@@ -39,6 +40,7 @@ for s in "$@"; do
     k7-v4)   viv $s 4 65536  $K7 block 7.5 8.0 8.0 4 ;;
     k7-v2x2) viv $s 2 131072 $K7 block 7.5 8.0 8.0 4 ;;
     k7-v0x2) viv $s 0 131072 $K7 block 7.5 8.0 8.0 4 ;;
+    k7-v2-150) viv $s 2 65536 $K7 block 7.5 9.0 8.0 4 ;;
     ku-v2b)  viv $s 2 65536  $KU block 4.0 4.0 4.0 2 ;;
     ku-v2u)  viv $s 2 65536  $KU ultra 4.0 4.0 4.0 2 ;;
     ku-v1b)  viv $s 1 65536  $KU block 4.0 4.0 4.0 2 ;;
