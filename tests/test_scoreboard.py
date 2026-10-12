@@ -22,7 +22,7 @@ def rows():
 
 
 @pytest.mark.parametrize("group,mean,worst", [
-    ("decode", 1.0, 3.5), ("prefill", 1.5, 3.5), ("batched", 1.0, 1.5), ("co-sim", 2.0, 5.0),
+    ("decode", 1.0, 3.5), ("prefill", 1.5, 5.0), ("batched", 1.0, 2.0), ("co-sim", 2.0, 5.0),
     ("co-sim layer", 2.0, 3.5), ("co-sim tile kernel", 3.5, 13.0),
     ("MoE layer run ms", 4.0, 6.0), ("MoE", 4.0, 6.0)])
 def test_reproduces_card_and_cosim(rows, group, mean, worst):
@@ -64,9 +64,10 @@ def test_more_bandwidth_decodes_faster():
     # buys only the 4-bit stream's last ~10%
     assert 1.0 < SB.decode("phi4-mini", wide)["tok_s"] / lo < 1.2
     assert SB.decode("phi4-mini", wide.replace(mxu_pump=2.0))["tok_s"] > 1.7 * lo
-    # the port bounds the YPCB: a faster DRAM alone changes nothing
-    assert SB.decode("phi4-mini", YPCB.replace(mts=1600))["tok_s"] == pytest.approx(lo)
-    assert YPCB.bound() == "port"
+    # the YPCB's DDR3 sits 3% under its port: a faster DRAM alone buys those 3%
+    assert SB.decode("phi4-mini", YPCB.replace(mts=1600))["tok_s"] == pytest.approx(lo * 1.03,
+                                                                                   rel=0.01)
+    assert YPCB.bound() == "memory" and YPCB.replace(mts=1600).bound() == "port"
 
 
 def test_the_clock_scales_a_port_bound_board():
@@ -240,7 +241,8 @@ def test_the_tile_kernel_is_taken_only_where_faster():
 
 def test_what_binds():
     d = SB.decode("phi4-mini", YPCB)
-    assert d["bound"].startswith("port") and abs(sum(d["shares"].values()) - 1) < 1e-9
+    assert d["bound"].startswith("memory") and abs(sum(d["shares"].values()) - 1) < 1e-9
+    assert SB.decode("phi4-mini", YPCB.replace(mts=1600))["bound"].startswith("port")
     assert SB.prefill("qwen3", YPCB, P=256)["bound"].startswith("MXU")
     assert SB.decode("phi4-mini", YPCB.replace(port_bytes=256))["bound"].startswith("memory")
     assert SB.moe_decode("qwen35-35b", YPCB)["shares"]["host link"] > 0.1

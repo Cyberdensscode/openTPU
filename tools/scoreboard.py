@@ -53,6 +53,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 MODELS_FILE = HERE / "scoreboard_models.json"
 RMAX_FILE = HERE / "scoreboard_rmax.json"
+COSIM_RUNS_FILE = HERE / "scoreboard_cosim_runs.jsonl"   # build/sbcosim.sh's runs (hwe-bench)
 D = 128                         # the MXU's depth, one weight block; the port's chunk is D bytes
 BLOCK = 256                     # the attention block: decode and prompt runs read whole blocks
 GB = 1e9
@@ -283,7 +284,7 @@ class HW:
     channels: int = 2               # memory channels a slice
     mem_eff: float = 0.97           # data share while streaming (the card: 8.04 K cycles a MB)
     port_bytes: int = 128           # core port bytes a cycle a slice
-    port_eff: float = 0.97
+    port_eff: float = 1.0            # the co-sim at an ideal memory: decode 4% faster than LiteDRAM
     gbps: float = 0.0               # a slice's peak memory GB/s (0: channels x mts x 8)
     fast_gb: float = 4.0            # GiB a slice holds for the model (32-bit addresses: 4)
     far_gbps: float = 0.0           # a second memory tier on the card (F2's DDR4)
@@ -364,7 +365,8 @@ def board(b: str = "ypcb", **kw) -> HW:
 # - attention streams a row's KV once a group of MCOLS query heads of a KV head (the code's
 #   parts: gemma4._attention, qwen3._attend_heads);
 # - run: cycles a device run; head_row: a logits row's sink (argmax / sampling);
-# - coll: S > 1, cycles a layer and row for the all-gathers (an estimate);
+# - coll: S > 1, cycles a layer and row for the all-gathers (the co-sim at S 2, Qwen3 at the
+#   port's rate: the layer halves, plus ~0.4 K at decode and ~1.5 K a row at R 4);
 # - moe_layer / moe_expert: a MoE layer's routing a row, an expert's start (the card's
 #   zero-miss layer runs); link_lead_ms: the host's time to see a decode layer's misses and
 #   start their DMA; a layer's link time past what the card hides (the dense MLP / shared
@@ -376,8 +378,11 @@ ROW_CYCLES = 7000.0
 CAL = {
     "kappa": {},                    # {model: (kappa_pass, kappa_row)}: KAPPA below
     "kappa_family": {},             # (the family's mean; set on first use)
-    "h": 0.0,                       # a row's overhead in a further pass, hidden but h
-    "vpu_share": 0.5,
+    "h": 0.14,                      # a row past the first MCOLS: its share of a row overhead
+    "over_form": "run",             # the overhead: "run" (kappa_pass a run, kappa_row a row)
+                                    # or "pass" (kappa_pass a weight pass, kappa_row the first
+                                    # MCOLS rows, h the rest's share)
+    "vpu_share": 0.8,
     "run": 5000.0,
     "head_row": 2000.0,
     "dstep_fill": 200.0,
@@ -389,8 +394,9 @@ CAL = {
     "att_blk": 0.0,                 # ... and a 256-token block of it (0: the KV stream binds)
     "tile_layer": 0.0,              # the tile kernel: cycles a layer and run outside the MXU
     "tile_row": 4874.0,             # ... and a row (x hidden / 1024)
-    "tile_card": 1.06,              # the card's prompt runs over compile_rows' co-sim
-    "coll": 1500.0,
+    "prompt_run": 1.0,              # a prompt run's layers over the model's (the card: 1.0)
+    "tile_card": 1.07,              # the tile kernel's prompt runs over its co-sim
+    "coll": 1000.0,
     "moe_layer": 6000.0,
     "moe_expert": 600.0,
     "link_lead_ms": 0.15,           # the host's lead a request (it sees it, starts the DMA)
@@ -400,9 +406,9 @@ CAL = {
 }
 
 
-KAPPA = {                           # `scoreboard.py fit` (2026-10-12, serial attention)
-    "gemma4": (3.7081, 0.8979), "lfm2": (0.0, 0.3077), "lfm2-2.6b": (0.4237, 0.3046),
-    "phi4-mini": (0.5064, 0.3276), "qwen3": (0.0, 0.8988), "qwen35": (0.0, 1.2847),
+KAPPA = {                           # `scoreboard.py fit` (2026-10-12: serial attention, a run + a row)
+    "gemma4": (3.7081, 0.8979), "lfm2": (0.0283, 0.2592), "lfm2-2.6b": (0.4237, 0.3046),
+    "phi4-mini": (0.5064, 0.3276), "qwen3": (0.266, 0.7267), "qwen35": (0.0, 1.2847),
     "qwen35-2b": (0.2813, 0.0), "qwen35-4b": (0.0, 0.0), "smollm3": (0.4908, 0.635)}
 CAL["kappa"].update(KAPPA)
 
@@ -450,13 +456,21 @@ def kappa(m: dict) -> tuple:
 
 
 def over_cycles(m: dict, hw: HW, R: int) -> float:
-    """A layer's overhead for a run of R rows at the configuration's vector unit."""
+    """A layer's overhead for a run of R rows at the configuration's vector unit.
+    over_form "run" (the default): kappa_pass a run, kappa_row every row (tiling's co-sim:
+    compile_rows' cycles a row are flat in R and MCOLS, the card's prompt runs 4-11% above);
+    the vector unit's share is vpu_share of the rows after the first (vpu-pump's co-sim:
+    every VOP's work halved takes 0.35% of decode and 2.7-4.3% of Qwen3's runs of 4).
+    over_form "pass": kappa_pass a weight pass, kappa_row a row of the first MCOLS, h the
+    rest's share."""
     kp, kr = kappa(m)
-    p = hw.rows_pass
-    reff = min(R, p) + CAL["h"] * max(0, R - p)
     s = CAL["vpu_share"]
-    return (kp * math.ceil(R / p) + kr * reff) * ROW_CYCLES * m["hidden"] / 1024 * \
-        (s / hw.vpu + 1 - s)
+    U = ROW_CYCLES * m["hidden"] / 1024
+    if CAL["over_form"] == "run":
+        return (kp + kr) * U + kr * (R - 1) * U * (s / hw.vpu + 1 - s)
+    p = hw.rows_pass
+    reff = min(R, hw.mcols) + CAL["h"] * max(0, R - hw.mcols)
+    return (kp * math.ceil(R / p) + kr * reff) * U * (s / hw.vpu + 1 - s)
 
 
 def dstep_cycles(lay: dict, hw: HW) -> float:
@@ -465,7 +479,7 @@ def dstep_cycles(lay: dict, hw: HW) -> float:
 
 
 def layer_cycles(m: dict, i: int, lay: dict, hw: HW, fmt: tuple, ctxs: list,
-                 experts: float | None = None, split: bool = False):
+                 experts: float | None = None, split: bool = False, prompt: bool = False):
     """Cycles of layer i (on each slice) for a run of len(ctxs) rows, row r at context
     ctxs[r]. experts: the distinct routed experts the run streams (MoE; default the rows'
     expected union). split: (cycles, {bytes, mem, mxu, rec, over})."""
@@ -477,7 +491,7 @@ def layer_cycles(m: dict, i: int, lay: dict, hw: HW, fmt: tuple, ctxs: list,
         wbytes += p * BITS[f] / 8
         mxu += mxu_cycles(p, f, R, hw)
     byts = math.ceil(R / hw.rows_pass) * wbytes
-    over = over_cycles(m, hw, R)
+    over = over_cycles(m, hw, R) / S          # the vector work splits with the heads (co-sim S 2)
     rec = att = 0.0
     tiled = hw.kernel == "tiled" and R > 1 and ctxs[-1] - ctxs[0] == R - 1   # a prompt run
     if lay["kind"] in ("attn", "sliding", "global"):
@@ -537,11 +551,13 @@ def layer_cycles(m: dict, i: int, lay: dict, hw: HW, fmt: tuple, ctxs: list,
         # MCOLS 4 and 8, T 4-16: the vector work it does not overlap, the MMs' fills)
         s_ = CAL["vpu_share"]
         over = (CAL["tile_layer"] + CAL["tile_row"] * R) * m["hidden"] / 1024 * \
-            (s_ / hw.vpu + 1 - s_) + (R * CAL["coll"] if S > 1 else 0.0)
-        # its co-sim is compile_rows-like; the card's prompt runs cost ~6% over that (their
-        # RunWords, mask loads, per-row V^T appends: tiling's slopes against the card's B0)
-        mxu *= CAL["tile_card"]
-        over *= CAL["tile_card"]
+            (s_ / hw.vpu + 1 - s_) / S + (R * CAL["coll"] if S > 1 else 0.0)
+        if prompt:
+            # fitted on its co-sim (compile_rows-like); a prompt run on the card costs more:
+            # the model's today's kernel (the card's prompt runs) sits ~7% above compile_rows'
+            # co-sim at every R and MCOLS (tiling's), the card's own compile_rows B0 4.7% under
+            mxu *= CAL["tile_card"]
+            over *= CAL["tile_card"]
     cyc = max(mem, mxu / S) + att + rec + over
     if split:
         return cyc, dict(bytes=byts + (kv if att and not tiled else 0.0), mem=mem, mxu=mxu / S,
@@ -581,18 +597,26 @@ def ple_cycles(m: dict, hw: HW, fmt: tuple, R: int) -> float:
 
 
 def run_cycles(m: dict, hw: HW, fmt: tuple, ctxs: list, logits: int = 1,
-               experts: float | None = None, split: bool = False):
+               experts: float | None = None, split: bool = False, prompt: bool = False):
     """Cycles of one device run: len(ctxs) rows through every layer, `logits` of them with
-    logits (the LM head streams once for them)."""
+    logits (the LM head streams once for them). prompt: a prompt run (prefill.run's run-time
+    rows: its run words, mask loads and per-row V^T appends cost CAL prompt_run over
+    compile_rows' layers)."""
     ple = ple_cycles(m, hw, fmt, len(ctxs))
     tot = CAL["run"] + ple
     parts = dict(bytes=0.0, mem=0.0, mxu=0.0, rec=0.0, over=CAL["run"], att=0.0, b_mem=0.0,
                  b_mxu=0.0)
+    lay_tot = 0.0
     for i, lay in layers(m):
-        c, p = layer_cycles(m, i, lay, hw, fmt, ctxs, experts, split=True)
-        tot += c
+        c, p = layer_cycles(m, i, lay, hw, fmt, ctxs, experts, split=True, prompt=prompt)
+        lay_tot += c
         for k in parts:
             parts[k] += p[k]
+    tot += lay_tot
+    if prompt and len(ctxs) > 1:
+        extra = lay_tot * (CAL["prompt_run"] - 1)
+        tot += extra
+        parts["over"] += extra
     if logits:
         tot += head_cycles(m, hw, fmt, logits)
     if split:
@@ -739,7 +763,7 @@ def prefill(name: str, hw: HW, wformat: str = "fp4", P: int = 1024, p0: int = 0)
         n = min(R, p0 + P - p, BLOCK - p % BLOCK if R < BLOCK else R)
         last = p + n >= p0 + P
         c, parts = run_cycles(m, hw, fmt, [p + r for r in range(n)], logits=1 if last else 0,
-                              split=True)
+                              split=True, prompt=True)
         cyc += c
         for k, v in parts.items():
             acc[k] = acc.get(k, 0.0) + v
@@ -1054,9 +1078,9 @@ CARD_DECODE = [   # (model, (layers, head, formats), Mcycles a token, MB a token
 ]
 CARD_PREFILL = [  # (model, formats, prompt P, rows a run, device Mcycles, source)
     ("qwen3", ("int8", "int8", ""), 236, 4, 288.0, "fmvf prompt runs, 59 runs"),
-    ("qwen3", ("int8", "int8", ""), 236, 8, 268.7, "fmvf, 30 runs of 8 (2 passes)"),
+    ("qwen3", ("int8", "int8", ""), 236, 8, 268.7, "fmvf off: compile_rows, 30 runs of 8"),
     ("lfm2", ("int8", "int8", ""), 238, 4, 96.5, "fmvf prompt runs, 60 runs"),
-    ("lfm2", ("int8", "int8", ""), 238, 8, 92.7, "fmvf, 31 runs"),
+    ("lfm2", ("int8", "int8", ""), 238, 8, 92.7, "fmvf off: compile_rows, 31 runs"),
     ("lfm2-2.6b", ("int8", "int8", "conv=fp4,mlp=fp4"), 238, 4, 1185.5, "fmvf prompt runs"),
     ("smollm3", ("int8", "int8", "gateup@9-35=fp4"), 291, 4, 1757.7,
      "fmvf prompt runs, 73 runs"),
@@ -1065,8 +1089,8 @@ CARD_PREFILL = [  # (model, formats, prompt P, rows a run, device Mcycles, sourc
     ("gemma4", ("int8", "int8", ""), 224, 4, 1056.2, "fmvf prompt runs, 56 runs"),
     ("qwen35-4b", ("fp4", "int8", ""), 237, 2, 2113.1, "fmvf, 119 runs"),
     ("qwen35-4b", ("fp4", "int8", ""), 237, 3, 2441.7, "fmvf, 79 runs"),
-    ("qwen35", ("fp4", "int8", ""), 237, 4, 412.8, "pa, 3.096 s, 60 runs"),
-    ("qwen35-2b", ("fp4", "int8", ""), 237, 4, 752.6, "pa, 5.645 s, 60 runs"),
+    ("qwen35", ("fp4", "int8", ""), 237, 4, 412.8, "pa: compile_rows, 3.096 s, 60 runs"),
+    ("qwen35-2b", ("fp4", "int8", ""), 237, 4, 752.6, "pa: compile_rows, 5.645 s, 60 runs"),
     # docs/prefill.md 7: a first prompt (A0) and a next turn of 13 tokens (B1), prompt runs
     ("qwen3", ("int8", "int8", ""), 24, 4, 30.5, "fmvf A0, 6 runs"),
     ("qwen3", ("int8", "int8", ""), 13, 4, 21.4, "fmvf B1, 4 runs", 267),
@@ -1099,11 +1123,19 @@ COSIM = [         # (model, formats, rows, position, cycles, what, hw overrides)
     ("qwen3", ("int8", "int8", ""), 0, 544, 5471471, "decode (litedram.md)", {}),
     ("lfm2", ("int8", "int8", ""), 0, 544, 2012426, "decode (litedram.md)", {}),
     ("qwen35", ("int8", "int8", ""), 0, 544, 6764651, "decode (litedram.md)", {}),
-    # the tiling agent's (tools/perf_tiled.py, branch tiled-prefill): today's kernel on the
-    # card's configuration, the first 2 layers, rows from 256, no logits; cycles a row x R
-    ("qwen3", ("fp4", "int8", ""), 4, 256, round(83.6e3 * 4), "2 layers, R 4 (tiling)", {},
-     2),
-]
+] + [  # the tiling agent's (tools/perf_tiled.py, branch tiled-prefill; otpu_seq's TAW fixed):
+       # today's compile_rows, ACT_ROWS max(MCOLS, R), the first 2 layers, rows from pos, no
+       # logits; cycles a row x R. The card's prompt runs cost ~6% more (tile_card)
+    ("qwen3", (f, "int8", ""), R, pos, round(c * 1e3 * R),
+     f"2 layers, MCOLS {mc}, R {R}" + (f" at {pos}" if pos != 256 else "") + " (tiling)",
+     {"mcols": mc, "act_rows": max(mc, R), "tmem_words": 65536 if R <= 8 else 262144}, 2)
+    for f, mc, pos, cs in (("fp4", 4, 256, (83.6, 82.6, 83.1, 84.7)),
+                           ("fp4", 8, 256, (57.7, 53.8, 53.0, 54.0)),
+                           ("int8", 4, 256, (89.2, 83.8, 83.8, 85.0)),
+                           ("int8", 8, 256, (89.2, 56.8, 54.5, 54.4)),
+                           ("fp4", 4, 1024, (110.8, None, None, None)),
+                           ("fp4", 8, 1024, (84.1, 82.0, None, None)))
+    for R, c in zip((4, 8, 16, 32), cs) if c]
 COSIM_TILED = [   # the tiling agent's tile kernel at TMEM 64K: Qwen3-0.6B, 2 layers, rows from
                   # pos, no logits; cycles a row (2026-10-12; its MXU 96-97% busy at MCOLS 4)
     ("qwen3", (f, "int8", ""), T, pos, round(c * 1e3 * T),
@@ -1169,7 +1201,8 @@ def points() -> list:
         p0 = p0[0] if p0 else 0
         at = f" at {p0}" if p0 else ""
         out.append(dict(group="prefill", model=name, fmt=fmt, runs=_prompt_runs(P, R, p0),
-                        hw={}, y=mc * 1e6, label=f"{name} {P} tokens{at}, R {R} ({src})"))
+                        hw={}, y=mc * 1e6, label=f"{name} {P} tokens{at}, R {R} ({src})",
+                        prompt="compile_rows" not in src))
     for name, fmt, R, ctx, ms, src in CARD_BATCH:
         out.append(dict(group="batched", model=name, fmt=fmt, runs=[([ctx] * R, R)], hw={},
                         y=ms * 133.33e3, label=f"{name} {R} rows at {ctx} ({src})"))
@@ -1181,7 +1214,7 @@ def points() -> list:
     for name, fmt, R, pos, cyc, what, kw, nl in COSIM_TILED:
         out.append(dict(group="co-sim tile kernel", model=name, fmt=fmt,
                         runs=[([pos + r for r in range(R)], 0)], hw=kw, y=cyc,
-                        label=f"{name} {fmt[0]} {what}", n_layers=nl, cosim_kernel=True))
+                        label=f"{name} {fmt[0]} {what}", n_layers=nl))
     for grp, rows in (("co-sim layer", LAYER_COSIM),
                       ("co-sim layer (compile_rows)", LAYER_COSIM_TILING)):
         for name, fmt, span, R, pos, cyc, src in rows:
@@ -1213,13 +1246,8 @@ def point_cycles(pt: dict) -> float:
                    for i in range(lo, hi)) / (hi - lo) / len(pt["ctxs"])
     if pt.get("n_layers"):
         m = truncated(m, pt["n_layers"])
-    save = CAL["tile_card"]
-    if pt.get("cosim_kernel"):                          # the co-sim's own kernel, no card cost
-        CAL["tile_card"] = 1.0
-    try:
-        return sum(run_cycles(m, hw, pt["fmt"], ctxs, logits=lg) for ctxs, lg in pt["runs"])
-    finally:
-        CAL["tile_card"] = save
+    return sum(run_cycles(m, hw, pt["fmt"], ctxs, logits=lg, prompt=pt.get("prompt", False))
+               for ctxs, lg in pt["runs"])
 
 
 def _with_kappa(name, k, f):
@@ -1319,6 +1347,10 @@ def validate(loo: bool = True) -> list:
         else:
             got = moe_prefill(name, hw, int(re.search(r"\((\d+)", q).group(1)))["ttft_s"]
         out.append(("MoE", f"{name} {q} ({src})", val, got, 100 * (got / val - 1), None))
+    if COSIM_RUNS_FILE.exists():
+        for x in cosim_layers(COSIM_RUNS_FILE):
+            out.append(("co-sim campaign", f"{x['what']}, {x['config']}", x["measured"] / 1e6,
+                        x["model"] / 1e6, x["error"], None))
     return out
 
 
