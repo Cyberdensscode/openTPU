@@ -40,8 +40,9 @@ def test_every_target_loads():
 
 
 def test_board_config_is_the_card_by_default(no_env):
-    """board_config() before targets: the same Config (its fields are in every cache key)."""
-    legacy = Config(S=1, D=128, MCOLS=4, ACT_BLOCKS=128, LANES=8, ACT_ROWS=0,
+    """board_config() before targets: the same Config (its fields are in every cache key), but
+    for the MX build's ACT_ROWS 16 (0 before)."""
+    legacy = Config(S=1, D=128, MCOLS=4, ACT_BLOCKS=128, LANES=8, ACT_ROWS=16,
                     TMEM_WORDS=1 << 16, IMEM_WORDS=1 << 15, DRAM_BYTES=1 << 32, PAIR=False,
                     DSTEP=False, STREAM=False)
     assert board_config() == legacy
@@ -75,11 +76,15 @@ def _hash_without_numerics(cfg) -> int:
 
 def test_arch_hash_is_stable_and_sensitive():
     card = T.config("ypcb-00338")
-    # in the bitstreams' CFG_HASH: keep it (e170f967 before the MX numerics, T.NUMERICS)
-    assert f"{T.arch_hash(card):08x}" == "ff270e6e"
-    # production's CFG_HASH, what a host of the previous numerics computes: it refuses MX builds
-    assert f"{_hash_without_numerics(card):08x}" == "e170f967"
-    assert T.arch_hash(card) == T.arch_hash(T.config("nangate45")), "same arch, same programs"
+    # in the bitstreams' CFG_HASH: keep it (the MX build at ACT_ROWS 16; ff270e6e at ACT_ROWS 4)
+    assert f"{T.arch_hash(card):08x}" == "89417856"
+    four = dataclasses.replace(card, ACT_ROWS=0)
+    assert f"{T.arch_hash(four):08x}" == "ff270e6e"
+    # production's CFG_HASH (ACT_ROWS 4, the previous numerics), what a host of the previous
+    # numerics computes for it: it refuses MX builds (T.NUMERICS)
+    assert f"{_hash_without_numerics(four):08x}" == "e170f967"
+    # the ASIC reference keeps the card's arch but for its ACT RAM rows (MCOLS)
+    assert T.arch_hash(four) == T.arch_hash(T.config("nangate45")), "same arch, same programs"
     for f in dataclasses.fields(Config):
         v = getattr(card, f.name)
         other = dataclasses.replace(card, **{f.name: (not v) if isinstance(v, bool) else v * 2
@@ -89,7 +94,8 @@ def test_arch_hash_is_stable_and_sensitive():
 
 def test_build_config_applies_the_flow_knobs():
     t = T.load("ypcb-00338")
-    assert T.build_config(t, MCOLS=4, LANES=8, ACT_ROWS=4, DSTEP=1) == T.config(t)
+    assert T.build_config(t, MCOLS=4, LANES=8, ACT_ROWS=16, DSTEP=1) == T.config(t)
+    assert T.build_config(t, MCOLS=4, LANES=8, DSTEP=1) == T.config(t)       # the target's 16
     c = T.build_config(t, MCOLS=2, ACT_ROWS=2, DSTEP=0)
     assert (c.MCOLS, c.ACT_ROWS, c.DSTEP, c.STREAM, c.PAIR) == (2, 0, False, False, True)
     assert T.build_config(t, MCOLS=4, ACT_ROWS=8).ACT_ROWS == 8
@@ -117,7 +123,7 @@ def test_card_target_matches_the_rtl_defaults():
         assert p[k] == board[k], k
     assert p["RPB"] == 8 * p["LANES"]                       # otpu_board: RPB = 8 * LANES
     top = _sv_defaults(ROOT / "rtl/boards/ypcb-00338/otpu_fpga_top_ld.sv")
-    for k in ("MCOLS", "VPU_CL", "MXU_IMPL", "LANES", "ULANES", "DDR_MTS", "PLATFORM"):
+    for k in ("MCOLS", "ACT_ROWS", "VPU_CL", "MXU_IMPL", "LANES", "ULANES", "DDR_MTS", "PLATFORM"):
         assert p[k] == top[k], k
     assert T.sim_uarch("ypcb-00338") == {"WIN": 16, "RPB": 128, "WPB": 1, "FIFO_DEPTH": 1024}
 
@@ -126,7 +132,10 @@ def test_target_cli():
     run = lambda *a: subprocess.run([sys.executable, "-m", "opentpu.target", *a], cwd=ROOT,
                                     capture_output=True, text=True, check=True).stdout
     env = dict(line.split("=", 1) for line in run("env", "ypcb-00338").split())
-    assert (env["T_MCOLS"], env["T_PLATFORM"], env["T_ARCH_HASH"]) == ("4", "1", "ff270e6e")
+    assert (env["T_MCOLS"], env["T_ACT_ROWS"], env["T_PLATFORM"], env["T_ARCH_HASH"]) == \
+        ("4", "16", "1", "89417856")
+    assert run("hash", "ypcb-00338", "MCOLS=4", "LANES=8", "ACT_ROWS=16", "DSTEP=1").strip() \
+        == "89417856"
     assert run("hash", "ypcb-00338", "MCOLS=4", "LANES=8", "ACT_ROWS=4", "DSTEP=1").strip() \
         == "ff270e6e"
     assert "bcu1525" in run("list")
@@ -156,7 +165,8 @@ def test_device_config_from_the_cfg_registers(no_env):
     """Map 4: the sizes come from the device; the hash must be the reported Config's."""
     t = FakeTransport(devname=None, regmap=4, pair=True, dstep=True, stream=True)
     info = Board(t).info()
-    assert info["cfg"]["platform"] == 1 and info["cfg"]["hash"] == 0xE170F967
+    assert info["cfg"]["platform"] == 1 and info["cfg"]["hash"] == 0x89417856
+    assert info["act_rows"] == 16 and info["caps"]["act_rows"]
     cfg = device_config(info)
     assert cfg == T.config("ypcb-00338")
     small = dict(R.cfg(t.cfg_words), TMEM_WORDS=1 << 15, IMEM_WORDS=1 << 14, ACT_BLOCKS=64,
