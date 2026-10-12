@@ -28,7 +28,8 @@ module otpu_top
   parameter int ULANES     = LANES,   // TMEM lanes of the MXU and the quantizer
   parameter int AXI        = 0,       // memory path: see the top
   parameter int TMEM_IMPL  = 0,       // TMEM: 0 a copy per read port, 1 banked (otpu_slice)
-  parameter bit TMEM_RQ    = 1'b0     // TMEM_IMPL 1: request-priority bank addresses (otpu_slice)
+  parameter bit TMEM_RQ    = 1'b0,    // TMEM_IMPL 1: request-priority bank addresses (otpu_slice)
+  parameter int TMEM_NCP   = 3        // TMEM_IMPL 1: copies (otpu_slice)
 ) (
   input  logic          clk,
   input  logic          sys_rst,
@@ -118,7 +119,7 @@ module otpu_top
                  .TMEM_WORDS(TMEM_WORDS), .IMEM_WORDS(IMEM_WORDS),
                  .FIFO_DEPTH(FIFO_DEPTH), .LANES(LANES), .WIN(WIN), .RPB(RPB),
                  .WPB(WPB), .MXU_IMPL(MXU_IMPL), .MXU_CL(MXU_CL), .VPU_CL(VPU_CL), .ULANES(ULANES),
-                 .TMEM_IMPL(TMEM_IMPL), .TMEM_RQ(TMEM_RQ))
+                 .TMEM_IMPL(TMEM_IMPL), .TMEM_RQ(TMEM_RQ), .TMEM_NCP(TMEM_NCP))
     u_slice (
       .clk, .sys_rst, .rst, .rinit, .ld_start, .ld_addr, .ld_n, .ld_busy(ldb[s]),
       .a_rdy, .b_rdy, .sw_rdy, .wr_idle, .rd_idle,

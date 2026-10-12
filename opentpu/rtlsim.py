@@ -179,6 +179,9 @@ if os.environ.get("OTPU_VPU_CL"):
 # TMEM_IMPL 1 target (OTPU_TARGET=nangate45): OTPU_TMEM_RQ=1 (docs/tmem_pump.md)
 if os.environ.get("OTPU_TMEM_RQ"):
     UARCH["TMEM_RQ"] = BOARD_UARCH["TMEM_RQ"] = int(os.environ["OTPU_TMEM_RQ"])
+# ... and OTPU_TMEM_NCP=4: four read slots (two pumped copies' ports; the core is the same)
+if os.environ.get("OTPU_TMEM_NCP"):
+    UARCH["TMEM_NCP"] = int(os.environ["OTPU_TMEM_NCP"])
 # TMEM lanes of the MXU and the quantizer when fewer than LANES (timing only): OTPU_ULANES=8
 if os.environ.get("OTPU_ULANES"):
     UARCH["ULANES"] = int(os.environ["OTPU_ULANES"])

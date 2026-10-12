@@ -47,8 +47,10 @@ module otpu_slice
   parameter bit HAS_DSTEP  = 1'b1,    // streams (DSTEP, STREAM): SE's tail in the VPU
   parameter int TMEM_IMPL  = 0,       // TMEM: 0 a copy per read port (FPGA block RAM), 1 banked
                                       //   (three copies of 1R1W RAMs: an ASIC; otpu_tmem)
-  parameter bit TMEM_RQ    = 1'b0     // TMEM_IMPL 1: the banks' addresses from the requests by
+  parameter bit TMEM_RQ    = 1'b0,    // TMEM_IMPL 1: the banks' addresses from the requests by
                                       //   priority, and the arbiter grants by them (gnt_q)
+  parameter int TMEM_NCP   = 3        // TMEM_IMPL 1: copies (3, or 4: two pumped copies' read
+                                      //   slots, docs/tmem_pump.md)
 ) (
   input  logic          clk,
   input  logic          sys_rst,
@@ -122,13 +124,19 @@ module otpu_slice
   // group on different copies (the quantizer's three, the VPU's two), so a group alone always
   // fits: copy 0 MXU, QUANT, VPU A; copy 1 VPU B, QUANT 2; copy 2 DMA, QUANT 3, COLL. The arbiter
   // counts one read per port and bank (its lanes there read one word) per copy (gnt_k).
-  localparam int NCP = 3;
-  localparam logic [NRP-1:0][1:0] CPY = {2'd2, 2'd1, 2'd2, 2'd1, 2'd0, 2'd0, 2'd2, 2'd0};
+  // TMEM_NCP 4 (two pumped copies' four read slots): MXU and VPU A, VPU B and QUANT 3, DMA and
+  // QUANT 2, QUANT and COLL
+  localparam int NCP = TMEM_NCP;
+  localparam logic [NRP-1:0][1:0] CPY = (TMEM_NCP == 4) ?
+    {2'd3, 2'd2, 2'd1, 2'd1, 2'd0, 2'd3, 2'd2, 2'd0} :
+    {2'd2, 2'd1, 2'd2, 2'd1, 2'd0, 2'd0, 2'd2, 2'd0};
   //                                    COLL  Q2    Q3    VB    VA    Q     DMA   MXU
   // TMEM_RQ: each read port's rank in the arbiter's priority order (its group's: DMA, COLL, VPU,
   // MXU, QUANT), for the copies' request-priority bank addresses (otpu_tmem RQ)
   localparam logic [NRP-1:0][2:0] PRANK = {3'd1, 3'd4, 3'd4, 3'd2, 3'd2, 3'd4, 3'd0, 3'd3};
   //                                       COLL  Q2    Q3    VB    VA    Q     DMA   MXU
+  initial if (TMEM_IMPL == 1 && TMEM_NCP != 3 && TMEM_NCP != 4)
+    $fatal(1, "otpu_slice: TMEM_NCP %0d (3 or 4)", TMEM_NCP);
   initial if (TMEM_IMPL == 1 && (RPB != 1 || WPB != 1))
     $fatal(1, "otpu_slice: TMEM_IMPL 1 needs RPB = 1 and WPB = 1 (RPB %0d WPB %0d)", RPB, WPB);
   localparam int W_DMA = 0, W_MXU = 1, W_COLL = 2, W_VPU = 3, NWP = 4;
