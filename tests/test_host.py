@@ -81,9 +81,9 @@ def test_v3_info_snapshot_and_rates():
     i = b.info()
     assert i["regmap"] == 3 and i["core_khz"] == 100_000 and i["build_id"] == 0x1234ABCD
     assert i["caps"] == {"trace": True, "temp": True, "i2c": False, "ddr": False, "w4": True,
-                         "pair": False, "dstep": False, "chash": False, "act_rows": False,
+                         "pair": False, "dstep": False, "chash": False, "act_rows": True,
                          "args": False, "stream": False, "hostcal": False, "gen": False,
-                         "waitw": False, "trace_depth": 4096, "pq_window": 64}
+                         "waitw": False, "mx": True, "trace_depth": 4096, "pq_window": 64}
     assert i["ddr_mts"] is None
     assert i["temp_c"] == pytest.approx(0x9C4 * 503.975 / 4096 - 273.15, abs=0.01)
     s0, s1 = b.snapshot(), b.snapshot()
@@ -164,16 +164,18 @@ def test_v1_bitstream_fallback():
 # ------------------------------------------------------------------------------ configuration
 @pytest.fixture
 def no_cfg_env(monkeypatch):
-    for k in ("OTPU_MCOLS", "OTPU_LANES", "OTPU_PAIR", "OTPU_DSTEP"):
+    for k in ("OTPU_MCOLS", "OTPU_LANES", "OTPU_PAIR", "OTPU_DSTEP", "OTPU_ACT_ROWS"):
         monkeypatch.delenv(k, raising=False)
     return monkeypatch
 
 
 def test_device_config_follows_the_bitstream(no_cfg_env):
-    info = Board(FakeTransport(devname=None, MCOLS=4, LANES=16)).info()
+    info = Board(FakeTransport(devname=None, MCOLS=4, LANES=16, act_rows=16)).info()
     cfg = device_config(info, DRAM_BYTES=1 << 22)
-    assert (cfg.D, cfg.MCOLS, cfg.LANES, cfg.DRAM_BYTES) == (128, 4, 16, 1 << 22)
-    assert cfg == board_config(MCOLS=4, LANES=16, DRAM_BYTES=1 << 22)
+    assert (cfg.D, cfg.MCOLS, cfg.LANES, cfg.DRAM_BYTES, cfg.ACT_ROWS) == (128, 4, 16, 1 << 22, 16)
+    assert cfg == board_config(MCOLS=4, LANES=16, DRAM_BYTES=1 << 22)      # the card's rows
+    rows4 = Board(FakeTransport(devname=None, MCOLS=4, LANES=16)).info()  # MCOLS rows: no bit24
+    assert device_config(rows4).ACT_ROWS == 0
     no_cfg_env.setenv("OTPU_MCOLS", "4")                        # agreeing: fine
     assert device_config(info).MCOLS == 4
     no_cfg_env.setenv("OTPU_MCOLS", "2")
