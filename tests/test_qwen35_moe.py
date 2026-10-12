@@ -1099,8 +1099,9 @@ def test_expert_major_prefill_is_bit_exact(tiny, R, skew, wformat, b, C, monkeyp
     table. skew: a router that knows expert 0 alone (its other rows zero), so experts 0 / 1 / 2
     take every row: long runs of passes of one expert. b: build B's PAIR, DSTEP and STREAM (a
     pass's rows one MM's). C: the passes' entries (Engine.em_pass; None: the configuration's,
-    4 here, with a short pass of 2 at PAIR, docs/offload.md 13.18): each row's math the same,
-    only grouped otherwise, so every C equals token by token's."""
+    docs/offload.md 13.18: 4 with b's MCOLS 4 and PAIR, a short pass of 2; 8 for int8 at the
+    default MCOLS 8): each row's math the same, only grouped otherwise, so every C equals token
+    by token's."""
     from opentpu.llm import qwen35 as Q35
     from opentpu.llm.moe import em_pass_rows, em_record, em_slots
     monkeypatch.setattr(Q35, "PREFILL_CHUNK", 24)
@@ -1115,7 +1116,7 @@ def test_expert_major_prefill_is_bit_exact(tiny, R, skew, wformat, b, C, monkeyp
     a, ref = (Engine(spec, W, cap=256, cfg=cfg, rows=1, resident=True, experts=6,
                      wformat=wformat, **kw)
               for kw in ({"layer_major": R, "expert_major": True}, {}))
-    assert em_pass_rows(cfg, wformat) == 4
+    assert em_pass_rows(cfg, wformat) == (4 if b else 8)
     a.em_pass = C
     sc = _scratch(a.server, monkeypatch)
     toks = [int(t) for t in np.random.default_rng(11).integers(0, 1000, 40)]
