@@ -11,7 +11,10 @@
 //               its own address; the sub-bank of word a is (a >> sbp) mod N
 //   +tm_sbp=B   the sub-bank field's lowest address bit [3]: 3 interleaves 8-word groups, 13
 //               (64K words, N 8) gives 8K-word regions
-//   +tm_sbh=1   XOR the next field above into the sub-bank (a hash) [0]
+//   +tm_sbh=1   XOR the next field above into the sub-bank (a hash) [0]; 2: XOR every field above
+//   +tm_pskew=S each port's addresses seen 8 * S[p] words later for the sub-bank only, one digit
+//               per port (port order as tm_cpy): an operand placement that keeps one unit's
+//               operands in different sub-banks, the most a compiler's placement could do [none]
 //   +tm_rps=R   reads per sub-bank RAM and cycle [1] (2: a true dual-port RAM's second port, or
 //               a copy pumped at 2x)
 //   +tm_rq=1    a RAM's address is the first asking port's whether or not its unit is granted
@@ -22,6 +25,7 @@
 //               hit them needs no RAM read; a write to a line drops it from every port's lines
 //   +tm_bufm=H  the ports with lines, a hex mask by port index [ff]
 //   +tm_share=0 two ports reading the same word still take two reads (no address compare) [1]
+//   +tm_tdp=1   true dual-port RAMs: a write takes one of the RAM's tm_rps accesses (one copy)
 // Two reads of the same word share a RAM read (+tm_share=1). A unit whose own reads need more than R reads of
 // one RAM (two of its ports in one sub-bank, different words) reads them over several cycles: it
 // is granted after ceil(n / R) - 1 more cycles (a holding register in the unit).
@@ -51,12 +55,12 @@ module otpu_tmem_model #(
 );
   localparam int BW = $clog2(LANES);
   localparam int MC = 8, MSB = 16, MR = 4, MB = 8;   // copies, sub-banks, reads, lines
-  int nsb, lsb, sbp, sbh, rps, rq, nbuf, share;
-  int cpy [NRP];
+  int nsb, lsb, sbp, sbh, rps, rq, nbuf, share, tdp;
+  int cpy [NRP], psk [NRP];
   logic [NRP-1:0] bufm;
   initial begin
     string s;
-    nsb = 8; sbp = 3; sbh = 0; rps = 1; rq = 0; nbuf = 0; bufm = '1; share = 1;
+    nsb = 8; sbp = 3; sbh = 0; rps = 1; rq = 0; nbuf = 0; bufm = '1; share = 1; tdp = 0;
     void'($value$plusargs("tm_nsb=%d", nsb));
     void'($value$plusargs("tm_sbp=%d", sbp));
     void'($value$plusargs("tm_sbh=%d", sbh));
@@ -65,9 +69,12 @@ module otpu_tmem_model #(
     void'($value$plusargs("tm_nbuf=%d", nbuf));
     void'($value$plusargs("tm_bufm=%h", bufm));
     void'($value$plusargs("tm_share=%d", share));
-    for (int p = 0; p < NRP; p++) cpy[p] = 0;
+    void'($value$plusargs("tm_tdp=%d", tdp));
+    for (int p = 0; p < NRP; p++) begin cpy[p] = 0; psk[p] = 0; end
     if ($value$plusargs("tm_cpy=%s", s))
       for (int p = 0; p < NRP && p < s.len(); p++) cpy[p] = int'(s[p]) - 48;
+    if ($value$plusargs("tm_pskew=%s", s))
+      for (int p = 0; p < NRP && p < s.len(); p++) psk[p] = 8 * (int'(s[p]) - 48);
     lsb = $clog2(nsb);
     if (nsb < 1 || nsb > MSB || (1 << lsb) != nsb || rps < 1 || rps > MR || nbuf > MB)
       $fatal(1, "otpu_tmem_model: nsb %0d (1..%0d, a power of 2), rps %0d (1..%0d), nbuf %0d (..%0d)",
@@ -75,15 +82,16 @@ module otpu_tmem_model #(
     for (int p = 0; p < NRP; p++)
       if (cpy[p] != 9 && (cpy[p] < 0 || cpy[p] >= MC))
         $fatal(1, "otpu_tmem_model: port %0d's copy %0d (0..%0d or 9)", p, cpy[p], MC - 1);
-    $display("TMMODEL cfg sid=%0d nsb=%0d sbp=%0d sbh=%0d rps=%0d rq=%0d nbuf=%0d bufm=%h share=%0d cpy=%0d%0d%0d%0d%0d%0d%0d%0d",
-             SID, nsb, sbp, sbh, rps, rq, nbuf, bufm, share, cpy[0], cpy[1], cpy[2], cpy[3], cpy[4],
+    $display("TMMODEL cfg sid=%0d nsb=%0d sbp=%0d sbh=%0d rps=%0d rq=%0d nbuf=%0d bufm=%h share=%0d tdp=%0d cpy=%0d%0d%0d%0d%0d%0d%0d%0d",
+             SID, nsb, sbp, sbh, rps, rq, nbuf, bufm, share, tdp, cpy[0], cpy[1], cpy[2], cpy[3], cpy[4],
              cpy[5], cpy[6], cpy[7]);
   end
 
   function automatic int sbank(input logic [31:0] a);
     logic [31:0] x;
     x = a >> sbp;
-    if (sbh != 0) x = x ^ (a >> (sbp + lsb));
+    if (sbh == 1) x = x ^ (a >> (sbp + lsb));
+    if (sbh == 2 && lsb > 0) for (int f = sbp + lsb; f < 32; f += lsb) x = x ^ (a >> f);
     return int'(x & 32'(nsb - 1));
   endfunction
 
@@ -104,7 +112,7 @@ module otpu_tmem_model #(
   logic [NRP-1:0][LANES-1:0] hitl;   // lanes served by the port's lines
   // The reads the RAMs make this cycle, as a list of {RAM, word}: RAM = copy << 8 | bank << 4 |
   // sub-bank, word = the address >> BW (two reads of one word share)
-  localparam int NU = NRP * LANES, NGL = 3 * LANES;
+  localparam int NU = (NRP + NWP) * LANES, NGL = 4 * LANES;
   always_comb begin
     logic [31:0] uk [NU], ur [NU], gk [NGL], gr [NGL];
     int nu, ng, need, rem, nn, used, last;
@@ -133,7 +141,7 @@ module otpu_tmem_model #(
               if (bhit(p, a)) hitl[p][l] = 1'b1;
               else begin
                 rqg[g] = 1'b1;
-                k = (32'(cpy[p]) << 8) | (32'(a[BW-1:0]) << 4) | 32'(sbank(a));
+                k = (32'(cpy[p]) << 8) | (32'(a[BW-1:0]) << 4) | 32'(sbank(a + 32'(psk[p])));
                 r = (share != 0) ? (a >> BW) : ((a >> BW) | (32'(p) << 28));
                 dup = 1'b0;
                 for (int m = 0; m < ng; m++) if (gk[m] == k && gr[m] == r) dup = 1'b1;
@@ -141,7 +149,8 @@ module otpu_tmem_model #(
               end
             end
       ok = 1'b1;
-      // writes: one per bank and cycle (today's rule)
+      // writes: one per bank and cycle (today's rule); tdp: each also takes one of its RAM's
+      // accesses (a write never shares)
       gw = '0;
       for (int p = 0; p < NWP; p++)
         if (int'(WGRP[p]) == g)
@@ -149,6 +158,12 @@ module otpu_tmem_model #(
             if (wq_en[p][l]) begin
               if (wt[w_addr[p][l][BW-1:0]]) ok = 1'b0;
               gw[w_addr[p][l][BW-1:0]] = 1'b1;
+              if (tdp != 0 && ng < NGL) begin
+                a = w_addr[p][l];
+                gk[ng] = (32'(a[BW-1:0]) << 4) | 32'(sbank(a));
+                gr[ng] = 32'h8000_0000 | (a >> BW);
+                ng++;
+              end
             end
       // reads, per RAM (at its first entry in the list): alone the group needs ceil(n / rps)
       // cycles for its n words there; in its last cycle its last words that the RAM does not

@@ -162,19 +162,30 @@ def stats(seg: np.ndarray) -> dict:
 
 def screen(seg: np.ndarray, cands: list[tuple]) -> dict:
     """Per candidate (name, nsb, sbp, hash, rps, free ports): cycles with a RAM over its reads,
-    and the extra cycles serializing them takes."""
+    and the extra cycles serializing them takes. rps "t": a true dual-port RAM, two accesses a
+    cycle, reads (distinct words) and writes together."""
     c, p, a = lanes(seg, (0, 2))
+    wc, _, wa = lanes(seg, (1, 3))
     out = {}
     for name, nsb, sbp, hsh, rps, free in cands:
         keep = ~np.isin(p, [PORTS.index(f) for f in free]) if free else np.ones(len(p), bool)
         cc, aa = c[keep], a[keep]
         lsb = int(nsb).bit_length() - 1
-        sb = (aa >> sbp)
-        if hsh:
-            sb = sb ^ (aa >> (sbp + lsb))
-        sb &= nsb - 1
-        ram = (cc << 9) | ((aa & 7) << 5) | sb
+        def ramof(cy, ad):
+            sb = (ad >> sbp)
+            if hsh == 1:
+                sb = sb ^ (ad >> (sbp + lsb))
+            elif hsh == 2 and lsb:
+                for f in range(sbp + lsb, 20, lsb):
+                    sb = sb ^ (ad >> f)
+            sb &= nsb - 1
+            return (cy << 9) | ((ad & 7) << 5) | sb
+        ram = ramof(cc, aa)
         word = aa >> 3
+        if rps == "t":           # writes take a port each (a distinct tag), reads share words
+            ram = np.concatenate([ram, ramof(wc, wa)])
+            word = np.concatenate([word, (wa >> 3) | (1 << 19)])
+            rps = 2
         u = np.unique((ram << 20) | word)
         ram_u, n = np.unique(u >> 20, return_counts=True)
         need = (n + rps - 1) // rps
@@ -199,6 +210,9 @@ CANDS = [  # name, sub-banks, field bit, hash, reads per RAM, ports off the RAM
     ("s8h", 8, 3, 1, 1, ()), ("s16h", 16, 3, 1, 1, ()),
     ("s8i2", 8, 3, 0, 2, ()), ("s4i2", 4, 3, 0, 2, ()), ("s2i2", 2, 3, 0, 2, ()),
     ("s8iq", 8, 3, 0, 1, ("Q3",)),
+    ("c1t", 1, 3, 0, "t", ()), ("s8t", 8, 3, 0, "t", ()), ("s16t", 16, 3, 0, "t", ()),
+    ("s8h2", 8, 3, 2, 1, ()), ("s16h2", 16, 3, 2, 1, ()), ("s8h2t", 8, 3, 2, "t", ()),
+    ("s16h2t", 16, 3, 2, "t", ()),
 ]
 
 

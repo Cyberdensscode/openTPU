@@ -1008,14 +1008,18 @@ def test_axi_write_bursts(have_verilator, stall, seed):
     assert aw == beats
 
 
-@pytest.mark.parametrize("impl", [0, 1])
-def test_tmem_random_traffic(have_verilator, impl):
+@pytest.mark.parametrize("impl,nsb,sbp", [(0, 4, 2), (1, 4, 2), (3, 4, 2), (3, 2, 4), (3, 8, 2)])
+def test_tmem_random_traffic(have_verilator, impl, nsb, sbp):
     """TMEM alone against a reference model; most reads hit the previous cycle's writes, which
     are still in TMEM's registered write stage (the bypass). impl 1: the banked TMEM (copies of
-    1R1W bank RAMs shared by ports, one granted read per copy and bank)."""
+    1R1W bank RAMs shared by ports, one granted read per copy and bank). impl 3 (EXPERIMENTAL,
+    docs/tmem_nocopy.md): one copy, nsb RAMs a bank with the sub-bank at word-address bit sbp
+    (interleaved groups, or regions), a port read only while no port before it takes one of its
+    RAMs for another word."""
     exe = rtlsim.build("tb_tmem", [rtlsim.RTL / "mem/otpu_tmem.sv",
                                    rtlsim.RTL / "tech/generic/otpu_tech_ram.sv",
-                                   rtlsim.TB / "tb_tmem.sv"], {"IMPL": impl})
+                                   rtlsim.TB / "tb_tmem.sv"],
+                       {"IMPL": impl, **({"NSB": nsb, "SBP": sbp} if impl == 3 else {})})
     r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=120)
     assert r.returncode == 0 and "PASS" in r.stdout, r.stdout[-2000:] + r.stderr[-2000:]
 

@@ -5,8 +5,10 @@
 // the word as of its own cycle (writes of the same cycle are not seen) the cycle after it is
 // granted, and the lane holds that value until its next granted read. IMPL 1 (the banked TMEM):
 // ports 0 and 1 share copy 0, port 2 has copy 1, and a read port is granted only while its banks
-// on its copy are free (as the slice's banked arbiter does).
-module tb_tmem #(parameter int IMPL = 0);
+// on its copy are free (as the slice's banked arbiter does). IMPL 3 (one copy, NSB RAMs a bank at
+// address bit SBP): a read port is granted only while no port before it in rank asks one of its
+// RAMs for another word (blk_x / blk_s, as the slice's grant does).
+module tb_tmem #(parameter int IMPL = 0, parameter int NSB = 4, parameter int SBP = 2);
   localparam int WORDS = 256, LANES = 4, NRP = 3, NWP = 2, WPB = 1, CYCLES = 20000;
   localparam int BW = $clog2(LANES);
   localparam int NCP = 2;
@@ -19,17 +21,19 @@ module tb_tmem #(parameter int IMPL = 0);
   logic [NWP-1:0]                  w_gnt;
   logic [NWP-1:0][LANES-1:0][31:0] w_addr, w_data;
 
+  logic [NRP-1:0] blk_x, blk_s;
   otpu_tmem #(.WORDS(WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .WPB(WPB), .IMPL(IMPL),
-              .NCP(NCP), .CPY(CPY)) dut (
+              .NCP(NCP), .CPY(CPY), .NSB(NSB), .SBP(SBP), .PRANK({3'd2, 3'd1, 3'd0}),
+              .GRP({3'd1, 3'd1, 3'd0})) dut (
     .clk, .r_en, .r_req, .r_addr, .r_data, .w_en, .w_req, .w_gnt, .w_addr, .w_data,
-    .dump(1'b0));
+    .blk_x, .blk_s, .dump(1'b0));
 
   logic [31:0] ref_mem [WORDS];
   logic [31:0] expect_q [NRP][LANES];
   bit          valid_q [NRP][LANES];
   int unsigned recent [8];              // addresses written in the last cycles
   int unsigned last_wrote [$];          // the previous cycle's writes (still registered in TMEM)
-  int          hits = 0, checks = 0;
+  int          hits = 0, checks = 0, blocked = 0;
 
   function automatic int unsigned pick_addr(int bank);
     int unsigned a;
@@ -83,11 +87,16 @@ module tb_tmem #(parameter int IMPL = 0);
           r_addr[p][l] = pick_addr(perm[l]);
           if (r_req[p][l]) banks[perm[l]] = 1'b1;
         end
-        g = $urandom_range(3) != 0 && (IMPL == 0 || (banks & rbusy[CPY[p]]) == '0);
-        if (g) rbusy[CPY[p]] |= banks;
+        g = $urandom_range(3) != 0 && (IMPL != 1 || (banks & rbusy[CPY[p]]) == '0);
+        if (g && IMPL == 1) rbusy[CPY[p]] |= banks;
         for (int l = 0; l < LANES; l++) r_en[p][l] = g && r_req[p][l];
       end
       #1;
+      if (IMPL == 3) begin             // the requests settled: no read of a RAM another port took
+        for (int p = 0; p < NRP; p++)
+          if (blk_x[p] || blk_s[p]) begin r_en[p] = '0; blocked++; end
+        #1;
+      end
       // ---- the reads see the memory before this cycle's writes
       for (int p = 0; p < NRP; p++)
         for (int l = 0; l < LANES; l++)
@@ -119,7 +128,8 @@ module tb_tmem #(parameter int IMPL = 0);
           end
     end
     if (hits < 1000) $fatal(1, "only %0d reads of the previous cycle's writes", hits);
-    $display("PASS checks=%0d bypass_reads=%0d", checks, hits);
+    if (IMPL == 3 && blocked < 1000) $fatal(1, "only %0d blocked reads", blocked);
+    $display("PASS checks=%0d bypass_reads=%0d blocked=%0d", checks, hits, blocked);
     $finish;
   end
 endmodule

@@ -52,8 +52,11 @@ module otpu_slice
                                       //   docs/tmem_nocopy.md)
   parameter bit TMEM_RQ    = 1'b0,    // TMEM_IMPL 1: the banks' addresses from the requests by
                                       //   priority, and the arbiter grants by them (gnt_q)
-  parameter int TMEM_NCP   = 3        // TMEM_IMPL 1: copies (3; 2, 4, 5, 7: the read slots of
+  parameter int TMEM_NCP   = 3,       // TMEM_IMPL 1: copies (3; 2, 4, 5, 7: the read slots of
                                       //   pumped copies, docs/tmem_pump.md)
+  parameter int TMEM_NSB   = 8,       // TMEM_IMPL 3 (EXPERIMENTAL): one copy, each bank TMEM_NSB
+  parameter int TMEM_SBP   = 3        //   RAMs, the sub-bank at word-address bit TMEM_SBP
+                                      //   (docs/tmem_nocopy.md)
 ) (
   input  logic          clk,
   input  logic          sys_rst,
@@ -163,6 +166,14 @@ module otpu_slice
   // PV MM waits for) ran at about half its rate; the drain holds a cycle instead
   // (docs/litedram.md section 11, "The core's own gaps": Qwen3 4-bit -3.0% cycles per token).
   localparam int G_DMA = 0, G_COLL = 1, G_VPU = 2, G_MXU = 3, G_Q = 4, NG = 5;
+  // TMEM_IMPL 3: every read port its own rank (the groups' order, DMA COLL VPU MXU QUANT; within
+  // a group in port order) and its group
+  localparam logic [NRP-1:0][2:0] PRANK3 = {3'd1, 3'd6, 3'd7, 3'd3, 3'd2, 3'd5, 3'd0, 3'd4};
+  //                                        COLL  Q2    Q3    VB    VA    Q     DMA   MXU
+  localparam logic [NRP-1:0][2:0] RGRP = {3'(G_COLL), 3'(G_Q), 3'(G_Q), 3'(G_VPU), 3'(G_VPU),
+                                          3'(G_Q), 3'(G_DMA), 3'(G_MXU)};
+  initial if (TMEM_IMPL == 3 && (WPB != 1 || ARB_MASK))
+    $fatal(1, "otpu_slice: TMEM_IMPL 3 needs WPB = 1 (WPB %0d)", WPB);
 
   // ---- sequencer
   cmd_t ucmd [NUNITS];
@@ -309,6 +320,8 @@ module otpu_slice
 
   // ---- TMEM
   logic [NRP-1:0][LANES-1:0]       rq_en, r_en;
+  logic [NRP-1:0]                  tm_bx, tm_bs, tm_sv, tm_pre;   // TMEM_IMPL 3 (below)
+  logic [NRP-1:0][LANES-1:0]       rq_t;
   logic [NRP-1:0][LANES-1:0][31:0] r_addr, r_data;
   logic [NWP-1:0][LANES-1:0]       wq_en, w_en;
   logic [NWP-1:0][LANES-1:0][31:0] w_addr, w_data;
@@ -323,9 +336,10 @@ module otpu_slice
               .SH_HOST(P_DMA),
               .SH_MASK((TMEM_IMPL == 2) ? '0 : (NRP'(1) << P_Q3) | (NRP'(1) << P_COLL)),
               .SID(SID), .IMPL((TMEM_IMPL == 2) ? 0 : TMEM_IMPL), .NCP(NCP), .CPY(CPY), .RQ(TMEM_RQ),
-              .PRANK(PRANK)) u_tmem (
-    .clk, .r_en, .r_req(rq_en), .r_addr, .r_data, .w_en, .w_req(wq_en), .w_gnt, .w_addr,
-    .w_data, .dump);
+              .PRANK((TMEM_IMPL == 3) ? PRANK3 : PRANK), .NSB(TMEM_NSB), .SBP(TMEM_SBP),
+              .GRP(RGRP)) u_tmem (
+    .clk, .r_en, .r_req(rq_t), .r_addr, .r_data, .w_en, .w_req(wq_en), .w_gnt, .w_addr,
+    .w_data, .blk_x(tm_bx), .blk_s(tm_bs), .dump);
   assign coll_rdata = r_data[P_COLL];
   // the units' TMEM requests
   logic [LANES-1:0]        dma_ren, dma_wen, va_ren, vb_ren, v_wen;
@@ -572,13 +586,13 @@ module otpu_slice
     cgl_m = aok[G_COLL];
   end
 
-  logic [NG-1:0] gnt_k, gnt_q, gnt_x;
-  logic          cgl_k, cgl_q, cgl_x;
+  logic [NG-1:0] gnt_k, gnt_q, gnt_x, gnt_s;
+  logic          cgl_k, cgl_q, cgl_x, cgl_s;
   always_comb begin
     gnt = ARB_MASK ? gnt_m : (TMEM_IMPL == 1) ? (TMEM_RQ ? gnt_q : gnt_k) :
-          (TMEM_IMPL == 2) ? gnt_x : gnt_c;
+          (TMEM_IMPL == 2) ? gnt_x : (TMEM_IMPL == 3) ? gnt_s : gnt_c;
     coll_gnt_local = ARB_MASK ? cgl_m : (TMEM_IMPL == 1) ? (TMEM_RQ ? cgl_q : cgl_k) :
-                     (TMEM_IMPL == 2) ? cgl_x : cgl_c;
+                     (TMEM_IMPL == 2) ? cgl_x : (TMEM_IMPL == 3) ? cgl_s : cgl_c;
     for (int p = 0; p < NRP; p++) r_en[p] = rq_en[p];
     for (int p = 0; p < NWP; p++) w_en[p] = wq_en[p];
     w_gnt = '1;
@@ -590,7 +604,53 @@ module otpu_slice
     if (!v_ren)       begin r_en[P_VA] = '0; r_en[P_VB] = '0; end
     if (!gnt[G_VPU])  w_en[W_VPU] = '0;
     if (!gnt[G_COLL]) begin r_en[P_COLL] = '0; w_en[W_COLL] = '0; end
+    if (TMEM_IMPL == 3)               // a split group's ports: read once, ahead of the grant
+      for (int p = 0; p < NRP; p++) begin
+        if (tm_sv[p]) r_en[p] = '0;
+        if (tm_pre[p]) r_en[p] = rq_en[p];
+      end
   end
+
+  // TMEM_IMPL 3 (EXPERIMENTAL, docs/tmem_nocopy.md): one copy of sub-banked RAMs (otpu_tmem IMPL
+  // 3). A group is granted when no port of another group blocks one of its reads (tm_bx, from
+  // the requests: the RAMs' addresses do not wait for the grants), its write banks are free (acf,
+  // as gnt_q) and its own ports do not collide (tm_bs). When they do, its ports read over
+  // successive cycles: those not blocked read ahead of the grant (tm_pre: their lanes hold the
+  // words), drop out of the requests (tm_sv), and the unit is granted when the rest can read.
+  always_comb
+    for (int p = 0; p < NRP; p++) rq_t[p] = (TMEM_IMPL == 3 && tm_sv[p]) ? '0 : rq_en[p];
+  logic [NG-1:0] gs3;
+  always_comb begin
+    gnt_s = gs3;
+    gnt_s[G_COLL] = coll_gnt;      // every slice must grant the collective
+  end
+  always_comb begin
+    logic [NG-1:0]  gs;
+    logic [NRP-1:0] rp, ask;
+    logic           rd_ok, self;
+    tm_pre = '0;
+    for (int p = 0; p < NRP; p++) ask[p] = |rq_t[p];
+    for (int g = 0; g < NG; g++) begin
+      rp = grp_rports(g);
+      rd_ok = (tm_bx & rp & ask) == '0;
+      self = (tm_bs & rp & ask) != '0;
+      gs[g] = rd_ok && !self;
+      for (int h = 0; h < g; h++) if (gs[h] && acf[g][h]) gs[g] = 1'b0;
+      if (g == G_Q && q_awant && !sw_rdy) gs[g] = 1'b0;    // QST write the DRAM cannot take
+      if (rd_ok && self) tm_pre = tm_pre | (rp & ask & ~tm_bs);
+    end
+    gs3 = gs;
+    cgl_s = gs[G_COLL];
+  end
+  always_ff @(posedge clk)
+    if (srst || TMEM_IMPL != 3) tm_sv <= '0;
+    else
+      for (int g = 0; g < NG; g++) begin
+        logic [NRP-1:0] rp;
+        rp = grp_rports(g);
+        for (int p = 0; p < NRP; p++)
+          if (rp[p]) tm_sv[p] <= gnt[g] ? 1'b0 : (tm_sv[p] | tm_pre[p]);
+      end
 
   always_comb begin
     int rc [LANES];

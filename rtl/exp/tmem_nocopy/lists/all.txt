@@ -15,7 +15,7 @@ z_ph_r3 zero: models/Phi-4-mini-instruct rows 3 544 --layers 2
 # prefill at MCOLS 8
 p8_q3 --model qwen3 --wformat fp4 --head-format int8 --pos 544 --layers 2 --rows 8 --logits none --mcols 8 --check
 p8_q35 --model qwen35 --wformat fp4 --head-format int8 --pos 544 --layers 4 --rows 4 --logits none --mcols 8 --check
-z8_q4_r4 zero: models/Qwen3.5-4B rows 4 544 --layers 4 --mcols 8
+z8_q2_r4 zero: models/Qwen3.5-2B rows 4 544 --layers 4 --mcols 8
 # batched decode: B slots, the picks on the device (opentpu/llm/batch.py)
 b4_q3 --model qwen3 --wformat fp4 --head-format int8 --pos 544 --layers 2 --batch 4 --check
 b8_q3 --model qwen3 --wformat fp4 --head-format int8 --pos 544 --layers 2 --batch 8 --mcols 8 --check

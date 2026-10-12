@@ -188,6 +188,11 @@ if os.environ.get("OTPU_TMEM_NCP"):
 # set by +tm_* plusargs: OTPU_SIM_PLUSARGS; docs/tmem_nocopy.md)
 if os.environ.get("OTPU_TMEM_IMPL"):
     UARCH["TMEM_IMPL"] = BOARD_UARCH["TMEM_IMPL"] = int(os.environ["OTPU_TMEM_IMPL"])
+# ... OTPU_TMEM_IMPL=3: one copy of sub-banked RAMs (otpu_tmem IMPL 3), OTPU_TMEM_NSB RAMs a bank
+# with the sub-bank at word-address bit OTPU_TMEM_SBP
+for _k in ("NSB", "SBP"):
+    if os.environ.get("OTPU_TMEM_" + _k):
+        UARCH["TMEM_" + _k] = int(os.environ["OTPU_TMEM_" + _k])
 # TMEM lanes of the MXU and the quantizer when fewer than LANES (timing only): OTPU_ULANES=8
 if os.environ.get("OTPU_ULANES"):
     UARCH["ULANES"] = int(os.environ["OTPU_ULANES"])
