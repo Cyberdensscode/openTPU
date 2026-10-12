@@ -35,8 +35,9 @@ co-simulation, Verilator) or estimated.
   `dstep-mr`, docs/dstep_mr.md). The card's state step is bound by the stream engine's 8 words a
   cycle, not by DRAM: stepping a run's R rows with the state read and written once cuts its DRAM
   bytes by R (37.7 -> 9.4 MB a 0.8B row at R = 4) for -1.8% to -3.7% of the cycles (built,
-  bit-exact); two chained engines take -19% of Qwen3.5-0.8B's run (bound). The engines a slice
-  needs follow the MXU's width: P = MCOLS / 2.
+  bit-exact); two chained engines take -19% of Qwen3.5-0.8B's run (bound; -18.6% as built).
+  The chain is parked (the lead, 2026-10-12): the ASIC's prefill step goes to the MXU (the
+  chunkwise delta rule, docs/dstep_mr.md 9) in the release after r2.
 
 ## 1. Method
 
@@ -365,7 +366,7 @@ command. The same flow as section 2.1 (xc7k480t-2 at 7.5 ns, placed and routed; 
 | final - today | **-7,578 (-53%)** | +4 | **-5,007 (-47%)** | **-7** | **-2,747 (-51%)** | +7 | -1,722 | +0.131 ns | |
 | today, xcku5p 4.0 ns | 15,166 | 794 | 10,754 | 7 | | 28.5 | | +0.027 ns | `c_fp` (the footprint, 14 levels) |
 | v2 15-bit, xcku5p 4.0 ns | 5,935 | 798 | 5,402 | 0 | | 33.5 | | +0.068 ns | `wc_n` -> a unit's command copy (9 levels) |
-| final, xcku5p 4.0 ns | pending (omarchy, after the WAITC gate) | | | | | | | | |
+| final, xcku5p 4.0 ns | not run (dropped for release r2, 2026-10-13) | | | | | | | | |
 
 - **The +7 RAMB36 are per-instruction metadata, not a data buffer**: the sidecar holds each
   instruction's wait entry (236 Kbit for IMEM's 4,096 instructions), written by the host with
@@ -411,7 +412,8 @@ So on the 35B's layer runs (#1 / #4, points):
   weight streams (LD) and the attention's QST would pass an older blocked one today.
 - **the compiler's counts over the exact dependencies**: +0.75 / +0.68 (`wcmx0` - `inodq`;
   the 26B: +0.13 / +0.19). Knowing the run's arguments changes nothing (`wcma` = `wcm`), so the
-  conservative counts do not come from the arguments' bounds: the open compiler item below.
+  conservative counts do not come from the arguments' bounds, nor from the RLDs' (the RLD
+  bounds below).
 - **the 15-VOP hold**: +0.44 / +0.47 (`wcmx` - `wcmx0`), and on p8_q3 all of v2's cost (+0.82
   points of +0.45%: without the hold v2's order gains 0.37%). At 24 it costs +0.09 / +0.01, at
   31 nothing on these runs; at 8 (`wcm8`) +0.46 / +1.17 more than at 15.
@@ -426,15 +428,33 @@ in-order DMA and quantizer (+0.18 / +0.69) and the compiler's counts (+0.75 / +0
 expert FFN over M = 4 tokens, the kernel an expert-major prefill would run per expert; M = 16
 does not fit TMEM in this tool): 28,337 cycles, v2 -0.01% (15 and 31 alike).
 
-**The open compiler item**: on l_q35m the counts cost +0.7 points over the exact dependencies.
-The likely cause is the RLD-derived DRAM addresses: the MoE layer runs address each expert's
-weights from the routing (an RLD loads the expert's index at run time), the pass knows nothing
-of an RLD's value (`wait_counts(rld=None)`: any 32-bit value), so every footprint computed from
-it covers the whole space it addresses and conflicts with every older write there in the
-window (the K/V stores, the activations' spills). A bound per RLD (`rld={pc: (lo, hi)}`: the expert table's range,
-which the kernel knows when it emits the RLD) would make the counts exact there. Not done: it
-goes after the multi-row DSTEP work, and the waits pass's tests must show the bounds hold for
-every program that emits an RLD.
+**The RLD bounds** (the compiler item this section left open; branch `waitc-rld`): the MoE
+layer runs address each expert's weights from the routing (an RLD loads the expert's index at
+run time), and the pass took an RLD's value as any 32-bit value, so every footprint computed
+from it covered the whole space it addresses. `isa.rld(..., bound=(lo, hi))` now carries what
+the kernel knows of the word (flag bit 2, w3..w4; the hardware ignores it, the ISA simulator
+stops on a value outside it), and the pass uses it: the experts' indices (0 .. E-1), the
+directory's and the answers' offsets, the slots (the pool's first and last), a row's place in
+the scratch, the present / missing flags. On the 35B's layer programs 13 of 14 RLDs are
+bounded, 116 / 124 entries change, the VPU masks' bits fall from 1,473 to 985 and 1,570 to
+1,064, and no loop of unknown count is widened any more (28 -> 0). Cycles (simulated, job R,
+wcm against 38a6342b's, the same i0):
+
+| row | i0 cycles | wcm (38a6342b) | wcm with the RLD bounds |
+|---|---|---|---|
+| l_q35m#1 | 388,844 | +1.03% | +0.93% |
+| l_q35m#4 | 302,998 | +1.52% | +1.37% |
+| l_g26#0,1 | 967,330 | +0.49% | +0.46% |
+| l_g26#0,5 | 988,619 | +0.35% | +0.31% |
+| m_g26#0 / #0,1 / #0,5 | 755,866 / 1,510,335 / 1,605,752 | +0.38 / +0.36 / +0.30% | +0.32 / +0.31 / +0.27% |
+| m_q35m#1 / #3 / #4 | 4,484,132 / 5,148,870 / 5,414,569 | +0.03 / +0.02 / +0.08% | +0.01 / +0.00 / +0.05% |
+
+The bounds take 0.09 / 0.14 points off the 35B's layer runs, which is the VPU mask's share
+over the exact producers (38a6342b's `wcm` against `wcmx31`: +0.10 / +0.15): l_q35m is now at `wcmx31`'s
++0.93% / +1.37%. The counts' +0.75 / +0.68 over the exact dependencies stay, so the
+RLD-derived addresses were not their cause; what is left is the in-order DMA and quantizer
+(+0.18 / +0.69) and counts that must hold for every iteration of a loop (a loop body's entry
+is the worst over its iterations; not measured further).
 
 **The entries' ASIC form.** The dense sidecar grows with IMEM's depth (section 8: +23% of
 IMEM's bits, ~2.6x the hazard check at 8K instructions on nangate45), so how compressible are
@@ -670,9 +690,9 @@ Per board:
   gates and the remaining four workloads pass; section 6). The VPU stays at 8 lanes. The ready
   stamp (section 7) is the next 1.8-2.2K LUT if the build needs them.
 - **BCU1525** (xcvu9p, two slices): the same RTL and compiler, twice the saving (-18.5K LUT
-  with the 15-bit mask on the xcku5p, the final's pending; -14 DSP, +14 RAMB36). The device has room; the reason is timing: at 250 MHz on the
+  with the 15-bit mask on the xcku5p, the final's not run; -14 DSP, +14 RAMB36). The device has room; the reason is timing: at 250 MHz on the
   UltraScale+ stand-in the footprint path is today's worst (+0.027 ns) and v2's worst is the
-  wait test (+0.068 ns with the 15-bit mask; the final's pending). Take it with the YPCB's validation.
+  wait test (+0.068 ns with the 15-bit mask; the final's not run). Take it with the YPCB's validation.
 - **F2** (VU47P, UltraScale+ with HBM; no target yet): v2 as on the BCU1525. HBM raises the DRAM
   rate that bounds decode by an order of magnitude or more, so the MXU's and the VPU's share of
   decode grows (and the softmax's composites with the context): rerun section 5's
@@ -773,10 +793,13 @@ At MCOLS 8 and 16 (4 rows; "of the floor": what two and four engines take of `no
   step at 32 Z / W of the MXU's time (Z the state words, W the weight MACs of a row: 0.30 for
   0.8B, 0.11 for 2B and 4B, 0.21 for the 35B; estimated).
 - **Area** (docs/dstep_mr.md 6): an engine is the DSTEP datapath of section 2.2, ~20.6K LUT and
-  86 DSP on the FPGA (OOC of one engine against two at STREAM_T 4 pending), ~0.7 mm² on nangate45
-  (estimated): compute, not a copy of SRAM. On the card at ~97% of its slices (A) is the
-  affordable half; the ASIC takes the chain, P = MCOLS / 2 per slice, each slice its own heads'
-  states under docs/dataflow.md's rule (c).
-- **One streaming engine**: the chain covers attention decode's K/V stream too (each engine a
-  query, the K/V row forwarded, m, l and acc carried; docs/dstep_mr.md 5), with a numerics
-  decision (the online softmax) to take first.
+  86 DSP on the FPGA, ~0.7 mm² on nangate45 (estimated; the OOC of one engine against two was
+  not run): compute, not a copy of SRAM.
+- **Decision** (the lead, 2026-10-12; docs/dstep_mr.md 8, 9): the chain (C) is parked, its
+  bit-exact RTL a card-only option; the ASIC's prefill state step goes to the MXU, the chunkwise
+  delta rule (D) with its products in three int8 MMs, in the release after r2 (a first
+  co-simulation at C = 4 puts it at 1.8-2.4x today's run on the card, bound by the quantizer: it
+  needs runs of C >= 16 and the bound still to run). Decode and short runs keep today's single
+  engine; (A) at STREAM_T 4 is built and exact.
+- **One streaming engine** (attention decode on a chain, docs/dstep_mr.md 5) stays a separate
+  question, with its numerics decision (the online softmax) first.
