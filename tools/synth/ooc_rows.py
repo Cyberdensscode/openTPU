@@ -4,7 +4,7 @@ on the card's part at the core clock's period. One JSON line per run: LUTs, FFs,
 BRAM36 / 18, WNS and fmax.
 
     python3 tools/synth/ooc_rows.py OUT [--rows 4,16] [--tops otpu_actram,otpu_mxu]
-        [--period 7.5] [--mcols 4] [--param otpu_mxu:IMPL=2 ...]
+        [--period 7.5] [--mcols 4] [--param otpu_mxu:IMPL=2 ...] [--src otpu_mxu:rtl/... ...]
 
 Run on a Vivado host (VIVADO: the vivado binary) from the tree's root, one job at a time.
 """
@@ -40,9 +40,14 @@ def main():
     ap.add_argument("--period", type=float, default=7.5)
     ap.add_argument("--mcols", type=int, default=4)
     ap.add_argument("--param", action="append", default=[], help="TOP:NAME=VALUE")
+    ap.add_argument("--src", action="append", default=[], help="TOP:PATH, another source of TOP")
     a = ap.parse_args()
     vivado = os.environ.get("VIVADO", "vivado")
     extra: dict = {}
+    more: dict = {}
+    for p in a.src:
+        top, path = p.split(":", 1)
+        more.setdefault(top, []).append(path)
     for p in a.param:
         top, kv = p.split(":", 1)
         k, v = kv.split("=", 1)
@@ -54,7 +59,8 @@ def main():
             out = Path(a.out) / f"{top}_mc{a.mcols}_rows{rows}"
             out.mkdir(parents=True, exist_ok=True)
             tcl = out / "ooc.tcl"
-            tcl.write_text(vivado_tcl(ROOT, top, BASE + srcs, prm, out, a.period))
+            tcl.write_text(vivado_tcl(ROOT, top, BASE + srcs + more.get(top, []), prm, out,
+                                      a.period))
             t = time.time()
             with (out / "vivado.log").open("w") as f:
                 rc = subprocess.run([vivado, "-mode", "batch", "-nojournal", "-nolog", "-source",
