@@ -993,7 +993,7 @@ def main(argv=None):
         "a mixture-of-experts model bigger than the card's DRAM (lfm2-8b, qwen35-35b, "
         "gemma4-26b): its experts stream from a pool file into slots in the card's DRAM "
         "(docs/offload.md 14); --wformat auto takes the formats it ran with on the card")
-    moe.add_argument("--pool", help="the expert pool file (default: pool-<the experts' "
+    moe.add_argument("--pool", help="the expert pool file (default: pool-mx1-<the experts' "
                                     "format>.bin in the checkpoint's directory; "
                                     "tools/offload/pack_pool.py packs it)")
     moe.add_argument("--experts", type=int, default=0,

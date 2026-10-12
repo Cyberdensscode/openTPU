@@ -621,7 +621,7 @@ file on the host into slots in the card's DRAM. The card routes and computes eve
 the host only copies the experts it asks for ([offload.md](offload.md) section 14).
 
 ```
-otpu-chat --backend board --model qwen35-35b                     # its pool: models/Qwen3.5-35B-A3B/pool-fp4.bin
+otpu-chat --backend board --model qwen35-35b                     # its pool: models/Qwen3.5-35B-A3B/pool-mx1-fp4.bin
 otpu-chat --backend board --model lfm2-8b --pool /data/lfm8b.bin  # a pool elsewhere
 ```
 

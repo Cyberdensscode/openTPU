@@ -3757,11 +3757,13 @@ key differs from the base's: the base pool is refused, and the 26B-it has its ow
 ### 14.1 The pool
 
 Each model's experts are packed once into a pool file in the card's slot format (split, 10.4).
-otpu-chat looks for it in the checkpoint's directory, as `pool-<the experts' format>.bin`:
-LFM2.5-8B-A1B and gemma-4-26B-A4B-it stream nvfp4 experts (`pool-nvfp4.bin`, e.g.
-`models/LFM2.5-8B-A1B/pool-nvfp4.bin`), Qwen3.5-35B-A3B fp4 (`pool-fp4.bin`). Its `.packed`,
-`.format` and `.key` sit beside it. `--pool PATH` names another file. A symbolic link with no
-`.packed` beside it is followed: the companions then sit beside the file it names.
+otpu-chat looks for it in the checkpoint's directory, as `pool-<the MXU's numerics>-<the experts'
+format>.bin`: LFM2.5-8B-A1B and gemma-4-26B-A4B-it stream nvfp4 experts (`pool-mx1-nvfp4.bin`, e.g.
+`models/LFM2.5-8B-A1B/pool-mx1-nvfp4.bin`), Qwen3.5-35B-A3B fp4 (`pool-mx1-fp4.bin`). A pool of the
+MXU before MX (`pool-fp4.bin`, key 1) keeps its name beside it, for a qualification and a rollback;
+this tree refuses it. Its `.packed`, `.format` and `.key` sit beside it. `--pool PATH` names another
+file. A symbolic link with no `.packed` beside it is followed: the companions then sit beside the
+file it names.
 
 Packing takes the whole checkpoint (the card's host may keep one without the experts,
 strip_experts.py) and runs on any host:
@@ -3775,7 +3777,7 @@ OTPU_FORMATS=experts=nvfp4 python3 tools/offload/pack_pool.py MODEL POOL init --
 
 `--wformat` is the experts' format (default fp4): LFM2.5-8B-A1B's pool needs `--wformat nvfp4` on
 every command. Gemma 4 26B's needs `OTPU_FORMATS=experts=nvfp4` and `--wformat int8` on every
-command (its layers are int8, its experts nvfp4; with `experts=fp4` it takes pool-fp4.bin).
+command (its layers are int8, its experts nvfp4; with `experts=fp4` it takes pool-mx1-fp4.bin).
 Qwen3.5-35B-A3B's nvfp4 layers do not change its experts' bytes or its key. The pools are 4.6 GB
 (LFM2.5-8B-A1B, nvfp4, 704 experts), 17.5 GB (Qwen3.5-35B-A3B, fp4, 10240) and 14.6 GB
 (gemma-4-26B-A4B-it, nvfp4, 3840; 13.5 GB in fp4); before MX, all fp4, 4.1, 17.1 and 13.2 GB. Every
@@ -3840,7 +3842,7 @@ written, no hints, no layer-ahead, no expert-major prefill.
 
 At load, LFM2.5-8B-A1B at the default `--cap 2048`: `experts: 638 slots of 704 experts (91%),
 5.85 MB each; pool models/LFM2.5-8B-A1B/pool-fp4.bin` before MX; this tree's nvfp4 image holds
-572 slots (81%) of 6.48 MB, from `pool-nvfp4.bin`.
+572 slots (81%) of 6.48 MB, from `pool-mx1-nvfp4.bin`.
 
 Each turn's numbers add the experts (LFM2.5-8B-A1B's first turn in 14.5):
 - the status line: `· 99% hit · 6.6 MB/tok` after the decode rate;

@@ -3,11 +3,13 @@
 # of two greedy turns (tools/qual/chatmoe.py: otpu-chat's Chat, engine and settings, the card's
 # decode loop picking every token), checked turn by turn against the ISA simulator's run with
 # the card's configuration, with each turn's TTFT, prefill and decode tok/s and the slots' hits.
-#   lfm2-8b      LFM2.5-8B-A1B: fp4 with an int8 head, its prompt token by token
-#   qwen35-35b   Qwen3.5-35B-A3B: fp4, int8 head, the embedding table on the host, its prompt
-#                layer by layer (R = 2, pooled slots)
-#   gemma4-26b   gemma-4-26B-A4B-it (the instruct checkpoint): int8 layers, fp4 experts and head,
-#                its prompt layer by layer
+#   lfm2-8b      LFM2.5-8B-A1B: nvfp4 with an int8 head, its prompt token by token
+#   qwen35-35b   Qwen3.5-35B-A3B: nvfp4 layers, fp4 experts, int8 head, the embedding table on
+#                the host, its prompt layer by layer (R = 2, pooled slots)
+#   gemma4-26b   gemma-4-26B-A4B-it (the instruct checkpoint): int8 layers, nvfp4 experts, fp4
+#                head, its prompt layer by layer
+# (streamed.FORMATS, the MX formats). The pools are the MX MXU's (key 2, numerics mx1:
+# pool-*-mx.split.bin); the pools before MX (pool-*-fp4.split.bin, key 1) are refused.
 # The checkpoints and pools are the offload sessions' (tools/offload/sessions/env.sh: O), each
 # pool stamped with its key (pack_pool.py MODEL POOL stamp); the references are
 # RF/chatmoe-<model>.json. A model whose files are not staged is skipped. Before each model
@@ -25,10 +27,10 @@ set -u
 SESSION=${SESSION:-chatmoe-$(date +%m%d-%H%M)}
 source "$(dirname "$0")/../offload/sessions/env.sh"
 exec > >(tee -a $R/session.log) 2>&1
-G26POOL=${G26POOL:-../g26it/pool-g26it-fp4.split.bin}
+G26POOL=${G26POOL:-../g26it/pool-g26it-mx.split.bin}
 declare -A RUN=(        # checkpoint, pool (in O)
-  [lfm2-8b]="LFM2.5-8B-A1B pool-lfm25-8b-fp4.split.bin"
-  [qwen35-35b]="Qwen3.5-35B-A3B pool-q35-fp4.split.bin"
+  [lfm2-8b]="LFM2.5-8B-A1B pool-lfm25-8b-mx.split.bin"
+  [qwen35-35b]="Qwen3.5-35B-A3B pool-q35-mx.split.bin"
   [gemma4-26b]="gemma-4-26B-A4B-it $G26POOL")
 echo "chatmoe start $(date +%T) tree $rev mem $(mem) GB"
 timeout 1800 python -m opentpu.host.selftest 2>&1 | grep -E "\[(PASS|FAIL)\]|config" | tail -12

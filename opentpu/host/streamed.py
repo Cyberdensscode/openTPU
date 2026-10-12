@@ -9,7 +9,7 @@ into per-layer slots in its DRAM. The host only reads the file and writes DRAM
 layer runs or steps, the card's decode loop, a host-sampled step).
 
     eng = engine("models/Qwen3.5-35B-A3B", cfg, backend, cap=2048,
-                 pool="models/Qwen3.5-35B-A3B/pool-fp4.bin")
+                 pool="models/Qwen3.5-35B-A3B/pool-mx1-fp4.bin")
 
 The settings default to the ones measured best on the card (docs/offload.md 10-13): the slots
 filling the DRAM, replaced by decayed use; the prompt layer by layer in runs of two rows with
@@ -73,9 +73,13 @@ def fit_experts(spec, cfg, cap: int, image=None, **kw) -> int:
 
 
 def default_pool(model_dir, efmt: str) -> Path:
-    """Where a checkpoint's pool goes by default: in its directory, pool-<the experts'
-    format>.bin (with its .packed, .format and .key beside it)."""
-    return Path(model_dir) / f"pool-{efmt}.bin"
+    """Where a checkpoint's pool goes by default: in its directory, pool-<the MXU's numerics>-
+    <the experts' format>.bin (pool-mx1-fp4.bin, pool-mx1-nvfp4.bin; with its .packed, .format
+    and .key beside it, or beside the file it links to). The numerics in the name keep a pool
+    of the MXU before MX (pool-fp4.bin, key 1: refused) beside this tree's, for a qualification
+    and a rollback."""
+    from opentpu.quant import MX_NUMERICS
+    return Path(model_dir) / f"pool-{MX_NUMERICS}-{efmt}.bin"
 
 
 def _pack_hint(model, pool, wformat: str, formats: str | None) -> str:

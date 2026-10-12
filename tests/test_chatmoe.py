@@ -126,9 +126,9 @@ def test_streamed_defaults_are_the_cards_runs():
     assert ST.defaults(object.__new__(lfm2.Spec)) == ("nvfp4", "int8", None)
     assert ST.defaults(object.__new__(gemma4.Spec)) == ("int8", "fp4", "experts=nvfp4")
     assert ST.default_pool("models/Qwen3.5-35B-A3B", "fp4") == \
-        Path("models/Qwen3.5-35B-A3B/pool-fp4.bin")
+        Path("models/Qwen3.5-35B-A3B/pool-mx1-fp4.bin")      # (beside the MXU before MX's
     assert ST.default_pool("models/LFM2.5-8B-A1B", "nvfp4") == \
-        Path("models/LFM2.5-8B-A1B/pool-nvfp4.bin")
+        Path("models/LFM2.5-8B-A1B/pool-mx1-nvfp4.bin")      # pool-fp4.bin, key 1)
 
 
 def test_a_chat_turn_is_moe_cards_run(ckpt, formats, tmp_path):
@@ -302,7 +302,7 @@ def test_the_pool_is_checked_before_the_image(tmp_path, monkeypatch):
 
     def engine(pool, W=None):
         return ST.engine(d, CFG, "isa", 256, pool, experts=K, W=W)
-    with pytest.raises(ST.PoolError, match=r"no expert pool at .*pool-fp4.bin: pack it .*"
+    with pytest.raises(ST.PoolError, match=r"no expert pool at .*pool-mx1-fp4.bin: pack it .*"
                                            r"pack_pool.py .* init .* pack I N"):
         engine(ST.DEFAULT)
     bad = tmp_path / "bad.bin"
@@ -310,7 +310,7 @@ def test_the_pool_is_checked_before_the_image(tmp_path, monkeypatch):
     with pytest.raises(ST.PoolError, match="1000 bytes, not this image's pool"):
         engine(bad)
     assert bad.stat().st_size == 1000
-    pool = d / "pool-fp4.bin"
+    pool = d / "pool-mx1-fp4.bin"
     _pack_pool(d, pool, "init", monkeypatch=monkeypatch)
     kf = Path(str(pool) + ".key")
     key = kf.read_text()
@@ -372,9 +372,9 @@ def test_otpu_chat_runs_a_streamed_moe(tmp_path, monkeypatch, capfd):
     monkeypatch.setattr(C.Chat, "ask_plain", lambda self, text: plain(self, text, sys.stdout))
     argv = ["--model", str(d), "--prompt", "11 22 33 44 55", "--greedy", "--max-new", "4",
             "--experts", str(K)]
-    with pytest.raises(SystemExit, match="otpu-chat: no expert pool at .*pool-fp4.bin"):
+    with pytest.raises(SystemExit, match="otpu-chat: no expert pool at .*pool-mx1-fp4.bin"):
         C.main(argv)
-    pool = d / "pool-fp4.bin"
+    pool = d / "pool-mx1-fp4.bin"
     _pack_pool(d, pool, "init", monkeypatch=monkeypatch)
     _pack_pool(d, pool, "pack", 0, 1, monkeypatch=monkeypatch)
     capfd.readouterr()
@@ -403,7 +403,7 @@ def test_otpu_chat_clamps_the_models_top_k(tmp_path, monkeypatch, capfd):
     monkeypatch.setattr(C.Chat, "ask_plain", lambda self, text: (
         on_card.append((self.on_card, self.pick.params["top_k"], self.eng._snaps is not None)),
         plain(self, text, sys.stdout)))
-    pool = d / "pool-nvfp4.bin"                 # (LFM2's experts are nvfp4: streamed.FORMATS)
+    pool = d / "pool-mx1-nvfp4.bin"             # (LFM2's experts are nvfp4: streamed.FORMATS)
     _pack_pool(d, pool, "init", "--wformat", "nvfp4", monkeypatch=monkeypatch)
     _pack_pool(d, pool, "pack", 0, 1, "--wformat", "nvfp4", monkeypatch=monkeypatch)
     argv = ["--model", str(d), "--prompt", "11 22 33", "--max-new", "3", "--experts", str(K)]
@@ -448,7 +448,7 @@ def test_the_scripted_chat_checks_a_run_against_its_reference(tmp_path, monkeypa
     (exit 1, the turn and the token named)."""
     d = _checkpoint("qwen35", tmp_path / "model")
     monkeypatch.delenv("OTPU_FORMATS", raising=False)
-    pool = d / "pool-fp4.bin"
+    pool = ST.default_pool(d, "fp4")
     _pack_pool(d, pool, "init", monkeypatch=monkeypatch)
     _pack_pool(d, pool, "pack", 0, 1, monkeypatch=monkeypatch)
     (tmp_path / "cfg.pkl").write_bytes(pickle.dumps(CFG))
