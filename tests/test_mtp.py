@@ -227,9 +227,8 @@ def test_mtp_loop_on_the_device_is_plain_greedy(P, drafter, fmt, N, stop):
     prompt = [int(t) for t in np.random.default_rng(P).integers(0, 1000, P)]
     want = _plain(spec, W, prompt, N, kw, cfg)
     ids = None
-    if stop:                                # the second of the first accepted pair stops it
-        k = 2
-        assert want[k] not in want[:k]
+    if stop:                                # the second of an accepted pair stops it: the first
+        k = next(k for k in range(2, len(want), 2) if want[k] not in want[:k])  # new to them
         ids = [want[k]]
         want = want[:k + 1]
     right = np.zeros(514, np.float32)
@@ -303,9 +302,8 @@ def test_mtp_sampled_loop_is_plain_sampling(P, drafter, how, N, stop):
     prompt = [int(t) for t in np.random.default_rng(P).integers(0, 1000, P)]
     want, ref, hits = _plain_sampled(spec, W, prompt, N, samp, 5, cfg)
     ids = []
-    if stop:                                # the second of the first accepted pair stops it
-        k = 2
-        assert want[k] not in want[:k]
+    if stop:                                # the second of an accepted pair stops it: the first
+        k = next(k for k in range(2, len(want), 2) if want[k] not in want[:k])  # new to them
         ids = [want[k]]
         want, ref, _ = _plain_sampled(spec, W, prompt, N, samp, 5, cfg, ids)
         assert len(want) == k + 1
