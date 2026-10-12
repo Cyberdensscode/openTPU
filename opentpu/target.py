@@ -189,10 +189,18 @@ def config(t: Target | str | None = None, **kw):
     return Config(**{**t.arch, **kw})
 
 
+# The numerics the programs and images assume, hashed with the Config: "mx", the MX MXU and
+# quantizer (docs/isa.md MM, QACT, QST; docs/mx_mxu.md; CAPS bit29). A host of the previous
+# numerics computes the Config's hash without it, so it refuses an MX bitstream wherever it
+# checks the CFG_HASH (opentpu/host/board.py device_config: ConfigMismatch), and an MX host
+# refuses a bitstream of the previous numerics the same way.
+NUMERICS = "mx"
+
+
 def arch_hash(cfg) -> int:
-    """A stable 32-bit hash of a Config's fields (the CFG_HASH register; programs compiled for
-    one Config run on any device whose Config hashes the same)."""
-    d = dataclasses.asdict(cfg)
+    """A stable 32-bit hash of a Config's fields and the numerics (the CFG_HASH register;
+    programs compiled for one Config run on any device whose Config hashes the same)."""
+    d = dict(dataclasses.asdict(cfg), NUMERICS=NUMERICS)
     s = json.dumps({k: (int(v) if isinstance(v, bool) else v) for k, v in sorted(d.items())},
                    separators=(",", ":"))
     return int.from_bytes(hashlib.sha256(s.encode()).digest()[:4], "big")

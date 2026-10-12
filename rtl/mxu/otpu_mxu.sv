@@ -398,6 +398,33 @@ module otpu_mxu
   assign act_blk2 = 16'(c_ab) + {ck[14:0], 1'b1};
   assign act_hi = c_hi;
   assign act_grp = cg;
+`ifndef SYNTHESIS
+  // co-sim statistic of the scale reads: port A line requests, and those that fetch a row's Sw
+  // alone (i_sws: its Sw in neither neighbour's line). Totals in xs_a / xs_sw (otpu_slice prints
+  // them at the dump: rtlsim's stats["mxu_scale"]); under +trace one line a command as its
+  // issue ends, "MXS<sid> a=<requests> sw=<Sw alone>", in issue order (= the MMs' order;
+  // tools/perf_qwen.py's MM table). Not a trace event: the board does not record it.
+  longint unsigned xs_a, xs_sw;
+  int unsigned     xc_a, xc_sw;
+  bit              xs_trace;
+  initial begin
+    xs_a = 0; xs_sw = 0; xc_a = 0; xc_sw = 0;
+    xs_trace = $test$plusargs("trace");
+  end
+  always @(posedge clk)
+    if (rst) begin
+      xc_a = 0; xc_sw = 0;
+    end else if (go_iss) begin
+      if (a_req) begin
+        xs_a++; xc_a++;
+        if (i_sws) begin xs_sw++; xc_sw++; end
+      end
+      if (!i_sws && i_left == 1) begin
+        if (xs_trace) $display("MXS%0d a=%0d sw=%0d", SID, xc_a, xc_sw);
+        xc_a = 0; xc_sw = 0;
+      end
+    end
+`endif
   assign act_ren = 1'b1;
 
   // ---- the tags of the requests in flight (LUT RAM) and the responses: a response is

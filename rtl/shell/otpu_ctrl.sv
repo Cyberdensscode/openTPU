@@ -44,7 +44,10 @@
 //                      bit25 the run's arguments (ARG0..7), bit26 STREAM (the stream engine's
 //                      hardware subset, docs/stream.md; with DSTEP), bit27 the DDR3
 //                      controllers want the host's calibration (LiteDRAM:
-//                      opentpu/host/memcal.py), bit30 GEN: the decode loop's instructions
+//                      opentpu/host/memcal.py), bit29 MX: the MX numerics (MM's exact
+//                      accumulation with power-of-two block scales, QACT / QST's offsets;
+//                      docs/isa.md, docs/mx_mxu.md; every bitstream since), bit30 GEN: the
+//                      decode loop's instructions
 //                      (RLD, VOP ARGMAX, HALT CHAIN; docs/isa.md, docs/autodecode.md), bit31
 //                      WAITW (the DMA waits for a word the host writes; docs/isa.md)
 //   0x44 CORE_KHZ  RO  the core clock in kHz (build parameter)
@@ -178,7 +181,7 @@ module otpu_ctrl #(
   input  logic [4:0]  i2c_in
 );
   localparam int NFR = 13;
-  localparam logic [31:0] CAPS = {1'b1, 1'b1, 2'd0, HOSTCAL, DSTEP, 2'd3,  // bit31 WAITW, bit30 GEN, bit27 HOSTCAL, bit26 STREAM, bit25 ARG, bit24 ACT_ROWS
+  localparam logic [31:0] CAPS = {1'b1, 1'b1, 1'b1, 1'b0, HOSTCAL, DSTEP, 2'd3,  // bit31 WAITW, bit30 GEN, bit29 MX, bit27 HOSTCAL, bit26 STREAM, bit25 ARG, bit24 ACT_ROWS
                                   8'($clog2(PQ_WIN)),
                                   8'(TRACE_DEPTH != 0 ? $clog2(TRACE_DEPTH) : 0),
                                   CHASH, DSTEP, 1'b1, 1'b1, DDR_MTS != 0, HAS_I2C, HAS_TEMP,

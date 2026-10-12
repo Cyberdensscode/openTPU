@@ -63,9 +63,22 @@ def test_board_config_follows_otpu_target(no_env):
         board_config()
 
 
+def _hash_without_numerics(cfg) -> int:
+    """arch_hash before the MX numerics (what today's production host computes)."""
+    import hashlib
+    import json
+    d = dataclasses.asdict(cfg)
+    s = json.dumps({k: (int(v) if isinstance(v, bool) else v) for k, v in sorted(d.items())},
+                   separators=(",", ":"))
+    return int.from_bytes(hashlib.sha256(s.encode()).digest()[:4], "big")
+
+
 def test_arch_hash_is_stable_and_sensitive():
     card = T.config("ypcb-00338")
-    assert f"{T.arch_hash(card):08x}" == "e170f967"     # in the bitstreams' CFG_HASH: keep it
+    # in the bitstreams' CFG_HASH: keep it (e170f967 before the MX numerics, T.NUMERICS)
+    assert f"{T.arch_hash(card):08x}" == "ff270e6e"
+    # production's CFG_HASH, what a host of the previous numerics computes: it refuses MX builds
+    assert f"{_hash_without_numerics(card):08x}" == "e170f967"
     assert T.arch_hash(card) == T.arch_hash(T.config("nangate45")), "same arch, same programs"
     for f in dataclasses.fields(Config):
         v = getattr(card, f.name)
@@ -113,9 +126,9 @@ def test_target_cli():
     run = lambda *a: subprocess.run([sys.executable, "-m", "opentpu.target", *a], cwd=ROOT,
                                     capture_output=True, text=True, check=True).stdout
     env = dict(line.split("=", 1) for line in run("env", "ypcb-00338").split())
-    assert (env["T_MCOLS"], env["T_PLATFORM"], env["T_ARCH_HASH"]) == ("4", "1", "e170f967")
+    assert (env["T_MCOLS"], env["T_PLATFORM"], env["T_ARCH_HASH"]) == ("4", "1", "ff270e6e")
     assert run("hash", "ypcb-00338", "MCOLS=4", "LANES=8", "ACT_ROWS=4", "DSTEP=1").strip() \
-        == "e170f967"
+        == "ff270e6e"
     assert "bcu1525" in run("list")
 
 

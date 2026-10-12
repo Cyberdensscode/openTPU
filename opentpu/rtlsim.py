@@ -352,6 +352,10 @@ def _run(cfg, programs: list, images: list, dram_lat: int = 8, max_cycles: int =
             drams[s][at:at + 4 * len(progs[s])] = 0
     tmems = [_read_hex(tmp / f"tmem_{s}.hex", cfg.TMEM_WORDS) for s in range(cfg.S)]
     stats = {"cycles": cycles, "instructions": icounts}
+    # per slice, the MXU's scale reads: port A line requests, and those that fetched a row's Sw
+    # alone (otpu_mxu xs_*)
+    stats["mxu_scale"] = [{"areq": int(a), "sw": int(w)} for a, w in
+                          re.findall(r"MXSCALE s\d+ areq=(\d+) sw=(\d+)", out)]
     if error_ok:
         stats["error"] = bool(err)
     if axi:

@@ -330,7 +330,12 @@ module otpu_slice
     .t_ren(mxu_ren), .t_raddr(mxu_raddr), .t_rdata(r_data[P_MXU][ULANES-1:0]),
     .t_wen(mxu_wen), .t_waddr(mxu_waddr), .t_wdata(mxu_wdata), .t_gnt(gnt[G_MXU]));
 
-  otpu_quant #(.D(D), .LANES(ULANES), .SID(SID)) u_quant (
+  // the quantizer's group maxes of a row (MX offsets; not ROW mode): a QACT's 4 KB (KB <=
+  // ACT_BLOCKS: the ACT RAM's bound) and a QST's KB (its row in TMEM: KB <= TMEM_WORDS / D), so
+  // every QACT and QST the ISA's bounds allow fits (the card: 512)
+  localparam int QG = (4 * ACT_BLOCKS > TMEM_WORDS / D) ? 4 * ACT_BLOCKS : TMEM_WORDS / D;
+  localparam int Q_GR = (QG <= 8) ? 8 : (1 << $clog2(QG));
+  otpu_quant #(.D(D), .LANES(ULANES), .GR(Q_GR), .SID(SID)) u_quant (
     .clk, .rst(rst_q), .start(ustart[U_Q]), .cmd(ucmd[U_Q]), .rdy(r_q), .done(d_q), .gnt(gnt[G_Q]),
     .t_ren(q_ren), .t_raddr(q_raddr), .t_rdata(r_data[P_Q][ULANES-1:0]),
     .t_ren2(q_ren2), .t_raddr2(q_raddr2), .t_rdata2(r_data[P_Q2][ULANES-1:0]),
@@ -691,6 +696,10 @@ module otpu_slice
   // board's trace buffer records (otpu_trace.sv, opentpu/hwtrace.py)
   bit trace;
   initial trace = $test$plusargs("trace");
+  // the MXU's scale reads (otpu_mxu xs_*; rtlsim stats["mxu_scale"]): port A line requests, and
+  // those that fetched a row's Sw alone
+  always @(posedge clk)
+    if (dump) $display("MXSCALE s%0d areq=%0d sw=%0d", SID, u_mxu.xs_a, u_mxu.xs_sw);
   always_ff @(posedge clk)
     if (trace) begin
       if (pf.sq.g) $display("T%0d G c=%0d s=%0d", SID, pf.sq.cyc, pf.sq.g_slot);

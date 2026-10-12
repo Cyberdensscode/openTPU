@@ -56,6 +56,11 @@ CAP_HOSTCAL, R_MEMCAL = 1 << 27, 0x10000
 # A DDR4 board's LiteDRAM cores (the BCU1525: one per DIMM, calibrated by their own CPUs;
 # opentpu/host/ddr4.py): DIMM d's CSRs in BAR0 at R_DDR4 + d x DDR4_STRIDE
 R_DDR4, DDR4_STRIDE = 0x40000, 0x10000
+# CAPS bit29: the MX numerics (docs/isa.md MM, QACT, QST; docs/mx_mxu.md): MM accumulates each
+# output exactly with power-of-two block scales, QACT / QST quantize to a row scale and
+# power-of-two offsets. Programs and images of the previous numerics compute garbage on such a
+# bitstream and vice versa (the CFG_HASH differs too: opentpu/target.py arch_hash)
+CAP_MX = 1 << 29
 # CAPS bit30: the decode loop on the card (docs/isa.md RLD, VOP ARGMAX, HALT CHAIN; the
 # generate programs of opentpu/llm/generate.py)
 CAP_GEN = 1 << 30
@@ -134,7 +139,7 @@ def caps(v: int) -> dict:
             "chash": bool(v & CAP_CHASH), "act_rows": bool(v & CAP_ACT),
             "args": bool(v & CAP_ARGS), "stream": bool(v & CAP_STREAM),
             "hostcal": bool(v & CAP_HOSTCAL), "gen": bool(v & CAP_GEN),
-            "waitw": bool(v & CAP_WAITW),
+            "waitw": bool(v & CAP_WAITW), "mx": bool(v & CAP_MX),
             "trace_depth": 1 << ((v >> 8) & 0xFF) if v & CAP_TRACE else 0,
             "pq_window": 1 << ((v >> 16) & 0xFF)}
 
