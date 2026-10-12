@@ -5,7 +5,9 @@
 // bank, the guests only when their host does not ask (IMPL 0), one granted port per copy and bank
 // (IMPL 1, the slice's gnt_k). Addresses mostly in a small window, so reads often meet the
 // writes in flight (the bypass) and recent ones.
-// Built and run by run_tb.sh (Verilator --binary --timing, -GIMPL / -GNCP / -GCPYV).
+// K = 3 / 4 (one copy pumped at 3x / 4x, reads a cycle later): its read data are compared with
+// otpu_tmem's of the cycle before.
+// Built and run by run_tb.sh (Verilator --binary --timing, -GIMPL / -GNCP / -GCPYV / -GK).
 // Prints TB_RESULT PASS / FAIL with the counts.
 `timescale 1ns / 1ps
 module tb_tmem_pump #(
@@ -17,7 +19,8 @@ module tb_tmem_pump #(
   parameter int SEED   = 1,
   parameter int HOT    = 256,       // the hot window's words
   parameter bit BYP    = 1'b0,      // otpu_tmem_pump's (redundant) bypass
-  parameter bit RQ     = 1'b0       // IMPL 1: request-priority addresses (otpu_tmem RQ)
+  parameter bit RQ     = 1'b0,      // IMPL 1: request-priority addresses (otpu_tmem RQ)
+  parameter int K      = 2          // the pump factor (otpu_tmem_pump K)
 );
   localparam int LANES = 8, NRP = 8, NWP = 4, BW = 3;
   localparam int P_MXU = 0, P_DMA = 1, P_Q = 2, P_VA = 3, P_VB = 4, P_Q3 = 5, P_Q2 = 6, P_COLL = 7;
@@ -28,18 +31,21 @@ module tb_tmem_pump #(
   function automatic logic [NRP-1:0][2:0] cpy3();
     for (int p = 0; p < NRP; p++) cpy3[p] = CPYV[3 * p +: 3];
   endfunction
-  function automatic logic [NRP-1:0][1:0] cpy2();
-    for (int p = 0; p < NRP; p++) cpy2[p] = CPYV[3 * p +: 2];
-  endfunction
   localparam logic [NRP-1:0][2:0] CPY3 = cpy3();
-  localparam logic [NRP-1:0][1:0] CPY2 = cpy2();
   // the slice's priority ranks (otpu_slice PRANK): DMA, COLL, VPU, MXU, QUANT
   //                                       COLL  Q2    Q3    VB    VA    Q     DMA   MXU
   localparam logic [NRP-1:0][2:0] PRANK = {3'd1, 3'd4, 3'd4, 3'd2, 3'd2, 3'd4, 3'd0, 3'd3};
 
-  logic clk = 1'b0, clk_f = 1'b1;
-  always #2 clk_f = ~clk_f;          // 4 ns: rises at 4, 8, 12, ...
-  always #4 clk = ~clk;              // 8 ns: rises at 4, 12, ... with clk_f
+  // the core clock 24 ns (rises at 12, 36, ...), clk_f 24 / K ns with a rise at every core edge
+  localparam int HF = 12 / K;
+  localparam int OFF = (12 % (2 * HF) != 0) ? 12 % (2 * HF) : 2 * HF;
+  logic clk = 1'b0, clk_f = 1'b0;
+  always #12 clk = ~clk;
+  initial begin
+    #(OFF);
+    forever begin clk_f = 1'b1; #(HF); clk_f = 1'b0; #(HF); end
+  end
+  initial if (12 % K != 0) $fatal(1, "tb_tmem_pump: K %0d", K);
 
   logic [NRP-1:0][LANES-1:0]       r_en, r_req;
   logic [NRP-1:0][LANES-1:0][31:0] r_addr, rd_ref, rd_dut;
@@ -49,13 +55,13 @@ module tb_tmem_pump #(
 
   otpu_tmem #(.WORDS(WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .WPB(1), .GEN_R(GEN_R),
               .GEN_W(GEN_W), .SH_HOST(P_DMA), .SH_MASK(IMPL == 0 ? SH_MASK : '0), .SID(0),
-              .IMPL(IMPL), .NCP(NCP), .CPY(CPY2), .RQ(RQ), .PRANK(PRANK)) u_ref (
+              .IMPL(IMPL), .NCP(NCP), .CPY(CPY3), .RQ(RQ), .PRANK(PRANK)) u_ref (
     .clk, .r_en, .r_req, .r_addr, .r_data(rd_ref), .w_en, .w_req, .w_gnt, .w_addr, .w_data,
     .dump(1'b0));
   otpu_tmem_pump #(.WORDS(WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .GEN_R(GEN_R),
                    .GEN_W(GEN_W), .SH_HOST(P_DMA), .SH_MASK(IMPL == 0 ? SH_MASK : '0),
                    .IMPL(IMPL), .NCP(NCP), .CPY(CPY3), .BYP(BYP), .RQ(RQ),
-                   .PRANK(PRANK)) u_dut (
+                   .PRANK(PRANK), .K(K)) u_dut (
     .clk, .clk_f, .r_en, .r_req, .r_addr, .r_data(rd_dut), .w_en, .w_req, .w_gnt, .w_addr,
     .w_data);
 
@@ -90,6 +96,7 @@ module tb_tmem_pump #(
 
   // the arbitration groups' read ports and grants
   logic [NRP-1:0] rg;
+  logic [NRP-1:0][LANES-1:0][31:0] rd_prev;   // K > 2: the reference's data a cycle ago
   int unsigned cyc, mism, reads, rdx, wrs, bypass_cand;
   initial begin
     void'($urandom(SEED));
@@ -99,15 +106,16 @@ module tb_tmem_pump #(
     for (cyc = 0; cyc < CYCLES; cyc++) begin
       @(posedge clk);
       #1;                            // after the core edge, before the next fast edge (2 ns)
-      // compare what the last edge produced
+      // compare what the last edge produced (K > 2: with the reference's a cycle earlier)
       for (int p = 0; p < NRP; p++)
         for (int l = 0; l < LANES; l++)
-          if (rd_ref[p][l] !== rd_dut[p][l]) begin
+          if ((K > 2 ? rd_prev[p][l] : rd_ref[p][l]) !== rd_dut[p][l] && (K == 2 || cyc > 0)) begin
             if (mism < 20)
               $display("MISMATCH cycle %0d port %0d lane %0d: ref %h pump %h", cyc, p, l,
-                       rd_ref[p][l], rd_dut[p][l]);
+                       K > 2 ? rd_prev[p][l] : rd_ref[p][l], rd_dut[p][l]);
             mism++;
           end
+      rd_prev = rd_ref;
       // next cycle's requests
       begin
         logic [LANES-1:0] wbk, b;
@@ -157,7 +165,7 @@ module tb_tmem_pump #(
           need = '0;
           ok = ($urandom % 100) < 90;
           for (int p = 0; p < NRP; p++)
-            if (ports[p]) need[CPY2[p] % NCP] |= banks(rq[p], ra[p]);
+            if (ports[p]) need[CPY3[p] % NCP] |= banks(rq[p], ra[p]);
           if (IMPL == 1)
             for (int c = 0; c < NCP; c++) if ((need[c] & occ[c]) != '0) ok = 1'b0;
           if (IMPL == 0) begin
@@ -187,8 +195,8 @@ module tb_tmem_pump #(
         end
       end
     end
-    $display("TB_RESULT %s IMPL %0d NCP %0d RQ %0d WORDS %0d BYP %0d: %0d cycles, %0d lane reads, %0d lane writes, %0d mismatches",
-             mism == 0 ? "PASS" : "FAIL", IMPL, NCP, RQ, WORDS, BYP, CYCLES, reads, wrs, mism);
+    $display("TB_RESULT %s IMPL %0d NCP %0d RQ %0d WORDS %0d BYP %0d K %0d: %0d cycles, %0d lane reads, %0d lane writes, %0d mismatches",
+             mism == 0 ? "PASS" : "FAIL", IMPL, NCP, RQ, WORDS, BYP, K, CYCLES, reads, wrs, mism);
     $finish;
   end
 endmodule

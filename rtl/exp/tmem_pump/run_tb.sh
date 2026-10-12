@@ -8,6 +8,8 @@
 #                  pumped copies (3 of their 4 slots)
 #   i1n4           IMPL 1, NCP 4: 4 banked copies against 2 pumped copies (4 slots)
 #   i1n3q, i1n4q   the same with request-priority addresses (otpu_tmem RQ, the slice's gnt_q)
+#   k3n5, k4n7     one copy pumped at 3x / 4x (K, reads a cycle later): 5 / 7 banked slots against
+#                  otpu_tmem's 5 / 7 banked copies a cycle earlier; k3n5q, k4n7q with RQ
 # WORDS 4096 (a hot window of 256 words) and 65536 (the card's size, a window of 1024).
 set -e
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
@@ -35,3 +37,9 @@ one i1n3   -GIMPL=1 -GNCP=3 "-GCPYV=$CPY3" -GWORDS=4096 -GSEED=3
 one i1n4   -GIMPL=1 -GNCP=4 "-GCPYV=$CPY4" -GWORDS=4096 -GSEED=4
 one i1n3q  -GIMPL=1 -GNCP=3 "-GCPYV=$CPY3" -GWORDS=4096 -GSEED=6 -GRQ=1
 one i1n4q  -GIMPL=1 -GNCP=4 "-GCPYV=$CPY4" -GWORDS=4096 -GSEED=7 -GRQ=1
+CPY5="24'b001100001100011010001000"   # 5 slots: MXU 0, DMA 1, Q 2, VA 3, VB 4, Q3 1, Q2 4, COLL 1
+CPY7="24'b001110101100011010001000"   # 7 slots: MXU 0, DMA 1, Q 2, VA 3, VB 4, Q3 5, Q2 6, COLL 1
+one k3n5   -GIMPL=1 -GNCP=5 "-GCPYV=$CPY5" -GWORDS=4096 -GSEED=8 -GK=3
+one k4n7   -GIMPL=1 -GNCP=7 "-GCPYV=$CPY7" -GWORDS=4096 -GSEED=9 -GK=4
+one k3n5q  -GIMPL=1 -GNCP=5 "-GCPYV=$CPY5" -GWORDS=4096 -GSEED=10 -GK=3 -GRQ=1
+one k4n7q  -GIMPL=1 -GNCP=7 "-GCPYV=$CPY7" -GWORDS=65536 -GHOT=1024 -GSEED=11 -GK=4 -GRQ=1

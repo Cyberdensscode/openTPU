@@ -1,12 +1,15 @@
 # EXPERIMENTAL (docs/tmem_pump.md): out-of-context synthesis + implementation of the TMEM
 # experiment's top (tmem_pump_top) with its clocks from an MMCM. Vivado on omarchy only:
 #   vivado -mode batch -nojournal -source rtl/exp/tmem_pump/ooc.tcl -tclargs <out> <VAR> \
-#     <WORDS> <PART> <FAMILY> <STYLE> <CLKIN_NS> <MULT> <DIV_S> <DIV_F>
+#     <WORDS> <PART> <FAMILY> <STYLE> <CLKIN_NS> <MULT> <DIV_S> <DIV_F> [PK] [CASC]
 # VAR: tmem_pump_top's (0 otpu_tmem IMPL 0, 1 IMPL 1, 2 pumped IMPL 0, 3 pumped NCP 4, 4 pumped
-# NCP 2). FAMILY 0: 7 series (MMCME2), 1: UltraScale+ (MMCME4). STYLE: the pumped banks'
-# ram_style (block / ultra). Prints OTPU_* summary lines; reports go to <out>.
+# NCP 2, 5 one copy pumped at PK x, PK 3 or 4). FAMILY 0: 7 series (MMCME2), 1: UltraScale+
+# (MMCME4). STYLE: the pumped banks' ram_style (block / ultra). Prints OTPU_* summary lines;
+# reports go to <out>.
 set out [file normalize [lindex $argv 0]]
-lassign [lrange $argv 1 end] var words part family style clkin mult div_s div_f
+lassign [lrange $argv 1 end] var words part family style clkin mult div_s div_f pk casc
+if {$pk eq ""} { set pk 3 }
+if {$casc eq ""} { set casc 0 }
 set root [file normalize [file join [file dirname [info script]] ../../..]]
 file mkdir $out
 
@@ -17,7 +20,7 @@ read_verilog -sv [list $root/rtl/tech/generic/otpu_tech_ram.sv $root/rtl/mem/otp
 synth_design -top tmem_pump_top -part $part -mode out_of_context -flatten_hierarchy rebuilt \
   -verilog_define SYNTHESIS -generic VAR=$var -generic WORDS=$words -generic FAMILY=$family \
   -generic STYLE=\"$style\" -generic CLKIN_NS=$clkin -generic MULT=$mult -generic DIV_S=$div_s \
-  -generic DIV_F=$div_f
+  -generic DIV_F=$div_f -generic PK=$pk -generic CASC=$casc
 create_clock -period $clkin -name clk_in [get_ports clk_in]
 set cs [get_clocks -quiet -of_objects [get_pins -hier -filter {NAME =~ *u_mmcm/CLKOUT0}]]
 set cf [get_clocks -quiet -of_objects [get_pins -hier -filter {NAME =~ *u_mmcm/CLKOUT1}]]
@@ -32,7 +35,7 @@ foreach {t c} [list slow $cs fast $cf] {
 set rams [get_cells -quiet -hierarchical -filter {REF_NAME =~ RAMB* || REF_NAME =~ URAM*}]
 set rp [get_pins -quiet -hierarchical -filter {NAME =~ *u_pb/ra[*] || NAME =~ *u_pb/rb[*] || NAME =~ *u_pb/rena || NAME =~ *u_pb/renb}]
 set pwf {}
-foreach c [get_cells -quiet -hierarchical -filter {NAME =~ *u_tmem/pw_* && IS_SEQUENTIAL}] {
+foreach c [get_cells -quiet -hierarchical -filter {NAME =~ *u_tmem/*pw_* && IS_SEQUENTIAL}] {
   set ck [get_clocks -quiet -of_objects [get_pins -quiet -of_objects $c -filter {IS_CLOCK}]]
   if {[llength $cf] && $ck eq [get_property NAME $cf]} { lappend pwf $c }
 }
@@ -46,6 +49,24 @@ if {[llength $rp]} {
 if {[llength $pwf]} {
   set_multicycle_path 2 -setup -end -from $cs -to $pwf
   set_multicycle_path 1 -hold -end -from $cs -to $pwf
+}
+# VAR 5 (otpu_pumpk_bank, K = the clocks' ratio): the core-domain inputs reach the RAM only at core
+# edges (slot 0's request and the write stage), and the fast registers loaded there (the
+# registered slots, the next edge's read, the presented words) take them in a core period; the
+# presented words (oq) reach the core domain in a core period. The rest is one fast period.
+set kpins [get_pins -quiet -hierarchical -filter {NAME =~ *u_pkb/ra0[*] || NAME =~ *u_pkb/ren0 || NAME =~ *u_pkb/wv || NAME =~ *u_pkb/wa[*] || NAME =~ *u_pkb/wd[*]}]
+set kreg [get_cells -quiet -hierarchical -filter {(NAME =~ *u_pkb/sra_reg* || NAME =~ *u_pkb/sren_reg* || NAME =~ *u_pkb/ad_?_r_reg* || NAME =~ *u_pkb/en_?_r_reg* || NAME =~ *u_pkb/oq_reg*) && IS_SEQUENTIAL}]
+set koq [get_cells -quiet -hierarchical -filter {NAME =~ *u_pkb/oq_reg* && IS_SEQUENTIAL}]
+puts "OTPU_MCP_K pins [llength $kpins] regs [llength $kreg] oq [llength $koq]"
+if {[llength $kpins] && [llength $cf]} {
+  set kk [expr {round([get_property PERIOD $cs] / [get_property PERIOD $cf])}]
+  puts "OTPU_K $kk"
+  set_multicycle_path $kk -setup -end -from $cs -through $kpins -to $rams
+  set_multicycle_path [expr {$kk - 1}] -hold -end -from $cs -through $kpins -to $rams
+  set_multicycle_path $kk -setup -end -from $cs -to $kreg
+  set_multicycle_path [expr {$kk - 1}] -hold -end -from $cs -to $kreg
+  set_multicycle_path $kk -setup -start -from $koq -to $cs
+  set_multicycle_path [expr {$kk - 1}] -hold -start -from $koq -to $cs
 }
 report_utilization -file $out/util_synth.txt
 opt_design

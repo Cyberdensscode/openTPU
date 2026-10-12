@@ -7,6 +7,8 @@
 //   VAR 2  otpu_tmem_pump IMPL 0: 3 pumped copies (6 slots: the card's behaviour)
 //   VAR 3  otpu_tmem_pump IMPL 1, NCP 4: 2 pumped copies (4 banked slots)
 //   VAR 4  otpu_tmem_pump IMPL 1, NCP 2: 1 pumped copy (2 banked slots)
+//   VAR 5  otpu_tmem_pump IMPL 1, K = PK (3 or 4): 1 copy pumped at PK x, 2 PK - 1 banked slots
+//          (requests registered: reads a cycle later)
 // The clocks come from one MMCM (FAMILY 0: MMCME2_ADV, 7 series; 1: MMCME4_ADV, UltraScale+):
 // VCO = the input clock x MULT, clk_s = VCO / DIV_S, clk_f = VCO / DIV_F, both through global
 // buffers, so Vivado times the real skew between them.
@@ -18,7 +20,9 @@ module tmem_pump_top #(
   parameter real CLKIN_NS = 7.5,
   parameter real MULT = 8.0,
   parameter real DIV_S = 8.0,
-  parameter int DIV_F = 4
+  parameter int DIV_F = 4,
+  parameter int PK = 3,
+  parameter int CASC = 0
 ) (
   input  logic                          clk_in,
   input  logic [7:0][7:0]               r_en_in,
@@ -38,10 +42,11 @@ module tmem_pump_top #(
   localparam logic [NWP-1:0] GEN_W = NWP'(1) << W_MXU;
   localparam logic [NRP-1:0] SH_MASK = (NRP'(1) << P_Q3) | (NRP'(1) << P_COLL);
   //                                       COLL  Q2    Q3    VB    VA    Q     DMA   MXU
-  localparam logic [NRP-1:0][1:0] CPY2 = {2'd2, 2'd1, 2'd2, 2'd1, 2'd0, 2'd0, 2'd2, 2'd0};
   localparam logic [NRP-1:0][2:0] CPY3 = {3'd2, 3'd1, 3'd2, 3'd1, 3'd0, 3'd0, 3'd2, 3'd0};
   localparam logic [NRP-1:0][2:0] CPY4 = {3'd3, 3'd2, 3'd1, 3'd1, 3'd0, 3'd3, 3'd2, 3'd0};
   localparam logic [NRP-1:0][2:0] CPYB = {3'd1, 3'd1, 3'd1, 3'd1, 3'd0, 3'd0, 3'd1, 3'd0};
+  localparam logic [NRP-1:0][2:0] CPY5 = {3'd1, 3'd4, 3'd1, 3'd4, 3'd3, 3'd2, 3'd1, 3'd0};
+  localparam logic [NRP-1:0][2:0] CPY7 = {3'd1, 3'd6, 3'd5, 3'd4, 3'd3, 3'd2, 3'd1, 3'd0};
 
   logic clkfb, clk_s_u, clk_f_u, clk_s, clk_f;
   if (FAMILY == 0) begin : g_k7
@@ -91,9 +96,15 @@ module tmem_pump_top #(
   if (VAR == 0 || VAR == 1) begin : g_ref
     otpu_tmem #(.WORDS(WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .WPB(1), .GEN_R(GEN_R),
                 .GEN_W(GEN_W), .SH_HOST(P_DMA), .SH_MASK(VAR == 0 ? SH_MASK : '0), .SID(0),
-                .IMPL(VAR), .NCP(3), .CPY(CPY2)) u_tmem (
+                .IMPL(VAR), .NCP(3), .CPY(CPY3)) u_tmem (
       .clk(clk_s), .r_en, .r_req, .r_addr, .r_data, .w_en, .w_req, .w_gnt, .w_addr, .w_data,
       .dump(1'b0));
+  end else if (VAR == 5) begin : g_pumpk
+    otpu_tmem_pump #(.WORDS(WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .GEN_R(GEN_R),
+                     .GEN_W(GEN_W), .SH_HOST(P_DMA), .SH_MASK('0), .IMPL(1), .NCP(2 * PK - 1),
+                     .CPY(PK == 3 ? CPY5 : CPY7), .STYLE(STYLE), .K(PK), .CASC(CASC)) u_tmem (
+      .clk(clk_s), .clk_f, .r_en, .r_req, .r_addr, .r_data, .w_en, .w_req, .w_gnt, .w_addr,
+      .w_data);
   end else begin : g_pump
     otpu_tmem_pump #(.WORDS(WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .GEN_R(GEN_R),
                      .GEN_W(GEN_W), .SH_HOST(P_DMA), .SH_MASK(VAR == 2 ? SH_MASK : '0),

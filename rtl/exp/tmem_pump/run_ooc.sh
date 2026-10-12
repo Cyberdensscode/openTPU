@@ -15,6 +15,13 @@
 # The boards' own parts at 250 / 500 MHz (omarchy has them; opentpu has no UltraScale+ part):
 #   vu9-v2b, vu9-v2u    pumped 3 copies, block RAM / UltraRAM, xcvu9p-fsgd2104-2L-e (BCU1525)
 #   vu47-v2b, vu47-v2u  the same on xcvu47p-fsvh2892-2-e (AWS F2)
+# One copy pumped at 3x / 4x (VAR 5, PK 3 / 4: 5 / 7 banked slots, reads a cycle later):
+#   k7-p1x3  xc7k480t, 133.33 / 400 MHz      k7-p1x4  xc7k480t, 133.33 / 533.33 MHz
+#   ku-p1x3b-133, ku-p1x3u-133  xcku5p, 133.33 / 400 MHz, block RAM / UltraRAM
+#   ku-p1x4b-133, ku-p1x4u-133  xcku5p, 133.33 / 533.33 MHz
+#   ku-p1x3b-200, ku-p1x3u-200  xcku5p, 200 / 600 MHz (the BCU1525's likely core clock)
+#   ku-p1x4b-200, ku-p1x4u-200  xcku5p, 200 / 800 MHz
+#   ku-p1x3c-200, ku-p1x3c-133, ku-p1x4c-133  block RAM with the bank's RAMs uncascaded (CASC 1)
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 O=${1:?outdir}; shift
 mkdir -p "$O"
@@ -49,6 +56,20 @@ for s in "$@"; do
     vu9-v2u)  viv $s 2 65536  $VU9 ultra 4.0 4.0 4.0 2 ;;
     vu47-v2b) viv $s 2 65536  $VU47 block 4.0 4.0 4.0 2 ;;
     vu47-v2u) viv $s 2 65536  $VU47 ultra 4.0 4.0 4.0 2 ;;
+    k7-p1x3)  viv $s 5 65536 $K7 block 7.5 9.0 9.0 3 3 ;;
+    k7-p1x4)  viv $s 5 65536 $K7 block 7.5 8.0 8.0 2 4 ;;
+    ku-p1x3b-133) viv $s 5 65536 $KU block 7.5 9.0 9.0 3 3 ;;
+    ku-p1x3u-133) viv $s 5 65536 $KU ultra 7.5 9.0 9.0 3 3 ;;
+    ku-p1x4b-133) viv $s 5 65536 $KU block 7.5 8.0 8.0 2 4 ;;
+    ku-p1x4u-133) viv $s 5 65536 $KU ultra 7.5 8.0 8.0 2 4 ;;
+    ku-p1x3b-200) viv $s 5 65536 $KU block 5.0 6.0 6.0 2 3 ;;
+    ku-p1x3u-200) viv $s 5 65536 $KU ultra 5.0 6.0 6.0 2 3 ;;
+    ku-p1x4b-200) viv $s 5 65536 $KU block 5.0 8.0 8.0 2 4 ;;
+    ku-p1x4u-200) viv $s 5 65536 $KU ultra 5.0 8.0 8.0 2 4 ;;
+    ku-p1x3c-200) viv $s 5 65536 $KU block 5.0 6.0 6.0 2 3 1 ;;
+    ku-p1x3c-133) viv $s 5 65536 $KU block 7.5 9.0 9.0 3 3 1 ;;
+    ku-p1x4c-133) viv $s 5 65536 $KU block 7.5 8.0 8.0 2 4 1 ;;
+    ku-p1x4c-200) viv $s 5 65536 $KU block 5.0 8.0 8.0 2 4 1 ;;
     *) echo "unknown step $s" >> "$O/progress.txt" ;;
   esac
 done

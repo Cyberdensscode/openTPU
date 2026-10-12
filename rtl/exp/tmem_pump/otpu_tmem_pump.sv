@@ -12,6 +12,15 @@
 // per copy cannot keep that: it would be issued half a cycle early (before its request settles)
 // or its data would land half a cycle late; see docs/tmem_pump.md.
 //
+// K = 3 or 4 (one copy pumped at 3x / 4x, IMPL 1 with NCP = 2K - 1 slots): see otpu_pumpk_bank.
+// More edges do not give more reads at otpu_tmem's latency: a read's word must hold through the
+// whole next core cycle, and a port's output holds one word, so each port gives one such read a
+// core cycle at any K; a read at any other fast edge either takes its request before it has
+// settled or delivers its word late. So the K copy registers the requests at the core edge and
+// spreads the reads over the next core cycle: 2K - 1 read slots and the write, each read's word
+// presented a core cycle later than otpu_tmem's (read latency 2: not the units' contract; for the
+// out-of-context timing and the slot count, docs/tmem_pump.md).
+//
 // Behaviour, port for port, is otpu_tmem's with WPB = 1:
 //   IMPL 0: a slot per read port's copy (the hosts: every port but the guests SH_MASK, which share
 //           SH_HOST's slot in priority order), reads from the requests: 6 slots for the slice's 8
@@ -52,8 +61,12 @@ module otpu_tmem_pump #(
   parameter logic [NRP-1:0][2:0] PRANK = '0,
   parameter string STYLE = "block",        // the banks' ram_style ("block", "ultra")
   parameter bit    BYP   = 1'b0,           // keep otpu_tmem's bypass (redundant here: see below)
-  parameter bit    FW    = 1'b1            // the write stage and the phase in the fast domain
+  parameter bit    FW    = 1'b1,           // the write stage and the phase in the fast domain
                                            // (below; 0: both in the core domain, as first built)
+  parameter int    K     = 2,              // clk_f = K x clk: 2 (the copies above), or 3 / 4: one
+                                           // copy of 2K - 1 slots, reads a cycle later (above)
+  parameter int    CASC  = 0               // K > 2, block RAM: 1 keeps a bank's RAMs out of a
+                                           // cascade (UltraScale+ cascade_height 1), 0 Vivado's
 ) (
   input  logic                                clk,
   input  logic                                clk_f,
@@ -97,9 +110,11 @@ module otpu_tmem_pump #(
     return -1;
   endfunction
   localparam int NS  = n_slots();
-  localparam int NPC = (NS + 1) / 2;
+  localparam int NPC = (K > 2) ? 1 : (NS + 1) / 2;
   initial if (IMPL == 1) for (int p = 0; p < NRP; p++)
     if (CPY[p] >= NCP) $fatal(1, "otpu_tmem_pump: port %0d's slot %0d >= NCP %0d", p, CPY[p], NCP);
+  initial if (K > 2 && (IMPL != 1 || NS != 2 * K - 1 || K > 4 || BYP))
+    $fatal(1, "otpu_tmem_pump: K %0d needs IMPL 1, NCP %0d and no BYP", K, 2 * K - 1);
 
   // ---- write selection (otpu_tmem g_w1, WPB = 1)
   logic [LANES-1:0]         bw_v;
@@ -161,7 +176,7 @@ module otpu_tmem_pump #(
   (* max_fanout = 16 *) logic [LANES-1:0][IW-1:0] pw_a;
   (* max_fanout = 16 *) logic [LANES-1:0][31:0]   pw_d;
   logic [LANES-1:0][31:0]                         pd;
-  if (FW) begin : g_fw
+  if (FW && K == 2) begin : g_fw
     (* keep *) logic wtog;
     (* keep *) logic wtq;
     (* max_fanout = 32 *) logic pw_ev;
@@ -187,7 +202,7 @@ module otpu_tmem_pump #(
     end
   end
   always_ff @(posedge clk)
-    if (BYP) pd <= pw_d;
+    if (BYP && K == 2) pd <= pw_d;
 `ifndef SYNTHESIS
   initial pw_v = '0;
 `endif
@@ -276,6 +291,31 @@ module otpu_tmem_pump #(
 
   // ---- the pumped copies: copy c's bank b serves slot 2c on port A and slot 2c + 1 on port B
   logic [NRP-1:0][LANES-1:0][31:0] hq;     // each host's bank data
+  if (K > 2) begin : g_k
+    // one copy at K x: bank b's slot s is host_on(s)'s (otpu_pumpk_bank); its word comes a
+    // cycle later than otpu_tmem's
+    for (genvar b = 0; b < LANES; b++) begin : g_bank
+      logic [2*K-2:1]         rens;
+      logic [2*K-2:1][IW-1:0] ras;
+      logic [2*K-2:0][31:0]   oq;
+      for (genvar s = 1; s < 2 * K - 1; s++) begin : g_s
+        localparam int HS = host_on(s);
+        assign rens[s] = (HS >= 0) ? h_en[HS < 0 ? 0 : HS][b] : 1'b0;
+        assign ras[s] = h_a[HS < 0 ? 0 : HS][b];
+      end
+      localparam int H0 = host_on(0);
+      otpu_pumpk_bank #(.N(BD), .STYLE(STYLE), .K(K), .CASC(CASC)) u_pkb (
+        .clk, .clk_f, .wv(pw_v[b]), .wa(pw_a[b]), .wd(pw_d[b]),
+        .ren0((H0 >= 0) ? h_en[H0 < 0 ? 0 : H0][b] : 1'b0), .ra0(h_a[H0 < 0 ? 0 : H0][b]),
+        .rens, .ras, .oq);
+      for (genvar s = 0; s < 2 * K - 1; s++) begin : g_o
+        localparam int HS = host_on(s);
+        if (HS >= 0) begin : g_h
+          assign hq[HS][b] = oq[s];
+        end
+      end
+    end
+  end else begin : g_k2
   for (genvar c = 0; c < NPC; c++) begin : g_pc
     localparam int HA = host_on(2 * c);
     localparam int HB = host_on(2 * c + 1);
@@ -294,13 +334,35 @@ module otpu_tmem_pump #(
       end
     end
   end
+  end
   for (genvar p = 0; p < NRP; p++) begin : g_nohost
     if (host_of(p) != p) begin : g_z
       assign hq[p] = '0;
     end
   end
 
-  // ---- per port: the bypass and the lanes' data path (otpu_tmem)
+  // ---- per port: the bypass and the lanes' data path (otpu_tmem); K > 2 takes the requests a
+  // cycle later, with the words
+  logic [NRP-1:0][LANES-1:0]         ren_l;
+  logic [NRP-1:0][LANES-1:0][BW-1:0] rbk_l;
+  if (K > 2) begin : g_l2
+    always_ff @(posedge clk)
+      for (int p = 0; p < NRP; p++)
+        for (int l = 0; l < LANES; l++) begin
+          ren_l[p][l] <= r_en[p][l];
+          rbk_l[p][l] <= r_addr[p][l][BW-1:0];
+        end
+`ifndef SYNTHESIS
+    initial ren_l = '0;
+`endif
+  end else begin : g_l1
+    always_comb
+      for (int p = 0; p < NRP; p++)
+        for (int l = 0; l < LANES; l++) begin
+          ren_l[p][l] = r_en[p][l];
+          rbk_l[p][l] = r_addr[p][l][BW-1:0];
+        end
+  end
   logic [NRP-1:0][LANES-1:0][31:0] pq;
   for (genvar p = 0; p < NRP; p++) begin : g_port
     if (host_of(p) == p) begin : g_copy
@@ -322,7 +384,7 @@ module otpu_tmem_pump #(
     end else begin : g_guest
       assign pq[p] = pq[host_of(p)];
     end
-    wire  [BW-1:0]            rot = r_addr[p][0][BW-1:0];
+    wire  [BW-1:0]            rot = rbk_l[p][0];
     wire  [LANES-1:0][31:0]   qb = pq[p];
     logic [LANES-1:0][BW-1:0] sel;
     logic [LANES-1:0][BW-1:0] rq;
@@ -333,13 +395,13 @@ module otpu_tmem_pump #(
     end else begin : g_rot
       (* keep *) logic [LANES-1:0][BW-1:0] rot_q;
       always_ff @(posedge clk)
-        for (int l = 0; l < LANES; l++) if (|r_en[p]) rot_q[l] <= rot;
+        for (int l = 0; l < LANES; l++) if (|ren_l[p]) rot_q[l] <= rot;
       assign rq = rot_q;
     end
     always_ff @(posedge clk)
       for (int l = 0; l < LANES; l++) begin
-        fresh[l] <= r_en[p][l];
-        if (GEN_R[p] && r_en[p][l]) sel[l] <= r_addr[p][l][BW-1:0];
+        fresh[l] <= ren_l[p][l];
+        if (GEN_R[p] && ren_l[p][l]) sel[l] <= rbk_l[p][l];
         if (fresh[l]) held[l] <= lq[l];
       end
     always_comb
@@ -431,5 +493,144 @@ module otpu_pump_bank #(
 `ifndef SYNTHESIS
     initial for (int i = 0; i < N; i++) mem[i] = '0;
 `endif
+  end
+endmodule
+
+// One bank of a copy pumped at K = 3 or 4 times the core clock (clk_f = K x clk, aligned): a true
+// dual-port RAM serving 2K - 1 read slots and the write in each core cycle, with the requests
+// registered, so a read's word comes in the cycle after next (a cycle later than otpu_tmem's). In
+// the core cycle after a request, at fast edge e = 0 .. K-1 (e = 0 the core edge):
+//   - port B reads slot e: slot 0 at the core edge from the request itself (ren0 / ra0, as the 2x
+//     copies read), slots e >= 1 from the requests registered at that edge (sren / sra);
+//   - port A writes the write stage at e = 0 (where otpu_tmem lands it), and reads slot K - 1 + e
+//     at e >= 1.
+// Each word is taken at the next fast edge (sq; the last edge's straight from the RAM) and all are
+// presented at the next core edge (oq) for a whole core cycle. Slot 0 meets the landing write on
+// the other port at e = 0: its word is the write stage's where the addresses match (bh / pd, as
+// otpu_tmem's bypass); every later read sees that write in the RAM. The next edge's address and
+// enable are registered a fast edge ahead (ad_*_r), so only a 2:1 multiplexer sits before the RAM.
+// Timing contract (ooc.tcl): ren0 / ra0 / wv / wa / wd into the RAM, and the core-domain inputs
+// of sren / sra / ad_*_r / en_*_r / oq, a core period (K fast periods); oq into the core domain a
+// core period; the rest in one fast period.
+(* keep_hierarchy = "yes" *)
+module otpu_pumpk_bank #(
+  parameter int    N     = 8192,
+  parameter string STYLE = "block",
+  parameter int    K     = 3,
+  parameter int    CASC  = 0         // 1: the bank's block RAMs uncascaded (cascade_height 1): on
+                                     // UltraScale+ Vivado splits 8K x 32 into cascaded RAMB36E2,
+                                     // whose chain sits in the RAM-to-register path (one fast period)
+) (
+  input  logic                          clk,
+  input  logic                          clk_f,
+  input  logic                          wv,
+  input  logic [$clog2(N)-1:0]          wa,
+  input  logic [31:0]                   wd,
+  input  logic                          ren0,
+  input  logic [$clog2(N)-1:0]          ra0,
+  input  logic [2*K-2:1]                rens,
+  input  logic [2*K-2:1][$clog2(N)-1:0] ras,
+  output logic [2*K-2:0][31:0]          oq
+);
+  localparam int NS = 2 * K - 1;
+  localparam int AW = $clog2(N);
+  // the phase: tog flips at every core edge, tq follows it a fast edge later and t2 one more; they
+  // differ between fast edges 1 and 2 only, so ph (the fast cycle's index: e after edge e) is set
+  // to 2 at edge 2 and counts otherwise (no reset: it aligns itself within the first core cycle)
+  (* keep *) logic tog, tq, t2;
+  logic [1:0] ph;
+  always_ff @(posedge clk) tog <= !tog;
+  always_ff @(posedge clk_f) begin
+    tq <= tog;
+    t2 <= tq;
+    ph <= (tq != t2) ? 2'd2 : (ph == 2'(K - 1)) ? 2'd0 : ph + 2'd1;
+  end
+`ifndef SYNTHESIS
+  initial begin tog = 1'b0; tq = 1'b0; t2 = 1'b0; ph = 2'd0; end
+`endif
+  wire ce = (ph == 2'(K - 1));             // this fast cycle ends at a core edge
+  // the slots' requests, registered at the core edge
+  logic [NS-1:1]         sren;
+  logic [NS-1:1][AW-1:0] sra;
+  always_ff @(posedge clk_f)
+    if (ce) begin sren <= rens; sra <= ras; end
+  // the next edge's reads, a fast edge ahead: at the edge after ph the next is n = ph + 2 (mod K);
+  // n = 1 follows the core edge, whose registered requests are being loaded (from rens / ras)
+  logic          ce_r, en_b_r, en_a_r;
+  logic [AW-1:0] ad_b_r, ad_a_r;
+  always_ff @(posedge clk_f) begin
+    int n;
+    n = (int'(ph) + 2) % K;
+    ce_r <= (n == 0);
+    if (ce) begin
+      en_b_r <= rens[1]; ad_b_r <= ras[1];
+      en_a_r <= rens[K]; ad_a_r <= ras[K];
+    end else if (n != 0) begin
+      en_b_r <= sren[n]; ad_b_r <= sra[n];
+      en_a_r <= sren[K - 1 + n]; ad_a_r <= sra[K - 1 + n];
+    end
+  end
+`ifndef SYNTHESIS
+  initial ce_r = 1'b0;
+`endif
+  wire          en_b = ce_r ? ren0 : en_b_r;
+  wire [AW-1:0] ad_b = ce_r ? ra0 : ad_b_r;
+  wire          en_a = ce_r ? wv : en_a_r;
+  wire          we_a = ce_r && wv;
+  wire [AW-1:0] ad_a = ce_r ? wa : ad_a_r;
+  logic [31:0] qa, qb;
+  if (STYLE == "ultra") begin : g_u
+    (* ram_style = "ultra" *) logic [31:0] mem [N];
+    always_ff @(posedge clk_f)
+      if (en_a) begin
+        if (we_a) mem[ad_a] <= wd;
+        else qa <= mem[ad_a];
+      end
+    always_ff @(posedge clk_f)
+      if (en_b) qb <= mem[ad_b];
+`ifndef SYNTHESIS
+    initial for (int i = 0; i < N; i++) mem[i] = '0;
+`endif
+  end else if (CASC == 1) begin : g_b1
+    (* ram_style = "block", cascade_height = 1 *) logic [31:0] mem [N];
+    always_ff @(posedge clk_f)
+      if (en_a) begin
+        if (we_a) mem[ad_a] <= wd;
+        else qa <= mem[ad_a];
+      end
+    always_ff @(posedge clk_f)
+      if (en_b) qb <= mem[ad_b];
+`ifndef SYNTHESIS
+    initial for (int i = 0; i < N; i++) mem[i] = '0;
+`endif
+  end else begin : g_b
+    (* ram_style = "block" *) logic [31:0] mem [N];
+    always_ff @(posedge clk_f)
+      if (en_a) begin
+        if (we_a) mem[ad_a] <= wd;
+        else qa <= mem[ad_a];
+      end
+    always_ff @(posedge clk_f)
+      if (en_b) qb <= mem[ad_b];
+`ifndef SYNTHESIS
+    initial for (int i = 0; i < N; i++) mem[i] = '0;
+`endif
+  end
+  // slot 0's bypass: the landing write (wv / wa / wd at the core edge) and slot 0's request
+  logic        bh;
+  logic [31:0] pd;
+  always_ff @(posedge clk) begin
+    bh <= wv && ren0 && wa == ra0;
+    pd <= wd;
+  end
+  // the words: port B's slot e taken at edge e + 1, port A's slot K - 1 + e likewise; the last
+  // edge's (slots K - 1 and NS - 1) go to oq straight from the RAM at the core edge
+  logic [NS-1:0][31:0] sq;
+  always_ff @(posedge clk_f) begin
+    for (int e = 0; e < K - 1; e++) if (int'(ph) == e) sq[e] <= qb;
+    for (int e = 1; e < K - 1; e++) if (int'(ph) == e) sq[K - 1 + e] <= qa;
+    if (ce)
+      for (int s = 0; s < NS; s++)
+        oq[s] <= (s == 0) ? (bh ? pd : sq[0]) : (s == K - 1) ? qb : (s == NS - 1) ? qa : sq[s];
   end
 endmodule
