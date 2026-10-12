@@ -104,8 +104,11 @@ def test_card_target_matches_the_rtl_defaults():
         assert p[k] == board[k], k
     assert p["RPB"] == 8 * p["LANES"]                       # otpu_board: RPB = 8 * LANES
     top = _sv_defaults(ROOT / "rtl/boards/ypcb-00338/otpu_fpga_top_ld.sv")
-    for k in ("MCOLS", "VPU_CL", "MXU_IMPL", "LANES", "ULANES", "DDR_MTS", "PLATFORM"):
+    for k in ("MCOLS", "VPU_CL", "MXU_IMPL", "LANES", "ULANES", "DDR_MTS", "PLATFORM",
+              "TRACE_DEPTH"):
         assert p[k] == top[k], k
+    assert _sv_defaults(ROOT / "rtl/boards/ypcb-00338/otpu_native_sys.sv")["TRACE_DEPTH"] \
+        == p["TRACE_DEPTH"]
     assert T.sim_uarch("ypcb-00338") == {"WIN": 16, "RPB": 128, "WPB": 1, "FIFO_DEPTH": 1024}
 
 

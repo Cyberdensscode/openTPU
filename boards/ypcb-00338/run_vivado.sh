@@ -12,6 +12,8 @@
 #                                         # phys_opt (its default CORE_MHZ is 100); about half the time
 #   PCIE_GEN=1 ./run_vivado.sh            # PCIe Gen1 x8 (xdma_aclk 125 MHz); the default is 2, Gen2 x8
 #                                         # (250 MHz; vivado/bd_native.tcl, docs/offload.md section 6)
+#   TRACE_DEPTH=0 ./run_vivado.sh         # no hardware trace buffer (CAPS trace bit 0; the default is the
+#                                         # target's 16384 records: 32 RAMB36, docs/infra_hunt.md)
 #   VIVADO_DOCKER=image ./run_vivado.sh   # Docker (e.g. Apple Silicon with Rosetta), see docs/board.md
 #   VIVADO_AS_USER=1                      # Docker on Linux: run as the calling user (see run())
 #   STEP=impl ./run_vivado.sh             # rerun implementation only (keeps project and synthesis)
@@ -86,6 +88,7 @@ mkdir -p "$out"
 export OTPU_IP_CACHE="${OTPU_IP_CACHE-$HOME/.cache/otpu-vivado-ip}"
 export OTPU_FAST="${FAST:-0}"
 export PCIE_GEN="${PCIE_GEN:-2}"    # read by vivado/bd_native.tcl and userclk1_reroute.tcl
+export TRACE_DEPTH="${TRACE_DEPTH:-${T_TRACE_DEPTH:-16384}}"   # read by vivado/create_project.tcl
 if [[ "${STEP:-}" == impl ]]; then
   run "$here/vivado/build.tcl" "$out" "$jobs" impl "${IMPL_STRATEGY:-}"
 else
