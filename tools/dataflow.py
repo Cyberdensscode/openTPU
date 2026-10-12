@@ -1181,7 +1181,8 @@ def report(paths) -> str:
 KV_HEADS = {"Qwen3-0.6B": (16, 8, 128), "SmolLM3-3B": (16, 4, 128),
             "Phi-4-mini-instruct": (24, 8, 128), "Qwen3.5-0.8B": (8, 2, 256),
             "Qwen3.5-2B": (8, 2, 256), "Qwen3.5-4B": (16, 4, 256), "LFM2.5-230M": (16, 8, 64),
-            "LFM2-2.6B": (32, 8, 64), "gemma-4-E2B-it": (8, 1, 256)}
+            "LFM2-2.6B": (32, 8, 64), "gemma-4-E2B-it": (8, 1, 256),
+            "gemma-4-E4B-it": (8, 2, 256)}
 
 
 def kv_parts(r) -> dict:
@@ -1244,8 +1245,9 @@ def kv_options(heads, p, mcols: int, D: int = 128) -> dict:
     o["V rows"] = (o["today"][0], app_rows, p["adv_k"], p["adv_v"], opa(p["adv_k"]))
     o["fp4 V"] = (o["today"][0] - v8 / 2, p["app"], p["adv_k"], av4, opa(p["adv_k"]))
     # 6-bit (int6 / MXFP6; a proposal): 3/4 of the values' bytes, rows packed in the stream (d
-    # 128: 96 bytes a row), scales as today's (MXFP6's E8M0 a 32-block: d / 32 bytes a row)
-    k6 = rows_k * 0.75 * d
+    # 128: 96 bytes a row), scales as today's (MXFP6's E8M0 a 32-block: d / 32 bytes a row);
+    # whole-chunk rows (d >= D) scale the run's K bytes, as fp4 K's do
+    k6 = p["kv_k"] * 0.75 if d >= D else rows_k * 0.75 * d
     o["6b V"] = (o["today"][0] - v8 / 4, p["app"], p["adv_k"], p["adv_v"], opa(p["adv_k"]))
     o["6b K"] = (o["today"][0] - p["kv_k"] + k6, p["app"], p["adv_k"], p["adv_v"],
                  opa(p["adv_k"]))
