@@ -27,8 +27,9 @@ from .compiler import (TEMP_RC_FN, Affine, Bcast, CompileError, KVDesc, QTensor,
                        Tensor, Tile, current, jit, tile_split, unnamed)
 
 __all__ = ["jit", "program_id", "num_programs", "block_size", "tmem_words", "mxu_columns",
-           "load", "store", "dot", "quantize", "exp2", "log2", "recip", "rsqrt", "abs", "maximum",
-           "minimum", "max", "sum", "outer", "full", "zeros",
+           "load", "store", "dot", "quantize", "stationary", "quantize_into", "exp2", "log2",
+           "recip", "rsqrt", "abs", "maximum", "minimum", "max", "sum", "sumsq", "outer", "full",
+           "zeros",
            "empty", "all_gather", "all_reduce", "range", "static_range", "kv_append", "Tensor", "QTensor",
            "KVDesc", "Tile", "CompileError", "LOG2E", "LN2"]
 
@@ -75,14 +76,30 @@ def store(desc: Tensor, value) -> None:
     current().store(desc, value)
 
 
-def quantize(x: Tile) -> Stationary:
+def quantize(x: Tile, free: bool = False, rscale: Tile | None = None,
+             cscale: Tile | None = None) -> Stationary:
     """Quantize rows of `x` into ACT RAM once, to reuse as the stationary operand of dot().
 
     `quantize(a * v[None, :])` on an unnamed product fuses the column scaling into the
-    quantizer (QACT CSCALE): no separate vector pass.
+    quantizer (QACT CSCALE): no separate vector pass. free: the operand does not keep `x`
+    alive (only its shape), so its TMEM can be reused while the operand stays in ACT RAM.
+    rscale / cscale: quantize (x * rscale[:, None]) * cscale[None, :] in the quantizer (QACT
+    RSCALE / CSCALE; RMSNorm's x * r * gamma) without tracing the products.
     """
     temp = unnamed(sys.getrefcount(x), TEMP_RC_FN, x)
-    return current().quantize(x, temp)
+    return current().quantize(x, temp, free, rscale, cscale)
+
+
+def stationary(rows: int, cols: int) -> Stationary:
+    """ACT RAM for a stationary operand of [rows, cols], filled by quantize_into in parts of
+    whole D blocks (each part's QACT gives its blocks the bytes and scales a quantize of the
+    whole tile would)."""
+    return current().stationary(rows, cols)
+
+
+def quantize_into(st: Stationary, x: Tile, col: int) -> None:
+    """Quantize x's rows into the stationary `st`'s columns col .. col + x.cols."""
+    current().quantize_into(st, x, col)
 
 
 def dot(a, w: QTensor, acc: Tile | None = None, out: Tile | None = None,
@@ -203,6 +220,12 @@ def sum(x, axis: int = -1) -> Tile:  # noqa: A001
     `sum(S * k[None, :], axis=1)` is S @ k); `sum(a * a)` is RSSQ."""
     temp = unnamed(sys.getrefcount(x), TEMP_RC_FN, x)
     return current().reduce(I.V_RSUM, x, axis, temp)
+
+
+def sumsq(x: Tile) -> Tile:
+    """Row sums of squares, sum(x * x, axis=1): the VOP RSSQ the peephole makes of that
+    expression, without tracing the product tile."""
+    return current().reduce(I.V_RSSQ, x, -1)
 
 
 def outer(x: Tile, y: Tile, acc: Tile | None = None, decay: Tile | None = None) -> Tile:

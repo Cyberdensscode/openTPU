@@ -582,6 +582,15 @@ class Bcast:
     __rmul__ = __mul__
 
 
+class _Parts:
+    """The shape of a stationary operand filled in parts (Builder.stationary), or of one whose
+    source tile was let go once quantized (Builder.quantize(free=True))."""
+
+    def __init__(self, b, rows: int, cols: int, shape: tuple | None = None):
+        self.b, self.rows, self.cols = b, rows, cols
+        self.shape = shape or (rows, cols)
+
+
 class Stationary:
     """A tile quantized into ACT RAM blocks [ab, ab+KB), in chunks of up to ACT_ROWS rows.
     `pair`: its rows are also in ACT rows M..2M-1 (QACT DUP), so 4-bit MMs run at full rate
@@ -1313,7 +1322,13 @@ class Builder:
                 off = Affine.of(t.offset).static() + r * rstride
                 self.stores.append((t.host, off, n))
 
-    def quantize(self, x: Tile, temp: bool = False) -> Stationary:
+    def quantize(self, x: Tile, temp: bool = False, free: bool = False,
+                 rscale: Tile | None = None, cscale: Tile | None = None) -> Stationary:
+        """QACT x's rows into ACT RAM blocks. free: the stationary does not keep x (its TMEM is
+        free once the QACTs have read it), only its shape: operands kept in ACT RAM while TMEM
+        is reused (a tiled prefill's MLP activations). rscale [rows] / cscale [cols]: quantize
+        (x * rscale[:, None]) * cscale[None, :] (QACT RSCALE / CSCALE), the instruction the
+        peephole makes of that expression, without its product tiles."""
         x = self.materialize(x)
         self.check_live(x)
         D = self.cfg.D
@@ -1321,9 +1336,17 @@ class Builder:
             raise CompileError(f"reduction dim {x.cols} must be a multiple of D={D}")
         KB = x.cols // D
         src, rs, cs, rsc = x.base, (x.rs if len(x.shape) == 2 else x.cols), None, None
-        fused = self.fuse_cscale(x) if temp else None
+        fused = self.fuse_cscale(x) if temp and rscale is None and cscale is None else None
         if fused is not None:
             src, rs, cs, rsc = fused
+        if rscale is not None or cscale is not None:
+            self.check_live(rscale, cscale)
+            if (rscale is not None and rscale.shape != (x.rows,)) or \
+                    (cscale is not None and cscale.shape != (x.cols,)):
+                raise CompileError(f"quantize: scales {rscale and rscale.shape} / "
+                                   f"{cscale and cscale.shape} for a {x.shape} tile")
+            cs = None if cscale is None else cscale.base
+            rsc = None if rscale is None else rscale.base
         chunks, owners = [], []
         # column reuse: a tile of at most MCOLS/2 rows is written twice (no extra cycles), so a
         # 4-bit MM can feed the odd K-blocks to the second half of the columns. A taller tile
@@ -1343,7 +1366,48 @@ class Builder:
             chunks.append((ab, mc))
             owners.append(owner)
         st.loop = self.loops[-1].loop if self.loops else None     # created in this loop body
+        if free:
+            st.src = _Parts(self, x.rows, x.cols, x.shape)
         return st
+
+    def stationary(self, rows: int, cols: int) -> Stationary:
+        """ACT RAM blocks for a stationary operand of `rows` rows (at most ACT_ROWS) and `cols`
+        columns, filled in parts of whole blocks by quantize_into (a tiled prefill's attention
+        output: a KV head's columns at a time). Each part's QACT quantizes its blocks as a
+        quantize of the whole tile would (per row and block), so the operand is the same."""
+        D = self.cfg.D
+        if cols % D:
+            raise CompileError(f"reduction dim {cols} must be a multiple of D={D}")
+        if rows > self.cfg.act_rows:
+            raise CompileError(f"a stationary of {rows} rows: ACT RAM holds {self.cfg.act_rows}")
+        KB = cols // D
+        pair = self.cfg.PAIR and 2 * rows <= self.cfg.MCOLS
+        st = Stationary(_Parts(self, rows, cols), [], KB, [], pair)
+        ab, owner = self.act_alloc(KB)
+        for k in builtins.range(ab, ab + KB):
+            self.act_live[k] = weakref.ref(st)
+        st.chunks.append((ab, rows))
+        st.owners.append(owner)
+        st.loop = self.loops[-1].loop if self.loops else None
+        return st
+
+    def quantize_into(self, st: Stationary, x: Tile, col: int) -> None:
+        """Quantize the rows of x into the blocks of `st` (from stationary()) from column
+        `col` on (QACT at the part's first block)."""
+        x = self.materialize(x)
+        self.check_live(x)
+        D = self.cfg.D
+        if not isinstance(st.src, _Parts):
+            raise CompileError("quantize_into: a stationary from stationary()")
+        if x.rows != st.src.rows or x.cols % D or col % D or col + x.cols > st.KB * D:
+            raise CompileError(f"quantize_into: a {x.shape} tile at column {col} of a "
+                               f"{st.src.shape} stationary")
+        if not self.stationary_valid(st):
+            raise CompileError("stationary operand was overwritten in ACT RAM")
+        (ab, mc), = st.chunks
+        rs = x.rs if len(x.shape) == 2 else x.cols
+        self.emit(I.qact(x.base, mc, ab + col // D, x.cols // D, rs, dup=st.pair,
+                         comment="quantize -> ACT (part)" + (" dup" if st.pair else "")))
 
     def fuse_cscale(self, x: Tile):
         """quantize(a * v[None, :]) with the product an unnamed temp just computed: drop the
