@@ -253,24 +253,28 @@ def test_tiled_prompt_runs_pair_rounding(tmp_path_factory, pair, P1, P2, same):
         assert all(np.abs(x - y).max() < 1e-3 * np.abs(y).max() for x, y in zip(got, want))
 
 
-@pytest.mark.parametrize("case, act, p0", [
-    ("qwen3", 4, 300),          # the card's ACT RAM (4 rows): a whole block, then the masked one
-    ("lfm2", 16, 200),          # 16 rows: replayed MMs, the convolution's channel parts
-    ("kh8", 16, 300),           # Qwen3.5: DeltaNet rows (DSTEP), gated attention
+@pytest.mark.parametrize("case, mcols, act, p0, T", [
+    ("qwen3", 4, 4, 300, 4),    # the card's ACT RAM (4 rows): a whole block, then the masked one
+    ("lfm2", 4, 16, 200, 16),   # 16 rows: replayed MMs, the convolution's channel parts
+    ("kh8", 4, 16, 300, 8),     # Qwen3.5: DeltaNet rows (DSTEP), gated attention
+    ("gemma4-1", 4, 16, 600, 8),    # Gemma 4: the sliding window's start-masked block
+    ("gemma4-2", 8, 16, 300, 8),    # E4B's groups of 4, two rows a tile (RowTiles)
 ])
-def test_tiled_prompt_run_on_rtl(tmp_path_factory, have_verilator, case, act, p0):
+def test_tiled_prompt_run_on_rtl(tmp_path_factory, have_verilator, case, mcols, act, p0, T):
     """A tiled prompt run (an L run, at a run-time position from the state's words, its tokens
     from out[]) on the RTL with the board's memory path: DRAM and TMEM as the ISA simulator's,
-    on the card's MXU (MCOLS 4) with its own ACT RAM of 4 rows and with 16."""
+    on the card's MXU (MCOLS 4) with its own ACT RAM of 4 rows and with 16, and on 8 columns."""
     from opentpu import rtlsim
-    W, spec, cfg, kw = _family(case, tmp_path_factory)
-    cfg = dataclasses.replace(cfg, MCOLS=4, ACT_ROWS=act)
-    eng = Engine(spec, W, cap=512, cfg=cfg, rows=act, resident=True, prompt_runs=True, **kw)
+    if case.startswith("gemma4"):
+        (W, spec, cfg), kw, cap = _gemma(tmp_path_factory, int(case[-1])), {}, 1024
+    else:
+        (W, spec, cfg, kw), cap = _family(case, tmp_path_factory), 512
+    cfg = dataclasses.replace(cfg, MCOLS=mcols, ACT_ROWS=act)
+    eng = Engine(spec, W, cap=cap, cfg=cfg, rows=act, resident=True, prompt_runs=True, **kw)
     eng.tile_runs = True
     toks = [int(t) for t in np.random.default_rng(p0).integers(0, 1000, p0 + act)]
     eng.prefill(toks[:p0])
-    T = PF.r_max(eng, p0 // eng.block + 1)
-    assert T == min(act, 8 if case == "kh8" else act)
+    assert PF.r_max(eng, p0 // eng.block + 1) == T
     progs, names = PF.programs(eng, p0, T, "L")
     PF.write_tokens(eng, p0, toks[p0:p0 + T])
     g, w = eng.image.lookup["gen"], PF.words(eng, names, p0, T)
@@ -284,3 +288,54 @@ def test_tiled_prompt_run_on_rtl(tmp_path_factory, have_verilator, case, act, p0
     n = eng.image.nbytes
     assert np.array_equal(drams[0][:n], m.slices[0].dram[:n])
     assert np.array_equal(tmems[0], m.slices[0].tmem)
+
+
+def _gemma(tmp_path_factory, nkv: int):
+    """test_gemma4's tiny Gemma 4 (sliding and global layers, KV-shared ones, a double-wide
+    MLP, per-layer inputs) with nkv KV heads: 8 query heads on 1 (two parts of 4 on MCOLS 4)
+    or on 2 (E4B's: groups of 4, two rows a tile at MCOLS 8)."""
+    import test_gemma4 as TG
+    tf = TG.transformers            # (the module test_gemma4 builds with: an engine's imports
+    orig = tf.Gemma4TextConfig      # can put another in sys.modules)
+    try:
+        tf.Gemma4TextConfig = lambda **k: orig(**{**k, "num_key_value_heads": nkv})
+        _, W, spec = TG._model(tmp_path_factory.mktemp("gemma4"))
+    finally:
+        tf.Gemma4TextConfig = orig
+    assert spec.kvh(0) == nkv
+    return W, spec, TG._cfg()
+
+
+@pytest.mark.parametrize("mcols, nkv, wf, host, P1, P2, R, T", [
+    (4, 1, "int8", "0", 250, 20, 4, 8),     # two parts of 4 heads a row, across the bucket's
+    (8, 2, "int8", "0", 250, 20, 4, 8),     # end; groups of 4: two rows a tile (RowTiles)
+    (4, 1, "fp4", "1", 37, 30, 8, 12),      # 4-bit layers, the PLE table on the host
+    (8, 2, "int8", "0", 760, 20, 4, 8),     # the sliding ring's wrap (768 slots), packed
+])
+def test_tiled_gemma4_prompt_runs_are_todays(tmp_path_factory, monkeypatch, mcols, nkv, wf,
+                                             host, P1, P2, R, T):
+    """Gemma 4's tiled prompt runs (T rows: 16 overflow IMEM or TMEM) against today's prompt
+    runs of R rows: the last logits, the layers' DRAM (weights, KV caches, the sliding rings)
+    and the next step's logits bit for bit."""
+    monkeypatch.setenv("OTPU_PLE_HOST", host)
+    W, spec, cfg = _gemma(tmp_path_factory, nkv)
+    cfg = dataclasses.replace(cfg, MCOLS=mcols, ACT_ROWS=16)
+    kw = dict(wformat=wf, head_format="int8" if wf == "fp4" else None)
+    r = np.random.default_rng(P1)
+    p1, p2 = ([int(t) for t in r.integers(0, 1000, n)] for n in (P1, P2))
+    a = Engine(spec, W, cap=1024, cfg=cfg, rows=16, resident=True, prompt_runs=True, **kw)
+    a.tile_runs = True
+    got = [a.prefill(p1), a.prefill(p2)]
+    assert set(a._prompt_tile.values()) == {T}
+    b = Engine(spec, W, cap=1024, cfg=cfg, rows=16, resident=True, prompt_runs=True, **kw)
+    b.tile_runs = False
+    b._prompt_rmax = {k: (R, True) for k in range(5)}
+    want = [b.prefill(p1), b.prefill(p2)]
+    for x, y in zip(got, want):
+        assert np.array_equal(x.view(np.uint32), y.view(np.uint32))
+    img = a.image
+
+    def layers(e):
+        return e.backend.machine.slices[0].dram[img.layer0:img.head[0]]
+    assert np.array_equal(layers(a), layers(b))
+    assert np.array_equal(a.step(5), b.step(5))

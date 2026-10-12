@@ -182,10 +182,11 @@ def _attention_tile(x, lw, c, s_, pos, T: int, spec, block: int, parts: int,
     return x
 
 
-def _add_parts(x, acts, ws, parts: int) -> None:
+def _add_parts(x, acts, ws, parts: int, out=None) -> None:
     """x += sum_i acts[i] . ws[i]^T, the sum in the order of the list (dot, then dot(acc=)),
     by `parts` parts of the output columns: TMEM holds [T, H / parts] of the sum at a time,
-    each element summed as one [T, H] result would be."""
+    each element summed as one [T, H] result would be. out: the sum into that [T, H] tile
+    instead (x untouched: Gemma's post-norms need the whole row)."""
     H = x.cols
     hp = H // parts
     for p in range(parts):
@@ -196,7 +197,10 @@ def _add_parts(x, acts, ws, parts: int) -> None:
                 y = ol.dot(a, w[n0:n0 + hp, :])
             else:
                 ol.dot(a, w[n0:n0 + hp, :], acc=y)
-        x[:, n0:n0 + hp].set(x[:, n0:n0 + hp] + y)
+        if out is None:
+            x[:, n0:n0 + hp].set(x[:, n0:n0 + hp] + y)
+        else:
+            out[:, n0:n0 + hp].set(y)
         del y
 
 
@@ -209,13 +213,14 @@ def down_chunk(wg, wd) -> int:
     return _chunk(wg.shape[0], D, D if wd.wf == 0 else 2 * D)
 
 
-def _mlp_tile(x, lw, spec, parts: int, sub: int, act=silu):
-    """x + W_down(act(W_gate xn) * (W_up xn)) for T rows: every chunk's activation quantized
-    once and kept in ACT RAM (the C columns of a W_down part, made `sub` columns at a time:
-    each piece's QACT gives its blocks what one of the whole chunk would), then the down
-    projection by `parts` parts of its output columns, each summing the chunks in swiglu_down's
-    order (the same bits)."""
-    xs = _norm_quantize(x, lw.g_post, spec.eps)
+def _mlp_tile(x, lw, spec, parts: int, sub: int, act=silu, g=None, out=None):
+    """x + W_down(act(W_gate xn) * (W_up xn)) for T rows (xn: x normed by g, default
+    lw.g_post): every chunk's activation quantized once and kept in ACT RAM (the C columns of
+    a W_down part, made `sub` columns at a time: each piece's QACT gives its blocks what one
+    of the whole chunk would), then the down projection by `parts` parts of its output
+    columns, each summing the chunks in swiglu_down's order (the same bits). out: the MLP's
+    output into that [T, H] tile instead (_add_parts)."""
+    xs = _norm_quantize(x, lw.g_post if g is None else g, spec.eps)
     wg, wu, wd = lw.wg, lw.wu, lw.wd
     T = x.rows
     C = down_chunk(wg, wd)
@@ -237,7 +242,7 @@ def _mlp_tile(x, lw, spec, parts: int, sub: int, act=silu):
         ol.quantize_into(acts[c0], act(g) * u, s0)
         del g, u
     xs = nxt = None                     # the operand's ACT blocks are free for the down MMs
-    _add_parts(x, [acts[c0] for c0 in starts], [wd[:, c0:c0 + C] for c0 in starts], parts)
+    _add_parts(x, [acts[c0] for c0 in starts], [wd[:, c0:c0 + C] for c0 in starts], parts, out)
     return x
 
 
@@ -408,6 +413,186 @@ def lfm2_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK):
     _lm_head_rows(x, m, spec, logit_rows)
 
 
+def pack_seq(seqs, G: int, block: int, cap: int):
+    """One packed tile's attention span from its rows' own (at run-time positions: Bucket with
+    an Additive tile, or Blocks whose masks are Additive tiles; the same blocks for every row
+    of a run, the masks their own): every masked block's RowTiles, row group i (G query rows)
+    taking row i's tile. One row: its own span."""
+    from ..kernels.attention import Additive, Blocks, Bucket
+    s0 = seqs[0]
+    if len(seqs) == 1:
+        return s0
+    if isinstance(s0, Bucket):
+        if any(s.add is None for s in seqs):
+            raise CompileError("a packed tile's masked block needs the mask tiles (Additive)")
+        t0 = (s0.blocks - 1) * block
+        return TileSeq(s0.blocks - 1, [(t0, min(block, cap - t0), RowTiles(
+            [(i * G, (i + 1) * G, s.add) for i, s in enumerate(seqs)]))])
+    if isinstance(s0, Blocks):
+        items = []
+        for k, (t0, n, m0) in enumerate(s0.items):
+            ms = [s.items[k][2] for s in seqs]
+            if m0 is None:
+                items.append((t0, n, None))
+                continue
+            if not all(isinstance(mk, Additive) for mk in ms):
+                raise CompileError("a packed tile's masked blocks need the mask tiles")
+            items.append((t0, n, RowTiles([(i * G, (i + 1) * G, mk)
+                                           for i, mk in enumerate(ms)])))
+        return Blocks(items)
+    raise CompileError(f"no packed span of {type(s0).__name__}")
+
+
+def _rope_rows_g(x, c, s, out):
+    """Gemma 4's _rope with one position per row (c, s: [T, nr]): the pairs (i, i + d / 2), i
+    < nr, rotated, the others passing through; into `out`. The same products as _rope's."""
+    from ..kernels.lib import rope_rows
+    d, nr = x.cols, c.cols
+    h = d // 2
+    if nr == h:
+        return rope_rows(x, c, s, out)
+    a, b = x[:, 0:nr], x[:, h:h + nr]
+    out[:, 0:nr].set(a * c - b * s)
+    out[:, h:h + nr].set(b * c + a * s)
+    out[:, nr:h].set(x[:, nr:h])
+    out[:, h + nr:d].set(x[:, h + nr:d])
+    return out
+
+
+def _gemma_attention_tile(x, lw, m, pos: RunRows, ropes, T: int, block: int, parts: int):
+    """gemma4._attention tiled for T rows of a prompt run: x += norm(W_o attention(norm(x))).
+    Per KV head its K / V (own layers: projected for the T rows, normed, K RoPE'd, appended a
+    row at a time to its slot: the sliding ring's or the cache's), then its query group in
+    parts of MCOLS heads, each part's [T, heads d] projected, normed and RoPE'd in place and
+    its rows attending in packed tiles (P = MCOLS / G rows; a row's span is its own: the
+    sliding window's Blocks or the global Bucket, their masks the mask tiles), the outputs
+    written over the part's queries and quantized into W_o's operand; then W_o by output parts
+    into [T, H] and the post-norm. Each row's arithmetic is _attention's."""
+    from ..kernels.lib import rmsnorm
+    from .gemma4 import SLIDE, _RowPos, _add_norm, _full_seq, _slide_seq, _slot
+    spec = m.spec
+    d, nkv, eps = lw.hd, lw.nkv, spec.eps
+    G = spec.n_q // nkv
+    c0, nr = (0, spec.head_dim // 2) if lw.kind == SLIDE else (spec.head_dim, spec.global_rot)
+    c, s_ = ropes[:, c0:c0 + nr], ropes[:, c0 + nr:c0 + 2 * nr]
+    kv = lw.kv
+    rows = [_RowPos(pos, r) for r in range(T)]
+    span = _slide_seq if lw.kind == SLIDE else _full_seq
+    rseq = [span(m, p, block) for p in rows]
+    xs = _norm_quantize(x, lw.g_in, eps)
+    qn = ol.load(lw.qn)
+    kn = ol.load(lw.kn) if lw.own else None
+    mc = ol.mxu_columns()
+    gs = min(G, mc)
+    P = packing(mc, G) if G <= mc else 1
+    tiles = [(r0, min(P, T - r0)) for r0 in range(0, T, P)]
+    gparts = [(g0, min(G, g0 + gs)) for g0 in range(0, G, gs)]
+    ost = ol.stationary(T, spec.n_q * d)
+    made, ent, qhs, kvh, seqs = {}, [], [], [], []
+
+    def part(j, g0, g1):
+        """KV head j's K / V appends (with its first part), the queries of heads g0 .. g1 of
+        its group: [T, (g1 - g0) d], read as [T (g1 - g0), d] (row (r, g))."""
+        if g0 == 0 and lw.own:
+            k = ol.dot(xs, lw.wk[j * d:(j + 1) * d, :])
+            v = k if lw.same else ol.dot(xs, lw.wv[j * d:(j + 1) * d, :])
+            kr = _rope_rows_g(rmsnorm(k, kn, eps), c, s_, ol.empty([T, d]))
+            vr = rmsnorm(v, None, eps)
+            for r in range(T):
+                ol.kv_append(kv, j, _slot(m, lw.kind, rows[r]), kr[r:r + 1, :], vr[r:r + 1, :])
+            del k, v, kr, vr
+        h0, h1 = j * G + g0, j * G + g1
+        q = ol.empty([T, (g1 - g0) * d], dense=True)          # (rows of heads: reshaped)
+        ol.dot(xs, lw.wq[h0 * d:h1 * d, :], out=q)
+        for g in range(g1 - g0):
+            qg = q[:, g * d:(g + 1) * d]
+            _rope_rows_g(rmsnorm(qg, qn, eps), c, s_, qg)
+        return q
+
+    def query(j, g0, g1, r0, n):
+        def emit():
+            if (j, g0) not in made:
+                made[(j, g0)] = part(j, g0, g1)
+            w = g1 - g0
+            return made[(j, g0)].reshape(T * w, d)[r0 * w:(r0 + n) * w, :]
+        return emit
+
+    for j in range(nkv):
+        for g0, g1 in gparts:
+            for r0, n in tiles:
+                ent.append((j, g0, g1, r0, n))
+                qhs.append(query(j, g0, g1, r0, n))
+                kvh.append(j)
+                seqs.append(pack_seq(rseq[r0:r0 + n], g1 - g0, block, kv.cap))
+
+    def emit(i, acc, l):
+        j, g0, g1, r0, n = ent[i]
+        w = g1 - g0
+        o = made[(j, g0)]                      # the outputs over the part's queries
+        o.reshape(T * w, d)[r0 * w:(r0 + n) * w, :].set(acc / l[:, None])
+        if r0 + n == T:
+            ol.quantize_into(ost, made.pop((j, g0)), (j * G + g0) * d)
+        del o
+
+    _attend_heads(qhs, kv, kvh, seqs, block, ol.LOG2E, depth=ATTN_DEPTH, emit=emit)
+    xs = None
+    y = ol.empty([T, x.cols])
+    _add_parts(x, [ost], [lw.wo], parts, y)
+    del ost
+    _add_norm(x, y, ol.load(lw.g_attn), eps)
+
+
+@ol.jit
+def gemma4_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK):
+    """gemma4_step's rows tiled: T rows of a prompt run (pos a RunRows with the image's mask
+    tiles), their tokens gathered from out[] and per-layer inputs as gemma4_step's; per layer
+    the tiled attention, the dense MLP (GeGLU) tiled into [T, H] for its post-norm, the
+    per-layer input block as gemma4._ple."""
+    from ..kernels.lib import gelu_tanh
+    from .gemma4 import _add_norm, _gathered_out, _ple, _ple_inputs, _pos_rows
+    from .qwen3 import fill_logits
+    fill_logits(m)
+    spec = m.spec
+    if not isinstance(pos, RunRows) or pos.amask is None or spec.experts:
+        raise CompileError("a tiled Gemma 4 run is a dense model's prompt run with mask tiles")
+    e = _gathered_out(m, pos)
+    ropes = _pos_rows(m, pos, T, masks=False)
+    x = e * math.sqrt(spec.hidden)
+    del e
+    if spec.ple_dim:
+        _ple_inputs(m, x, None)
+    parts, sub = _widths(m, T)
+
+    def layer(li, it=None, jt=None):
+        lw = m.layer(li, it, jt)
+        _gemma_attention_tile(x, lw, m, pos, ropes, T, block, parts)
+        y = ol.empty([T, spec.hidden])
+        _mlp_tile(x, lw, spec, parts, sub(lw), act=gelu_tanh, g=lw.g_pre, out=y)
+        _add_norm(x, y, ol.load(lw.g_ffn), spec.eps, None if spec.ple_dim else ol.load(lw.ls))
+        del y
+        if spec.ple_dim:
+            _ple(x, lw, spec)
+
+    def unit(first, it=None):
+        for e0, su, r, nb in m.subs[first]:
+            if r == 1:
+                for e_ in range(len(su)):
+                    layer(first + e0 + e_, it)
+                continue
+            for jt in ol.range(r):
+                for e_ in range(len(su)):
+                    layer(first + e0 + e_, it, (jt, len(su), nb))
+
+    for first, _, reps in m.runs:
+        if reps == 1:
+            unit(first)
+            continue
+        for it in ol.range(reps):
+            unit(first, it)
+    if logit_rows:
+        _lm_head_rows(x, m, spec, list(logit_rows))
+
+
 @ol.jit
 def tile_run(m, kernel, pos, T: int, kind: str, block: int = ATTN_BLOCK, hidden: bool = False):
     """A tiled prompt run (docs/prefill.md): `kernel`'s T rows at the run-time position in the
@@ -418,7 +603,8 @@ def tile_run(m, kernel, pos, T: int, kind: str, block: int = ATTN_BLOCK, hidden:
         kernel.fn(m, pos, T, [T - 1] if kind == "L" else [], block, **kw)
 
 
-KERNELS = {"qwen3": qwen3_tile, "qwen35": qwen35_tile, "lfm2": lfm2_tile}
+KERNELS = {"qwen3": qwen3_tile, "qwen35": qwen35_tile, "lfm2": lfm2_tile,
+           "gemma4": gemma4_tile}
 
 
 def family(img) -> str | None:
@@ -460,13 +646,20 @@ def compile_tile_run(img, blocks: int, T: int, kind: str, block: int = ATTN_BLOC
     if kind not in ("P", "L"):
         raise ValueError(f"tiled prompt run kind {kind!r}")
     spec = img.spec
-    if getattr(spec, "moe", None) is not None:
+    if getattr(spec, "moe", None) is not None or getattr(spec, "experts", 0):
         raise ValueError("a MoE model's prompt runs layer by layer")
     if hidden and fam != "qwen35":
         raise ValueError("hidden rows: Qwen3.5's MTP")
     check(img, T)
     lo = max((blocks - 1) * block, getattr(spec, "conv_k", 1) - 1)
-    pos = RunRows(blocks, block, lo, img.lookup["zmask"], img.cap, T, 0, _amask(img.lookup))
+    if fam == "gemma4":             # (Gemma 4: its own mask tiles' address and step)
+        lk = img.lookup
+        if "amask" not in lk:
+            raise ValueError("a tiled Gemma 4 run needs the image's mask tiles")
+        pos = RunRows(blocks, block, lo, 0, img.cap, T, 0,
+                      (lk["amask"], 4 * lk["amask_M"] * (block + 1)))
+    else:
+        pos = RunRows(blocks, block, lo, img.lookup["zmask"], img.cap, T, 0, _amask(img.lookup))
     desc = (lambda s: img.descriptors(s, slot)) if fam == "qwen35" else img.descriptors
     bs = [trace_fit(tile_run, img.cfg, s, lambda s=s: {
         "m": desc(s), "kernel": KERNELS[fam], "pos": pos, "T": T, "kind": kind,
