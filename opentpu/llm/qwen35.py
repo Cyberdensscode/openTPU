@@ -1814,7 +1814,7 @@ def qwen35_step(m, pos: int, block: int = ATTN_BLOCK, tok: int | None = None):
     _lm_head(x, m, spec)
 
 
-def _deltanet_rows(x, lw, p0: int, spec: Spec, gr, on, fork: bool = False):
+def _deltanet_rows(x, lw, p0: int, spec: Spec, gr, on, fork: bool = False, xs=None):
     """_deltanet for R consecutive positions p0 .. p0+R-1 at once. The projections stream once
     for the R rows, pair of heads by pair; the convolution runs over the pair's rows before
     it in the chunk and its ring; each head's state is loaded once, updated and read row after
@@ -1834,7 +1834,8 @@ def _deltanet_rows(x, lw, p0: int, spec: Spec, gr, on, fork: bool = False):
     fork (the speculative verify, docs/mtp.md 9): the last row's state and window go to the
     other slot (DeltaNetParts), so the committed slot keeps those after the row before it:
     the last row's step is a STREAM into the other slot (or, on the VPU path, the state is
-    stored after the row before it too)."""
+    stored after the row before it too). xs: x's normed rows already quantized (a tiled run's,
+    tiled._norm_quantize: the same operand, without the normed [R, H] tile in TMEM)."""
     eps, K, R = spec.eps, spec.conv_k, x.rows
     dk, dv = spec.lin_dk, spec.lin_dv
     dn = lw.dn
@@ -1844,7 +1845,8 @@ def _deltanet_rows(x, lw, p0: int, spec: Spec, gr, on, fork: bool = False):
     CP, RP = nb * bw, nb * bw + 2 * dv                  # its convolved channels, its rows
     NP, ng, gp = nl // 2, nl // og, og // 2             # pairs, head groups, pairs per group
     TP = K * CP                                         # taps words of a pair (then its ring)
-    xs = ol.quantize(rmsnorm(x, ol.load(lw.g_in), eps))
+    if xs is None:                                      # (a tiled run's: tiled.py)
+        xs = ol.quantize(rmsnorm(x, ol.load(lw.g_in), eps))
     ab = ol.dot(xs, lw.wab)                             # [R, 2nl]: a, then b, of each head
     alog, dtb = ol.load(lw.alog), ol.load(lw.dtb)
     for r in range(R):

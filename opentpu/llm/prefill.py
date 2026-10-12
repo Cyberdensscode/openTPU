@@ -74,13 +74,18 @@ def supported(eng) -> bool:
             and (not host or getattr(img, "prompt_host_rows", False)))
 
 
-def tiling(eng) -> bool:
-    """Tiled prompt runs on (opentpu/llm/tiled.py): the engine's tile_runs, or where it has
-    none OTPU_TILE (off by default), for an image whose family has a tile kernel."""
-    t = getattr(eng, "tile_runs", None)
+def tile_flag(t) -> bool:
+    """Tiled prompt runs asked for: t (an engine's tile_runs), or where it is None OTPU_TILE
+    (off by default; in the reference cache's key: tools/qual/refs.py env_key)."""
     if t is None:
         t = os.environ.get("OTPU_TILE", "") not in ("", "0")
-    return bool(t) and TL.family(eng.image) is not None
+    return bool(t)
+
+
+def tiling(eng) -> bool:
+    """Tiled prompt runs on (opentpu/llm/tiled.py): tile_flag of the engine's tile_runs, for
+    an image whose family has a tile kernel."""
+    return tile_flag(getattr(eng, "tile_runs", None)) and TL.family(eng.image) is not None
 
 
 def programs(eng, p: int, R: int, kind: str, hidden: bool = False, slot: int = 0,

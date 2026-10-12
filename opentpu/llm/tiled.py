@@ -91,21 +91,74 @@ def _norm_quantize(x, g, eps: float):
     return ol.quantize(x, free=True, rscale=r, cscale=ol.load(g))
 
 
-def _attention_tile(x, lw, c, s_, pos, T: int, spec, block: int, parts: int,
+class Res:
+    """A tiled run's residual rows x [T, H]: in TMEM, or with a DRAM scratch (`spill`: the I/O
+    area's input rows, which a prompt run does not read) stored there while a block's
+    attention runs, the TMEM free for its queries and outputs, and loaded back for the
+    residual add (fp32 both ways: the same bits) into its own words (x is carried across the
+    layers' hardware loops: every iteration's instructions address it there)."""
+
+    def __init__(self, x, spill=None):
+        self.x, self.scratch = x, spill
+
+    def spill(self) -> None:
+        if self.scratch is not None:
+            x = self.x
+            self.at = (x.base, x.shape, x.rs)
+            ol.store(self.scratch, x)
+            self.x = None
+
+    def back(self):
+        if self.x is None:
+            x = self.x = _alloc_at(*self.at)
+            if x.contiguous:
+                ol.load(self.scratch, out=x)
+            else:                               # (rows padded: a load a row)
+                for r in range(x.rows):
+                    ol.load(self.scratch[r, :], out=x[r, :])
+        return self.x
+
+
+def _alloc_at(base: int, shape, rs: int):
+    """A tile at TMEM word `base` (Res.back: a loop-carried tile back in its own words), which
+    no live tile may hold."""
+    import gc
+    import weakref
+
+    from ..compiler import Tile
+    b = current()
+    n = (shape[0] - 1) * rs + shape[-1]
+    for attempt in range(2):
+        b.tmem_regions = [r for r in b.tmem_regions if r[2]() is not None]
+        if not any(lo < base + n and base < hi for lo, hi, _ in b.tmem_regions):
+            break
+        gc.collect()
+    else:
+        raise CompileError("TMEM: the residual rows' words are taken when they come back")
+    t = Tile(b, base, shape, rs)
+    t.spare = 0
+    b.tmem_regions.append((base, base + n, weakref.ref(t.buf)))
+    b.tmem_regions.sort(key=lambda r: r[0])
+    return t
+
+
+def _attention_tile(res: Res, lw, c, s_, pos, T: int, spec, block: int, parts: int,
                     gated: bool = False):
     """x += W_o . attention(x) for T rows of sequence 0 at positions pos .. pos + T - 1 (pos an
     int, or a prompt run's RunRows: run-time positions), their K / V appended first, each row
     attending causally over the cache: _attention_rows' arithmetic, one KV head's projections
     at a time and its queries in packed tiles. gated (Qwen3.5): each head's outputs times
-    sigmoid(W_gate x) before W_o, as _attention_rows' (acc / l) * sigmoid(gate)."""
+    sigmoid(W_gate x) before W_o, as _attention_rows' (acc / l) * sigmoid(gate). x: res.x,
+    spilled while the heads attend (Res)."""
     d, G, eps = spec.head_dim, spec.n_q // spec.n_kv, spec.eps
     D = ol.block_size()
     dk = -(-d // D) * D
     run = isinstance(pos, RunRows)
     kvc = lw.kvs[0]
-    xs = _norm_quantize(x, lw.g_in, eps)       # T rows: one pass a weight
+    xs = _norm_quantize(res.x, lw.g_in, eps)   # T rows: one pass a weight
     qn, kn = _load_opt(lw.qn), _load_opt(lw.kn)
     c, s_ = _rope_gate(lw, c, s_)
+    res.spill()                                # (after the tiles that outlive the heads)
     scale = ol.LOG2E / math.sqrt(d)
     heads = list(kvc.owned_heads(spec.n_kv))
     nq = len(heads) * G
@@ -172,14 +225,18 @@ def _attention_tile(x, lw, c, s_, pos, T: int, spec, block: int, parts: int,
                 acc[a * w:(a + 1) * w, :] / l[a * w:(a + 1) * w][:, None])
         if r0 + n == T and g1 == G:            # the head's rows done: quantized, freed
             o = oh.pop(j)
-            if gated:
-                o.set(o * sigmoid(ol.dot(xs, lw.wgate[j * G * d:(j + 1) * G * d, :])))
+            if gated:                          # a head at a time (TMEM: [T, d] temporaries)
+                for g in range(G):
+                    h0 = (j * G + g) * d
+                    og = o[:, g * d:(g + 1) * d]
+                    og.set(og * sigmoid(ol.dot(xs, lw.wgate[h0:h0 + d, :])))
+                    del og
             ol.quantize_into(ost, o, j * G * d)
             del o
 
     _attend_heads(qhs, kvc, kvh, seqs, block, scale, depth=ATTN_DEPTH, emit=emit)
-    _add_parts(x, [ost], [lw.wo], parts)                       # x += W_o o, by output parts
-    return x
+    xs = None
+    _add_parts(res.back(), [ost], [lw.wo], parts)              # x += W_o o, by output parts
 
 
 def _add_parts(x, acts, ws, parts: int, out=None) -> None:
@@ -344,42 +401,59 @@ def _rows_of(pos, T: int):
 
 
 @ol.jit
-def qwen3_tile(m, p0, T: int, logit_rows, block: int = ATTN_BLOCK):
+def qwen3_tile(m, p0, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool = False):
     """T rows at positions p0 .. p0 + T - 1 of sequence 0 (p0 an int: their embedding and RoPE
     rows in the I/O area, as qwen3_rows'; a RunRows: a prompt run's tokens and positions), the
-    logits of `logit_rows` (empty: none)."""
+    logits of `logit_rows` (empty: none). spill: x in the I/O area's rows while each layer's
+    heads attend (Res)."""
     spec = m.spec
     x, c, s_ = _inputs_rows(m, _rows_of(p0, T))
+    res = Res(x, m.xr[0:T, :] if spill else None)
+    del x
     parts, sub = _widths(m, T)
     for lw in _layers(m):
-        _attention_tile(x, lw, c, s_, p0, T, spec, block, parts)
-        _mlp_tile(x, lw, spec, parts, sub(lw))
-    _lm_head_rows(x, m, spec, logit_rows)
+        _attention_tile(res, lw, c, s_, p0, T, spec, block, parts)
+        _mlp_tile(res.x, lw, spec, parts, sub(lw))
+    _lm_head_rows(res.x, m, spec, logit_rows)
 
 
 @ol.jit
-def qwen35_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, hidden: bool = False):
+def qwen35_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, hidden: bool = False,
+                spill: bool = False, drows: int = 0):
     """qwen35_rows tiled: T rows of a prompt run (pos a RunRows), its attention layers and
-    MLPs tiled, its DeltaNet layers today's rows (_deltanet_rows over the T rows: each weight
-    streamed once, pair of heads by pair). hidden: MTP's rows (each row's final-normed hidden
-    to m.hid, as qwen35_rows')."""
+    MLPs tiled, its DeltaNet layers today's rows (_deltanet_rows over the T rows, or in runs
+    of `drows` rows one after another: their pair buffers grow with the rows; each weight
+    streamed once a run, pair of heads by pair). hidden: MTP's rows (each row's final-normed
+    hidden to m.hid, as qwen35_rows'). spill: as qwen3_tile's."""
     from ..kernels.lib import rmsnorm
     from .qwen35 import LIN, _deltanet_rows, run_layers
     spec = m.spec
     if not isinstance(pos, RunRows) or pos.lo < spec.conv_k - 1:
         raise CompileError("a tiled Qwen3.5 run is a prompt run from conv_k - 1")
     x, c, s_ = _inputs_rows(m, pos)
+    res = Res(x, m.xr[0:T, :] if spill else None)
+    del x
     parts, sub = _widths(m, T)
+    dr = drows or T
 
     def layer(li, it):
         lw = m.layer(li, it)
+        x = res.x
         if lw.kind == LIN:
-            x.set(_deltanet_rows(x, lw, pos.lo, spec, m.gr[0:T, :], m.on[0:T, :]))
+            for r0 in range(0, T, dr):
+                xr = x[r0:min(T, r0 + dr), :]
+                n = xr.rows
+                xr.set(_deltanet_rows(xr, lw, pos.lo, spec, m.gr[0:n, :], m.on[0:n, :],
+                                      xs=_norm_quantize(xr, lw.g_in, spec.eps)))
+                del xr
+            del x
         else:
-            _attention_tile(x, lw, c, s_, pos, T, spec, block, parts, gated=True)
-        _mlp_tile(x, lw, spec, parts, sub(lw))
+            del x
+            _attention_tile(res, lw, c, s_, pos, T, spec, block, parts, gated=True)
+        _mlp_tile(res.x, lw, spec, parts, sub(lw))
 
     run_layers(m.plan, layer)
+    x = res.x
     if hidden:
         g = ol.load(m.g_final)
         for r in range(T):
@@ -389,14 +463,16 @@ def qwen35_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, hidden: boo
 
 
 @ol.jit
-def lfm2_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK):
+def lfm2_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool = False):
     """lfm2_rows tiled: T rows of a prompt run (pos a RunRows), its attention layers, its
-    convolution blocks and its MLPs tiled."""
+    convolution blocks and its MLPs tiled. spill: as qwen3_tile's."""
     from .lfm2 import CONV, run_layers
     spec = m.spec
     if not isinstance(pos, RunRows):
         raise CompileError("a tiled LFM2 run is a prompt run")
     x, c, s_ = _inputs_rows(m, pos)
+    res = Res(x, m.xr[0:T, :] if spill else None)
+    del x
     parts, sub = _widths(m, T)
     D, W = ol.block_size(), ol.tmem_words()
 
@@ -404,13 +480,13 @@ def lfm2_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK):
         lw = m.layer(li, it)
         if lw.kind == CONV:
             n = lw.taps.shape[1]
-            _conv_tile(x, lw, pos, spec, parts, conv_parts(n, spec.conv_k, D, T, W))
+            _conv_tile(res.x, lw, pos, spec, parts, conv_parts(n, spec.conv_k, D, T, W))
         else:
-            _attention_tile(x, lw, c, s_, pos, T, spec, block, parts)
-        _mlp_tile(x, lw, spec, parts, sub(lw))
+            _attention_tile(res, lw, c, s_, pos, T, spec, block, parts)
+        _mlp_tile(res.x, lw, spec, parts, sub(lw))
 
     run_layers(m.plan, layer)
-    _lm_head_rows(x, m, spec, logit_rows)
+    _lm_head_rows(res.x, m, spec, logit_rows)
 
 
 def pack_seq(seqs, G: int, block: int, cap: int):
@@ -459,7 +535,11 @@ def _rope_rows_g(x, c, s, out):
     return out
 
 
-def _gemma_attention_tile(x, lw, m, pos: RunRows, ropes, T: int, block: int, parts: int):
+QPART = 8       # Gemma 4: a query part's [T, heads d] at most TMEM / QPART words
+
+
+def _gemma_attention_tile(res: Res, lw, m, pos: RunRows, ropes, T: int, block: int,
+                          parts: int):
     """gemma4._attention tiled for T rows of a prompt run: x += norm(W_o attention(norm(x))).
     Per KV head its K / V (own layers: projected for the T rows, normed, K RoPE'd, appended a
     row at a time to its slot: the sliding ring's or the cache's), then its query group in
@@ -467,7 +547,8 @@ def _gemma_attention_tile(x, lw, m, pos: RunRows, ropes, T: int, block: int, par
     its rows attending in packed tiles (P = MCOLS / G rows; a row's span is its own: the
     sliding window's Blocks or the global Bucket, their masks the mask tiles), the outputs
     written over the part's queries and quantized into W_o's operand; then W_o by output parts
-    into [T, H] and the post-norm. Each row's arithmetic is _attention's."""
+    into [T, H] and the post-norm. Each row's arithmetic is _attention's. x: res.x, spilled
+    while the heads attend and W_o runs (Res)."""
     from ..kernels.lib import rmsnorm
     from .gemma4 import SLIDE, _RowPos, _add_norm, _full_seq, _slide_seq, _slot
     spec = m.spec
@@ -479,12 +560,16 @@ def _gemma_attention_tile(x, lw, m, pos: RunRows, ropes, T: int, block: int, par
     rows = [_RowPos(pos, r) for r in range(T)]
     span = _slide_seq if lw.kind == SLIDE else _full_seq
     rseq = [span(m, p, block) for p in rows]
-    xs = _norm_quantize(x, lw.g_in, eps)
+    xs = _norm_quantize(res.x, lw.g_in, eps)
     qn = ol.load(lw.qn)
     kn = ol.load(lw.kn) if lw.own else None
+    res.spill()                                # (after the tiles that outlive the heads)
     mc = ol.mxu_columns()
     gs = min(G, mc)
-    P = packing(mc, G) if G <= mc else 1
+    while gs % 2 == 0 and T * gs * d > ol.tmem_words() // QPART:
+        gs //= 2                               # a part's [T, gs d] queries in an eighth of TMEM
+    P = packing(mc, gs)                        # rows of gs heads a tile: K / V streamed G / mc
+    #                                            times a row whatever gs (P gs = MCOLS)
     tiles = [(r0, min(P, T - r0)) for r0 in range(0, T, P)]
     gparts = [(g0, min(G, g0 + gs)) for g0 in range(0, G, gs)]
     ost = ol.stationary(T, spec.n_q * d)
@@ -536,18 +621,20 @@ def _gemma_attention_tile(x, lw, m, pos: RunRows, ropes, T: int, block: int, par
 
     _attend_heads(qhs, kv, kvh, seqs, block, ol.LOG2E, depth=ATTN_DEPTH, emit=emit)
     xs = None
-    y = ol.empty([T, x.cols])
-    _add_parts(x, [ost], [lw.wo], parts, y)
+    x = res.back()
+    y = ol.empty([T, spec.hidden])
+    _add_parts(y, [ost], [lw.wo], parts, y)
     del ost
     _add_norm(x, y, ol.load(lw.g_attn), eps)
 
 
 @ol.jit
-def gemma4_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK):
+def gemma4_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool = False):
     """gemma4_step's rows tiled: T rows of a prompt run (pos a RunRows with the image's mask
     tiles), their tokens gathered from out[] and per-layer inputs as gemma4_step's; per layer
     the tiled attention, the dense MLP (GeGLU) tiled into [T, H] for its post-norm, the
-    per-layer input block as gemma4._ple."""
+    per-layer input block as gemma4._ple. spill: x in the I/O area's input rows while each
+    layer's heads attend and W_o runs (Res)."""
     from ..kernels.lib import gelu_tanh
     from .gemma4 import _add_norm, _gathered_out, _ple, _ple_inputs, _pos_rows
     from .qwen3 import fill_logits
@@ -555,17 +642,19 @@ def gemma4_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK):
     spec = m.spec
     if not isinstance(pos, RunRows) or pos.amask is None or spec.experts:
         raise CompileError("a tiled Gemma 4 run is a dense model's prompt run with mask tiles")
-    e = _gathered_out(m, pos)
+    x = _gathered_out(m, pos)
     ropes = _pos_rows(m, pos, T, masks=False)
-    x = e * math.sqrt(spec.hidden)
-    del e
+    x.set(x * math.sqrt(spec.hidden))           # (in place: one [T, H] tile)
     if spec.ple_dim:
         _ple_inputs(m, x, None)
+    res = Res(x, m.x[0:T, :] if spill else None)
+    del x
     parts, sub = _widths(m, T)
 
     def layer(li, it=None, jt=None):
         lw = m.layer(li, it, jt)
-        _gemma_attention_tile(x, lw, m, pos, ropes, T, block, parts)
+        _gemma_attention_tile(res, lw, m, pos, ropes, T, block, parts)
+        x = res.x
         y = ol.empty([T, spec.hidden])
         _mlp_tile(x, lw, spec, parts, sub(lw), act=gelu_tanh, g=lw.g_pre, out=y)
         _add_norm(x, y, ol.load(lw.g_ffn), spec.eps, None if spec.ple_dim else ol.load(lw.ls))
@@ -590,17 +679,17 @@ def gemma4_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK):
         for it in ol.range(reps):
             unit(first, it)
     if logit_rows:
-        _lm_head_rows(x, m, spec, list(logit_rows))
+        _lm_head_rows(res.x, m, spec, list(logit_rows))
 
 
 @ol.jit
-def tile_run(m, kernel, pos, T: int, kind: str, block: int = ATTN_BLOCK, hidden: bool = False):
+def tile_run(m, kernel, pos, T: int, kind: str, block: int = ATTN_BLOCK, kw=None):
     """A tiled prompt run (docs/prefill.md): `kernel`'s T rows at the run-time position in the
     generate state's tpos word (pos: a RunRows, toks_at 0), their tokens from out[]; kind "P",
-    or "L" (the prompt's last run: its last row's logits)."""
-    kw = {"hidden": hidden} if hidden else {}
+    or "L" (the prompt's last run: its last row's logits). kw: the kernel's own (hidden, spill,
+    drows)."""
     with RunWords(m, pos):
-        kernel.fn(m, pos, T, [T - 1] if kind == "L" else [], block, **kw)
+        kernel.fn(m, pos, T, [T - 1] if kind == "L" else [], block, **(kw or {}))
 
 
 KERNELS = {"qwen3": qwen3_tile, "qwen35": qwen35_tile, "lfm2": lfm2_tile,
@@ -661,7 +750,30 @@ def compile_tile_run(img, blocks: int, T: int, kind: str, block: int = ATTN_BLOC
     else:
         pos = RunRows(blocks, block, lo, img.lookup["zmask"], img.cap, T, 0, _amask(img.lookup))
     desc = (lambda s: img.descriptors(s, slot)) if fam == "qwen35" else img.descriptors
-    bs = [trace_fit(tile_run, img.cfg, s, lambda s=s: {
-        "m": desc(s), "kernel": KERNELS[fam], "pos": pos, "T": T, "kind": kind,
-        "block": block, "hidden": hidden}) for s in range(img.cfg.S)]
-    return [b.finish() for b in bs], list(bs[0].run_args)
+    err = None
+    for v in variants(fam, T, img.cfg.MCOLS):       # the first that fits TMEM and ACT RAM
+        kw = dict(v, hidden=True) if hidden else v
+        try:
+            bs = [trace_fit(tile_run, img.cfg, s, lambda s=s: {
+                "m": desc(s), "kernel": KERNELS[fam], "pos": pos, "T": T, "kind": kind,
+                "block": block, "kw": kw}) for s in range(img.cfg.S)]
+        except CompileError as e:
+            if not any(w in str(e) for w in ("TMEM", "ACT RAM")):
+                raise
+            err = e
+            continue
+        return [b.finish() for b in bs], list(bs[0].run_args)
+    raise err
+
+
+def variants(fam: str, T: int, mcols: int) -> list:
+    """A tiled run's forms, tried in order until one fits TMEM and ACT RAM: as it is; x spilled
+    while the heads attend (Res); Qwen3.5's DeltaNet layers in runs of fewer rows (whole passes
+    of MCOLS, then fewer: their pair buffers grow with the rows)."""
+    out = [{}, {"spill": True}]
+    if fam == "qwen35":
+        d = T
+        while d > 1:
+            d = d - mcols if d > mcols else d - 1
+            out.append({"spill": True, "drows": d})
+    return out

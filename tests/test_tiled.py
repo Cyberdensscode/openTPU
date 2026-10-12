@@ -183,14 +183,15 @@ def _prompt_engines(case, mcols, act, R, tmp_path_factory, pair=None):
 
 def _dram_but_scratch(eng, P):
     """Each slice's DRAM but the runs' own words (test_prefill._drams), the I/O area's logits
-    rows (an L run writes its last row's: row T - 1 or R - 1) and Qwen3.5's per-row scratch
-    gr / on (the last run's rows)."""
+    rows (an L run writes its last row's: row T - 1 or R - 1), its input rows (a tiled run's
+    spilled x: tiled.Res) and Qwen3.5's per-row scratch gr / on (the last run's rows)."""
     from test_prefill import _drams
     io, n = eng.image.io, eng.image.nbytes
     out = []
     for d in _drams(eng, P):
         d = d[:n].copy()
         d[io["logits"]:io["logits"] + 4 * eng.image.rows * eng.spec.vocab] = 0
+        d[io["x"]:io["x"] + 4 * eng.image.rows * eng.spec.hidden] = 0
         if "gr" in io:
             d[io["gr"]:io["gr"] + 4 * 2 * eng.image.nl * eng.image.grows] = 0
             d[io["on"]:io["on"] + 4 * 4 * eng.spec.lin_dv * eng.image.grows] = 0
@@ -198,22 +199,28 @@ def _dram_but_scratch(eng, P):
     return out
 
 
-@pytest.mark.parametrize("case, mcols, P1, P2, R, T", [
-    ("qwen3", 4, 250, 20, 8, 16),   # 2 rows a packed tile (G = 2), across the bucket's end
-    ("qwen3", 2, 37, 30, 4, 16),    # MCOLS = G: a row a tile
-    ("qwen3", 8, 37, 30, 8, 16),    # 4 rows a tile
-    ("smollm3", 4, 37, 30, 8, 16),  # no q / k norms, layers without RoPE (G = 4: a row a tile)
-    ("phi3", 4, 37, 30, 8, 16),     # G = 3, RoPE on 96 of 128 dimensions, LongRoPE
-    ("phi3", 8, 37, 30, 8, 16),     # 2 rows of 3 heads a tile
-    ("lfm2", 4, 250, 20, 8, 16),    # convolution blocks by channel parts, 64-wide heads
-    ("kh8", 4, 250, 20, 4, 8),      # Qwen3.5: gated attention, DeltaNet rows (16 rows: TMEM)
-    ("kh16", 4, 37, 30, 4, 8),      # 16 DeltaNet heads
+@pytest.mark.parametrize("case, mcols, P1, P2, R, T, form", [
+    ("qwen3", 4, 250, 20, 8, 16, None),     # 2 rows a packed tile (G = 2), across the bucket's
+    ("qwen3", 2, 37, 30, 4, 16, None),      # end; MCOLS = G: a row a tile
+    ("qwen3", 8, 37, 30, 8, 16, None),      # 4 rows a tile
+    ("smollm3", 4, 37, 30, 8, 16, None),    # no q / k norms, layers without RoPE (G = 4)
+    ("phi3", 4, 37, 30, 8, 16, None),       # G = 3, RoPE on 96 of 128 dimensions, LongRoPE
+    ("phi3", 8, 37, 30, 8, 16, None),       # 2 rows of 3 heads a tile
+    ("lfm2", 4, 250, 20, 8, 16, None),      # convolution blocks by channel parts, 64-wide heads
+    ("kh8", 4, 250, 20, 4, 12, None),       # Qwen3.5: gated attention, DeltaNet rows (16:
+    ("kh16", 4, 37, 30, 4, 12, None),       # TMEM); 16 DeltaNet heads
+    ("qwen3", 4, 250, 20, 8, 16, {"spill": True}),     # x spilled while the heads attend
+    ("lfm2", 4, 37, 30, 8, 16, {"spill": True}),
+    ("kh8", 4, 250, 20, 4, 12, {"spill": True, "drows": 5}),   # DeltaNet in runs of 5, 5, 2
 ])
-def test_tiled_prompt_runs_are_todays(tmp_path_factory, case, mcols, P1, P2, R, T):
+def test_tiled_prompt_runs_are_todays(tmp_path_factory, monkeypatch, case, mcols, P1, P2, R, T,
+                                      form):
     """Two prompts (a chat's turns, the second from where the first left) through tiled prompt
     runs of T rows and through today's of R: the last logits and every slice's DRAM (KV caches,
     DeltaNet states and windows, LFM2's rings) bit for bit; today's runs at MCOLS 4 do not pair
-    (int8 weights)."""
+    (int8 weights). form: the tiled runs' form (tiled.variants), else the first that fits."""
+    if form is not None:
+        monkeypatch.setattr(tiled, "variants", lambda fam, T, mc: [form])
     r = np.random.default_rng(P1)
     p1, p2 = ([int(t) for t in r.integers(0, 1000, n)] for n in (P1, P2))
     spec, a, b = _prompt_engines(case, mcols, 16, R, tmp_path_factory)
@@ -253,18 +260,23 @@ def test_tiled_prompt_runs_pair_rounding(tmp_path_factory, pair, P1, P2, same):
         assert all(np.abs(x - y).max() < 1e-3 * np.abs(y).max() for x, y in zip(got, want))
 
 
-@pytest.mark.parametrize("case, mcols, act, p0, T", [
-    ("qwen3", 4, 4, 300, 4),    # the card's ACT RAM (4 rows): a whole block, then the masked one
-    ("lfm2", 4, 16, 200, 16),   # 16 rows: replayed MMs, the convolution's channel parts
-    ("kh8", 4, 16, 300, 8),     # Qwen3.5: DeltaNet rows (DSTEP), gated attention
-    ("gemma4-1", 4, 16, 600, 8),    # Gemma 4: the sliding window's start-masked block
-    ("gemma4-2", 8, 16, 300, 8),    # E4B's groups of 4, two rows a tile (RowTiles)
-])
-def test_tiled_prompt_run_on_rtl(tmp_path_factory, have_verilator, case, mcols, act, p0, T):
+@pytest.mark.parametrize("case, mcols, act, p0, T, form", [
+    ("qwen3", 4, 4, 300, 4, None),      # the card's ACT RAM (4 rows): a whole block, then the
+    ("lfm2", 4, 16, 200, 16, None),     # masked one; 16 rows: replayed MMs, the convolution's
+    ("kh8", 4, 16, 300, 12, None),      # channel parts; Qwen3.5: DeltaNet rows (DSTEP), gated
+    ("gemma4-1", 4, 16, 600, 8, None),  # Gemma 4: the sliding window's start-masked block
+    ("gemma4-2", 8, 16, 300, 8, None),  # E4B's groups of 4, two rows a tile (RowTiles)
+    ("kh8", 4, 16, 300, 12, {"spill": True, "drows": 5}),  # x stored and loaded back in place,
+])                                                          # DeltaNet in runs of 5, 5, 2
+def test_tiled_prompt_run_on_rtl(tmp_path_factory, monkeypatch, have_verilator, case, mcols,
+                                 act, p0, T, form):
     """A tiled prompt run (an L run, at a run-time position from the state's words, its tokens
     from out[]) on the RTL with the board's memory path: DRAM and TMEM as the ISA simulator's,
-    on the card's MXU (MCOLS 4) with its own ACT RAM of 4 rows and with 16, and on 8 columns."""
+    on the card's MXU (MCOLS 4) with its own ACT RAM of 4 rows and with 16, and on 8 columns;
+    form: the run's form (tiled.variants)."""
     from opentpu import rtlsim
+    if form is not None:
+        monkeypatch.setattr(tiled, "variants", lambda fam, T, mc: [form])
     if case.startswith("gemma4"):
         (W, spec, cfg), kw, cap = _gemma(tmp_path_factory, int(case[-1])), {}, 1024
     else:
@@ -306,18 +318,24 @@ def _gemma(tmp_path_factory, nkv: int):
     return W, spec, TG._cfg()
 
 
-@pytest.mark.parametrize("mcols, nkv, wf, host, P1, P2, R, T", [
-    (4, 1, "int8", "0", 250, 20, 4, 8),     # two parts of 4 heads a row, across the bucket's
-    (8, 2, "int8", "0", 250, 20, 4, 8),     # end; groups of 4: two rows a tile (RowTiles)
-    (4, 1, "fp4", "1", 37, 30, 8, 12),      # 4-bit layers, the PLE table on the host
-    (8, 2, "int8", "0", 760, 20, 4, 8),     # the sliding ring's wrap (768 slots), packed
-])
+@pytest.mark.parametrize("mcols, nkv, wf, host, P1, P2, R, T, form", [
+    (4, 1, "int8", "0", 250, 20, 4, 8, None),   # two parts of 4 heads a row, across the
+    (8, 2, "int8", "0", 250, 20, 4, 8, None),   # bucket's end; groups of 4: two rows a tile
+    #                                             (bucket 1: 16 rows, bucket 2 8: IMEM)
+    (4, 1, "fp4", "1", 37, 30, 8, 12, None),    # 4-bit layers, the PLE table on the host
+    (8, 2, "int8", "0", 760, 20, 4, 8, None),   # the sliding ring's wrap (768 slots), packed
+    (8, 1, "int8", "0", 250, 20, 4, 8, "small"),    # x spilled; query parts of 2 heads (the
+])                                                  # global layers' 1), 4 (8) rows a tile
 def test_tiled_gemma4_prompt_runs_are_todays(tmp_path_factory, monkeypatch, mcols, nkv, wf,
-                                             host, P1, P2, R, T):
+                                             host, P1, P2, R, T, form):
     """Gemma 4's tiled prompt runs (T rows: 16 overflow IMEM or TMEM) against today's prompt
     runs of R rows: the last logits, the layers' DRAM (weights, KV caches, the sliding rings)
-    and the next step's logits bit for bit."""
+    and the next step's logits bit for bit. form "small": x spilled while the heads attend and
+    the query parts held to TMEM / 64 words (tiled.QPART)."""
     monkeypatch.setenv("OTPU_PLE_HOST", host)
+    if form == "small":
+        monkeypatch.setattr(tiled, "variants", lambda fam, T, mc: [{"spill": True}])
+        monkeypatch.setattr(tiled, "QPART", 64)
     W, spec, cfg = _gemma(tmp_path_factory, nkv)
     cfg = dataclasses.replace(cfg, MCOLS=mcols, ACT_ROWS=16)
     kw = dict(wformat=wf, head_format="int8" if wf == "fp4" else None)
@@ -326,7 +344,7 @@ def test_tiled_gemma4_prompt_runs_are_todays(tmp_path_factory, monkeypatch, mcol
     a = Engine(spec, W, cap=1024, cfg=cfg, rows=16, resident=True, prompt_runs=True, **kw)
     a.tile_runs = True
     got = [a.prefill(p1), a.prefill(p2)]
-    assert set(a._prompt_tile.values()) == {T}
+    assert min(a._prompt_tile.values()) == T
     b = Engine(spec, W, cap=1024, cfg=cfg, rows=16, resident=True, prompt_runs=True, **kw)
     b.tile_runs = False
     b._prompt_rmax = {k: (R, True) for k in range(5)}
@@ -339,3 +357,50 @@ def test_tiled_gemma4_prompt_runs_are_todays(tmp_path_factory, monkeypatch, mcol
         return e.backend.machine.slices[0].dram[img.layer0:img.head[0]]
     assert np.array_equal(layers(a), layers(b))
     assert np.array_equal(a.step(5), b.step(5))
+    if form == "small":             # (the global layers' 4 heads a row, 8 at MCOLS 8: parts
+        tile = a._prompt_progs      # of 1 and 2 heads, 8 and 4 rows a tile)
+        assert any(k[0] == "prompt tile" for k in tile)
+
+
+@pytest.mark.parametrize("how", ["kwarg", "env"])
+def test_engine_tile_runs_rows(tmp_path_factory, monkeypatch, how):
+    """Engine(tile_runs=True), or OTPU_TILE=1 where it says nothing: its image's I/O rows grow
+    to the configuration's ACT_ROWS (an L run of T rows writes row T - 1's logits) and a
+    prompt's runs are tiled ones of up to ACT_ROWS rows; without either, neither."""
+    W, spec, cfg, kw = _family("qwen3", tmp_path_factory)
+    cfg = dataclasses.replace(cfg, MCOLS=4, ACT_ROWS=16)
+    monkeypatch.delenv("OTPU_TILE", raising=False)
+    off = Engine(spec, W, cap=512, cfg=cfg, rows=8, resident=True, prompt_runs=True, **kw)
+    assert off.rows == 8 and not PF.tiling(off)
+    if how == "env":
+        monkeypatch.setenv("OTPU_TILE", "1")
+        eng = Engine(spec, W, cap=512, cfg=cfg, rows=8, resident=True, prompt_runs=True, **kw)
+    else:
+        eng = Engine(spec, W, cap=512, cfg=cfg, rows=8, resident=True, prompt_runs=True,
+                     tile_runs=True, **kw)
+    assert eng.rows == eng.image.rows == 16 and PF.tiling(eng)
+    toks = [int(t) for t in np.random.default_rng(3).integers(0, 1000, 40)]
+    lg = eng.prefill(toks)
+    assert [s["rows"] for s in eng.stats] == [16, 16, 8]
+    want = off.prefill(toks)
+    assert np.array_equal(lg.view(np.uint32), want.view(np.uint32))
+
+
+def test_reference_key_tells_tiled_runs():
+    """tools/qual/refs.py: OTPU_TILE is in a reference's key (env_key: the hashed sources read
+    it), so a tiled qual's references are its own."""
+    import importlib.util
+    import os
+    root = Path(__file__).resolve().parents[1]
+    sp = importlib.util.spec_from_file_location("qual_refs_t", root / "tools/qual/refs.py")
+    refs = importlib.util.module_from_spec(sp)
+    sp.loader.exec_module(refs)
+    old = os.environ.pop("OTPU_TILE", None)
+    try:
+        assert "OTPU_TILE" not in refs.env_key()
+        os.environ["OTPU_TILE"] = "1"
+        assert refs.env_key()["OTPU_TILE"] == "1"
+    finally:
+        os.environ.pop("OTPU_TILE", None)
+        if old is not None:
+            os.environ["OTPU_TILE"] = old

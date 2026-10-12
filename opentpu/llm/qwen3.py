@@ -2051,7 +2051,9 @@ class Engine:
     run-time positions, its tokens from out[] (opentpu/llm/prefill.py): compiled once per
     bucket and kind, not per prompt. A dense model's resident image (prefill.supported). With
     the pipeline, bucket 1's are loaded or compiled on a thread as the engine starts
-    (prefill.warm).
+    (prefill.warm). tile_runs (docs/tiled_prefill.md; None: OTPU_TILE=1 turns them on): the
+    prompt runs tiled (opentpu/llm/tiled.py), up to ACT_ROWS rows a run, the image's I/O rows
+    at least ACT_ROWS.
 
     rollback(k) takes the context back to its first k tokens (a chat's next turn, whose
     template renders the last reply differently from what was fed: opentpu/llm/snapshot.py).
@@ -2071,10 +2073,12 @@ class Engine:
                  restore: str = "lazy", embed_runs: bool = False, release_weights: bool = True,
                  pool_map: bool = True, prog_cache: bool | None = None,
                  prompt_runs: bool = False, layer_ahead=None, expert_major: bool = False,
-                 snapshots: int = 0, batch_area: bool = False):
+                 snapshots: int = 0, batch_area: bool = False, tile_runs: bool | None = None):
+        from . import prefill as PF
         self.spec, self.cap, self.block = spec, cap, block
         self.prog_cache = PC.enabled() if prog_cache is None else bool(prog_cache)
         self.prompt_runs = prompt_runs
+        self.tile_runs = tile_runs          # (None: OTPU_TILE's choice, prefill.tile_flag)
         self.batch, self.rows = batch, max(rows, batch)
         wkw = dict(wformat=wformat, head_format=head_format)
         if experts is not None:             # a MoE model's expert slots per layer
@@ -2089,6 +2093,12 @@ class Engine:
         if lookup:
             wkw["lookup"] = True
         self.cfg = cfg or device_config(spec, cap, batch=batch, rows=self.rows, **wkw)
+        if prompt_runs and PF.tile_flag(tile_runs) and self.cfg.act_rows > self.rows:
+            # tiled prompt runs of up to ACT_ROWS rows (prefill.py): the image's I/O rows hold
+            # an L run's last row's logits (row T - 1)
+            self.rows = self.cfg.act_rows
+            if cfg is None:
+                self.cfg = device_config(spec, cap, batch=batch, rows=self.rows, **wkw)
         try:
             self.image = spec.image(self.cfg, cap, batch, self.rows, **wkw)
         except MemoryError as e:            # an int8 embedding table of its own that does not
