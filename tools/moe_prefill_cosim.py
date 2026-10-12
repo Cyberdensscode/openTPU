@@ -24,7 +24,10 @@ uniform, of `used` (the layer's distinct experts in a chunk; by default the prom
 of the 35B's 256, 75 of the 26B's 128), or a router trace's layer-local ids (--route, .npy
 [rows, k]). After the run every used expert's tag must be zero and every (row, rank) output
 place written (checked; --isa: the ISA simulator, no cycles). Its record: passes (numpy's
-bucketing), cycles, ms, ms a pass, the experts' bytes streamed (each pass streams its expert).
+bucketing), cycles, ms, ms a pass, the experts' bytes streamed (each pass streams its expert),
+the run's DRAM bytes by kind and a row (em_bytes), and layer-major's passes on the same ids in
+runs of 2 rows (lm2: each run's union; the synthetic routing's adjacent rows are independent,
+so against a prompt's it overstates them).
 --set KEY=VALUE overrides the board configuration (MCOLS=16, ...). One JSON line per run.
 """
 from __future__ import annotations
@@ -272,6 +275,22 @@ def em_passes(ids: np.ndarray, E: int) -> tuple:
     return int(((c + 1) // 2).sum()), int((c > 0).sum())
 
 
+def em_bytes(ids: np.ndarray, passes: int, fb: int, H: int) -> dict:
+    """The expert run's DRAM traffic by kind, in bytes of whole 64-byte lines: each pass streams
+    its expert (fb), reads its two rows' X and 1 / rms, writes their two outputs, reads its
+    directory entry and zeroes its slot's tag; the tables read each row's ids."""
+    def ln(b):
+        return -(-b // 64) * 64
+    rows, k = ids.shape
+    return dict(weights=passes * fb, rows_in=passes * 2 * (ln(4 * H) + 64),
+                rows_out=passes * 2 * ln(4 * H), tables=rows * ln(4 * k), words=passes * 2 * 64)
+
+
+def lm_passes(ids: np.ndarray, R: int = 2) -> int:
+    """Layer-major's expert passes on the same ids, runs of R rows: each run's union once."""
+    return sum(len(np.unique(ids[r:r + R])) for r in range(0, len(ids), R))
+
+
 def em_dram(img, li: int, ids: np.ndarray):
     """(DRAM, the experts' slots): the zero image with the words the expert run of layer li
     reads once every expert its chunk needs has landed (the module docstring)."""
@@ -362,6 +381,11 @@ def cmd_em(a):
                                                             "STREAM")}, **over},
                    expert_mib=round(passes * fb / 2**20, 1),
                    dram_bound_ms=round(passes * (fb + 16 * s.hidden) / 14.1e9 * 1e3, 3))
+        mv = em_bytes(ids, passes, fb, s.hidden)
+        lm = lm_passes(ids)
+        rec.update(bytes=mv, bytes_a_row=round(sum(mv.values()) / rows),
+                   weight_bytes_a_row=round(mv["weights"] / rows), lm2_passes=lm,
+                   lm2_weight_bytes_a_row=round(lm * fb / rows))
         t = time.time()
         if a.isa:
             m = Machine(cfg, progs, [dram], args).run(max_steps=1 << 34)
