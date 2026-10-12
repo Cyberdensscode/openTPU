@@ -339,11 +339,11 @@ BOARDS = {
 }
 
 
-def board(name: str = "ypcb", **kw) -> HW:
+def board(b: str = "ypcb", **kw) -> HW:
     """A board preset with what-if overrides: board("bcu1525", mhz=200, mts=2400)."""
-    if name not in BOARDS:
-        raise KeyError(f"unknown board {name!r}: {', '.join(BOARDS)}")
-    return BOARDS[name].replace(**kw) if kw else BOARDS[name]
+    if b not in BOARDS:
+        raise KeyError(f"unknown board {b!r}: {', '.join(BOARDS)}")
+    return BOARDS[b].replace(**kw) if kw else BOARDS[b]
 
 
 # ------------------------------------------------------------------------------- calibration
@@ -607,19 +607,33 @@ def _fit_rows(name: str, hw: HW, bucket: int) -> tuple:
     return (int(a[0] + (b[0] - a[0]) * w), int(a[1] + (b[1] - a[1]) * w))
 
 
+def _rule_rows(r: int, hw: HW, fmt: str) -> int:
+    p = hw.rows_pass
+    if r > p:
+        return (r // p) * p
+    if fmt == "fp4" and hw.pair and r > 1 and r % 2 and r > hw.mcols // 2:
+        return r - 1
+    return r
+
+
 def prefill_rows(name: str, hw: HW, bucket: int = 1, fmt: str = "fp4") -> int:
-    """Rows a prefill run in a bucket: --rows, else the TMEM fit (and IMEM's unless imem 0),
-    then whole passes above one pass, and for 4-bit an odd R's R - 1 (PAIR: prefer_rows)."""
+    """Rows a prefill run in a bucket: --rows, else the most the TMEM fit allows (and IMEM's
+    unless imem 0) as the host's rule takes them: whole passes above one pass, and for 4-bit
+    an odd R's R - 1 (PAIR: prefer_rows); of those, and of the fewer whole passes and MXU
+    groups, the R the model finds fastest a row (the host's rule weighs its cost a row)."""
     if hw.rows:
         return hw.rows
     tm, im = _fit_rows(name, hw, bucket)
-    r = max(1, min(tm, im) if hw.imem else tm)
-    p = hw.rows_pass
-    if r > p:
-        r = (r // p) * p
-    elif fmt == "fp4" and hw.pair and r > 1 and r % 2 and r > hw.mcols // 2:
-        r -= 1
-    return r
+    top = _rule_rows(max(1, min(tm, im) if hw.imem else tm), hw, fmt)
+    cands = {top} | {r for r in range(hw.mcols, top, hw.mcols)}
+    if len(cands) == 1:
+        return top
+    m = model(name)
+    f = formats_of(name, "fp4" if fmt == "fp4" else "auto" if fmt == "mix" else fmt)
+    c0 = (bucket - 1) * BLOCK + BLOCK // 2
+    cost = {r: run_cycles(m, hw, f, [c0 + i for i in range(r)], logits=0) / r for r in cands}
+    best = min(cost.values())
+    return max(r for r in cands if cost[r] <= best * 1.001)
 
 
 def prefill(name: str, hw: HW, wformat: str = "fp4", P: int = 1024, p0: int = 0) -> dict:
@@ -841,10 +855,13 @@ WHATIFS = [
     ("TMEM x4 (16 ACT RAM rows)", dict(tmem_words=262144, act_rows=16)),
     ("tiled prefill, 64 rows a run", dict(rows=64, act_rows=64, imem=0)),
     ("8 users in one pass (replay)", dict(batch_rows=8, act_rows=8)),
-    ("8 users in one pass, MCOLS 8", dict(batch_rows=8, mcols=8)),
     ("VPU x2", dict(vpu=2.0)),
     ("MXU pumped x2", dict(mxu_pump=2.0)),
     ("MCOLS 8 + TMEM x4 + VPU x2", dict(mcols=8, tmem_words=262144, act_rows=16, vpu=2.0)),
+    ("MXU x2 + TMEM x4 + VPU x2 (pumped)", dict(mxu_pump=2.0, tmem_words=262144, act_rows=16,
+                                                 vpu=2.0)),
+    ("port 256 B a cycle (memory permitting)", dict(port_bytes=256)),
+    ("port 256 B + MXU x2", dict(port_bytes=256, mxu_pump=2.0)),
 ]
 
 
@@ -961,7 +978,7 @@ def points() -> list:
     for name, fmt, R, pos, cyc, what, kw in COSIM:
         runs = [([pos], 1)] if R == 0 else [([pos + r for r in range(R)], 0)]
         out.append(dict(group="co-sim", model=name, fmt=fmt, runs=runs, hw=kw, y=cyc,
-                        label=f"{name} {what}"))
+                        label=f"{name} {fmt[0]} {what}"))
     return out
 
 
