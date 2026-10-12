@@ -60,6 +60,14 @@ workloads through the workloads agent's scoreboard. Nothing here ran on the card
   most 4-bit kinds (every non-Gemma gate / up, the MoE models' dense kinds, LFM2.5-8B-A1B's
   experts), not in the 35B's streamed experts. Without NVFP4, LFM2.5-8B-A1B would be 2.3 points
   worse than today.
+- **The production finals** (3.7: `formats_scan.py` with the production quantizers and the
+  device's ranges, each model in its production configuration): MX is better than today on all
+  13 card models (16 rows: the -it models on both texts), by 0.06 to 12 points of dKL, and its
+  tail is no longer but on Qwen3.5-35B-A3B (8 tokens over 0.5 against 6, within noise) and
+  E4B-it on docs/isa.md (16 against 8, from its `fp4x6` head: accepted, formats.md). 11 rows are
+  within 2 SE of 3.6's; the others are the models' sensitivity to the quantizer's realization
+  (the device's tie rounding and ranges against 3.6's: one change moves E4B-it's docs/isa.md by
+  0.6 points), not errors.
 - **A side finding**: a TMEM above 64K words serializes the sequencer (16-bit TMEM ranges in its
   dependency window): +70% on an 8-row prefill at 256K words until the ranges are widened
   (section 4).
@@ -648,6 +656,126 @@ runs'). The decode-time model is the card's for the dense models, an estimate fo
 slope) and for the MoE models (above). The runs' numbers (every row's dKL, SE, bytes and drops;
 each kind's effect, cost and bar; the opportunities against both references; the defaults and the
 decisions) are `tools/exp/mx_acc.json`.
+
+### 3.7 The production finals
+
+Every card model at 2000 tokens in its production configuration on the MX column as mx-column
+(3095bb02) sets it, through the production path: `tools/formats_scan.py ppl` with `opentpu.quant`'s
+quantizers (int8 = `int8x`, fp4 = `fp4x6`, nvfp4 = `nvfp4r`; QACT `a8x32`; the weight's exact ties
+rounded as the device's fp32 quantizer rounds them; MM's window drops) and the device's ranges: K
+as QST writes it (ROW at d = D, else an offset per D-block), P per attention block of 256
+positions, the down projection's input per F chunk (`kernels.mlp.down_chunk`), the DeltaNet
+out_proj's per head group, the int8 embedding as the gather's rows, a MoE expert's down input per
+slot range (`moe.ExpertFormat.ranges`). The configurations: `formats.MIXES` for the dense 4-bit
+models, `streamed.FORMATS` for the MoE models (LFM2.5-8B-A1B nvfp4 with an int8 head;
+Qwen3.5-35B-A3B fp4 with `attn, delta, mlp=nvfp4` and an int8 head; gemma-4-26B-A4B-it int8 with
+`experts=nvfp4` and an fp4 head), `Spec.fit_formats` for E4B-it; Gemma's PLE table as the image of
+cap 2048 places it. For the MoE models formats_scan gains the LFM2-MoE and Qwen3.5-MoE FFN (this
+branch: the router in int8, `moe.route`, Qwen3.5's shared expert and its gate, each routed expert
+read once and quantized once per format), held by `formats_scan.py check` to `lfm2` /
+`qwen35.emulated_logits` on tiny MoE models (logits to 1.9e-15). Today is 3.6's today rows, the
+pre-MX formats_scan's exactly: the float NLL per token is equal in every run, and ee8f118d's
+formats_scan gives 3.6's today KL per token to the last digit on Qwen3-0.6B (int8), LFM2-2.6B
+(`conv=fp4,mlp=fp4`) and E2B-it on the chat. MX - today is paired per token (points of dKL, SE over
+the tokens).
+
+| model | text | production on MX | MX - today, points (SE) | phase 1's MX - today | finals - phase 1's MX, points (SE) |
+|:--|:--|:--|--:|--:|--:|
+| Qwen3-0.6B | docs/isa.md | int8 | -0.25 (0.04) | -0.25 (0.05) | -0.008 (0.027), 0.3 SE |
+| LFM2.5-230M | docs/isa.md | int8 | -0.12 (0.01) | -0.11 (0.01) | -0.015 (0.009), 1.7 SE |
+| Qwen3.5-0.8B | docs/isa.md | int8 | -0.06 (0.01) | -0.04 (0.01) | -0.022 (0.005), 4.2 SE |
+| Qwen3.5-2B | docs/isa.md | int8 | -0.10 (0.01) | -0.08 (0.01) | -0.024 (0.006), 4.3 SE |
+| Gemma 4 E2B-it | the chat | int8 (fp4 PLE table) | -0.55 (0.13) | -0.50 (0.14) | -0.055 (0.086), 0.6 SE |
+| Gemma 4 E2B-it | docs/isa.md | int8 (fp4 PLE table) | -2.11 (0.21) | -1.78 (0.19) | -0.330 (0.105), 3.1 SE |
+| Qwen3.5-4B | docs/isa.md | `delta=fp4x6, mlp=nvfp4` | -1.04 (0.14) | -1.03 (0.14) | -0.014 (0.025), 0.6 SE |
+| LFM2-2.6B | docs/isa.md | `conv=nvfp4, gateup=nvfp4, down=fp4x6` | -1.69 (0.33) | -1.69 (0.33) | -0.005 (0.038), 0.1 SE |
+| SmolLM3-3B | docs/isa.md | `gateup@9-35=nvfp4` | -0.32 (0.06) | -0.28 (0.06) | -0.042 (0.030), 1.4 SE |
+| Phi-4-mini | docs/isa.md | `gateup@4-29=nvfp4, down@4-29=fp4x6` | -0.28 (0.10) | -0.35 (0.09) | +0.064 (0.036), 1.8 SE |
+| Gemma 4 E4B-it | the chat | `head=fp4x6, gateup@0-11=fp4x6` | -0.35 (0.07) | -0.34 (0.08) | -0.016 (0.038), 0.4 SE |
+| Gemma 4 E4B-it | docs/isa.md | `head=fp4x6, gateup@0-11=fp4x6` | -0.80 (0.32) | -1.44 (0.34) | +0.639 (0.149), 4.3 SE |
+| LFM2.5-8B-A1B | docs/isa.md | nvfp4, int8 head | -2.14 (0.61) | -2.47 (0.60) | +0.333 (0.326), 1.0 SE |
+| Qwen3.5-35B-A3B | docs/isa.md | fp4x6, `attn, delta, mlp=nvfp4`, int8 head | -0.70 (0.17) | -0.76 (0.18) | +0.058 (0.053), 1.1 SE |
+| gemma-4-26B-A4B-it | the chat | int8, `experts=nvfp4`, fp4x6 head | -3.75 (2.29) | +0.18 (2.39) | -3.928 (1.664), 2.4 SE |
+| gemma-4-26B-A4B-it | docs/isa.md | int8, `experts=nvfp4`, fp4x6 head | -11.98 (3.54) | -15.21 (3.36) | +3.232 (1.808), 1.8 SE |
+
+**Consistency with 3.6.** The production path and phase 1's emulation run the same layers (on a
+tiny Qwen3.5 the MX tree's layer code with phase 1's quantizers gives phase 1's layer outputs
+exactly) and differ in four places: an int8x weight's exact tie (the device's fp32 rounding against
+half to even: 3.5e-4 of the values, unbiased, the same squared error), the ranges (P per attention
+block, the down projection's input per F chunk, the DeltaNet out_proj per head group, against one
+range a row), the int8 embedding (the gather's rows) and MM's drops in q.K and P.V (phase 1 summed
+the attention exactly). 11 of the 16 rows are within 2 SE of phase 1's MX row of the same
+configuration; the others are the two Qwen3.5 int8 models (-0.022 (0.005) and -0.024 (0.006): 4 SE
+of a tiny paired SE, in MX's favour), the two Gemma -it models on docs/isa.md, the cross-check text
+(E2B-it -0.33 (0.11), E4B-it +0.64 (0.15)), and gemma-4-26B-A4B-it on the chat -3.93 (1.66), whose
+KL is large everywhere (p99 near 6 on the chat). With phase 1's choices put back in the production
+path the rows go back to phase 1's: E4B-it -0.02 (0.08) from its row and E2B-it -0.18 (0.10) with
+the ties and the ranges put back, Qwen3.5-0.8B -0.011 (0.005) with all but the attention's drops.
+They are not errors but the models' sensitivity to the quantizer's realization: on E4B-it any one
+of the changes alone (the ties only: -0.59 (0.14) from the final; P and down only: -0.54 (0.15))
+brings the final back, though they touch disjoint code, and E2B-it moved the other way. On
+docs/isa.md an instruct model's dKL moves by up to ~0.6 points with one rounding step on a few
+weights, more than its token SE; on the chat, the text the -it defaults are decided on, E2B-it's
+and E4B-it's finals are within 0.6 SE of phase 1's rows. The 26B, whose KL is an order larger than
+the others' on both texts, moves by points between neighbouring configurations already in phase 1's
+factorial (its experts NVFP4 against `fp4x6` on the chat: +1.75 (1.98)); its finals are not ablated
+(50 min a run). formats.md's Gemma 4 E4B-it section has the decomposition.
+
+**The tail.** The mean can hide a few bad tokens (MM's window dropping a group on a row with an
+outlier, mx-compiler's finding on validate), so each final's KL per token against today's, on the
+same tokens:
+
+| model | text | p99, MX / today | max, MX / today | tokens > 0.1 | tokens > 0.5 | window drops (layer weights' MMs): inputs, tokens |
+|:--|:--|--:|--:|--:|--:|:--|
+| Qwen3-0.6B | docs/isa.md | 0.060 / 0.067 | 0.42 / 0.61 | 5 / 8 | 0 / 1 | not counted |
+| LFM2.5-230M | docs/isa.md | 0.016 / 0.021 | 0.15 / 0.13 | 1 / 1 | 0 / 0 | not counted |
+| Qwen3.5-0.8B | docs/isa.md | 0.013 / 0.018 | 0.08 / 0.04 | 0 / 0 | 0 / 0 | not counted |
+| Qwen3.5-2B | docs/isa.md | 0.010 / 0.016 | 0.04 / 0.05 | 0 / 0 | 0 / 0 | not counted |
+| Gemma 4 E2B-it | the chat | 0.197 / 0.328 | 0.62 / 1.23 | 58 / 89 | 4 / 9 | 4.1e-05, 887 (every MM kind) |
+| Gemma 4 E2B-it | docs/isa.md | 0.284 / 0.552 | 0.75 / 1.74 | 93 / 196 | 4 / 24 | 8.9e-06, 271 (every MM kind) |
+| Qwen3.5-4B | docs/isa.md | 0.257 / 0.331 | 0.61 / 1.20 | 174 / 254 | 3 / 7 | 2.8e-04, 1906 |
+| LFM2-2.6B | docs/isa.md | 0.337 / 0.442 | 2.61 / 4.64 | 288 / 421 | 8 / 16 | 4.0e-05, 871 (every MM kind) |
+| SmolLM3-3B | docs/isa.md | 0.127 / 0.144 | 0.50 / 0.72 | 33 / 53 | 1 / 1 | not counted |
+| Phi-4-mini | docs/isa.md | 0.173 / 0.216 | 0.93 / 0.99 | 89 / 103 | 3 / 4 | 2.2e-03, 1959 (every MM kind) |
+| Gemma 4 E4B-it | the chat | 0.152 / 0.206 | 0.62 / 0.77 | 38 / 51 | 1 / 3 | 1.5e-05, 604 (every MM kind) |
+| Gemma 4 E4B-it | docs/isa.md | 0.381 / 0.292 | 2.74 / 6.10 | 102 / 178 | 16 / 8 | 5.8e-07, 19 |
+| LFM2.5-8B-A1B | docs/isa.md | 1.517 / 1.426 | 3.14 / 3.58 | 1589 / 1658 | 366 / 393 | 4.6e-05, 1312 (every MM kind) |
+| Qwen3.5-35B-A3B | docs/isa.md | 0.268 / 0.293 | 1.49 / 2.12 | 207 / 270 | 8 / 6 | not counted |
+| gemma-4-26B-A4B-it | the chat | 5.762 / 6.051 | 16.11 / 19.39 | 444 / 495 | 216 / 251 | 1.6e-07, 2 |
+| gemma-4-26B-A4B-it | docs/isa.md | 9.147 / 9.237 | 17.82 / 19.48 | 1190 / 1246 | 542 / 628 | 6.3e-08, 0 |
+
+MX has no more tokens over 0.5 than today on every model but two, and a max no higher but on
+LFM2.5-230M (0.15 against 0.13) and Qwen3.5-0.8B (0.08 against 0.04), both far under 0.5; its p99
+is lower everywhere but on E4B-it's docs/isa.md and LFM2.5-8B-A1B (1.52 against 1.43, a model whose
+KL is large on that text in every row). Qwen3.5-35B-A3B has 8 tokens over 0.5 against today's 6 (a
+bootstrap over the tokens puts the difference within -4 to +8; over 0.3 and over 1.0 MX has fewer,
+16 against 19 and 1 against 3, and a lower max, 1.49 against 2.12): its high tokens are the `fp4x6`
+experts' (MX int8 under 0.15 on them; phase 1's identical row has the same tokens high, and its
+NVFP4-experts row 7 over 0.5). Gemma 4 E4B-it on docs/isa.md has 16 against 8, from its `fp4x6`
+head (2 with an NVFP4 head, which does not fit its image; the decision, and the chat's 1 against 3,
+in formats.md's E4B-it section). The 26B's KL is large on both texts and its tail too, shorter on
+MX: the 26B on the chat 216 against 251 over 0.5 (max 16.1 against 19.4); the 26B on docs/isa.md
+542 against 628 over 0.5 (max 17.8 against 19.5).
+
+**Drops.** `formats_scan.py ppl` now counts what MM's window drops in every variant's MMs
+(`_counted_mm` around `quant.mx_matmul`; "drops" in a row of the JSON: the MMs, the (row, 16
+columns) inputs and (row, output, group) terms dropped, per MM kind: the layers' weights, q.K, P.V,
+the head; the dropped terms per token; the first runs, marked "every MM kind" above, have them
+together). The layer weights' drops are few and fall on tokens no worse than today: Qwen3.5-4B's
+`fp4x6` DeltaNet (W 11) drops 2.8e-4 of its inputs' groups, on 1906 tokens (MX int8: 142 groups on
+30 tokens), and on those tokens MX - today is -0.010 points; E4B-it's on docs/isa.md 80 groups on
+19 tokens. P.V drops a group where an attention probability is under 2^-16 of its block's largest
+(Qwen3.5-4B 3.5e-4 of the groups, the same in MX int8); q.K and the head drop nothing in any run
+counted. Where every kind is counted together (Phi-4-mini 2.2e-3 of the inputs, as much in its MX
+int8 row: not the 4-bit kinds') MX - today on the tokens with a drop is -0.002 to -0.031.
+
+**What ran where.** hwe-bench (the dense models, the MoE models, the ablations; the priority slot
+from 17:40) and omarchy (Gemma 4 E2B-it and E4B-it), 2026-10-12, 2000 tokens, 6 BLAS threads, one
+process a run: 45 s for LFM2.5-230M to 82 min for Qwen3.5-35B-A3B (25.5 GB); the 26B 49 and 38 min
+(33 and 40 GB, the chat and docs/isa.md). The today rows' identity: ee8f118d's formats_scan on the
+same text (docs/isa.md as the MX tree has it) and the same chat ids. The runs' numbers (each row's
+MX - today, phase 1's, the difference, dKL from float, the tails and the drops) are
+`tools/exp/mx_finals.json`.
 
 ## 4. Attention on shared lanes
 

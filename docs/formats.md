@@ -421,6 +421,56 @@ taken; on the instruct one it brings perplexity from +3.17% over int8 to +0.01%.
 Every bucket's decode, generate (greedy and sampled) and prompt run programs fit IMEM and TMEM
 at 2048 tokens (`test_gemma4.py`'s test_e4b_programs_fit).
 
+**On the MX column (2026-10-12): the head stays `fp4x6`.** The two 4-bit kinds, head and layers
+0-11's gate / up, each in `fp4x6` or NVFP4, the rest `int8x` ([mx_mxu.md](mx_mxu.md) 3.6: phase
+1's factorial, `tools/exp/mx_formats.py`, 2000 tokens of each text; dKL against int8, KL per
+token against float):
+
+| head, gate / up 0-11 | the chat: dKL (SE) | > 0.5 | max | docs/isa.md: dKL (SE) | > 0.5 | max |
+|:--|--:|--:|--:|--:|--:|--:|
+| today (fp4 and fp4, int8 / a8) | +0.55 (0.07) | 3 | 0.77 | +2.30 (0.37) | 8 | 6.10 |
+| **`fp4x6`, `fp4x6` (the default)** | +0.21 (0.07) | 0 | 0.49 | +0.86 (0.18) | 11 | 1.33 |
+| `fp4x6`, NVFP4 | +0.20 (0.07) | 1 | 0.54 | +0.54 (0.17) | 6 | 2.50 |
+| NVFP4, `fp4x6` | +0.18 (0.06) | 0 | 0.41 | +0.39 (0.17) | 2 | 1.45 |
+| NVFP4, NVFP4 | +0.18 (0.06) | 0 | 0.41 | +0.26 (0.15) | 2 | 0.63 |
+| the default, production final (`formats_scan.py`) | +0.20 (0.06) | 1 | 0.62 | +1.50 (0.24) | 16 | 2.74 |
+
+(> 0.5: tokens whose KL is over 0.5; int8: 1 and 4 such tokens, max 0.51 and 2.32.) The rule
+decides the -it models on their chat (mx_mxu.md 3.6): there an NVFP4 head gains -0.02 (0.04) and
+NVFP4 gate / up -0.005, under their bars, so both stay `fp4x6`, and the production final is 0.35
+(0.07) points better than today with 1 token over 0.5 against today's 3. On docs/isa.md, text far
+from what the instruct model was tuned on, the `fp4x6` head is what lengthens the tail: 11
+tokens over 0.5 (the final 16) against 2 with an NVFP4 head and today's 8, while the mean is still
+better than today's (the final -0.80 (0.32)). An NVFP4 head does not fit E4B-it's 4 GiB image at
+cap 2048 (4114.6 MiB, the MX compiler's measure). Decided (the coordinator on the MX lead's
+recommendation, 2026-10-12): the head stays `fp4x6`; an NVFP4 head for E4B-it is the first use of
+any image savings to come (the tile kernel, MCOLS 8, the PLE work).
+
+**The production final on docs/isa.md is 0.64 (0.15) points over phase 1's row of the same
+configuration** (mx_mxu.md 3.7), and that is not a bug: the final rounds as the device does and
+phase 1's emulation did not, in three places (an int8x weight's exact tie: the device's fp32
+quantizer against half to even; P per attention block of 256 positions and the down projection's
+input per F chunk against one range a row), and any one of them alone brings the final back to
+phase 1's row:
+
+| the production path with phase 1's | - the final, points (SE) | - phase 1's row | > 0.5 | max |
+|:--|--:|--:|--:|--:|
+| ties only | -0.59 (0.14) | +0.05 (0.10) | 10 | 2.16 |
+| whole-row P and down input only | -0.54 (0.15) | +0.10 (0.09) | 11 | 1.92 |
+| all three | -0.66 (0.13) | -0.02 (0.08) | 6 | 1.86 |
+
+The two single changes touch disjoint code (the weights' rounding, the activations' ranges), so
+neither path holds an error the other corrects. The ties are unbiased (3.5e-4 of int8x values
+round the other way, 50% of them away from zero, the squared error identical: Qwen3.5-0.8B's
+weights), and the device's ranges are finer than phase 1's. What the table measures is
+E4B-it's sensitivity on that text: one rounding step on a few weights or a different range moves
+its dKL by about 0.6 points, four times the token SE, spread over the whole text (+1.5 and +1.8
+points in the first and last 250 tokens, +0.1 to +0.5 between, 0.31 without the tokens over 0.5);
+the production realization is the high one. E2B-it on the same text moved the other way (its
+final 0.33 under phase 1's row; mx_mxu.md 3.7). On the chat there is none of it: the final is
+-0.016 (0.038) from phase 1's row, every 250-token window within 0.13. So nothing in the
+production path changes, and E4B-it is not rerun.
+
 ### Qwen3.5-35B-A3B's head
 
 The 35B ([offload.md](offload.md): fp4 layers, the experts streamed into slots, the int8 head)
