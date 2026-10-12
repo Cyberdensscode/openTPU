@@ -642,10 +642,13 @@ MCOLS 4 on the YPCB and parametric in MCOLS (4 and 8 tested) and E. It is bit-ex
   (columns j and j + M), and the row (MCOLS x 48-bit integers, MCOLS Sa', Sw) written to the
   result FIFO: RF = 32 rows at MCOLS 4 (64 at 8), three LUT RAM copies with their own write
   pointer and enable replicas (the write fan-out was the experiment's tightest path).
-- **E shared lanes** (`otpu_mx_lane`, E = MCOLS/2 by default, `MXU_E` / `OTPU_MXU_E`): i2f48
-  (round to nearest even), x Sw, x Sa', then the existing TMEM write or the ACC / ASCALE
-  read-modify-write and RMAX. The drain picks up to E results of the head row a cycle (fewer at a
-  TMEM bank conflict).
+- **E shared lanes** (`otpu_mx_lane`, E = MCOLS/2 by default, `MXU_E` / `OTPU_MXU_E`; above MCOLS
+  it is MCOLS): i2f48 (round to nearest even), x Sw, x Sa', then the existing TMEM write or the
+  ACC / ASCALE read-modify-write and RMAX. The drain picks up to E results of the head row a
+  cycle (fewer at a TMEM bank conflict). The card builds E = 4, full rate at MCOLS 4
+  (`targets/ypcb-00338.toml` [uarch] MXU_E: the board top, `run_vivado.sh` / `make bit MXU_E=`,
+  the board model and `rtlsim.BOARD_UARCH` follow it; timing only, so the CFG_HASH stays
+  89417856): see "The card's lanes" below.
 
 **`rtl/vpu/otpu_quant.sv`**: QACT and QST in the MX form, two passes a row (section 8's risk):
 pass 0 computes the row's amax and each group's (QACT D/4, QST D) into four group RAMs, the
@@ -740,3 +743,35 @@ QACT start to end, b370889d / two passes / row buffer: 2x128 96 / 158 / 101 cycl
 558 / 295, 4x1024 632 / 1,198 / 695, 4x2048 1,208 / 2,222 / 1,335; a 1-row QACT keeps the second
 read's latency (1x1024 200 / 310 / 308). The MMs asked port A for 1,461,408 scale lines in the
 decode token, none for a row's Sw alone (today's compiler's layouts).
+
+**The card's lanes: E 4.** A single-block MM (q.K^T at d = 128: KB 1) gives G outputs a K row,
+G a KV head's query rows, and the drain takes E of the head row's a cycle: at E 2 a row of 3 or
+4 takes two cycles against the array's one. With ACT_ROWS 16 at MCOLS 4 a head of G > 4 rows
+replays each chunk ceil(G/4) times, so the array's time a K row is KB x ceil(G/4) and the
+G 8 models (Qwen3.5-35B, Gemma 4 E2B / E4B at d 256: KB 2) balance at E 2; P.V's 256-token blocks
+(KB 2) balance at G 2 to 8. On the card the drain bounds q.K^T for G 3 (Phi-4-mini) and G 4
+(SmolLM3) at d 128. Decode co-simulations (`tools/perf_qwen.py`, 2 and 4 layers and the LM head,
+LiteDRAM DDR3-1066 at 133.33 MHz, PAIR / DSTEP / STREAM; the previous numerics: ee8f118d's RTL
+and compiler; a full token = the head + the layers x the 4- minus 2-layer difference):
+
+| model (G, d) | | layer at 2000 | layer at 4000 | full token at 2000 | at 4000 |
+|---|---|---:|---:|---:|---:|
+| Phi-4-mini (3, 128) | previous | 881,660 | 916,436 | 33.35M | 34.46M |
+| | MX E 2 | +0.30% | +2.94% | -0.12% | +2.13% |
+| | MX E 3 / E 4 | -2.09% | -1.78% | -2.15% | -1.88% |
+| SmolLM3-3B (4, 128) | previous | 676,358 | 696,982 | 26.55M | 27.29M |
+| | MX E 2 / E 3 | +0.29% | +1.68% | +0.06% | +1.34% |
+| | MX E 4 | -1.12% | -1.10% | -1.23% | -1.21% |
+
+The 2-layer runs at 2000 tokens of Qwen3-0.6B (G 2: 1,613,955 cycles at E 2 and E 4, 1,644,467
+before), Qwen3.5-0.8B (G 4 at d 256: 2,487,917 at E 2 and E 4, 2,540,395 before) and Gemma 4
+E2B (G 8 at d 256: 3,986,760 at E 2, 3,986,572 at E 4, 4,077,912 before) do not move with E.
+Phi-4-mini's and SmolLM3's layers without the drain's excess are faster than the previous
+numerics' (and the LM head 2.5% smaller), but at E 2 the excess, about T x Hkv cycles a layer,
+grows with the position, and both models' decode is slower than before by 4000 tokens. E 3
+(bit-exact with the ISA simulator, `perf_qwen --check`) fixes G 3 only. Out of context (`otpu_mxu`, MCOLS 4,
+ACT_ROWS 16, 7.5 ns): E 2 12,311 LUT / 22,472 FF / 562 DSP (WNS +0.164), E 3 14,116 / 23,824 /
+568 (+0.206), E 4 16,171 / 25,113 / 574 (+0.067, the same pop_q -> otpu_pe INMODE path), about
+1,930 LUT, 1,320 FF and 6 DSP a lane. The card builds E 4. Packing the drain across rows (G 3:
+1.5 cycles a row) or lanes without ACC / ASCALE would cost less area but fix less (G 4 needs four
+results a cycle), and splitting a head's rows across MMs keeps G x T / E.

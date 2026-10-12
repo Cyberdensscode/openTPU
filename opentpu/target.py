@@ -46,6 +46,8 @@ FAMILIES = ("generic", "xilinx7", "xilinxus", "asic")
 # uarch keys every target names (timing only; the RTL's parameters of the same names)
 UARCH_KEYS = ("MXU_IMPL", "MXU_CL", "VPU_CL", "ULANES", "TMEM_IMPL", "RPB", "WPB", "WIN",
               "FIFO_DEPTH", "TRACE_DEPTH", "PQ_WIN", "CHASH")
+# and the optional ones (absent: the RTL's default): MXU_E, the MXU's epilogue lanes (0: MCOLS / 2;
+# above MCOLS: MCOLS)
 PLATFORM_KEYS = ("board", "core_mhz", "mem", "channels_per_slice", "channel_bytes", "beat_bytes",
                  "host")
 # The slice's TMEM read ports (otpu_slice NRP) and the most lanes a simulation may set
@@ -215,6 +217,8 @@ def sim_uarch(t: Target | str | None = None) -> dict:
          "FIFO_DEPTH": u["FIFO_DEPTH"]}
     if u["TMEM_IMPL"]:
         d["TMEM_IMPL"] = u["TMEM_IMPL"]
+    if u.get("MXU_E"):
+        d["MXU_E"] = u["MXU_E"]
     return d
 
 
@@ -229,8 +233,8 @@ def rtl_params(t: Target | str | None = None) -> dict:
         "S": a["S"], "D": a["D"], "MCOLS": a["MCOLS"], "ACT_ROWS": t.act_rows,
         "ACT_BLOCKS": a["ACT_BLOCKS"], "TMEM_WORDS": a["TMEM_WORDS"],
         "IMEM_WORDS": a["IMEM_WORDS"], "LANES": a["LANES"], "DSTEP": int(a["DSTEP"]),
-        "MXU_IMPL": u["MXU_IMPL"], "MXU_CL": u["MXU_CL"], "VPU_CL": u["VPU_CL"],
-        "ULANES": u["ULANES"], "TMEM_IMPL": u["TMEM_IMPL"],
+        "MXU_IMPL": u["MXU_IMPL"], "MXU_CL": u["MXU_CL"], "MXU_E": u.get("MXU_E", 0),
+        "VPU_CL": u["VPU_CL"], "ULANES": u["ULANES"], "TMEM_IMPL": u["TMEM_IMPL"],
         "RPB": u["RPB"] or NRP * a["LANES"], "WPB": u["WPB"], "WIN": u["WIN"],
         "FIFO_DEPTH": u["FIFO_DEPTH"], "TRACE_DEPTH": u["TRACE_DEPTH"], "PQ_WIN": u["PQ_WIN"],
         "CHASH": int(u["CHASH"]),

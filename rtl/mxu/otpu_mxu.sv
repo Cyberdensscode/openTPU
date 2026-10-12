@@ -53,7 +53,7 @@ module otpu_mxu
   parameter int LANES = 8,       // TMEM banks (the drain's lanes write distinct banks)
   parameter int IMPL  = 2,       // the dot product: 2 systolic (the only one; CFG_UARCH reports it)
   parameter int CL    = 16,      // products per cascade chain (at most D/8)
-  parameter int E     = 0,       // epilogue lanes (0: MCOLS / 2, at least 1; at most MCOLS, LANES)
+  parameter int E     = 0,       // epilogue lanes (0: MCOLS / 2, at least 1; more than MCOLS: MCOLS)
   parameter int SID   = 0
 ) (
   input  logic                  clk,
@@ -103,7 +103,8 @@ module otpu_mxu
   localparam int PW = $clog2(DEPTH);
   localparam int LM = 2, LA = 4;
   // epilogue lanes; NL: the drain's lanes per step
-  localparam int EL = (E > 0) ? E : ((MCOLS >= 2) ? MCOLS / 2 : 1);
+  // (a target's E holds at a smaller MCOLS too: the card's 4 is 2 at MCOLS 2)
+  localparam int EL = (E > MCOLS) ? MCOLS : (E > 0) ? E : ((MCOLS >= 2) ? MCOLS / 2 : 1);
   localparam int NL = EL;
   // chains of CLS products, CPG of them per group of D/8 elements (1, or 2 above D = 128)
   localparam int CLS = (D / 8 < CL) ? D / 8 : CL;
@@ -123,7 +124,7 @@ module otpu_mxu
   initial if (IMPL != 2) $fatal(1, "otpu_mxu: IMPL 2 (systolic) is the only dot product");
   initial if (D % 16 != 0 || (D / 8) % CLS != 0 || CPG > 2)
     $fatal(1, "otpu_mxu: D a multiple of 16, D/8 a multiple of CLS, at most two chains a group");
-  initial if (EL > MCOLS || EL > LANES) $fatal(1, "otpu_mxu: E %0d > MCOLS or LANES", EL);
+  initial if (EL > LANES) $fatal(1, "otpu_mxu: E %0d > LANES", EL);
   initial if (ROWS < MCOLS || ROWS > 255) $fatal(1, "otpu_mxu: MCOLS <= ROWS < 256");
 
   // conflict-free drain run for a row stride: LANES / gcd(ors, LANES), at most NL

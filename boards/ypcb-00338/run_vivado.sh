@@ -6,6 +6,7 @@
 #                                         # for; host calibration), MCOLS=4, the systolic MXU
 #   MCOLS=2 ./run_vivado.sh               # 2 MXU columns (4, the default: faster prefill / batched decode)
 #   VPU_CL=4 ./run_vivado.sh              # 4 VPU lanes with exp2/recip/rsqrt (faster softmax)
+#   MXU_E=2 ./run_vivado.sh               # 2 MXU epilogue lanes (the target's: 4, full rate at MCOLS 4)
 #   LANES=16 ./run_vivado.sh              # 16 VPU lanes / TMEM banks
 #   CORE_MHZ=100 ./run_vivado.sh          # another core clock (default 133.33, the production image's)
 #   FAST=1 ./run_vivado.sh                # development build: default strategies, no retiming or post-route
@@ -39,6 +40,7 @@ mcols="${MCOLS:-${T_MCOLS:-4}}"     # MXU columns (the host reads them from the 
 vpu_cl="${VPU_CL:-${T_VPU_CL:-2}}"  # VPU lanes with the composite functions (timing only)
 lanes="${LANES:-${T_LANES:-8}}"     # VPU lanes / TMEM banks (likewise in VERSION)
 act_rows="${ACT_ROWS:-${T_ACT_ROWS:-$mcols}}"  # ACT RAM rows (> MCOLS: MM replay; the ACT_ROWS register)
+mxu_e="${MXU_E:-${T_MXU_E:-4}}"   # MXU epilogue lanes (timing only; 0: MCOLS / 2)
 dstep="${DSTEP:-${T_DSTEP:-1}}"     # 0: no DSTEP datapath in the DMA (CAPS bit6 = 0)
 mxu="$([[ "${T_MXU_IMPL:-2}" == 0 ]] && echo tree || echo systolic)"   # the MXU's dot product
 core_mhz="${CORE_MHZ:-$([[ "${FAST:-0}" == 1 ]] && echo 100 || echo "${T_CORE_MHZ:-133.33}")}"  # accelerator clock (FAST=1: 100)
@@ -89,7 +91,7 @@ export PCIE_GEN="${PCIE_GEN:-2}"    # read by vivado/bd_native.tcl and userclk1_
 if [[ "${STEP:-}" == impl ]]; then
   run "$here/vivado/build.tcl" "$out" "$jobs" impl "${IMPL_STRATEGY:-}"
 else
-  run "$here/vivado/create_project.tcl" "$speed" "$out" "$mcols" "$core_mhz" "$build_id" "$vpu_cl" "$lanes" "$act_rows" "$dstep" "$mxu" "$platform" "$arch_hash"
+  run "$here/vivado/create_project.tcl" "$speed" "$out" "$mcols" "$core_mhz" "$build_id" "$vpu_cl" "$lanes" "$act_rows" "$dstep" "$mxu" "$platform" "$arch_hash" "$mxu_e"
   run "$here/vivado/build.tcl" "$out" "$jobs" full "${IMPL_STRATEGY:-}"
 fi
 echo "done: $out/otpu.bit"
