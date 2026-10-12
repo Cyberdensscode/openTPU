@@ -214,7 +214,8 @@ package otpu_pkg;
         o.a[0] = 24'(rows - 1);   o.w[0] = c.w5;
         o.a[1] = 24'(rows - 1);   o.w[1] = c.w6;
         o.a[2] = 24'(kb * D - 1); o.w[2] = c.w7;
-        o.a[3] = 24'(rows);       o.w[3] = kb;
+        // a scale row's words (not ROW): S and ceil(KB/4) words of d bytes
+        o.a[3] = 24'(rows);       o.w[3] = 32'd1 + ((kb + 32'd3) >> 2);
       end
       OP_VOP: begin
         rows = 32'(c.w4[15:0]);
@@ -298,10 +299,17 @@ package otpu_pkg;
         end
       end
       OP_MM: begin
-        n = 32'(c.w4[15:0]); kb = 32'(c.w4[31:16]); m = 32'(c.w6[23:16]);
+        n = 32'(c.w4[15:0]); kb = 32'(c.w4[23:16]); m = 32'(c.w6[23:16]);
         if (n != 0 && kb != 0 && m != 0) begin
           f.rd[0] = mk(SP_DRAM, c.w1, p.p0 + kb * D);
-          if (!c.flags[0]) f.rd[1] = mk(SP_DRAM, c.w2, p.p1 + kb * 4);
+          // a scale row's bytes up to block k0 + KB's (docs/isa.md "Weight formats"; PAIR's odd
+          // KB: one block more): RSC Sw; int8x Sw and a byte a block; int4x / fp4x6 Sw, a
+          // reserved word and a word a block; NVFP4 Sw, three reserved words and 8 bytes a block
+          if (!c.flags[0])
+            f.rd[1] = mk(SP_DRAM, c.w2, p.p1 + (c.flags[7] ? 32'd4 :
+                         (c.flags[5:4] == 2'd0) ? 32'd4 + 32'(c.w4[31:24]) + kb :
+                         (c.flags[5:4] == 2'd3) ? 32'd24 + ((32'(c.w4[31:24]) + kb) << 3) :
+                                                  32'd12 + ((32'(c.w4[31:24]) + kb) << 2)));
           if (c.flags[3])  f.rd[3] = mk(SP_TMEM, c.w2, m);                         // ASCALE
           f.rd[2] = mk(SP_ACT, 32'(c.w6[31:24]), kb);
           f.wr[0] = mk(SP_TMEM, c.w3, p.p2 + n);

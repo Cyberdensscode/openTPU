@@ -1,5 +1,5 @@
 """The cell families (rtl/tech/<family>): the vendor cells compute what the generic models do,
-cycle for cycle. sim/tech/tb_tech_dsp.sv drives every otpu_pe variant and otpu_colend with random
+cycle for cycle. sim/tech/tb_tech_dsp.sv drives every otpu_pe variant and otpu_mxce with random
 operands and enables; the trace with rtl/tech/xilinx7 (on yosys's DSP48E1 simulation model) must
 equal the trace with rtl/tech/generic. (rtl/tech/xilinxus's DSP48E2 has no open model: Vivado's
 simulator checks it, docs/targets.md.)"""

@@ -231,7 +231,7 @@ def test_tech_families_define_the_same_cells():
             mods[m.group(1)] = (norm(m.group(2)), norm(m.group(3)))
         return mods
     ref = iface(ROOT / "rtl/tech/generic/otpu_tech_dsp.sv")
-    assert set(ref) == {"otpu_pe", "otpu_colend"}
+    assert set(ref) == {"otpu_pe", "otpu_mxce"}
     for fam in ("xilinx7", "xilinxus"):
         assert iface(ROOT / f"rtl/tech/{fam}/otpu_tech_dsp.sv") == ref, fam
 

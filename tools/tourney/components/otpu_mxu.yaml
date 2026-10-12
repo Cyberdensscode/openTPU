@@ -1,8 +1,9 @@
 name: otpu_mxu
-description: 'MXU: streams int8 weight chunks (D bytes/cycle) through a prefetch FIFO against up to MCOLS
-  stationary int8 rows in ACT RAM; products in the systolic array (IMPL 2: a DSP48E1 per position, weights
-  hopping column to column), i2f, scale multiplies, isum_4 partial loop, result FIFO, drain with ACC/ASCALE
-  read-modify-write, RMAX.'
+description: 'MXU, the MX column: streams weight chunks (D bytes/cycle) and their scale lines through prefetch
+  FIFOs against up to MCOLS stationary int8 rows in ACT RAM; products in the systolic array (a DSP48E1 per
+  position, weights hopping column to column), the column end (otpu_mxce: each chain end times m << sh, the
+  row accumulated exactly in 48 bits), PAIR''s integer add, result FIFO, E shared lanes (i2f48, x Sw, x Sa''),
+  drain with ACC/ASCALE read-modify-write, RMAX.'
 allowed:
 - rtl/mxu/otpu_mxu.sv
 - rtl/tech/xilinx7/otpu_tech_dsp.sv

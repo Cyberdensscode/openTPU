@@ -18,8 +18,9 @@ module tb_top;
   parameter int WIN        = 32;
   parameter int RPB        = 4;
   parameter int WPB        = 2;
-  parameter int MXU_IMPL   = 0;
+  parameter int MXU_IMPL   = 2;
   parameter int MXU_CL     = 16;
+  parameter int MXU_E      = 0;       // MXU epilogue lanes (0: MCOLS / 2)
   parameter int VPU_CL     = (LANES >= 8) ? LANES / 4 : 1;
   parameter int ULANES     = LANES;
   parameter int AXI        = 0;       // otpu_top's memory path (1: the board's, native; 2: the
@@ -37,7 +38,7 @@ module tb_top;
 
   otpu_top #(.S(S), .D(D), .MCOLS(MCOLS), .ACT_BLOCKS(ACT_BLOCKS), .ACT_ROWS(ACT_ROWS), .TMEM_WORDS(TMEM_WORDS),
              .IMEM_WORDS(IMEM_WORDS), .DRAM_WORDS(DRAM_WORDS), .DRAM_LAT(DRAM_LAT),
-             .LANES(LANES), .WIN(WIN), .RPB(RPB), .WPB(WPB), .MXU_IMPL(MXU_IMPL), .MXU_CL(MXU_CL), .VPU_CL(VPU_CL), .ULANES(ULANES), .AXI(AXI), .FIFO_DEPTH(FIFO_DEPTH),
+             .LANES(LANES), .WIN(WIN), .RPB(RPB), .WPB(WPB), .MXU_IMPL(MXU_IMPL), .MXU_CL(MXU_CL), .MXU_E(MXU_E), .VPU_CL(VPU_CL), .ULANES(ULANES), .AXI(AXI), .FIFO_DEPTH(FIFO_DEPTH),
              .TMEM_IMPL(TMEM_IMPL)) dut (
     .clk, .sys_rst, .rst, .rinit, .ld_start, .ld_addr, .ld_n, .ld_busy, .all_halted, .any_error, .icount,
     .dump);

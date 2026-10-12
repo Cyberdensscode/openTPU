@@ -32,7 +32,7 @@ module otpu_board #(
   parameter int RPB        = 8 * LANES,   // every read lane (TMEM is replicated per read port):
                                           // the slice's shallow write-mask arbiter
   parameter int WPB        = 1,
-  parameter int MXU_IMPL   = 0,
+  parameter int MXU_IMPL   = 2,
   parameter int MXU_CL     = 16,
   parameter int VPU_CL     = (LANES >= 8) ? LANES / 4 : 1,  // VPU lanes with exp2/recip/rsqrt
   parameter int ULANES     = LANES,   // TMEM lanes of the MXU and the quantizer
@@ -160,7 +160,8 @@ module otpu_board #(
   logic [IW-1:0] instr;
   logic [31:0] arg [8];               // the run's arguments (ARG0..7: R8..R15 at the start)
   logic a_req, a_we, a_rvalid, a_rdy, b_req, b_tag, b_we, b_par, b_rvalid, b_rtag, b_rdy;
-  logic [31:0] a_addr, a_wdata, a_rdata, a_rdata2, b_addr;
+  logic [31:0] a_addr, a_wdata, b_addr;
+  logic [255:0] a_rdata;
   logic [3:0]  a_be, sw_be;
   logic        sw_req, sw_rdy;
   logic [31:0] sw_addr, sw_wdata;
@@ -282,7 +283,7 @@ module otpu_board #(
     .ld_addr(x_ld_addr[0]), .ld_n(x_ld_n[0]),
     .ld_busy(q_ld_busy[0]), .a_rdy, .b_rdy, .sw_rdy, .wr_idle(q_wr_idle[0]),
     .rd_idle(q_rd_idle[0]),
-    .a_req, .a_we, .a_addr, .a_wdata, .a_be, .a_rvalid, .a_rdata, .a_rdata2,
+    .a_req, .a_we, .a_addr, .a_wdata, .a_be, .a_rvalid, .a_rdata,
     .sw_req, .sw_addr, .sw_wdata, .sw_be,
     .b_req, .b_tag, .b_we, .b_wmask, .b_wdata, .b_addr, .b_par, .b_rvalid, .b_rtag, .b_rdata,
     .coll_req(sc_req[0]), .coll_cmd(sc_cmd[0]), .coll_ack(sc_ack[0]),
@@ -311,7 +312,7 @@ module otpu_board #(
   otpu_native_dram #(.D(D), .CHASH(CHASH)) u_mem (
     .clk, .rst(x_srst[0]), .a_flush(x_rst[0] || x_ld_start[0] || a_inval),
     .a_rdy_x(a_rdy), .a_req_x(a_req), .a_we_x(a_we), .a_addr_x(a_addr), .a_wdata_x(a_wdata),
-        .a_be_x(a_be), .a_rvalid, .a_rdata, .a_rdata2,
+        .a_be_x(a_be), .a_rvalid, .a_rdata,
     .sw_rdy, .sw_req, .sw_addr, .sw_wdata, .sw_be,
     .b_rdy, .b_req, .b_tag, .b_we, .b_wmask, .b_wdata, .b_addr, .b_par, .b_rvalid, .b_rtag,
     .b_rdata, .wr_idle(q_wr_idle[0]), .rd_idle(q_rd_idle[0]),
@@ -324,7 +325,8 @@ module otpu_board #(
   for (genvar s = 1; s < S; s++) begin : g_slice
     logic           a_req, a_we, a_rvalid, a_rdy, b_req, b_tag, b_we, b_par, b_rvalid, b_rtag;
     logic           b_rdy, a_inval, sw_req, sw_rdy;
-    logic [31:0]    a_addr, a_wdata, a_rdata, a_rdata2, b_addr, sw_addr, sw_wdata;
+    logic [31:0]    a_addr, a_wdata, b_addr, sw_addr, sw_wdata;
+    logic [255:0]   a_rdata;
     logic [3:0]     a_be, sw_be;
     logic [D/4-1:0] b_wmask;
     logic [D*8-1:0] b_wdata, b_rdata;
@@ -340,7 +342,7 @@ module otpu_board #(
       .ld_addr(x_ld_addr[s]), .ld_n(x_ld_n[s]),
       .ld_busy(q_ld_busy[s]), .a_rdy, .b_rdy, .sw_rdy, .wr_idle(q_wr_idle[s]),
       .rd_idle(q_rd_idle[s]),
-      .a_req, .a_we, .a_addr, .a_wdata, .a_be, .a_rvalid, .a_rdata, .a_rdata2,
+      .a_req, .a_we, .a_addr, .a_wdata, .a_be, .a_rvalid, .a_rdata,
       .sw_req, .sw_addr, .sw_wdata, .sw_be,
       .b_req, .b_tag, .b_we, .b_wmask, .b_wdata, .b_addr, .b_par, .b_rvalid, .b_rtag, .b_rdata,
       .coll_req(sc_req[s]), .coll_cmd(sc_cmd[s]), .coll_ack(sc_ack[s]),
@@ -353,7 +355,7 @@ module otpu_board #(
     otpu_native_dram #(.D(D), .CHASH(CHASH)) u_mem (
       .clk, .rst(x_srst[s]), .a_flush(x_rst[s] || x_ld_start[s] || a_inval),
       .a_rdy_x(a_rdy), .a_req_x(a_req), .a_we_x(a_we), .a_addr_x(a_addr), .a_wdata_x(a_wdata),
-          .a_be_x(a_be), .a_rvalid, .a_rdata, .a_rdata2,
+          .a_be_x(a_be), .a_rvalid, .a_rdata,
       .sw_rdy, .sw_req, .sw_addr, .sw_wdata, .sw_be,
       .b_rdy, .b_req, .b_tag, .b_we, .b_wmask, .b_wdata, .b_addr, .b_par, .b_rvalid, .b_rtag,
       .b_rdata, .wr_idle(q_wr_idle[s]), .rd_idle(q_rd_idle[s]),

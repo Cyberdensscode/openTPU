@@ -13,7 +13,7 @@ TMEM arbiter's) and stage, and gives the path a kind:
              units' latency, but the stages beyond 2 / 4 are delay registers appended after the
              logic (otpu_delay u_pad): deeper LM / LA move no logic, so they shorten no path
              unless synthesis retimes (SYNTH_RETIME_MODULES)
-    systolic the systolic MXU's cells (otpu_pe, otpu_colend)
+    systolic the systolic MXU's cells (otpu_pe, otpu_mxce)
     sram     from or into an SRAM macro (its clock-to-q or setup and the wire to it)
     tmem     the TMEM's bank muxes and its copy selection, the slice's arbiter
     dma      the DMA and its chunk buffer
