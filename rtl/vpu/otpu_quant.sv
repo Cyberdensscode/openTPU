@@ -17,6 +17,15 @@
 //           block's first chunk its record {da3, da2, da1, da0, S}; QST: the bytes)
 // A row's pass 1 starts once its scale is out of the scale unit (and QST's scale row written);
 // the next row's pass 0 follows its pass 1 at once.
+//
+// QACT rows of up to XD x LANES elements go through the row buffer instead (XD > 0): pass 0
+// also pushes the prescaled chunks into a FIFO (block RAM, XD chunks) and the reader goes on to
+// the next row's pass 0 at once; pass 1 pops the row's chunks from the FIFO once its scale is
+// out (a TMEM read and the prescale fewer), while the following rows' pass 0 run. Up to NB = 4
+// rows are between the passes: the group maxes and the rows' scales are kept per row in NB banks
+// (row r in bank r % 4), and pass 0 of row r waits for pass 1 of row r - 4 to have read them; the
+// FIFO's free entries are counted at the reads (credits). A row's chunks are popped in order, so
+// the result is the two-pass one bit for bit.
 
 // N-cycle delay line (N >= 2) like otpu_delay, but its last stage has a synchronous reset: a
 // flip-flop with a reset is not packed into the shift-register LUTs in front of it, so the
@@ -123,6 +132,7 @@ module otpu_quant
   parameter int D     = 32,
   parameter int LANES = 8,
   parameter int GR    = 1024,               // group maxes of a row (QACT 4*KB, QST KB; not ROW)
+  parameter int XD    = 1024,               // row buffer chunks (QACT rows <= XD*LANES); 0: none
   parameter int SID   = 0
 ) (
   input  logic                    clk,
@@ -175,6 +185,9 @@ module otpu_quant
   localparam int PL = LANES / QN;           // a chunk's lanes per QACT group
   localparam int GWN = GR / 4;              // group words (four group maxes each)
   localparam int GA = $clog2(GWN);
+  localparam int NB = 4;                    // row banks: group maxes and scales of rows in flight
+  localparam int XW = (XD > 1) ? $clog2(XD) : 1;
+  initial if (XD == 1 || (XD & (XD - 1)) != 0) $fatal(1, "otpu_quant: XD 0 or a power of two >= 2");
   initial if (D % LANES != 0 || (D & (D - 1)) != 0)
     $fatal(1, "otpu_quant: D a power of two, a multiple of LANES");
   initial if (LANES < 4) $fatal(1, "otpu_quant: QST word writes need LANES >= 4");
@@ -185,6 +198,7 @@ module otpu_quant
 
   // ------------------------------------------------------------------ command
   logic        busy, is_st, rowm, csf, rsf, ackw, dup;
+  logic        bm;                           // QACT through the row buffer
   logic [31:0] csb, rsb, srs, drs, es;
   logic [15:0] rows, KB;
   logic [7:0]  ab;
@@ -225,7 +239,18 @@ module otpu_quant
   logic [31:0] rem;
   logic [LANES-1:0] rmask;
   always_comb for (int l = 0; l < LANES; l++) rmask[l] = 32'(l) < ew && 32'(l) < rem;
-  wire riss = busy && !ackw && !rd_done && !rd_wait && !sw_ph;
+  // the row buffer: pass 1's row r1 (popping while p1a), its element, the FIFO's pointers and
+  // its entries taken by issued reads (credits)
+  logic        p1a;
+  logic [15:0] r1;
+  logic [31:0] e1c;
+  logic [XW-1:0] xw, xr;
+  logic [XW:0] xocc;                         // <= XD: below XD while its top bit is clear
+  logic [2:0]  dr;                           // r - r1 (<= NB)
+  // buffered: a read needs a free FIFO entry, and row r's banks free (pass 1 of row r - NB done);
+  // one LUT on the read enables' path
+  wire xok = !bm || (!xocc[XW] && !dr[2]);
+  wire riss = busy && !ackw && !rd_done && !rd_wait && !sw_ph && xok;
 
   typedef struct packed {
     logic             v;
@@ -237,6 +262,11 @@ module otpu_quant
     logic [LANES-1:0] mask;
   } rm_t;
   rm_t m0, mp;                               // data arriving now / after the prescale
+  // buffered pass 1: a chunk popped (its data and group word arriving), then +1, +2 (the writer's
+  // stage, like mp); the offsets' stages take their chunk from mb0 or m0
+  rm_t mb0, mb1, mb2;
+  rm_t m1s;
+  assign m1s = bm ? mb0 : m0;
 
   // (the addresses follow the position alone: a lane's counts only while its enable is up)
   always_comb begin
@@ -328,7 +358,7 @@ module otpu_quant
 
   // the row's running max with this chunk folded in (a row's first chunk restarts it): the
   // scale unit's input at the row's last chunk
-  f32_t amx_r, amx_s, nmax;
+  f32_t amx_r, nmax;
   assign nmax = (mc.e != 0 && mgt(amx_r, cmax)) ? amx_r : cmax;
   // the group maxes: QST's D-blocks, QACT's sub-blocks of D/4 (one or more chunks each, or QN a
   // chunk), folded like the row's and written at the group's last chunk to the group RAMs
@@ -340,7 +370,7 @@ module otpu_quant
   wire [31:0] gix = is_st ? (mce >> DL) : (mce >> QGL);   // the chunk's (first) group
   assign gnew = (!gfst && mgt(gacc, cmax)) ? gacc : cmax;
   logic [3:0]       gw_we;
-  logic [GA-1:0]    gw_a;
+  logic [GA+1:0]    gw_a;                    // {row bank, word}
   logic [3:0][30:0] gw_d;
   always_ff @(posedge clk) if (en) begin
     gw_we <= '0;
@@ -354,26 +384,32 @@ module otpu_quant
           gw_d[2'(gix[1:0] + 2'(p))] <= pmx[p][30:0];
         end
       end
-      gw_a <= GA'(gix >> 2);
+      gw_a <= {mc.row[1:0], GA'(gix >> 2)};
     end
   end
   // the group RAMs' reads: the chunk's group word at a pass 1 read (QACT: the block's four
-  // groups; QST: the word of its block), the next scale-row word in QST's scale row phase
+  // groups; QST: the word of its block; buffered: at a pop), the next scale-row word in QST's
+  // scale row phase; NB banks of GWN words, row r in bank r % NB
   logic [3:0][30:0] grd;
-  wire [GA-1:0] gr_a = sw_ph ? GA'(sw_i) : is_st ? GA'(e >> (DL + 2)) : GA'(e >> DL);
+  wire [GA+1:0] gr_a = sw_ph ? {r[1:0], GA'(sw_i)} : is_st ? {r[1:0], GA'(e >> (DL + 2))}
+                     : bm ? {r1[1:0], GA'(e1c >> DL)} : {r[1:0], GA'(e >> DL)};
   for (genvar s = 0; s < 4; s++) begin : g_gr
-    otpu_ram_1r1w #(.W(31), .N(GWN), .STYLE("block")) u_g (
+    otpu_ram_1r1w #(.W(31), .N(NB * GWN), .STYLE("block")) u_g (
       .clk, .we(en && gw_we[s]), .wa(gw_a), .wd(gw_d[s]), .re(en), .ra(gr_a), .rd(grd[s]));
   end
 
   // scale unit (its amax is don't-care while sq_iv is low: sc/inv are read only under sq_ov)
   logic        sq_iv, sq_ov;
+  logic [1:0]  sq_ot;
   f32_t        sq_amax, sq_sc, sq_inv;
   assign sq_iv   = mc.v && mc.last && !mc.pass;
   assign sq_amax = nmax;
-  otpu_qscale #(.LM(LM), .LA(LA), .TW(1)) u_sc (.clk, .rst, .en, .iv(sq_iv), .itag(1'b0),
-    .amax(sq_amax), .ov(sq_ov), .otag(), .sc(sq_sc), .inv(sq_inv));
-  f32_t sc2, inv2, amx2;                     // the row's S, inv and amax (pass 1)
+  otpu_qscale #(.LM(LM), .LA(LA), .TW(2)) u_sc (.clk, .rst, .en, .iv(sq_iv), .itag(mc.row[1:0]),
+    .amax(sq_amax), .ov(sq_ov), .otag(sq_ot), .sc(sq_sc), .inv(sq_inv));
+  // the rows' S, inv and amax by bank (row r in r % NB: written at its scale's input / output,
+  // read through its pass 1); sv: the bank's scale is out and its pass 1 not yet started
+  f32_t       sc_q [NB], inv_q [NB], amx_q [NB];
+  logic [NB-1:0] sv;
 
   // ------------------------------------------------------------------ pass 1: offsets
   // d = min(31, e(amax) - e(a) - (f(a) > f(amax))), 0 for a = 0 and in ROW mode (a <= amax)
@@ -395,9 +431,11 @@ module otpu_quant
   // block's record bytes the next, delayed to the prescale's output
   logic [3:0][4:0] dq;
   logic [31:0]     e1;
+  logic [1:0]      b1;                       // the chunk's row bank
   always_ff @(posedge clk) if (en) begin
-    for (int s = 0; s < 4; s++) dq[s] <= dval(grd[s], amx2, rowm);
-    e1 <= m0.e;
+    for (int s = 0; s < 4; s++) dq[s] <= dval(grd[s], amx_q[m1s.row[1:0]], rowm);
+    e1 <= m1s.e;
+    b1 <= m1s.row[1:0];
   end
   f32_t        invl [LANES], invp [LANES];
   logic [31:0] dal, dap;
@@ -405,7 +443,7 @@ module otpu_quant
     for (int l = 0; l < LANES; l++) begin
       logic [31:0] el;
       el = e1 + 32'(l);
-      invl[l] <= p2mul(inv2, dq[is_st ? el[DL+1:DL] : el[QGL+1:QGL]]);
+      invl[l] <= p2mul(inv_q[b1], dq[is_st ? el[DL+1:DL] : el[QGL+1:QGL]]);
     end
     dal <= {3'b0, dq[3], 3'b0, dq[2], 3'b0, dq[1], 3'b0, dq[0]};
   end
@@ -419,9 +457,9 @@ module otpu_quant
     for (int l = 0; l < LANES; l++) begin
       logic [31:0] el;
       el = e1 + 32'(l);
-      if (p2mul(inv2, dq[is_st ? el[DL+1:DL] : el[QGL+1:QGL]]) !=
-          fp_mul(inv2, {1'b0, 8'(8'd127 + 8'(dq[is_st ? el[DL+1:DL] : el[QGL+1:QGL]])), 23'd0}))
-        $fatal(1, "otpu_quant: inv %h * 2^d is not fp_mul's", inv2);
+      if (p2mul(inv_q[b1], dq[is_st ? el[DL+1:DL] : el[QGL+1:QGL]]) !=
+          fp_mul(inv_q[b1], {1'b0, 8'(8'd127 + 8'(dq[is_st ? el[DL+1:DL] : el[QGL+1:QGL]])), 23'd0}))
+        $fatal(1, "otpu_quant: inv %h * 2^d is not fp_mul's", inv_q[b1]);
     end
 `endif
 
@@ -437,31 +475,71 @@ module otpu_quant
     logic             st;        // QST byte
     logic [31:0]      baddr;     // QST byte address
     logic             fin;       // last write of the instruction
+    logic [31:0]      sc;        // the row's S (the scale record)
   } wm_t;
   wm_t   wq, wqd;                            // at the multiplier input / at the write stage
   f32_t  wx [LANES], winv [LANES];
-  f32_t  wsc_d;
+  // buffered pass 1: the popped chunk's data, delayed to the offsets' output (mb2)
+  f32_t  xd [LANES], xb1 [LANES], xb2 [LANES];
+  always_ff @(posedge clk) if (en) begin
+    xb1 <= xd;
+    xb2 <= xb1;
+  end
+  always_ff @(posedge clk)
+    if (rst) begin
+      mb1 <= '0;
+      mb2 <= '0;
+    end else if (en) begin
+      mb1 <= mb0;
+      mb2 <= mb1;
+    end
+  // the row buffer: pass 0's prescaled chunks (buffered QACT), popped by pass 1 in order (the
+  // read registered: the popped chunk's data arrives with mb0)
+  wire xpush = bm && mp.v && !mp.pass;
+  if (XD > 0) begin : g_xb
+    logic [LANES*32-1:0] xwd, xrd;
+    always_comb for (int l = 0; l < LANES; l++) xwd[32*l +: 32] = xp[l];
+    otpu_ram_1r1w #(.W(LANES * 32), .N(XD), .STYLE("block")) u_xb (
+      .clk, .we(en && xpush), .wa(xw), .wd(xwd), .re(en), .ra(xr), .rd(xrd));
+    always_comb for (int l = 0; l < LANES; l++) xd[l] = xrd[32*l +: 32];
+  end else begin : g_nxb
+    always_comb for (int l = 0; l < LANES; l++) xd[l] = F_ZERO;
+  end
+`ifndef SYNTHESIS
+  // the FIFO: a pop takes a chunk pushed before it, a push never overruns (the credits)
+  int unsigned xs_n;
+  always @(posedge clk)
+    if (rst || start) xs_n = 0;
+    else if (busy && en) begin
+      if (p1a && xs_n == 0) $fatal(1, "otpu_quant: row buffer popped empty");
+      xs_n = xs_n + (xpush ? 1 : 0) - (p1a ? 1 : 0);
+      if (xs_n > XD) $fatal(1, "otpu_quant: row buffer overrun");
+    end
+`endif
   always_comb begin
+    rm_t   m;
     wq = '0;
     for (int l = 0; l < LANES; l++) begin
       wx[l] = F_ZERO;
       winv[l] = F_ZERO;
     end
-    if (mp.v && mp.pass) begin
+    m = mb2.v ? mb2 : mp;                    // (mb2 only when buffered, mp.pass only when not)
+    if (mb2.v || (mp.v && mp.pass)) begin
       wq.v = 1'b1;
-      wq.mask = mp.mask;
+      wq.mask = m.mask;
       for (int l = 0; l < LANES; l++) begin
-        wx[l] = xp[l];
-        winv[l] = invp[l];
+        wx[l] = mb2.v ? xb2[l] : xp[l];
+        winv[l] = mb2.v ? invl[l] : invp[l];
       end
-      wq.row = mp.row[7:0];
-      wq.idx = (32'(ab) * D + mp.e) & ~32'(LANES - 1);  // QACT: e steps by LANES (QST: unused)
-      wq.sw = !is_st && (mp.e[DL-1:0] == 0);
-      wq.blk = 16'(ab) + 16'(mp.e >> DL);
-      wq.da = dap;
+      wq.row = m.row[7:0];
+      wq.idx = (32'(ab) * D + m.e) & ~32'(LANES - 1);   // QACT: e steps by LANES (QST: unused)
+      wq.sw = !is_st && (m.e[DL-1:0] == 0);
+      wq.blk = 16'(ab) + 16'(m.e >> DL);
+      wq.da = mb2.v ? dal : dap;
       wq.st = is_st;
       wq.baddr = mp_baddr;
-      wq.fin = mp.glast;
+      wq.fin = m.glast;
+      wq.sc = sc_q[m.row[1:0]];
     end
   end
   // the writer's selection registered in front of the multipliers
@@ -508,8 +586,6 @@ module otpu_quant
     end
   end
   otpu_qdly #(.W($bits(wm_t)), .N(LM + 2)) u_wq (.clk, .rst, .en, .d(wq_r), .q(wqd));  // ends in a flip-flop
-  // the row's S at the write stage (constant over a row's pass 1)
-  otpu_delay #(.W(32), .N(LM + 3)) u_ws (.clk, .en, .d(sc2), .q(wsc_d));
 
   // QST's scale row: S, then (not ROW) the d words: word j holds groups 4j .. 4j+3, the group
   // RAMs' word j (read the cycle before), the bytes of groups past KB 0
@@ -518,7 +594,7 @@ module otpu_quant
     dword = '0;
     for (int s = 0; s < 4; s++)
       if (32'(sw_i) * 4 + 32'(s) < 32'(KB) + 4)        // groups 4(sw_i - 1) + s < KB
-        dword[8*s +: 8] = {3'b0, dval(grd[s], amx2, 1'b0)};
+        dword[8*s +: 8] = {3'b0, dval(grd[s], amx_q[r[1:0]], 1'b0)};
   end
   // a DRAM write is waiting (independent of the grant, which the slice derives from it)
   assign a_want = (busy && !ackw && wqd.v && wqd.st) || sw_ph;
@@ -555,7 +631,7 @@ module otpu_quant
           asc_we = 1'b1;
           asc_row = wqd.row;
           asc_blk = wqd.blk;
-          asc_data = {wqd.da, wsc_d};
+          asc_data = {wqd.da, wqd.sc};
         end
       end
     end
@@ -563,7 +639,7 @@ module otpu_quant
       a_req = 1'b1;
       a_we = 1'b1;
       a_addr = (sbase + {sw_i, 2'b00}) >> 2;
-      a_wdata = (sw_i == 0) ? sc2 : dword;
+      a_wdata = (sw_i == 0) ? sc_q[r[1:0]] : dword;
       a_be = 4'hF;
     end
     if (!gnt) begin
@@ -596,8 +672,12 @@ module otpu_quant
       ackw <= 1'b0;
       sw_ph <= 1'b0;
       m0 <= '0;
+      mb0 <= '0;
+      p1a <= 1'b0;
+      bm <= 1'b0;
     end else if (ackw) begin
       m0 <= '0;
+      mb0 <= '0;
       if (wr_idle) begin
         ackw <= 1'b0;
         busy <= 1'b0;
@@ -642,6 +722,9 @@ module otpu_quant
       pass <= 1'b0; rd_wait <= 1'b0; wide <= 1'b0; sw_ph <= 1'b0; sw_i <= '0;
       m0 <= '0;
       st_frz <= '0;
+      bm <= XD > 0 && !qst && 32'(kb) * D <= 32'(XD) * LANES;
+      p1a <= 1'b0; r1 <= '0; e1c <= '0; xw <= '0; xr <= '0; xocc <= '0; dr <= '0; sv <= '0;
+      mb0 <= '0;
       if (nr == 0 || kb == 0) begin
         rd_done <= 1'b1;
         done_w <= 1'b1;
@@ -666,13 +749,13 @@ module otpu_quant
           e <= e + ew;
           rem <= rem - ew;
           badr <= badr + bstep;
-        end else if (!pass) begin                 // wait for the row's scale, re-read it
+        end else if (!pass && !bm) begin          // wait for the row's scale, re-read it
           rd_wait <= 1'b1;
           e <= '0;
           rem <= G;
           badr <= brs;
           wide <= is_st && es == 32'd1 && brs[1:0] == 2'd0;
-        end else begin                             // the next row
+        end else begin                             // the next row (buffered: after pass 0)
           e <= '0;
           rem <= G;
           pass <= 1'b0;
@@ -685,18 +768,44 @@ module otpu_quant
           sbase <= sbase + sstep;
         end
       end
+      // ---- buffered pass 1: once row r1's scale is out, pop its chunks (one a cycle, the
+      // group word read with each); a row's start takes a cycle
+      mb0 <= '0;
+      if (p1a) begin
+        mb0.v <= 1'b1;
+        mb0.e <= e1c;
+        mb0.row <= r1;
+        mb0.mask <= '1;
+        mb0.last <= (e1c + LANES >= G);
+        mb0.glast <= (e1c + LANES >= G) && (32'(r1) + 1 == 32'(rows));
+        xr <= xr + 1'b1;
+        if (e1c + LANES >= G) begin
+          p1a <= 1'b0;
+          r1 <= r1 + 1'b1;
+        end else e1c <= e1c + LANES;
+      end else if (bm && 32'(r1) < 32'(rows) && sv[r1[1:0]]) begin
+        p1a <= 1'b1;
+        e1c <= '0;
+      end
+      // the FIFO's entries taken (a buffered read) and given back (a pop); rows between the
+      // passes (r - r1)
+      xocc <= xocc + ((bm && riss) ? 1'b1 : 1'b0) - (p1a ? 1'b1 : 1'b0);
+      if (xpush) xw <= xw + 1'b1;
+      dr <= dr + ((bm && riss && rlast) ? 3'd1 : 3'd0) - ((p1a && e1c + LANES >= G) ? 3'd1 : 3'd0);
       // ---- the maxes
       if (mc.v && !mc.pass) begin
         amx_r <= nmax;
         gacc <= gnew;
       end
-      if (sq_iv) amx_s <= nmax;
-      // ---- the row's scale: QST writes its scale row, then pass 1 starts
+      if (sq_iv) amx_q[mc.row[1:0]] <= nmax;
+      // ---- the row's scale: QST writes its scale row, then pass 1 starts (buffered: pass 1
+      // takes it when it gets to the row)
       if (sq_ov) begin
-        sc2 <= sq_sc;
-        inv2 <= sq_inv;
-        amx2 <= amx_s;
-        if (is_st) begin
+        sc_q[sq_ot] <= sq_sc;
+        inv_q[sq_ot] <= sq_inv;
+        if (bm) begin
+          sv[sq_ot] <= 1'b1;
+        end else if (is_st) begin
           sw_ph <= 1'b1;
           sw_i <= '0;
         end else begin
@@ -705,6 +814,7 @@ module otpu_quant
           rd_wait <= 1'b0;
         end
       end
+      if (!p1a && bm && 32'(r1) < 32'(rows) && sv[r1[1:0]]) sv[r1[1:0]] <= 1'b0;
       if (sw_ph) begin
         if (sw_i + 16'd1 == swn) begin
           sw_ph <= 1'b0;

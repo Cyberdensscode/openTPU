@@ -605,3 +605,138 @@ to clog2(TMEM_WORDS).
   `otpu_seq`; `OTPU_TAW` here is a co-sim define only), or every access above 2^16 serializes.
 - **The pumped clock domain** on the 7-series (docs/dsp_pumping.md section 5: +0.16 ns at 266.67
   MHz out of context; a full build not run).
+
+
+## 9. The RTL (branch `mx-rtl-prod`, 2026-10-12)
+
+The MX column replaces the MXU's previous datapath (no second IMPL: `MXU_IMPL` must be 2), at
+MCOLS 4 on the YPCB and parametric in MCOLS (4 and 8 tested) and E. It is bit-exact against
+`opentpu/isasim.py` (the ISA of b370889d) in Verilator.
+
+**`rtl/mxu/otpu_mxu.sv`**
+- **The array** is the systolic one unchanged (chains of CLS = min(16, D/8) products, weights
+  hopping column to column, PAIR's select in `otpu_pe`), so each chain end is one group of D/8
+  elements (a 4-bit sub-block's half at D = 128 is a chain: two chain ends a sub-block, CPG = 2
+  at D = 256).
+- **The column end** (`otpu_mxce` in `rtl/tech/{generic,xilinx7,xilinxus}`, replacing
+  `otpu_colend`): eight multiplier DSPs, B = m << sh per group (the shift in fabric two cycles
+  ahead, `bm2`), their products summed down the PCIN cascade in two halves, and a ninth DSP that
+  accumulates the row (OPMODE P + PCIN, or PCIN at the row's first block) in 48 bits: 9 DSPs a
+  column (the decision's "+4 a row against fp4x6's 5": NVFP4's 16-long groups each get one). sh =
+  W - dw - da comes from the scale entry and the ACT RAM's record (11-bit signed; B = 0 when
+  negative, the drop).
+- **The scale reader.** The issuer asks port A for the 32-byte line holding each advance's block
+  data (int8x a byte, int4x / fp4x6 a word, PAIR two; NVFP4 eight bytes, PAIR sixteen; RSC Sw) and
+  for the row's Sw. Port A now returns the aligned 32-byte line (256 bits, `otpu_dram` /
+  `otpu_native_dram`, the ASIC top's pins) instead of a word, so Sw shares a line with the row's
+  first advance or the previous row's last when the layout allows; otherwise one request cycle
+  without a chunk fetches it (a cycle a row: rows of KB >= 8 lose under 1/KB). A tag per request
+  (128 in flight, LUT RAM) says where the data sits in the line; the response fills one entry a
+  chunk ({Sw, the low block's data} and {the high block's data}: two block RAM FIFOs of 96 and 64
+  bits).
+- **The ACT RAM** record is 64 bits a (row, block): {da3, da2, da1, da0, Sa} (`otpu_actram`); one
+  Sa a row per MM is the ISA's rule, so each column carries Sa' = Sa x 2^-W of the row's last
+  block to the result FIFO (an exponent subtract, `fp_pow2m`, with fp_mul's flush; the simulation
+  checks it against the multiply).
+- **Row assembly**: the column ends' row sums are deskewed, PAIR's partner integer added
+  (columns j and j + M), and the row (MCOLS x 48-bit integers, MCOLS Sa', Sw) written to the
+  result FIFO: RF = 32 rows at MCOLS 4 (64 at 8), three LUT RAM copies with their own write
+  pointer and enable replicas (the write fan-out was the experiment's tightest path).
+- **E shared lanes** (`otpu_mx_lane`, E = MCOLS/2 by default, `MXU_E` / `OTPU_MXU_E`): i2f48
+  (round to nearest even), x Sw, x Sa', then the existing TMEM write or the ACC / ASCALE
+  read-modify-write and RMAX. The drain picks up to E results of the head row a cycle (fewer at a
+  TMEM bank conflict).
+
+**`rtl/vpu/otpu_quant.sv`**: QACT and QST in the MX form, two passes a row (section 8's risk):
+pass 0 computes the row's amax and each group's (QACT D/4, QST D) into four group RAMs, the
+scale unit (reciprocal) gives S and inv, QST writes its scale row (S, then four d bytes a cycle),
+and pass 1 reads the row again and writes q8(x x (inv x 2^d)) with d from the group RAMs (inv x
+2^d an exponent add). The ACT RAM gets {d, S} at each block's first chunk. The slice sizes the
+group RAMs from the configuration (the power of two at or above max(4 ACT_BLOCKS, TMEM_WORDS /
+D): 512 groups on the card), so every QACT within the ACT RAM's bounds and every QST whose row
+fits TMEM fits: no new ISA bound.
+
+**The row buffer.** The two passes cost a 4-row prefill +0.45% in co-simulation (below), so QACT
+rows go through a FIFO of prescaled chunks (`otpu_quant` XD, the slice's `QUANT_XD`, rtlsim's
+`OTPU_QUANT_XD`; default 1024 chunks of LANES x 32 bits, rows of up to 8,192 elements at LANES
+8): pass 0 also pushes each chunk x 2^-e(amax) into it and the reader goes on to the next row's
+pass 0 at once; pass 1 pops the row's chunks once its scale is out of the scale unit (no second
+TMEM read or prescale). Up to four rows are between the passes: the group maxes and the rows' S,
+inv and amax are kept by row in four banks (row r in r % 4; the scale unit carries the bank as
+its tag), and a read waits for a free FIFO entry (credits: the counter's top bit) and for its
+row's banks (pass 1 of row r - 4 done). The S of a block's ACT RAM record travels with its
+write. QST, and QACT rows over XD x LANES elements, keep the two passes over TMEM; XD 0 leaves
+the buffer out.
+
+**Identity.** CAPS bit29 (MX) is set by every MX bitstream (`opentpu/host/regs.py` CAP_MX), and
+`opentpu/target.py` hashes the numerics (`NUMERICS = "mx"`) with the Config. The card target's
+ACT RAM now holds 16 rows (`targets/ypcb-00338.toml` ACT_ROWS = 16; the board Makefile and
+`run_vivado.sh` take it from the target, the fake and the board model follow it): its CFG_HASH is
+89417856 (ff270e6e at ACT_ROWS 4; e170f967, the previous numerics at 4 rows, is production
+91a9c2d3's), so a host of the previous numerics refuses an MX bitstream wherever it checks the
+hash (`board.device_config`: ConfigMismatch), and the reverse; `BoardBackend` and otpu-serve
+check only that the program fits (the MX compiler adds the hash check).
+
+**Port A** returns the aligned 32-byte line (256 bits) in `otpu_dram`, `otpu_native_dram`, the
+slice, the board shell and the ASIC top's pins.
+
+**Scale-read statistic** (simulation): `otpu_mxu` counts its port A line requests and those that
+fetch a row's Sw alone; rtlsim's `stats["mxu_scale"]` has the totals, and `tools/perf_qwen.py`
+prints them and adds both to its MM-by-source table (per MM from the `MXS` lines under +trace).
+
+**Tests** (Verilator against isasim, every one bit-exact):
+- `tests/test_quant_rtl.py`: `test_mm_mx_rtl` over 12 cases (int8x, int4x, fp4x6, NVFP4; D 32 /
+  128; MCOLS 4 / 8; E 1 / 2 / 4; PAIR, RSC, k0, sh = 0 and -1 forced at the window's edge, Sw
+  corners), each run plain, UNIT + RMAX, ACC + RMAX and ASCALE; `test_mm_mx_replay_rtl` (M >
+  MCOLS, up to ACT_ROWS 16 at D 128); `test_quantizer_modes_rtl` (QACT and QST in every mode at
+  D 32 / 128, LANES 8 / 16, read back by UNIT and int8x MMs; with the row buffer, without it,
+  and with a buffer of one row and a third, where the reads wait for entries); the ties tests
+  for QACT and QST.
+- `tests/test_rtl.py`: the fuzzers, the scoreboard stress, replay and count tests on MX MMs
+  (every format, PAIR from DUP rows, RSC, k0), the hazard program's QST scale rows.
+- `tests/test_tech.py`: the xilinx7 `otpu_mxce` on Yosys's DSP48E1 model equals the generic one
+  at CPG 1 and 2.
+
+**Out of context** (Vivado on omarchy, xc7k480t-2 at 7.5 ns, D 128, MCOLS 4, DEPTH 1024, LANES
+8): `otpu_mxu` LUT 12,311, LUT RAM 4,071, FF 22,472, DSP 562, BRAM36 33, WNS +0.164 against
+b370889d's 15,704 / 3,656 / 24,545 / 554 / 32, WNS +0.051. Both are limited by the same pop_q ->
+`otpu_pe` INMODE fan-out. The new paths' slacks: shift into B +4.69, chain end into A +0.98, the
+accumulator's OPMODE +4.62, shift registers +3.49, scale decode +2.47, row add +3.50, the lanes'
+i2f48 +3.61, result FIFO write +2.35, drain pick +1.61, scale line +4.69, scale FIFO +2.79.
+`otpu_actram` at 4 and 16 rows: 9,361 / 9,629 LUTs, 68 BRAM36 both, WNS +0.879 / +1.341.
+
+**Board builds** (YPCB-00338, DDR3-1066, ACT_ROWS 16, CFG_HASH 89417856, post-route):
+
+| | dev dd372036 (FAST, 100 MHz) | 999b0bc0 (133.33 MHz) | production 91a9c2d3 |
+|---|---|---|---|
+| WNS / WHS (ns) | +0.025 / +0.012 | +0.059 / +0.023 | +0.013 / +0.012 |
+| core_clk WNS (ns) | +0.074 | +0.070 | |
+| LUT | 161,221 | 172,276 | 177,292 |
+| FF | 128,929 | 134,996 | 134,913 |
+| BRAM tiles (RAMB36 + RAMB18 / 2) | 607.5 | 607.5 | 602.5 |
+| DSP | 722 | 722 | 716 |
+| `u_mxu` LUT / FF / DSP | 17,553 / 18,444 / 562 | 19,889 / 19,965 / 562 | 25,082 / 21,823 / 554 |
+| `u_quant` LUT / FF / RAMB18 | 7,184 / - / 4 | 7,635 / 8,511 / 4 | 7,924 / 6,969 / 0 |
+| `u_act` LUT / RAMB36 | 722 / 68 | 1,321 / 68 | 958 / 64 (+4 RAMB18) |
+| `u_mem` LUT / FF | 12,715 / 3,935 | 14,101 / 3,954 | 14,328 / 3,767 |
+
+The 133.33 MHz build's core paths at the limit are the sequencer's (`u_seq` q_cmd -> c_fp,
++0.070, unchanged code), port A's line (`u_mem` aoh -> a_rdata, +0.077, 96% route) and the ACT
+RAM's write data (+0.081, route). Port A's 256-bit line costs about +170 FF in `u_mem`. Neither
+build has the row buffer (two passes); it adds 15 RAMB18 (7.5 BRAM36: Yosys synth_xilinx of
+`otpu_quant` at D 128, LANES 8, XD 1024 against XD 0, the four group RAMs unchanged at one
+RAMB18 each), +561 FF and +371 LUT.
+
+**QACT's cost** (co-simulation, `tools/perf_qwen.py`, Qwen3-0.6B, 2 layers and the LM head,
+against b370889d's per-block streaming QACT, the MM unchanged):
+
+| | decode token | 4-row prefill |
+|---|---|---|
+| b370889d | 1,537,293 | 1,577,203 |
+| two passes (XD 0) | 1,537,739 (+0.029%) | 1,584,347 (+0.453%) |
+| row buffer (XD 1024) | 1,537,477 (+0.012%) | 1,577,931 (+0.046%) |
+
+QACT start to end, b370889d / two passes / row buffer: 2x128 96 / 158 / 101 cycles, 4x384 272 /
+558 / 295, 4x1024 632 / 1,198 / 695, 4x2048 1,208 / 2,222 / 1,335; a 1-row QACT keeps the second
+read's latency (1x1024 200 / 310 / 308). The MMs asked port A for 1,461,408 scale lines in the
+decode token, none for a row's Sw alone (today's compiler's layouts).

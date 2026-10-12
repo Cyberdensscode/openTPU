@@ -168,11 +168,14 @@ def _qrows(rng, R, n, g):
     return x
 
 
-@pytest.mark.parametrize("D,lanes", [(32, 8), (32, 16), (128, 8), (128, 16)])
-def test_quantizer_modes_rtl(have_verilator, D, lanes):
+@pytest.mark.parametrize("D,lanes,xd", [(32, 8, None), (32, 16, None), (128, 8, None),
+                                         (128, 16, None), (32, 8, 0), (32, 8, 32), (128, 8, 128)])
+def test_quantizer_modes_rtl(have_verilator, D, lanes, xd):
     """QACT (ROW or not, CSCALE, RSCALE, DUP) read back by identity MMs, UNIT (y = q * Sa *
     2^-da; groups past the window drop) and int8x; QST (ROW or not, HALF, element strides 1 to
-    3, rows not word aligned, KB 1 to 6) into DRAM with its scale rows."""
+    3, rows not word aligned, KB 1 to 6) into DRAM with its scale rows. xd: the quantizer's row
+    buffer (QUANT_XD; default 1024 chunks: every QACT here goes through it), 0 (none: two passes
+    over TMEM), or one row and a third of the next (the reads wait for free entries)."""
     cfg = Config(S=1, D=D, MCOLS=4, LANES=lanes, DRAM_BYTES=1 << 20)
     rng = np.random.default_rng(D + lanes)
     R, KB = 6, 3
@@ -216,7 +219,7 @@ def test_quantizer_modes_rtl(have_verilator, D, lanes):
                           half=half))
         sd += 0x8000
     prog.append(I.halt())
-    _both(cfg, prog, dram)
+    _both(cfg, prog, dram, uarch=None if xd is None else {"QUANT_XD": xd})
 
 
 def _ties(amax, rng):
