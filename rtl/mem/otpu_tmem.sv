@@ -433,6 +433,16 @@ module otpu_tmem #(
       end
 `ifndef SYNTHESIS
     initial rpv = '0;
+    // the replays' premise: no write lands on a word awaiting its replay before the replay wins
+    // (it would read the new word). A write landing in the cycle the replay wins is fine (the
+    // RAM reads first); one landing while it loses again is not.
+    always @(posedge clk)
+      for (int p = 0; p < NRP; p++)
+        if (RPL && rpv[p] && lost[p])
+          for (int b = 0; b < LANES; b++)
+            if (rpe[p][b] && pw_v[b][0] && pw_a[b][0] == rpa[p][b])
+              $fatal(1, "TMEM%0d: port %0d's word %0d awaiting a replay was written at %0t", SID, p,
+                     int'(rpa[p][b]) * LANES + b, $time);
 `endif
     assign frz = RPL ? rpv : '0;
     always_comb
