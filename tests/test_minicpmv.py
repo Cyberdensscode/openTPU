@@ -117,3 +117,85 @@ def test_a_partial_head_block_is_the_padded_heads_logits(tiny):
         assert np.array_equal(la.view(np.uint32), lb[:V].view(np.uint32))
         assert la[V - 1].view(np.uint32) == lb[V - 1].view(np.uint32)
         assert not np.any(lb[V:])
+
+
+# =============================================================================== vision (HF 5.18)
+def _hf_tiny():
+    """A tiny random MiniCPM-V 4.7 of HF's own classes (transformers >= 5.18), fp32."""
+    if not hasattr(transformers, "MiniCPMV4_7ForConditionalGeneration"):
+        pytest.skip("transformers without minicpmv4_7 (>= 5.18)")
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    import minicpmv_hf
+    import tempfile
+    d = minicpmv_hf.tiny_checkpoint(Path(tempfile.mkdtemp()))
+    m = transformers.MiniCPMV4_7ForConditionalGeneration.from_pretrained(
+        d, dtype=torch.float32).eval()
+    return m, d
+
+
+@pytest.fixture(scope="module")
+def hf_tiny():
+    return _hf_tiny()
+
+
+@pytest.mark.parametrize("size", [(8, 12), (16, 8), (4, 4)])
+def test_vision_reference_matches_hf(hf_tiny, size):
+    """The numpy tower, window merger and projector (minicpmv.vision_reference) give HF's
+    get_image_features rows for a crop of h x w patches (fp32)."""
+    from opentpu.llm import minicpmv as MV
+    m, d = hf_tiny
+    vs = MV.VisionSpec.from_hf(d)
+    W = MV.load_vision(d)
+    h, w = size
+    rng = np.random.default_rng(h * 100 + w)
+    P = rng.uniform(-1, 1, (h * w, 3 * vs.patch ** 2)).astype(np.float32)
+    # HF's packing: [1, 3, patch, N * patch], patch l's block at columns l p .. l p + p
+    pv = torch.from_numpy(P.reshape(h * w, 3, vs.patch, vs.patch).transpose(1, 2, 0, 3)
+                          .reshape(1, 3, vs.patch, h * w * vs.patch))
+    with torch.no_grad():
+        hf = m.model.get_image_features(pv, torch.tensor([[h, w]])).pooler_output[0].numpy()
+    ours = MV.vision_reference(vs, W, P, (h, w))
+    assert ours.shape == hf.shape == (h * w // 16, 256)
+    assert np.abs(ours - hf).max() < 2e-5 * max(1.0, np.abs(hf).max())
+
+
+def test_canvas_positions_match_hf(hf_tiny):
+    """minicpmv.rope_index gives HF's get_rope_index: text, one image without slices, one with
+    a 2 x 3 grid of slices, the image-id prefix and the newline after it, text between."""
+    from opentpu.llm import minicpmv as MV
+    m, d = hf_tiny
+    vs = MV.VisionSpec.from_hf(d)
+    P = vs.image_token
+
+    def image(th, tw, grid=None, sh=0, sw=0, idt=(7, 8, 9)):
+        ids = list(idt) + [vs.image_start] + [P] * (th * tw // 16) + [vs.image_end]
+        sizes = [(th, tw)]
+        if grid:
+            rows = []
+            for r in range(grid[0]):
+                rows.append(([vs.slice_start] + [P] * (sh * sw // 16) + [vs.slice_end])
+                            * grid[1])
+                sizes += [(sh, sw)] * grid[1]
+            ids += sum((r + ([vs.newline] if i + 1 < grid[0] else []) for i, r in
+                        enumerate(rows)), [])
+        return ids, sizes
+    cases = []
+    a, sa = image(8, 12)
+    b, sb = image(16, 8, (2, 3), 8, 12)
+    cases.append(([1, 2, 3] + a + [vs.newline, 5, 6] + b + [vs.newline, 9, 10, 11], sa + sb))
+    cases.append(([4] * 5 + b + [12, 13], sb))
+    cases.append(([1, 2, 3, 4, 5], []))
+    for ids, sizes in cases:
+        mm = [1 if t == P else 0 for t in ids]
+        kw = {}
+        if sizes:
+            kw = dict(mm_token_type_ids=torch.tensor([mm]), target_sizes=torch.tensor(sizes))
+        else:
+            kw = dict(mm_token_type_ids=torch.tensor([mm]), target_sizes=torch.zeros(0, 2,
+                                                                                 dtype=torch.long))
+        hp, hd = m.model.get_rope_index(torch.tensor([ids]), **kw)
+        pos, delta = MV.rope_index(ids, sizes, vs)
+        assert np.array_equal(pos, hp[:, 0].numpy()), (ids, pos, hp[:, 0])
+        assert delta == int(hd[0, 0])
