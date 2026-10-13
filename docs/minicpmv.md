@@ -203,198 +203,309 @@ and with several images.
 
 ## 4. Mapping onto openTPU
 
-### 4.1 Text path (step 2)
+### 4.1 Text path
 
-- `load_spec`: `model_type` `minicpmv4_7` gives `qwen35.Spec.from_hf`, which already reads
-  `text_config`.
+- `load_spec`: `model_type` `minicpmv4_7` gives `minicpmv.Spec`. It is qwen35's Spec (its
+  `from_hf` reads `text_config`) plus the vision side (4.3); `vision=None` is the language
+  model alone.
 - `load_weights` and `LazyWeights` also skip `model.vision_tower.` and `model.merger.` (they skip
-  `model.visual.` today). The vision side has its own loader.
-- The formats are the qwen35 family's (streamed.FORMATS): fp4 experts, attention / DeltaNet /
-  shared expert nvfp4, int8 head, int8 embedding gathered on the device. Validation then checks
-  dKL on this checkpoint (section 5).
-- The pool is MX, built like `pool-q35-mx` (tools/offload/pack_pool.py, `moe.pool_key` with this
-  checkpoint's identity) on hwe-bench. 10,240 experts, about 14.9 GB.
-- The slim checkpoint for the card is every tensor but `mlp.experts.*` (the pool holds every
-  expert): about 6.0 GB in bf16 (4.9 GB LLM, 1.1 GB vision), plus the tokenizer and configs.
+  `model.visual.` today). The vision side has its own loader (`minicpmv.load_vision`).
+- The formats are the qwen35 family's (`streamed.FORMATS`, which takes a Spec's family from its
+  first base in the table): fp4 experts, attention / DeltaNet / shared expert NVFP4, int8 head,
+  int8 embedding on the host. Section 5 has their dKL on this checkpoint.
+- The pool is MX, built like `pool-q35-mx` (tools/offload/pack_pool.py) on hwe-bench:
+  - `pool-mcpv35-mx.split.bin`, 17,532,190,720 bytes: 10,240 experts in 1.71 MB slots, with
+    its .packed (all 10,240), .format and .key;
+  - its key holds this checkpoint's identity, the hash of its config.json.
+- The slim checkpoint for the card is every tensor but the routed experts
+  (tools/offload/strip_experts.py keeps the vision tower and the merger): 1,072 tensors, 5.59 GiB
+  of bf16, 6,021,430,313 bytes with the tokenizer and configs. Its config.json is the original's,
+  so the pool's key matches.
 
 With these, text-only prompts are qwen35-35b's programs over another checkpoint: same kernels,
 same bitstream, nothing new on the card.
 
-### 4.2 Vision tower on the card (step 3)
+### 4.2 Vision tower on the card
 
 Rule: the host only decodes, resizes, slices, normalizes and cuts patches (3.1), and computes
-integer indices (the NaViT position ids, the M-RoPE positions). Every multiply-add of the tower
-and projector is on the card.
+integer indices (4.5). Every multiply-add of the tower and projector is on the card.
 
-**Layout.** The vision weights are QTensors in the model's image (`minicpmv.VisionParts`), one
-block per encoder layer.
-- **Heads.** Every attention head is zero-padded from 72 to 128 (one D block): Wq, Wk, Wv get
-  zero rows and zero bias, and Wout gets zero columns. That makes q, k, v [N, 2048] and K/V
-  heads of d = 128. The scale stays 72^-0.5, given to the quantizer as the attention kernel takes
-  it, so the scores are those of 72-wide heads.
-- **Padding** 4304 -> 4352 and 17216 -> 17280 (zero rows of fc1 / linear_1 and zero bias,
-  zero columns of fc2 / linear_2; gelu_tanh(0) = 0), and the patch's 588 -> 640.
-- **Formats.** int8 to start; fp4 / nvfp4 per kind after the cosine check (5).
+**The card's window order.** The host cuts a crop's patch rows in this order
+(`minicpmv.card_order`, a permutation, as a tokenizer orders its pieces): each 4 x 4 block of
+the patch grid row-major, within it its four 2 x 2 windows row-major, within those their 4
+patches row-major. The position-table rows go in the same order.
+- Attention and the row-wise parts (LayerNorm, the linears, the MLPs) do not see the order.
+- A 2 x 2 window is 4 consecutive rows. So its [4C] merge row is those rows' 4608 words as they
+  lie in DRAM: no gather and no strided loads.
+- The window merger's output rows come out in the projector's window order (4 consecutive
+  rows a window, one level up).
+- The projector's rows come out row-major over the 4 x 4 blocks: HF's order, the order of the
+  crop's `<|image_pad|>` tokens.
+- The programs depend on the patch count N alone, not on (h, w).
 
-**Kernels** (generic, `opentpu/kernels/vit.py`; usable by any pre-norm ViT):
-- `layernorm(x, w, b)`: mean = RSUM / n, xc = x - mean (ROW), r = rsqrt(RSSQ(xc) / n + eps),
-  then xc r w + b. 6 VOPs, no new op.
-- A linear with a bias is the MM plus one VOP add (COL mode). The bias is fp32, not folded
-  into an int8 block.
-- **Bidirectional attention** over a crop. The crop's K and V are appended to a vision KV
-  scratch (`KVDesc`, capacity >= N, positions = token index; int8 K with fp32 row scale, V^T
-  tiles, as the LLM's cache). Then each head's queries, in groups of MCOLS rows, run
-  `attention._attend_heads` with an int length N: no mask, exactly bidirectional. The tail block
-  is padded as today.
-- **Window attention.** For a window in grid order, its 4 queries are two loads of 2 contiguous
-  rows of the Q scratch. Its keys are `attention.Blocks([(r0, 2, None), (r1, 2, None)])`, the
-  two 2-token runs in the grid-order KV scratch. Neither a reorder nor a mask is needed.
-- **Window concatenation for the merges.** In the row-major [h, w, C] residual, the windows of
-  window row i are two strided views: rows 2i and 2i + 1 of the grid, each [w / 2, 2C] with
-  row stride 2C. So a [w / 2, 4C] tile of z is two DMA loads into its halves, with no TMEM copy.
-  The window mean is 3 adds and a scale of the four C-wide quarters.
-- **GELU.**
-  - The ViT MLPs and the window merger use gelu_tanh (`lib.gelu_tanh`, as HF).
-  - The projector's GELU is erf. It is measured first: tanh's projector-output cosine and the
-    first token's dKL against exact erf, on real images (the lead's decision, 2026-10-13).
-  - If it shows, `lib.gelu_erf` composes it from existing VOPs:
-    max(x, 0) - |x| / 2 Q(|x| / sqrt 2), with
-    Q(z) = (a1 t + ... + a5 t^5) 2^(-z^2 log2 e), t = 1 / (1 + p z) (Abramowitz-Stegun 7.1.26,
-    |error| < 1.5e-7). About 20 VOPs per element, only on the projector's 4608 columns. It is a
-    numerics choice, reported with its error numbers.
+**Layout** (`minicpmv.VisionImage`).
+- The weights keep the checkpoint's shapes:
+  - q, k, v, out are [1152, 1152], unpadded;
+  - the MLP widths are padded to their chunks with zero rows and columns: 4304 -> 4352,
+    17216 -> 17408;
+  - the patch rows are padded 588 -> 640.
+- Each LayerNorm's bias is folded into the next linear's bias on the host, at build time like
+  the quantization: W (y + b) = W y + W b, with W b computed in float64.
+- Each encoder layer is a block of `lstride` bytes, so a run-time layer index addresses any of
+  them; block 27 is the window merger's attention.
+- **Formats** per kind (`VisionImage.formats`: attn, mlp, wm, proj, embed): int8 by default,
+  543 MB.
+- The work area of a crop of up to 2048 patches is 74.5 MB:
+  - P, the patch rows; E, the position rows; X and X2, the residual rows; Q head-major; O;
+  - the K/V scratch: K token-major, V^T rows `nmax` tokens wide, untiled;
+  - `vis`: the projector's output rows, the prompt's image rows (4.3).
 
-**Programs.** These are host-orchestrated runs over the crop, the qwen35 MoE prefill's model:
-a run per phase.
-- Row groups of R <= ACT_ROWS rows (16 on the card: the MX MXU replays each weight chunk for
-  MCOLS rows at a time) are a hardware loop with affine addresses, so a run fits IMEM at any N.
-- Per layer, three runs:
-  1. LN1 + Q, K, V (Q scaled to the Q scratch; K, V appended);
-  2. attention per head and query group;
-  3. out + residual + LN2 + MLP (F in chunks, as `swiglu_down`) + residual.
-- The window merger and the projector have their own runs.
-- The programs depend on the crop's (h, w) only through compile-time loop counts. They are
-  compiled per shape and kept in the program cache: a thumbnail's shape follows the aspect
-  ratio, and slices share one shape.
-- The residual stream is fp32 rows in DRAM, [N, 1152] (4.7 MB at N = 1024). The Q and O scratch
-  are [N, 2048] fp32 each, and the KV scratch 16 x N x 128 x 2 bytes.
-- The projector's output rows, [tokens, 2048] fp32, go to the image's `vis` buffer.
+**Kernels** (`opentpu/kernels/vit.py`; generic for a pre-norm ViT with 2 x 2 merges). No new
+op and no ISA change.
+- **LayerNorm before a linear** (`layernorm_q`): the mean (RSUM / n) and the centering on the
+  VPU, r = rsqrt(RSSQ / n + eps). Then QACT applies r as its row scale and the gain as its
+  column scale (RSCALE / CSCALE), so no normalized tile is ever written to TMEM; the bias is
+  the next linear's (above). The post LayerNorm, whose rows are stored, runs in place by column
+  parts.
+- **Q, K, V** (`vit_qkv`): each head's q, k and v land in the first 72 columns of zero-padded
+  [R, 128] tiles. Each starts as its bias (a fill), and the MM over the head's 72 weight rows
+  accumulates into it. The MXU streams no padding rows, and the K/V cache and Q get D-wide rows
+  (the scores are the 72-wide heads'; scale 72^-0.5). Q is stored head-major, one store per
+  head.
+- **Bidirectional attention** (`vit_attend`): `attention._attend_heads` with an int length N,
+  groups of MCOLS query rows, every head's output columns gathered in one [G, 1152] tile and
+  stored once.
+- **Window attention** (`vit_window_attend`): G = 16 rows (ACT_ROWS), i.e. 4 windows, per MM.
+  - The scores [16, 16] are computed against the group's 16 keys, plus a block-diagonal mask
+    (-inf outside the windows).
+  - The softmax is one block (no running maximum).
+  - Then P V^T. The MXU streams D-aligned rows, so P goes into a [16, 128] tile at the group's
+    offset within its 128 tokens (zero elsewhere; the band is cleared after its QACT), and V^T
+    streams from the aligned token.
+  - The 8 groups of a 128-token stretch are unrolled, and the stretches are a hardware loop.
+    The last stretch is run whole: its rows past N are scratch, each of their windows sees only
+    itself, and nothing reads them back.
+- **Out + MLP** (`vit_out_mlp`): O Wo^T accumulated into the residual rows, the MLP's
+  F = 4352 in chunks of 256 (the activations of chunk c quantized while chunk c + 1 streams).
+- **Merges** (`vit_merge`: the window merger's MLP and the projector):
+  - The window's [4608] row is never held whole. Its LayerNorm takes three passes over pieces
+    of 768 (sum, centered sum of squares, then normalize and QACT into a stationary built in
+    parts).
+  - The window mean is accumulated from the first pass.
+  - The MLP runs in chunks (512 for 17408, 256 for 4608) into the output tile.
+- **GELU.** The ViT MLPs and the window merger use gelu_tanh, as HF does. The projector's is
+  erf in HF; the card uses tanh there too, since the measurement (5.2) finds no difference.
+
+**Programs.** A crop is 13 programs; host-orchestrated runs, as the MoE prefill's are.
+- embed; then qkv / attend / out at a run-time layer index for layers 0..6; then the window
+  merger's qkv / window attention / out (no MLP) / merge; then qkv2 / attend2 / out2 (last:
+  with the post LayerNorm) for layers 7..26 on N / 4 rows; then the projector, at a run-time
+  output row.
+- Row groups of R = 16 rows (ACT_ROWS; the merges 8) are hardware loops, so every program fits
+  the card's IMEM at any N. At 1024, 1056 and 2048 patches the largest is the window attention,
+  1944 instructions of 4096; at MCOLS 8 / ACT_ROWS 8, 3734.
+- They compile in about 0.1 s each and are cached by patch count. The thumbnail's N follows the
+  aspect ratio; the slices of an image share one N.
 
 **Cost on the card** (MCOLS 4 x D 128, 512 MAC a cycle, MX replay so weights stream once per
-16 rows, 133 MHz), per crop of 1,024 patches with padded heads:
+16 rows, 133 MHz), per crop of 1,024 patches:
 
 | part | MAC |
 |---|---|
-| layers 0-6 | 170 G |
-| window merger | 35 G |
-| layers 7-26 at 256 tokens | 105 G |
+| patch embedding (640 -> 1152) | 0.8 G |
+| layers 0-6: linears 15.3 M a token, attention 16 x N^2 x (128 + 72) | 133 G |
+| window merger: attention, its 4608 -> 17408 -> 1152 MLP on N / 4 rows | 31 G |
+| layers 7-26 at 256 tokens | 83 G |
 | projector | 2 G |
 
-That is about 312 G MAC, about 4.6 s per crop at full MXU rate. A 448^2 image is 1 crop and
-64 tokens. A large image with 9 slices is 10 crops, about 46 s, and about 640 tokens.
+That is about 250 G MAC, about 3.7 s per crop at full MXU rate. The unpadded projections save
+20% against the first estimate's padded heads (312 G). A 448^2 image is 1 crop and 64 tokens;
+a large image with 9 slices is 10 crops, about 37 s, and about 640 tokens. The m8 build
+(MCOLS 8) halves it. On hwe-bench's ISA simulator a crop takes 5-7 minutes (a simulator,
+not the card).
 
-`--max-slices` (HF's `max_slice_nums`) bounds the cost: 1 gives the thumbnail alone. The 72 -> 128
-head padding costs about 17% of a layer's MACs. Packing the projections unpadded, padding only
-the K/V appends, is a later optimization. The m8 build (MCOLS 8) halves all of it.
+`--max-slices` (HF's `max_slice_nums`) bounds the cost: 1 gives the thumbnail alone.
 
-**DRAM.** Resident int8 vision weights take about 0.56 GB from the expert slots, about 330 slots
-of 1.67 MB, roughly 8 of each layer's ~43. The decode cost of that is measured with
-`streamed.probe` and the slot simulator before choosing. Options:
-- fp4 / nvfp4 vision weights: about half the bytes;
-- vision weights staged into the slot region only while an image is encoded. The slots refill
-  on demand; the server marks them empty. That is the ambitious option, for after v1.
+**DRAM.** The vision side resident costs expert slots. `streamed.fit_experts` at a 4096-token
+cache, 1.637 MiB slots of 40 layers:
 
-### 4.3 Image rows into the prompt (step 4)
+| vision side | MiB | slots a layer | slots |
+|---|---|---|---|
+| none (staged or streamed) | 0 | 41 | 1640 |
+| int8 resident | 617 (543 weights) | 31 | 1240 |
+| int8, the ViT MLPs fp4 | 498 | 33 | 1320 |
+| fp4 everywhere | 379 | 35 | 1400 |
 
-- **Rows.** The 35B prefills layer-major (`qwen35_layer_run`: the chunk's residual rows in
-  `xbuf`, or expert-major's records). A row's layer-0 input is today written by
-  `qwen35_embed_run` from the token's embedding.
-  - An image row instead gets a copy run, `vis[src:src + R] -> X[row:row + R]` (both run-time),
-    and its layer runs take `embedded=True`. These are device DMA copies of the vision output,
-    with no host math.
-  - Text rows are unchanged, so a text-only prompt runs exactly qwen35-35b's programs.
-- **M-RoPE without kernel changes.** Every kernel reads its RoPE rows from the image's
-  `cos_t` / `sin_t` at the token's slot (`m.cos_t[p]`, `RunPos.pos`). For this model those
-  tables become per-sequence: row s holds the cos / sin of slot s's M-RoPE position. A pristine
-  copy (positions 0 .. cap - 1) stays beside them. Writing the active rows takes two device runs,
-  no arithmetic beyond exact selects:
-  - **Image rows.** A run reads, per row, the host's integer (t, h, w) from a small table (RLD
-    into a `DevVar`, as the expert server's slot addresses). It loads the three pristine rows
-    and selects per frequency by the 0/1 column masks of T / H / W. These are exact:
-    x * 1 + y * 0 + z * 0 = x.
-  - **Text after an image.** `active[s] = pristine[s + delta]`, a contiguous DRAM copy with delta
-    a run argument, for the slots up to the capacity.
-  - Text-only sequences need neither run: active = pristine, bit-exact.
-  - Decode, the generate loop, chunked prefill and snapshots read the active table as they read
-    the table today.
-  - A chat rollback rewrites the rows past the restored prefix from the host's position map.
-  - qwen35 decodes one sequence (no batched decode), so one active table per image suffices.
+The lead's decision: measure resident int8, resident fp4 and staged-through-the-slots on decode
+hit rate and TTFT, and pick by data; staging must not flush hot experts (stage into the least
+recently used slots). Measurements and the choice: section 5.3.
 
-  Positions never exceed the slot index (the canvas compresses), so pristine rows 0 .. cap - 1
-  cover every position.
+### 4.3 Image rows into the prompt
 
-### 4.4 Host (step 4)
+**The model's image.** `load_spec` gives `minicpmv.Spec`: qwen35's Spec with `vision` (the
+VisionSpec), `vision_fmt`, and the work area's patches and image rows. Its `image()` is
+`minicpmv.Image`, which is qwen35's image plus a `VisionImage`.
+- The VisionImage is allocated after the model's DRAM and before the expert slots (qwen35's
+  `before_slots` hook), so the slots fill what is left (`fit_experts`).
+- `build` writes qwen35's image, then the vision weights from the checkpoint (`load_vision`).
+  The position table the host gathers from is an entry of an attribute of the image's own
+  (`vis_tables`), so an image cache hit puts it back.
+- The text path's programs are qwen35's: a text-only prompt runs exactly qwen35-35b's.
+
+**Rows.** The 35B prefills layer-major (`Engine.prefill_layers`: a chunk's residual rows in
+`xbuf`, or expert-major's records).
+- `prefill_layers(tokens, vis=...)` takes each token's vis row (-1 for text).
+- Layer 0 splits a chunk into runs of text and runs of image rows (consecutive vis rows, at
+  most R, within an attention block). An image run is two runs:
+  1. `vis_copy_run`: `vis[src:src + n] -> X[row:row + n]`, both run-time; xbuf rows or the
+     expert-major records. It is a DMA through TMEM, no arithmetic.
+  2. The layer run with `embedded=True`.
+- Text runs, layers 1 .. 39 and the head are unchanged.
+- The test gives image rows whose values an int8 embedding row holds exactly. Their logits and
+  the next three decode steps are bit for bit those of the same prompt with text ids whose
+  embedding rows are those values, layer-major and expert-major.
+
+**M-RoPE.** Every kernel reads its RoPE rows from the image's `cos_t` / `sin_t` at the token's
+slot. For an image prompt the host rewrites those rows (`minicpmv.Vision.positions`):
+- Slot s < T gets `rope_index`'s (t, h, w).
+- Slot s >= T gets s + delta, the decode's position.
+- Each row's frequency i is the table's entry at the position of section i mod 3
+  (`mrope_rows`): a gather of entries the image already holds, no arithmetic. A text
+  position's row is the table's row itself.
+- Only the rows that differ from what the table holds are written. Text after text writes
+  none, and a text-only conversation keeps the table as built, bit-exact.
+- A chat's rollback or new turn recomputes the positions of the whole conversation and writes
+  the difference. `/reset` writes the table's own rows back (`pristine`).
+- The rows written equal HF's `Qwen3_5MoeTextRotaryEmbedding` (interleaved, sections
+  [11, 11, 10]) at the canvas positions within 1e-4 (the table's float32 against HF's).
+
+The first design had two device runs build those rows (an RLD of the positions and masked
+selects). The host's gather writes the same values without a program: indexing and DMA, no
+arithmetic, the same class as a tokenizer's position ids (the lead approved it, 2026-10-13). It
+is 256 bytes per slot over PCIe (cos and sin, 32 frequencies each), once per image prompt: up to
+1 MB at a 4096-token cache.
+
+### 4.4 Host
 
 - `opentpu/llm/minicpmv.py` holds:
   - the processor port: torch/torchvision resize as HF does it, normalization, patches, the
     NaViT position ids, the placeholder text and the canvas positions;
   - the numpy references for the vision tower and projector (fp32, checked against HF);
-  - the quantized emulation;
-  - the image layout's vision part and the runs' driver.
-- **otpu-chat** gets `--image PATH` (repeatable; attached to the next user message) and
-  `--max-slices`.
-- **otpu-serve** accepts OpenAI `image_url` content parts:
-  - `data:` URLs (base64 PNG / JPEG / WebP);
-  - local paths only with an explicit flag;
-  - no remote fetch by default.
+  - the card's tower (`VisionImage`), the model's image (`Spec`, `Image`) and the host's side of
+    images on an engine (`Vision`: encode, positions, prompt).
+- **otpu-chat**:
+  - `--image PATH` (repeatable) attaches images to the first message; in `--plain`,
+    `/image PATH` attaches one to the next message (`Chat.attach`).
+  - `--max-slices N` is the latency knob. The default is the processor's 9, so card outputs
+    stay comparable with HF's.
+  - A turn's message carries its images before its text, as HF's processor does. The template
+    renders `<|image_pad|>` for each image, `expand` puts each image's placeholder text in its
+    place, and the tokenizer gives the ids: bit for bit HF's processor's.
+  - `Vision.prompt`: the RoPE rows for the whole conversation, the crops of the images with
+    tokens in the new part through the card's tower into the vis rows, then the prompt is
+    prefilled with its vis rows.
+- **otpu-serve** (docs/serve.md, Images):
+  - `image_url` (or `input_image`) content parts, in any order with the text parts;
+  - `data:` URLs by default; http(s) only with `--image-fetch` (20 s, 32 MB); never a file of
+    the server's;
+  - a request's `max_slices` (1 .. 36), `--max-slices` the server's default;
+  - a context's key holds each image token's content key (`minicpmv.keyed`: a negative int32,
+    a hash of the image's sha256 over its crops' sizes and patch rows and the token's index),
+    so the device's context, the prefix cache and the KV store reuse a context past an image
+    only for the same image at the same slices;
+  - the worker feeds and picks with the token ids, writes the running request's M-RoPE rows at
+    each switch, and encodes the images with tokens in the part it feeds. The model decodes one
+    sequence at a time, so the table is the running request's.
 
-  The image tokens are part of the prompt: a request with an image is prefilled with its
-  encoding first. A KV snapshot keys on the token ids plus each image's sha256, because the
-  `<|image_pad|>` ids alone do not identify the content.
+### 4.5 The host / device split
+
+| | host | card |
+|---|---|---|
+| image | decode, resize (bicubic, antialiased), slices, (x - 127.5) / 127.5, 14 x 14 patches | - |
+| integer indices | NaViT position ids, the card's window order, canvas M-RoPE positions | - |
+| tables | gathers rows the image holds: the position table's rows at the ids, the RoPE table's entries at the positions | - |
+| text | the chat template, the placeholder text, the tokenizer, the image tokens' content keys | - |
+| math | none | the patch embedding, 27 layers, the window merger, the projector, the language model |
+
+Every gather is indexing plus DMA of values the image already holds, as a tokenizer's position
+ids are: no host arithmetic on model values.
 
 ## 5. Validation
 
-**Text.** References:
+### 5.1 Text
+
+References:
 - openTPU's numpy `qwen35.reference_logits` (fp32, LazyWeights per tensor);
-- a layer-streaming HF reference: HF's own `Qwen3_5MoeDecoderLayer` modules, each layer's
-  weights loaded, run and freed, so the 35B fits hwe-bench's 62 GB. Its first 2 layers are
-  checked against the whole HF model built with 2 layers.
+- HF's own model on a host without the RAM for its experts (`tools/minicpmv_hf.py`,
+  `LazyExperts`: HF's eager expert loop reading each routed expert from the checkpoint; 0 logit
+  difference against `from_pretrained` on a tiny model).
 
-Checks:
-- layer-wise hidden-state cosine;
-- logits cosine and dKL of the emulation (production mix) and of the ISA simulator against the
-  references on real chat prompts;
-- the formats choice by dKL, finals at >= 2000 tokens (as the formats scans);
-- greedy tokens against HF's.
+Results (hwe-bench, ISA simulator):
+- Greedy: the card's 16 tokens equal HF's through the end of the turn.
+- The vocabulary's partial head block gives the logits of the head padded with zero rows, bit
+  for bit (tests/test_minicpmv.py).
+- Formats (tools/formats_scan.py ppl, 2000 tokens, dKL against int8):
 
-**Vision.**
+| formats | ppl | dKL | resident MiB |
+|---|---|---|---|
+| float | 15.218 | -0.99% (SE 0.04) | - |
+| int8 | 15.276 | 0 | 1846 |
+| production: fp4 experts, attn / delta / mlp nvfp4, head int8 | 16.102 | +5.68% (SE 0.22) | 1255 |
+
+  qwen35-35b ships at +4.00% (SE 0.16) on its own text (docs/mx_mxu.md). The single-kind swaps
+  to int8 (the lead's GO, 2026-10-13) are in progress.
+
+### 5.2 Vision
+
 - The processor port: pixel_values, target_sizes and placeholder ids equal to HF's processor's,
-  bit for bit, on several images and aspect ratios.
-- The canvas positions equal to HF's `get_rope_index`.
-- The tower and projector: the numpy reference against HF (fp32) on real images; the emulation
-  and the ISA simulator against both, by cosine per stage (after layer 6, the merger, layer 26,
-  the projector).
-- The GELU measurement (4.2), then the first token's dKL with the device's image rows against
-  HF's.
+  bit for bit, on 5 images at max-slices 1, 9 and 36. The canvas positions equal HF's
+  `get_rope_index`.
+- `vision_reference` against HF's `get_image_features` (fp32) on a tiny random MiniCPM-V; the
+  card's tower against the reference on a tiny tower (cosine >= 0.999 every row, 4 crop sizes)
+  and against HF's tiny model (two crops).
+- The projector's GELU (cats.jpg, refract.png, real weights): tanh against erf, row cosine
+  >= 0.99987, the first reply token's dKL 1e-7 .. 6e-7, the same top token. The card uses tanh.
+- The card's tower on the ISA simulator against HF's features (fp32), real weights:
 
-**Card.** These are prepared as scripts for the lead's sessions, never run on the card by this
-work.
+| image (crops) | format | row cosine mean | min | first token dKL |
+|---|---|---|---|---|
+| cats.jpg (3) | int8 | 0.9946 | 0.776 | 3.3e-7 |
+| cats.jpg (3) | int8, ViT MLPs fp4 | 0.9699 | 0.632 | 2.1e-7 |
+| refract.png (3) | int8 | 0.9936 | 0.957 | 7.8e-6 |
+| refract.png (3) | int8, ViT MLPs fp4 | 0.9611 | 0.673 | 3.6e-6 |
+
+  The ViT MLPs stay int8. The first token's dKL hardly moves with the rows; the reply's dKL
+  (HF's greedy reply teacher-forced with each variant's rows) follows.
+- End to end on a tiny MiniCPM-V with the real tokenizer: otpu-chat's prompt ids equal HF's
+  processor's in a 3-turn conversation with 2 images.
+
+### 5.3 The vision side's residence
+
+In progress: cachesim on qwen35-35b's router traces (lfu_layer, the card's policy) at the slot
+counts of 4.2, decode ms per token by its link model, and TTFT for staged and streamed weights.
 
 ## 6. Card plan
 
 On opentpu, `/data/otpu/minicpmv/` holds:
-- the slim checkpoint (no experts, about 6.0 GB);
-- the MX pool (about 14.9 GB with its .packed, .format and .key).
+- the slim checkpoint: 6,021,430,313 bytes (sha256 sums in `SUMS-slim`);
+- the MX pool: 17,532,190,720 bytes with its .packed, .format and .key (`SUMS-pool`).
 
-Relays go hwe-bench -> Mac -> opentpu. Nothing large goes on /home. Pool and checkpoint
-sha256 sums are recorded beside them.
+Relays go hwe-bench -> Mac -> opentpu, between card sessions. Nothing large goes on /home.
 
-The first session is text-only: the qwen35-35b qualification's prompts on this checkpoint. Then
-one image at `--max-slices 1`, then a sliced one.
+Sessions (the lead runs them; scripts prepared on this branch):
+1. Text only: the qwen35-35b qualification's prompts on this checkpoint (otpu-chat, MoE path).
+2. One image at `--max-slices 1` (the thumbnail), then a sliced one at the default 9.
+3. otpu-serve with image_url requests, the KV store reusing a context past the same image.
 
-## 7. Open questions for the lead
+## 7. Decisions
 
-1. The projector GELU: tanh or erf, decided by the measurement (4.2).
-2. The vision weights' format and residence (4.2 "DRAM"): resident int8 first, then fp4 /
-   nvfp4 and the slot cost.
-3. A default `--max-slices` for chat on the card: HF's 9 costs about 46 s of vision and about
-   640 prompt tokens per large image.
+1. Vocabulary 248,144: the partial head block, tested bit-identical to a zero-padded head.
+2. The projector's GELU: tanh (5.2).
+3. No MTP head in the checkpoint; DSpark later.
+4. The card host's storage: `/data/otpu/minicpmv/`.
+5. `--max-slices`: default 9, in otpu-chat and as otpu-serve's request field and option.
+6. M-RoPE rows written by the host's gather (4.3).
+
+Open:
+- the language model's formats (5.1: the single-kind swaps);
+- the vision side's residence and formats (4.2, 5.3).
