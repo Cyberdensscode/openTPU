@@ -324,12 +324,19 @@ def test_streamed_mtp_engine_from_a_checkpoint_and_an_extended_pool(tiny_moe_mtp
     run(m, a, "init")
     run(m, a, "pack", 0, 1)
     run(m, b, "extend", a)
-    run(m2, c, "extend", a, "--mtp-from", m)
+    v = tmp_path / "v.bin"                  # a pool with entries after its experts (vision)
+    v.write_bytes(a.read_bytes() + bytes(range(256)) * (2 * a.stat().st_size // 48 // 256))
+    Path(str(v) + ".packed").write_bytes(Path(str(a) + ".packed").read_bytes() + bytes([1, 1]))
+    for x in (".format", ".key"):
+        Path(str(v) + x).write_text(Path(str(a) + x).read_text())
+    run(m2, c, "extend", v, "--mtp-from", m)
     nE = spec.layers * spec.moe.E
     pa, pb = (np.fromfile(str(p) + ".packed", np.uint8) for p in (a, b))
     assert pa.tolist() == [1] * nE and pb.tolist() == [1] * nE + [0] * spec.moe.E
     slot = a.stat().st_size // nE
-    assert b.read_bytes()[:nE * slot] == a.read_bytes()
+    assert b.read_bytes()[:nE * slot] == c.read_bytes()[:nE * slot] == a.read_bytes()
+    assert b.stat().st_size == c.stat().st_size == (nE + spec.moe.E) * slot
+    assert Path(str(c) + ".packed").read_bytes() == pb.tobytes()
     kb, kc = (json.loads(Path(str(p) + ".key").read_text()) for p in (b, c))
     assert kb["layout"]["layers"] == spec.layers + 1 and "mtp_from" not in kb
     assert kc["mtp_from"] and {k: v for k, v in kc.items() if k not in ("mtp_from", "model")} \

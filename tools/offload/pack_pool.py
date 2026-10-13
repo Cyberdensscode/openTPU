@@ -79,8 +79,9 @@ def weights(a):
 
 def extend(a, n: int, slot: int, key: dict) -> None:
     """POOL: an MTP image's pool from the model's own pool SRC (a.args[0]), checked by its key:
-    SRC's experts and marks copied, the MTP layer's experts after them not packed."""
-    import shutil
+    SRC's experts and marks copied, the MTP layer's experts after them not packed. Entries of
+    SRC past its experts (MiniCPM-V's staged vision pieces, at layers * E + i) are not copied:
+    the key written has no "vision", and a staged run adds them again after the MTP layer."""
     from opentpu.host.offload import SPLIT
     from opentpu.llm import moe as MO
     src = a.args[0]
@@ -96,19 +97,27 @@ def extend(a, n: int, slot: int, key: dict) -> None:
         MO.check_pool_key(src, MO.pool_key(base, a.model))
     except ValueError as e:
         sys.exit(str(e))
-    if os.path.getsize(src) != n0 * slot:
-        sys.exit(f"{src}: {os.path.getsize(src)} bytes, not {n0} experts of {slot}")
+    size = os.path.getsize(src)
+    if size < n0 * slot or size % slot:
+        sys.exit(f"{src}: {size} bytes, not {n0} experts of {slot} (and whole entries after)")
     fmt = src + ".format"
     if not (os.path.exists(fmt) and open(fmt).read().strip() == SPLIT):
         sys.exit(f"{src} is not in the split format ({SPLIT}): repack it")
     pk = src + ".packed"
     done = np.fromfile(pk, np.uint8) if os.path.exists(pk) else np.ones(n0, np.uint8)
-    if len(done) != n0:
-        sys.exit(f"{pk}: {len(done)} marks, not {n0}")
+    if len(done) != size // slot:
+        sys.exit(f"{pk}: {len(done)} marks, not {size // slot}")
+    done = done[:n0]
     t0 = time.time()
-    shutil.copyfile(src, a.pool)
-    with open(a.pool, "r+b") as f:
-        f.truncate(n * slot)                # (the MTP layer's experts: sparse until packed)
+    with open(src, "rb") as f, open(a.pool, "wb") as g:     # SRC's experts only
+        left = n0 * slot
+        while left:
+            b = f.read(min(left, 64 << 20))
+            if not b:
+                sys.exit(f"{src}: short read")
+            g.write(b)
+            left -= len(b)
+        g.truncate(n * slot)                # (the MTP layer's experts: sparse until packed)
     np.concatenate([done, np.zeros(n - n0, np.uint8)]).tofile(a.pool + ".packed")
     open(a.pool + ".format", "w").write(SPLIT + "\n")
     open(a.pool + ".key", "w").write(json.dumps(key, indent=1) + "\n")
