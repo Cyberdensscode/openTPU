@@ -384,6 +384,7 @@ parameter, for the MCOLS 8 build. It is built on this branch:
     copies its data, the host refuses the GATHER program, and loaded past the host the GATHER
     sets ERROR and moves nothing);
   - `test_register_map` and `test_cfg_registers` read map 5.
+  - the gate: the full suite's RTL half passed on the pre-merge tree (400); r2's gate replaces the rest.
 - **Instance names.** The unit is now `u_sys/u_board/g_coll.u_coll` (or `g_coll_bar.u_coll`).
   The BCU1525 floorplan, its elaboration check and `tools/synth/board_equiv.sh` follow.
 
