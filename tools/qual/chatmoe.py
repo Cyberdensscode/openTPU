@@ -97,7 +97,7 @@ def _calls(eng, calls: list, trace: list | None = None) -> None:
                 return st
             b.start, b.wait = started, waited
 
-    def prefill_layers(tokens, logits: bool = True):
+    def prefill_layers(tokens, logits: bool = True, **kw):     # (kw: vis, an image's rows)
         c0 = {k: getattr(srv, k, 0) for k in CALL_COUNTS}
         k, t = len(eng.stats), time.perf_counter()
         srv.events = []                         # (the server's timeline: each poll that did work)
@@ -105,7 +105,7 @@ def _calls(eng, calls: list, trace: list | None = None) -> None:
             runs.clear()
             t0[0] = t
         try:
-            return base(tokens, logits)
+            return base(tokens, logits, **kw)
         finally:
             dt = time.perf_counter() - t
             cyc = sum((x or {}).get("cycles") or 0 for x in eng.stats[k:])
