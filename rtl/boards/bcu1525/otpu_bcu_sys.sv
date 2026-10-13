@@ -34,6 +34,7 @@ module otpu_bcu_sys #(
   parameter int CORE_KHZ   = 100000,
   parameter logic [31:0] BUILD_ID = 32'h0,
   parameter int DDR_MTS    = 1600,
+  parameter bit SEQ_WC     = 1'b0,    // EXPERIMENTAL: otpu_seq's wait entries (WAITC, docs/seq_vpu.md; CFG_UARCH bit24)
   parameter int PLATFORM   = 2,
   parameter logic [31:0] ARCH_HASH = 32'h0,
   // bit j: board channel j's native port crosses an SLR (slice 0 in SLR0 on DIMM C1 in SLR1,
@@ -186,7 +187,7 @@ module otpu_bcu_sys #(
                .MXU_CL(MXU_CL), .VPU_CL(VPU_CL), .ULANES(ULANES), .CORE_KHZ(CORE_KHZ),
                .BUILD_ID(BUILD_ID), .DDR_MTS(DDR_MTS), .TRACE_DEPTH(TRACE_DEPTH),
                .PQ_WIN(PQ_WIN), .HAS_I2C(1'b0), .CHASH(CHASH), .DSTEP(DSTEP),
-               .HOSTCAL(1'b0), .PLATFORM(PLATFORM), .ARCH_HASH(ARCH_HASH)) u_board (
+               .HOSTCAL(1'b0), .SEQ_WC(SEQ_WC), .PLATFORM(PLATFORM), .ARCH_HASH(ARCH_HASH)) u_board (
     .clk, .rst, .ctl_mrst, .calib, .ded, .temp, .led, .i2c_lo, .i2c_pin,
     .s_ctl_awaddr, .s_ctl_awvalid, .s_ctl_awready, .s_ctl_wdata, .s_ctl_wstrb, .s_ctl_wvalid,
     .s_ctl_wready, .s_ctl_bresp, .s_ctl_bvalid, .s_ctl_bready, .s_ctl_araddr, .s_ctl_arvalid,

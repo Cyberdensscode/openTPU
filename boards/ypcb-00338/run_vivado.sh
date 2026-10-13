@@ -46,12 +46,15 @@ lanes="${LANES:-${T_LANES:-8}}"     # VPU lanes / TMEM banks (likewise in VERSIO
 act_rows="${ACT_ROWS:-${T_ACT_ROWS:-$mcols}}"  # ACT RAM rows (> MCOLS: MM replay; the ACT_ROWS register)
 mxu_e="${MXU_E:-${T_MXU_E:-4}}"   # MXU epilogue lanes (timing only; 0: MCOLS / 2)
 dstep="${DSTEP:-${T_DSTEP:-1}}"     # 0: no DSTEP datapath in the DMA (CAPS bit6 = 0)
+# otpu_seq WAITC (EXPERIMENTAL, docs/seq_vpu.md; CFG_UARCH bit24, in CFG_HASH when on): the
+# target's [arch] SEQ_WC, or SEQ_WC=1. The host writes each program's wait entries
+seq_wc="${SEQ_WC:-${T_SEQ_WC:-0}}"
 mxu="$([[ "${T_MXU_IMPL:-2}" == 0 ]] && echo tree || echo systolic)"   # the MXU's dot product
 core_mhz="${CORE_MHZ:-$([[ "${FAST:-0}" == 1 ]] && echo 100 || echo "${T_CORE_MHZ:-133.33}")}"  # accelerator clock (FAST=1: 100)
 platform="${T_PLATFORM:-1}"
 # CFG_HASH: the arch hash of what this build is (the knobs applied to the target's arch)
 arch_hash="$(PYTHONPATH="$root" python3 -m opentpu.target hash "$target" MCOLS="$mcols" \
-  LANES="$lanes" ACT_ROWS="$act_rows" DSTEP="$dstep" 2>/dev/null || echo 0)"
+  LANES="$lanes" ACT_ROWS="$act_rows" DSTEP="$dstep" SEQ_WC="$seq_wc" 2>/dev/null || echo 0)"
 # BUILD_ID register: the git commit's first 8 hex digits, taken here (Vivado may run in Docker)
 build_id="${BUILD_ID:-$(git -C "$root" rev-parse HEAD 2>/dev/null | cut -c1-8)}"
 build_id="${build_id:-0}"
@@ -91,6 +94,7 @@ mkdir -p "$out"
 # the IP synthesis cache shared by this host's builds (create_project.tcl); OTPU_IP_CACHE= turns it off
 export OTPU_IP_CACHE="${OTPU_IP_CACHE-$HOME/.cache/otpu-vivado-ip}"
 export OTPU_FAST="${FAST:-0}"
+export OTPU_SEQ_WC_GEN="$seq_wc"
 export PCIE_GEN="${PCIE_GEN:-2}"    # read by vivado/bd_native.tcl and userclk1_reroute.tcl
 export TRACE_DEPTH="${TRACE_DEPTH:-${T_TRACE_DEPTH:-16384}}"   # read by vivado/create_project.tcl
 export COLL_GATHER="${COLL_GATHER:-1}"                          # read by vivado/create_project.tcl

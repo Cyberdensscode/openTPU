@@ -22,6 +22,8 @@ LANES = 8
 PAIR = true
 DSTEP = true
 STREAM = true
+SEQ_WC = false                  # the sequencer's wait entries (WAITC, EXPERIMENTAL: docs/seq_vpu.md):
+#                                 the host loads them with every program; needs WIN <= 16
 
 [uarch]                         # timing only: RTL parameters the programs do not see
 MXU_IMPL = 2                    # systolic (docs/mxu_systolic.md)

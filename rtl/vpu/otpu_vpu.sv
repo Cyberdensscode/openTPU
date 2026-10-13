@@ -212,7 +212,17 @@ module otpu_vpu
     t = base + AW'(c) + AW'(l);
     return 32'(t);
   endfunction
-  wire [15:0] iwid = comp_f(func) ? 16'(NCL) : 16'(LANES);   // columns issued per cycle
+  // composite columns a chunk: NCL; in simulation +vt_cw=W issues W (a composite path W lanes
+  // wide at today's latency: docs/seq_vpu.md, EXPERIMENTAL)
+  logic [15:0] cwid;
+`ifndef SYNTHESIS
+  int vt_cw = NCL;
+  initial void'($value$plusargs("vt_cw=%d", vt_cw));
+  assign cwid = 16'(vt_cw);
+`else
+  assign cwid = 16'(NCL);
+`endif
+  wire [15:0] iwid = comp_f(func) ? cwid : 16'(LANES);   // columns issued per cycle
 
   // C8: otpu_se_comp, whose stages are slot 0 (s = 0) and the tail's U (1) and Q (2). A
   // composite chunk is not issued while comp says slot 0 is taken when it would get there
@@ -225,7 +235,37 @@ module otpu_vpu
   f32_t             c_ia [LANES], c_ib [LANES], c_od [LANES];
   logic [LANES-1:0] c_om;
   logic [AW:0]      c_ometa;                   // {waddr, all_last}
-  wire              iss_ok = !(C8 && comp_f(func) && c_hold);
+  // EXPERIMENTAL (docs/seq_vpu.md), simulation only: a narrower vector path at today's latency.
+  // +vt_ew=N / +vt_comp=N: an elementwise / composite chunk issues on one enabled cycle in N
+  // (a path 1/N as wide; for the composites +vt_cw above is the exact model, this a gap at
+  // issue that the composite loop's schedule may partly absorb); +vt_red=N: while a reduction
+  // runs, the VPU advances on one cycle in N (its bubbles would break the partial loop's
+  // schedule, so the whole VPU waits). Defaults 1.
+  logic             iss_thr;                   // the chunk may issue this cycle
+  logic             red_thr;                   // the VPU may advance this cycle (a reduction's)
+`ifndef SYNTHESIS
+  int vt_ew = 1, vt_comp = 1, vt_red = 1;
+  int vt_c = 0, vt_r = 0;
+  initial begin
+    void'($value$plusargs("vt_ew=%d", vt_ew));
+    void'($value$plusargs("vt_comp=%d", vt_comp));
+    void'($value$plusargs("vt_red=%d", vt_red));
+  end
+  always_comb begin
+    int n;
+    n = is_reduce(func) ? 1 : comp_f(func) ? vt_comp : vt_ew;
+    iss_thr = (n <= 1) || (vt_c % n == 0) || filling;
+    red_thr = (vt_red <= 1) || !red_act || (vt_r % vt_red == 0);
+  end
+  always @(posedge clk) begin
+    if (en && issuing) vt_c <= vt_c + 1;
+    if (red_act) vt_r <= vt_r + 1;
+  end
+`else
+  assign iss_thr = 1'b1;
+  assign red_thr = 1'b1;
+`endif
+  wire              iss_ok = !(C8 && comp_f(func) && c_hold) && iss_thr;
 
   wire is_sum = (func == V_RSUM) || (func == V_RSSQ) || (func == V_RDOT);
   wire is_am = (func == V_ARGMAX);
@@ -1171,10 +1211,10 @@ module otpu_vpu
         end
         wn <= wn_nx;
         if (SE) begin
-          en_q <= ss_act_d ? ss_pe : pop ? (wn_p1 < 2) : (wn_p0 < 2);  // a stream: its pe (as sen)
+          en_q <= ss_act_d ? ss_pe : (pop ? (wn_p1 < 2) : (wn_p0 < 2)) && red_thr;  // a stream: its pe (as sen)
           en_r <= en_q;
         end else begin
-          en_r <= pop ? (wn_p1 < 2) : (wn_p0 < 2);
+          en_r <= (pop ? (wn_p1 < 2) : (wn_p0 < 2)) && red_thr;
         end
         done <= pop && hd.dn;
         dpend <= pdn && !en;
@@ -1367,7 +1407,11 @@ module otpu_vpu
           imm <= hc.w7;
           nslots <= n_slots(hf);
           c16 = hc.w4[31:16];
+`ifndef SYNTHESIS
+          nchunks = comp_f(hf) ? (c16 + cwid - 1) / cwid : (c16 + 16'(LANES) - 1) >> LW;
+`else
           nchunks = comp_f(hf) ? (c16 + 16'(NCL) - 1) >> CLW : (c16 + 16'(LANES) - 1) >> LW;
+`endif
           if (hf == V_RSUM || hf == V_RSSQ || hf == V_RDOT)
             nchunks = ((nchunks + 16'(RL) - 1) / 16'(RL)) * 16'(RL);
           nch <= nchunks;

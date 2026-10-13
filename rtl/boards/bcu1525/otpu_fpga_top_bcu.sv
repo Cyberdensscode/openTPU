@@ -50,6 +50,7 @@ module otpu_fpga_top_bcu #(
   parameter int CORE_KHZ   = 100000,        // core_clk as the block design makes it
   parameter logic [31:0] BUILD_ID = 32'h0,  // the git commit (BUILD_ID register)
   parameter int DDR_MTS    = 1600,          // the DDR4 data rate the cores run (DDR_MTS register)
+  parameter bit SEQ_WC     = 1'b0,    // EXPERIMENTAL: otpu_seq's wait entries (WAITC, docs/seq_vpu.md; CFG_UARCH bit24)
   parameter int PLATFORM   = 2,             // targets/bcu1525.toml (CFG_PLATFORM)
   parameter logic [31:0] ARCH_HASH = 32'h0, // its arch_hash (CFG_HASH; run_vivado.sh)
   parameter int PCIE_LANES = 16             // Gen3 x16 (or x8: bd.tcl)
@@ -377,7 +378,7 @@ module otpu_fpga_top_bcu #(
                  .LANES(LANES), .WIN(WIN), .RPB(RPB), .WPB(WPB), .MXU_IMPL(MXU_IMPL),
                  .MXU_CL(MXU_CL), .VPU_CL(VPU_CL), .ULANES(ULANES), .TRACE_DEPTH(TRACE_DEPTH),
                  .PQ_WIN(PQ_WIN), .CHASH(CHASH), .DSTEP(DSTEP), .CORE_KHZ(CORE_KHZ),
-                 .BUILD_ID(BUILD_ID), .DDR_MTS(DDR_MTS), .PLATFORM(PLATFORM),
+                 .BUILD_ID(BUILD_ID), .SEQ_WC(SEQ_WC), .DDR_MTS(DDR_MTS), .PLATFORM(PLATFORM),
                  .ARCH_HASH(ARCH_HASH)) u_sys (
     .clk(core_clk), .rst(core_rst), .ctl_mrst(lrs2), .xclk(xdma_aclk), .xrst,
     .calib, .ded, .temp({device_temp, 2'b00}), .led(board_led), .i2c_lo,

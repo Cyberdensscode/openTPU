@@ -1,0 +1,1 @@
+p_q3 --model qwen3 --wformat fp4 --head-format int8 --pos 544 --layers 2 --rows 4 --logits none --check

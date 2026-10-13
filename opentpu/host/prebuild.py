@@ -53,7 +53,11 @@ FORMATS4 = ("fp4", "int4")
 
 
 class _Drop:
-    """A backend that takes the image and keeps nothing."""
+    """A backend that takes the image and keeps nothing. Its flags are BoardBackend's on the
+    card's bitstream (run arguments, the decode loop with HALT CHAIN, the step programs filling
+    their logits), so the engine compiles the programs a card session compiles (waits_ahead)."""
+
+    args = chains = generates = fills = True
 
     def __init__(self, cfg, images):
         pass
@@ -61,19 +65,54 @@ class _Drop:
 
 def prebuild(cfg, spec, W, wformat: str, head_format: str | None, cap: int = CAP) -> dict:
     """Build (and drop) the image an Engine with this configuration and these formats builds;
-    the cache's counts over it, and how the image came (imgcache.last: "hit", "miss": built and
-    stored, "skip", "off")."""
+    the cache's counts over it, how the image came (imgcache.last: "hit", "miss": built and
+    stored, "skip", "off"), and on a configuration whose sequencer takes wait entries the
+    entries step's counts (waits_ahead)."""
     from .. import imgcache
     from ..llm.qwen3 import Engine
     s0 = dict(qcache.stats)
     try:
-        Engine(spec, W, cap=cap, cfg=cfg, backend=_Drop, wformat=wformat,
-               head_format=head_format, resident=True, pipeline=False)
+        eng = Engine(spec, W, cap=cap, cfg=cfg, backend=_Drop, wformat=wformat,
+                     head_format=head_format, resident=True, pipeline=False)
     except MemoryError:
         if cap <= SMALL_CAP:
             raise
         return prebuild(cfg, spec, W, wformat, head_format, SMALL_CAP)
-    return {**{k: qcache.stats[k] - s0[k] for k in s0}, "image": imgcache.last[0]}
+    out = {**{k: qcache.stats[k] - s0[k] for k in s0}, "image": imgcache.last[0]}
+    return {**out, "waits": waits_ahead(eng)}
+
+
+def waits_ahead(eng) -> dict | None:
+    """On a configuration whose sequencer takes wait entries (SEQ_WC, EXPERIMENTAL: the waits
+    pass takes up to seconds a program, docs/isa.md "Wait counts"), compute the entries of the
+    programs a session loads first, kept beside the program cache's programs on the disk
+    (waits.entries), where the session's engine finds them: each bucket's resident decode
+    program and greedy generate program(s), and the prompt runs prefill.warm compiled.
+    {"programs", "computed", "seconds"}; None without SEQ_WC or without the disk."""
+    from .. import isa as I
+    from .. import progcache as PC
+    from .. import waits as WT
+    from ..llm import generate as G
+    cfg = eng.cfg
+    if not cfg.SEQ_WC or PC.cache_dir() is None:
+        return None
+    c0, t0 = WT.stats["computed"], WT.stats["seconds"]
+    progs = []
+    for b in range(1, G.buckets(eng.cap, eng.block) + 1):
+        dec = eng._decode(max((b - 1) * eng.block, eng._conv_lo))
+        if dec is not None:
+            progs += list(dec[0])
+        if eng.image.lookup.get("gen") is not None:
+            gp = eng._generate_prog(b)
+            for part in (gp if isinstance(gp, tuple) else (gp,)):
+                progs += list(part)
+    for pp, _ in getattr(eng, "_prompt_progs", {}).values():
+        progs += [pp] if hasattr(pp, "dtype") else list(pp)
+    for p in progs:
+        w = p if hasattr(p, "dtype") else I.assemble(p)
+        WT.entries(w, cfg.D, cfg.S, prog=None if hasattr(p, "dtype") else p)
+    return {"programs": len(progs), "computed": WT.stats["computed"] - c0,
+            "seconds": round(WT.stats["seconds"] - t0, 1)}
 
 
 def default_cfg() -> Path | None:
@@ -153,6 +192,10 @@ def _build_one(cfg, run: str) -> int:
     p = model_dir(m)
     n = prebuild(cfg, load_spec(p), load_weights(p), wf, None if hf == "-" else hf)
     skip = f", {n['skip']} not written (disk space)" if n["skip"] else ""
+    if n.get("waits"):
+        w = n["waits"]
+        skip += (f"; wait entries of {w['programs']} programs, {w['computed']} computed "
+                 f"({w['seconds']} s)")
     img = {"hit": "in the image cache already", "miss": "image cached",
            "skip": "image not cached", "off": "no image cache"}[n["image"]]
     print(f"{run}: {n['hit']} cached, {n['miss']} quantized, {n['write']} written{skip}; "

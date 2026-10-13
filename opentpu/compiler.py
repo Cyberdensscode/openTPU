@@ -108,6 +108,41 @@ class DevVar(RunVar):
 ARG0 = 8                        # the run's arguments ARG0..7 are R8..R15 at the start
 
 
+class Program(list):
+    """A program's instructions (Builder.finish), with the run-time arguments it reads
+    (Builder.run_args: [(RunVar, c)], argument k in R15 - k): opentpu.waits bounds them by
+    their variables' bounds (an otpu_seq WAITC build's wait counts)."""
+
+    def __init__(self, instrs=(), run_args=()):
+        super().__init__(instrs)
+        self.run_args = list(run_args)
+
+
+class Words(np.ndarray):
+    """A program's assembled words (uint32) with its run_args, as Program keeps them (opentpu.waits
+    bounds the arguments with them on a WAITC device), and its wait entries when a compile
+    worker process computed them (waits: None, or uint64 per instruction). Pickled with both."""
+
+    run_args: list = []
+    waits = None
+
+    @staticmethod
+    def of(words, run_args=(), waits=None) -> "Words":
+        """words (any words; a Words keeps its entries unless `waits` replaces them)."""
+        w = np.asarray(words, np.uint32).view(Words)
+        w.run_args = list(run_args or ())
+        w.waits = getattr(words, "waits", None) if waits is None else waits
+        return w
+
+    def __reduce__(self):
+        fn, args, state = super().__reduce__()
+        return fn, args, (state, self.run_args, self.waits)
+
+    def __setstate__(self, s):
+        state, self.run_args, self.waits = s
+        super().__setstate__(state)
+
+
 def arg_reg(k: int) -> int:
     """The register of a program's k-th run-time argument (Builder.run_args): from R15 down,
     as address registers are taken from R1 up."""
@@ -1055,12 +1090,14 @@ class Builder:
             self.set_in[r] = g
         self.free_regs.append((r, frozenset(id(lb.loop) for lb in self.loops)))
 
-    def rld(self, r: int, t: "Tile", raw: bool = False, comment: str = "") -> None:
-        """R[r] = the one-word tile t as an int (RLD: f2i, or its bits with raw)."""
+    def rld(self, r: int, t: "Tile", raw: bool = False, comment: str = "",
+            bound: tuple | None = None) -> None:
+        """R[r] = the one-word tile t as an int (RLD: f2i, or its bits with raw); bound: the
+        values it may take (isa.rld)."""
         self.check_live(t)
         if t.rows * t.cols != 1:
             raise CompileError(f"rld: {t} is not one word")
-        self.emit(I.rld(r, t.base, raw=raw, comment=comment or "rld"))
+        self.emit(I.rld(r, t.base, raw=raw, bound=bound, comment=comment or "rld"))
 
     def waitw(self, t: "Tile", dram: int, ref: int = 0, cmp: int = I.C_EQ, ra: int = 0,
               rc: int = 0, interval: int = 0, timeout: int = 0, comment: str = "") -> None:
@@ -1827,7 +1864,7 @@ class Builder:
                 for r in sorted(self.used_regs - self.late_zero)]
         prog += self._flatten(self.root)
         prog.append(I.halt())
-        return prog
+        return Program(prog, self.run_args)
 
     def _flatten(self, items: list) -> list[I.Instr]:
         out = []

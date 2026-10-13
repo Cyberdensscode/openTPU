@@ -949,7 +949,7 @@ class Image:
                            "onehot": {f: b.alloc(4 * cfg.MCOLS * D * GA.onehot_blocks(
                                D, cfg.MCOLS, "int8" if f == "int8" else "fp4")) for f in fmts},
                            # the decode loop's area
-                           "gen": G.alloc(b, spec, cap, block, cfg.IMEM_WORDS)}
+                           "gen": G.alloc(b, spec, cap, block, cfg.IMEM_WORDS, cfg.SEQ_WC)}
             # the prompt runs' mask tiles, ends then starts (Additive); a MoE model's for its
             # tiled layer runs, opt-in (OTPU_TILE=1 as the image is built: layer_tile_flag,
             # tiled.compile_layer_tile)
@@ -1424,6 +1424,7 @@ class Image:
             ns.moe_dev = SimpleNamespace(mbox=Lo.mbox, served=Lo.served, answer=Lo.answer,
                                          dir=Lo.dir, tag=Lo.tag, fmt=self.fmt,
                                          hint_off=Lo.layers * Lo.E,
+                                         slots=Lo.slot_bounds, ids=Lo.layers * Lo.E,
                                          scratch=self.io.get("moe_scratch"),
                                          need_off=2 * Lo.layers * Lo.E,
                                          em_base=Lo.slots[0][0],

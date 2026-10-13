@@ -30,6 +30,10 @@ class Config:
     STREAM: bool = False     # the stream engine runs STREAM's hardware subset (docs/stream.md)
     ACT_ROWS: int = 0        # ACT RAM rows == max stationary rows of one MM (0: MCOLS); more
     #                          than MCOLS: the MXU replays each streamed chunk (docs/isa.md, MM)
+    SEQ_WC: bool = False     # EXPERIMENTAL: the sequencer takes each program's wait entries
+    #                          (WAITC, docs/isa.md "Wait counts"): the host writes them after
+    #                          every program (opentpu.waits), the chain slots hold them. The
+    #                          programs do not change; the ISA simulator ignores it
 
     @property
     def act_rows(self) -> int:
@@ -55,9 +59,10 @@ def board_config(**kw) -> Config:
     RAM rows (default MCOLS; more: the MXU replays each weight chunk for MCOLS rows at a time).
     The optional features stay off unless the environment turns them on, as before targets (the
     target states the hardware's truth: opentpu.target.config): OTPU_PAIR=1 column reuse (MM
-    PAIR / QACT DUP), OTPU_DSTEP=1 the DMA's DSTEP, OTPU_STREAM=1 the stream engine. They
-    configure the simulators and the board model; on the card,
-    opentpu.host.board.device_config takes them from the bitstream."""
+    PAIR / QACT DUP), OTPU_DSTEP=1 the DMA's DSTEP, OTPU_STREAM=1 the stream engine,
+    OTPU_SEQ_WC=1 the sequencer's wait entries (SEQ_WC, EXPERIMENTAL). They configure the
+    simulators and the board model; on the card, opentpu.host.board.device_config takes them
+    from the bitstream."""
     from .target import current
     a, env = current().arch, os.environ
     base = dict(S=a["S"], D=a["D"], MCOLS=int(env.get("OTPU_MCOLS", a["MCOLS"])),
@@ -67,7 +72,8 @@ def board_config(**kw) -> Config:
                 DRAM_BYTES=a["DRAM_BYTES"],
                 PAIR=bool(int(env.get("OTPU_PAIR", 0))),
                 DSTEP=bool(int(env.get("OTPU_DSTEP", 0))),
-                STREAM=bool(int(env.get("OTPU_STREAM", 0))))
+                STREAM=bool(int(env.get("OTPU_STREAM", 0))),
+                SEQ_WC=bool(int(env.get("OTPU_SEQ_WC", 0))))
     base.update(kw)
     return Config(**base)
 
@@ -210,6 +216,9 @@ class Slice:
             v = v if ins.flags & I.F_RAW else I.f2i(v)
             if ins.flags & I.F_MUL:
                 v = (v * ((self.reg(ins.rb) + w[1]) & 0xFFFFFFFF)) & 0xFFFFFFFF
+            if ins.flags & I.F_BOUND and not w[2] <= v <= w[3]:
+                raise SimError(f"RLD at pc {self.pc}: {v} outside its bound [{w[2]}, {w[3]}] "
+                               f"({ins.comment})")
             if ins.rd:
                 self.R[ins.rd] = v
             return
@@ -768,10 +777,15 @@ class Machine:
 
     def run(self, max_steps: int = 10_000_000) -> "Machine":
         steps = 0
+        # OTPU_WAITS_CHECK=1: each program's wait counts (opentpu.waits, otpu_seq WAITC) checked
+        # against this run (no effect on the result: the counts only order the units)
+        chk = {} if os.environ.get("OTPU_WAITS_CHECK") else None
         while not all(s.halted for s in self.slices):
             progressed = False
             for s in self.slices:
                 while not s.halted and s.waiting is None and s.polling is None:
+                    if chk is not None:
+                        self._waits_issue(chk, s)
                     s.step()
                     steps += 1
                     progressed = True
@@ -779,6 +793,8 @@ class Machine:
                         raise SimError("step limit exceeded")
                     if s.halted and s.chain is not None:
                         self._chain(s)
+                        if chk is not None:
+                            chk.pop(s.sid, None)
             live = [s for s in self.slices if not s.halted]
             if live and all(s.waiting is not None for s in live):
                 if len(live) != len(self.slices):
@@ -810,6 +826,15 @@ class Machine:
             if not progressed:
                 raise SimError("deadlock")
         return self
+
+    def _waits_issue(self, chk: dict, s: Slice) -> None:
+        from . import waits as W
+        c = chk.get(s.sid)
+        if c is None or c.prog is not s.prog:
+            c = chk[s.sid] = W.Checker(s.prog, W.wait_counts(s.prog, self.cfg.D, self.cfg.S),
+                                       self.cfg.D, self.cfg.S)
+        if 0 <= s.pc < len(s.prog) and s.prog[s.pc].op in W.UNIT:
+            c.issue(s.pc, [s.reg(r) for r in range(16)])
 
     def _gather(self) -> None:
         sl = self.slices

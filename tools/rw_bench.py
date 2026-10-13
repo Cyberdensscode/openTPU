@@ -23,7 +23,6 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from opentpu import isa as I  # noqa: E402
 from opentpu import language as ol  # noqa: E402
 from opentpu import quant as Q  # noqa: E402
 from opentpu import rtlsim  # noqa: E402
@@ -124,11 +123,10 @@ def main(argv=None) -> int:
             img, lay = image(n_mm if "mm" in mode else 1, max(nd, 1))
             prog = bench.trace(cfg, 0, {"m": descs(lay, n_mm if "mm" in mode else 1, max(nd, 1)),
                                         "mode": mode, "n_mm": n_mm, "n_dma": nd}).finish()
-            words = np.asarray(I.assemble(prog), np.uint32)
             if board is not None:
                 at = -(-len(img) // 4096) * 4096
                 board.write(0, img)
-                board.load_program(at, words)
+                board.load(at, prog)
                 st = board.run()
                 cyc = st["cycles"]
             else:

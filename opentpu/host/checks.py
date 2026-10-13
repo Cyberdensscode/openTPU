@@ -147,7 +147,7 @@ def vops_check(board, cfg, need: bool = False) -> tuple[bool, str]:
         progs = [(n, p) for g, n, p in op_checks(cfg) if g in ("vpu-reduce", "vpu-new")]
         bad = []
         for name, prog in progs:
-            ok2, msg2, _ = run_demo(board, cfg, prog, diag_image())
+            ok2, msg2, _ = run_demo(board, cfg, prog, diag_image(cfg))
             if not ok2:
                 bad.append(f"{name}: {msg2.split(',')[0]}")
         if bad:
@@ -178,7 +178,7 @@ def run_demo(board, cfg, prog: list | None = None,
     sl = Machine(dataclasses.replace(cfg, DRAM_BYTES=len(ref)), [prog], [ref]).run().slices[0]
     board.write(ZERO_AT, np.zeros(4 * cfg.TMEM_WORDS, np.uint8))
     board.write(0, img)
-    board.load_program(PROG_AT, np.asarray(I.assemble(prog), np.uint32))
+    board.load(PROG_AT, prog)
     st = board.run(timeout=10.0)
     got = board.read(0, PROG_AT)
     want = sl.dram[:PROG_AT]
@@ -265,7 +265,7 @@ def waitw_host(board, rounds: int = 20, seed: int = 5, sizes=W_SIZES,
         board.write(W_TOK, np.full(16, 0xDEADBEEF, "<u4"))
         board.write(p["data"], old if live else new)
         board.write(p["flag"], _u32(p["pre"] if live else p["word"]))
-        board.load_program(PROG_AT, np.asarray(I.assemble(waitw_host_program(p)), np.uint32))
+        board.load(PROG_AT, waitw_host_program(p))
         board.start()
         if live:
             time.sleep(p["delay"])
@@ -353,7 +353,7 @@ def waitw_tag(board, rounds: int = 2000, seed: int = 5, sizes=WT_SIZES,
         sw = swapped(a, m) if board.chash else np.zeros(m, bool)
         runs = [np.where(sw[:, None], rec[:, 1 - c], rec[:, c]).reshape(-1) for c in (0, 1)]
         ct = int(sw[-1])                    # the tag: beat 0 of the last chunk
-        board.load_program(PROG_AT, np.asarray(I.assemble(waitw_tag_program(p)), np.uint32))
+        board.load(PROG_AT, waitw_tag_program(p))
         board.start()
         if board.t.reg_read(R_STATUS) & ST_HALTED:
             return False, f"{what}: the card halted before the host wrote the tag"
@@ -386,8 +386,8 @@ def waitw_timeout(board) -> tuple[bool, str]:
     (Board.wait's 'WAITW timed out'; bitstreams before WAIT_TO: ERROR alone, 'illegal
     instruction'); the next run, a WAITW that holds, runs normally."""
     board.write(WB, _u32(0x1234))
-    board.load_program(PROG_AT, np.asarray(I.assemble(
-        [I.waitw(WB, W_T, 0x1235, I.C_EQ, interval=100, timeout=100000), I.halt()]), np.uint32))
+    board.load(PROG_AT, [I.waitw(WB, W_T, 0x1235, I.C_EQ, interval=100, timeout=100000),
+                         I.halt()])
     try:
         board.run(timeout=10.0)
         return False, "a WAITW that never holds ran to its HALT (no timeout)"
@@ -395,8 +395,7 @@ def waitw_timeout(board) -> tuple[bool, str]:
         if "illegal instruction" not in str(e) and "WAITW timed out" not in str(e):
             raise
         how = "ERROR and WAIT_TO" if "WAIT_TO" in str(e) else "ERROR (no WAIT_TO)"
-    board.load_program(PROG_AT, np.asarray(I.assemble(
-        [I.waitw(WB, W_T, 0x1234, I.C_EQ, timeout=100000), I.halt()]), np.uint32))
+    board.load(PROG_AT, [I.waitw(WB, W_T, 0x1234, I.C_EQ, timeout=100000), I.halt()])
     st = board.run(timeout=10.0)
     return True, f"{how} at the timeout; the next run halted normally ({st['cycles']} cycles)"
 

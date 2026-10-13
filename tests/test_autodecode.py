@@ -140,7 +140,7 @@ def test_the_gen_op_checks_run_on_the_isa_simulator():
     from opentpu.host.opchecks import diag_image, op_checks
     from opentpu.isasim import board_config
     cfg = board_config(DRAM_BYTES=1 << 23)
-    img = diag_image()
+    img = diag_image(cfg)
     checks = [(n, p) for g, n, p in op_checks(cfg, gen=True) if g == "gen"]
     assert len(checks) == 6 and not [g for g, _, _ in op_checks(cfg) if g == "gen"]
     for name, prog in checks:
@@ -279,7 +279,7 @@ def test_gen_op_checks_on_the_board_config_rtl(have_verilator):
     from opentpu.host.opchecks import diag_image, op_checks
     from opentpu.isasim import board_config
     cfg = board_config(DRAM_BYTES=1 << 23)
-    img = diag_image()
+    img = diag_image(cfg)
     for name, prog in [(n, p) for g, n, p in op_checks(cfg, gen=True) if g == "gen"]:
         _on_rtl([I.ld(ZERO_AT, 0, cfg.TMEM_WORDS)] + prog, cfg=cfg,
                 extra=[(0, img)])

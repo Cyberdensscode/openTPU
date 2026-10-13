@@ -69,6 +69,7 @@ def _hash_without_numerics(cfg) -> int:
     import hashlib
     import json
     d = dataclasses.asdict(cfg)
+    d.pop("SEQ_WC")                     # (a field that host's Config does not have)
     s = json.dumps({k: (int(v) if isinstance(v, bool) else v) for k, v in sorted(d.items())},
                    separators=(",", ":"))
     return int.from_bytes(hashlib.sha256(s.encode()).digest()[:4], "big")
@@ -124,7 +125,7 @@ def test_card_target_matches_the_rtl_defaults():
     assert p["RPB"] == 8 * p["LANES"]                       # otpu_board: RPB = 8 * LANES
     top = _sv_defaults(ROOT / "rtl/boards/ypcb-00338/otpu_fpga_top_ld.sv")
     for k in ("MCOLS", "ACT_ROWS", "VPU_CL", "MXU_IMPL", "MXU_E", "LANES", "ULANES", "DDR_MTS",
-              "PLATFORM", "TRACE_DEPTH"):
+              "PLATFORM", "TRACE_DEPTH", "SEQ_WC"):
         assert p[k] == top[k], k
     assert _sv_defaults(ROOT / "rtl/boards/ypcb-00338/otpu_native_sys.sv")["TRACE_DEPTH"] \
         == p["TRACE_DEPTH"]
@@ -155,14 +156,24 @@ def test_bad_target_files(tmp_path):
         p.write_text(good.replace(*edit))
         with pytest.raises(T.TargetError, match=msg):
             T.load(str(p))
+    # otpu_seq's wait entries (SEQ_WC) count a unit's last 15 instructions: a window of 16 at most
+    p = tmp_path / "nangate45-small.toml"
+    wc = good.replace("SEQ_WC = false", "SEQ_WC = true")
+    p.write_text(wc)
+    assert T.load(str(p)).arch["SEQ_WC"] and T.sim_uarch(T.load(str(p)))["SEQ_WC"] == 1
+    T.load.cache_clear()
+    p.write_text(wc.replace("WIN = 16", "WIN = 32"))
+    with pytest.raises(T.TargetError, match="SEQ_WC .* needs WIN <= 16"):
+        T.load(str(p))
 
 
 # ------------------------------------------------------------------------------ register map 4
 def test_cfg_register_codec():
     c = dict(S=2, TMEM_WORDS=1 << 16, IMEM_WORDS=1 << 15, ACT_BLOCKS=128, DRAM_BYTES=1 << 32,
              channels=2, channel_bytes=1 << 31, MXU_IMPL=2, TMEM_IMPL=1, VPU_CL=2, ULANES=8,
-             platform=2, hash=0x8B699C81)
+             SEQ_WC=1, platform=2, hash=0x8B699C81)
     assert R.cfg(R.cfg_words(c)) == c
+    assert R.cfg(R.cfg_words(dict(c, SEQ_WC=0)))["SEQ_WC"] == 0
 
 
 def test_device_config_from_the_cfg_registers(no_env):
@@ -290,7 +301,7 @@ def test_bcu1525_target_matches_its_rtl_defaults():
         top = _sv_defaults(ROOT / "rtl/boards/bcu1525" / f)
         for k in ("S", "D", "MCOLS", "ACT_BLOCKS", "TMEM_WORDS", "IMEM_WORDS", "FIFO_DEPTH",
                   "LANES", "WIN", "WPB", "MXU_IMPL", "MXU_CL", "VPU_CL", "ULANES", "TRACE_DEPTH",
-                  "PQ_WIN", "CHASH", "DSTEP", "DDR_MTS", "PLATFORM"):
+                  "PQ_WIN", "CHASH", "DSTEP", "DDR_MTS", "PLATFORM", "SEQ_WC"):
             assert p[k] == top[k], (f, k)
     assert p["RPB"] == 8 * p["LANES"]                       # the tops: RPB = 8 * LANES
     assert (p["NCH"], p["CH_LOG2"], p["DRAM_LOG2"]) == (2, 31, 32)

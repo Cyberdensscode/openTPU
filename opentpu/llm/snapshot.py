@@ -85,7 +85,9 @@ class Snapshots:
             return None
         need = n * sum(b for _, b in merged(image.state_regions(0)))
         base = -(-image.nbytes // 4096) * 4096
-        if -(-(base + need) // 4096) * 4096 + 4 * cfg.IMEM_WORDS > cfg.DRAM_BYTES:
+        from .. import waits as W
+        if -(-(base + need) // 4096) * 4096 + W.area(cfg.IMEM_WORDS, getattr(cfg, "SEQ_WC", False)) \
+                > cfg.DRAM_BYTES:
             return None
         return base
 

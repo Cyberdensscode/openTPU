@@ -488,7 +488,8 @@ class Image(EmbedHost):
             raise ValueError("embed_host needs the image's lookup tables (lookup=True)")
         self.lookup = _lookup_alloc(b, spec, cap, D=D, head=self.head if shared else None,
                                     M=cfg.MCOLS, embed_host=bool(embed_host),
-                                    rows=rows, imem=cfg.IMEM_WORDS) if lookup else {}
+                                    rows=rows, imem=cfg.IMEM_WORDS,
+                                    waitc=cfg.SEQ_WC) if lookup else {}
         self.choices = {"embed_host": self.embed_host,          # (the compile worker's
                         "formats": self.formats}                # image)
         self.offload = None
@@ -789,7 +790,8 @@ class Image(EmbedHost):
         if self.offload is not None:
             L = self.offload
             dev = SimpleNamespace(mbox=L.mbox, served=L.served, answer=L.answer, dir=L.dir,
-                                  tag=L.tag, fmt=self.fmt)
+                                  tag=L.tag, fmt=self.fmt, slots=L.slot_bounds,
+                                  ids=L.layers * L.E)
         return SimpleNamespace(
             spec=spec, layer=layer, plan=self.plan, moe_dev=dev,
             x=_tdesc(self.io["x"], (1, H)), cos=_tdesc(self.io["cos"], (d // 2,)),

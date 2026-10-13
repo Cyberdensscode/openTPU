@@ -36,9 +36,10 @@ from .. import isa as I
 from .. import progcache as PC
 from .. import qcache as QC
 from .. import quant as Q
+from .. import waits as WC
 from .. import language as ol
 from ..compiler import (Affine, CompileError, DevVar, KVDesc, QTensor, RunVar, Tensor, arg_words,
-                        current, k_scale_bytes, trace_fit)
+                        Words, current, k_scale_bytes, trace_fit)
 from . import formats as FM
 from . import generate as G
 from . import rope_parameters
@@ -365,7 +366,8 @@ def qk_gains(spec: Spec, W, p: str) -> tuple[np.ndarray, np.ndarray]:
 # =============================================================================== lookup tables
 def _lookup_alloc(b: "_Bump", spec, cap: int, block: int = None, D: int = 128,
                   head: tuple | None = None, M: int = 4, embed_host: bool = False,
-                  rows: int = 1, imem: int = 1 << 15, masks: bool = False) -> dict:
+                  rows: int = 1, imem: int = 1 << 15, masks: bool = False,
+                  waitc: bool = False) -> dict:
     """DRAM for the device-side inputs of a run-time position (RunPos): every token's embedding
     row, the RoPE cos / sin rows of every position, and the attention mask table
     (attention.Bucket: cap entries +inf, then a block of -inf). The embedding rows are fp32
@@ -403,7 +405,7 @@ def _lookup_alloc(b: "_Bump", spec, cap: int, block: int = None, D: int = 128,
         emb.update(amask=b.alloc(amask_table(block, M).nbytes), amask_M=M)
     return {**emb, "cos_t": b.alloc(4 * cap * half), "sin_t": b.alloc(4 * cap * half),
             "zmask": b.alloc(4 * (cap + block)), "half": half, "block": block, "D": D,
-            "gen": G.alloc(b, spec, cap, block, imem)}
+            "gen": G.alloc(b, spec, cap, block, imem, waitc)}
 
 
 def amask_table(block: int, M: int, start: bool = False) -> np.ndarray:
@@ -971,7 +973,8 @@ class Image(EmbedHost):
             raise ValueError("embed_host needs the image's lookup tables (lookup=True)")
         self.lookup = _lookup_alloc(b, spec, cap, D=D, head=self.head if shared else None,
                                     M=cfg.MCOLS, embed_host=bool(embed_host),
-                                    rows=rows, imem=cfg.IMEM_WORDS) if lookup else {}
+                                    rows=rows, imem=cfg.IMEM_WORDS,
+                                    waitc=cfg.SEQ_WC) if lookup else {}
         self.choices = {"embed_host": self.embed_host,          # (the compile worker's
                         "formats": self.formats}                # image)
         self.nbytes = b.next
@@ -1884,20 +1887,30 @@ def _worker_ready() -> bool:
     return True
 
 
+def worker_words(image, prog, run_args=None) -> np.ndarray:
+    """A compile worker's program (one slice's) as the engine takes it: its words (Words: with
+    its run_args), and on a configuration whose sequencer takes wait entries (SEQ_WC) its
+    entries, computed here and kept beside the program cache's programs (waits.entries)."""
+    from ..isa import assemble
+    ra = run_args if run_args is not None else getattr(prog, "run_args", ())
+    w = Words.of(assemble(prog), ra)
+    if image.cfg.SEQ_WC:
+        w.waits = WC.entries(w, image.cfg.D, image.cfg.S, ra, prog=prog)
+    return w
+
+
 def _worker_compile(pos: int) -> np.ndarray:
     """The worker process: the decode program for `pos`, assembled (one slice)."""
-    from ..isa import assemble
     image, block = _WORKER
-    return np.asarray(assemble(image.compile_step(pos, block)[0]), np.uint32)
+    return worker_words(image, image.compile_step(pos, block)[0])
 
 
 def _worker_decode(blocks: int, lo: int):
     """The worker process: the resident decode program of a bucket, assembled (one slice),
     and its run_args (compile_decode)."""
-    from ..isa import assemble
     image, block = _WORKER
     progs, ra = image.compile_decode(blocks, lo, block)
-    return np.asarray(assemble(progs[0]), np.uint32), ra
+    return worker_words(image, progs[0], ra), ra
 
 
 def layer_programs(image, key, block: int, hint: bool = False, em: bool = False):
@@ -1926,19 +1939,17 @@ def layer_programs(image, key, block: int, hint: bool = False, em: bool = False)
 def _worker_layer(key, hint: bool = False, em: bool = False):
     """The worker process: layer_programs' program, assembled (one slice), and its
     run_args."""
-    from ..isa import assemble
     image, block = _WORKER
     progs, ra = layer_programs(image, key, block, hint, em)
-    return np.asarray(assemble(progs[0]), np.uint32), ra
+    return worker_words(image, progs[0], ra), ra
 
 
 def _worker_chunk(seq: int, p0: int, n: int, left: int, fit: int, toks=None,
                   whole: bool = True, logits: bool = True):
     """The worker process: fit_chunk's run, its program assembled (one slice)."""
-    from ..isa import assemble
     image, block = _WORKER
     n, progs, fit = fit_chunk(image, block, seq, p0, n, left, fit, toks, whole, logits)
-    return n, None if progs is None else np.asarray(assemble(progs[0]), np.uint32), fit
+    return n, None if progs is None else worker_words(image, progs[0]), fit
 
 
 def fit_chunk(image, block: int, seq: int, p0: int, n: int, left: int, fit: int,
@@ -2220,7 +2231,8 @@ class Engine:
                                  "(resident=True)")
             from . import batch as BA
             self.bat = BA.alloc(self.image, self.cfg, batch, -(-len(images[0]) // 4096) * 4096)
-            if self.bat["end"] + 4 * self.cfg.IMEM_WORDS > self.cfg.DRAM_BYTES:
+            if self.bat["end"] + WC.area(self.cfg.IMEM_WORDS, self.cfg.SEQ_WC) > \
+                    self.cfg.DRAM_BYTES:
                 raise MemoryError("no room in the DRAM for the batch area")
             images = SN.grow(images, self.bat["end"])
             BA.build(images, self.bat, spec, self.cfg)
@@ -2394,9 +2406,11 @@ class Engine:
             return None
         b = pos // self.block + 1
         if b not in self._decodes:
-            self._decodes[b] = self.cached(self._decode_what(b),
-                                           lambda: self._take(("decode", b),
-                                                              self._compile_decode, b))
+            progs, ra = self.cached(self._decode_what(b),
+                                    lambda: self._take(("decode", b), self._compile_decode, b))
+            if isinstance(progs, np.ndarray):   # a worker's words: with their run_args
+                progs = Words.of(progs, ra)
+            self._decodes[b] = (progs, ra)
         return self._decodes[b]
 
     def cached(self, what, compile):
@@ -2894,13 +2908,13 @@ class Engine:
             if fut is not None and not fut.done() and not self._ready.done():
                 fut.cancel()                # the workers still starting: compiled here
                 fut = None
-            if fut is not None:
+            if fut is not None:             # (the words with their run_args: Words)
                 words, ra = fut.result()
-                self._layer_runs[key] = (None, ra, words)
+                self._layer_runs[key] = (None, ra, Words.of(words, ra))
             else:
                 progs, ra = layer_programs(self.image, key, self.block, self.layer_hint,
                                            self.expert_major)
-                words = np.asarray(I.assemble(progs[0]), np.uint32) \
+                words = Words.of(I.assemble(progs[0]), ra) \
                     if getattr(self.backend, "runs_words", False) else None
                 self._layer_runs[key] = (progs, ra, words)
         return self._layer_runs[key]
@@ -2998,11 +3012,18 @@ class Engine:
         new = [k for k in range(lo, b1 + 1) if k not in have]
         if not new:
             return
+        if getattr(self.backend, "waitc", False):   # (their wait entries at once: the workers)
+            items = [(np.asarray(I.assemble(prog), np.uint32), None, prog)
+                     for k in new for pj in (lambda p: p if isinstance(p, tuple) else (p,))(
+                         self._generate_prog(k, samp)) for prog in pj]
+            WC.entries_many(items, self.cfg.D, self.cfg.S,
+                            self._pool if self._procs and self._ready.done() else None)
         for k in new:
             progs = self._generate_prog(k, samp)
             for j, pj in enumerate(progs if isinstance(progs, tuple) else (progs,)):
                 for s, prog in enumerate(pj):
-                    self.backend.write(s, G.prog_slot(g, k, mode, j), I.assemble(prog))
+                    self.backend.write(s, G.prog_slot(g, k, mode, j),
+                                       G.slot_words(self.backend, prog))
         have |= set(new)
         for s in range(self.cfg.S):
             words = {}

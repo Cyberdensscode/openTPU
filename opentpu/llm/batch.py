@@ -262,11 +262,11 @@ def compile_step(image, area: dict, rows, kinds, block: int, span: int = 0) -> l
 
 
 def _worker_step(rows, kinds, area, span=0):
-    """The engine's compile worker process: compile_step, assembled (one slice)."""
-    from .qwen3 import _WORKER
+    """The engine's compile worker process: compile_step, assembled (one slice; with its wait
+    entries on a WAITC configuration: qwen3.worker_words)."""
+    from .qwen3 import _WORKER, worker_words
     image, block = _WORKER
-    return np.asarray(I.assemble(compile_step(image, area, rows, kinds, block, span)[0]),
-                      np.uint32)
+    return worker_words(image, compile_step(image, area, rows, kinds, block, span)[0])
 
 
 class Steps:
@@ -352,7 +352,8 @@ class Steps:
         rows, kinds, n = key
         progs = compile_step(self.eng.image, self.a, rows, kinds, self.eng.block, n)
         if self._words:                 # assembled once: the backend loads the words as they are
-            return np.asarray(I.assemble(progs[0]), np.uint32)
+            from .qwen3 import worker_words                 # (WAITC: with their entries)
+            return worker_words(self.eng.image, progs[0])
         return progs
 
     def _size(self, progs) -> int:

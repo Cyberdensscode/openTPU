@@ -26,6 +26,7 @@ module otpu_native_sys #(
   parameter bit DSTEP = 1'b1,
   parameter bit HOSTCAL = 1'b0,
   parameter bit XREG = 1'b0,
+  parameter bit SEQ_WC     = 1'b0,    // EXPERIMENTAL: otpu_seq's wait entries (WAITC, docs/seq_vpu.md; CFG_UARCH bit24)
   parameter int PLATFORM = 0,
   parameter logic [31:0] ARCH_HASH = 32'h0,
   parameter int TRACE_DEPTH = 16384,     // trace records (otpu_board; 0: no trace buffer)
@@ -179,7 +180,7 @@ module otpu_native_sys #(
   otpu_board #(.MCOLS(MCOLS), .ACT_ROWS(ACT_ROWS), .VPU_CL(VPU_CL), .MXU_IMPL(MXU_IMPL),
                .MXU_E(MXU_E), .LANES(LANES), .ULANES(ULANES),
                .CORE_KHZ(CORE_KHZ), .BUILD_ID(BUILD_ID), .DDR_MTS(DDR_MTS), .DSTEP(DSTEP),
-               .HOSTCAL(HOSTCAL), .PLATFORM(PLATFORM), .ARCH_HASH(ARCH_HASH),
+               .HOSTCAL(HOSTCAL), .SEQ_WC(SEQ_WC), .PLATFORM(PLATFORM), .ARCH_HASH(ARCH_HASH),
                .TRACE_DEPTH(TRACE_DEPTH), .COLL_GATHER(COLL_GATHER)) u_board (
     .clk, .rst, .ctl_mrst, .calib, .ded, .temp, .led, .i2c_lo, .i2c_pin,
     .s_ctl_awaddr, .s_ctl_awvalid, .s_ctl_awready, .s_ctl_wdata, .s_ctl_wstrb, .s_ctl_wvalid,

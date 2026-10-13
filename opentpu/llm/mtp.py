@@ -265,9 +265,8 @@ class MTPDecoder:
                     raise CompileError(f"MTP loop program {KINDS[k]} of bucket {blk}: "
                                        f"{max(map(len, progs))} instructions, IMEM "
                                        f"{img.cfg.IMEM_WORDS // 8}")
-                for s_, prog in enumerate(progs):
-                    w = np.asarray(I.assemble(prog), np.uint32)
-                    eng.backend.write(s_, prog_addr(a, blk, k), w)
+                for s_, prog in enumerate(progs):     # (with its wait entries: chained)
+                    eng.backend.write(s_, prog_addr(a, blk, k), G.slot_words(eng.backend, prog))
                 tab[2 * k], tab[2 * k + 1] = prog_addr(a, blk, k), len(I.assemble(progs[0])) // 8
                 done[(blk, k)] = progs
             for s_ in range(img.cfg.S):
@@ -399,11 +398,12 @@ V0, E0, D2, D1 = 0, 2, 4, 5
 
 
 def gen_alloc(b, cap: int, spec, block: int = ATTN_BLOCK,
-              imem_words: int = 1 << 15) -> dict:
-    """DRAM of the MTP loop: a program slot per bucket and kind, and the chain table
-    ([address, instructions] per bucket and kind); the sampled verify's row 1 logits (the
-    generate loop's lg holds row 0's: generate.Sampler)."""
-    nb, slot = G.buckets(cap, block), G.prog_bytes(imem_words)
+              imem_words: int = 1 << 15, waitc: bool = False) -> dict:
+    """DRAM of the MTP loop: a program slot per bucket and kind (with its wait entries on a
+    WAITC device: generate.prog_bytes), and the chain table ([address, instructions] per bucket
+    and kind); the sampled verify's row 1 logits (the generate loop's lg holds row 0's:
+    generate.Sampler)."""
+    nb, slot = G.buckets(cap, block), G.prog_bytes(imem_words, waitc)
     return {"progs": b.alloc(slot * NK * nb), "ptab": b.alloc(8 * NK * nb), "nb": nb,
             "slot": slot,
             "dtab": b.alloc(4 * (cap + 2)),     # tests: the draft of each position

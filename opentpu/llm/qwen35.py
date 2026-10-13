@@ -799,11 +799,13 @@ class Image(EmbedHost):
                                     M=cfg.MCOLS, embed_host=bool(embed_host),
                                     rows=self.grows,                # (layer 0's R rows)
                                     imem=cfg.IMEM_WORDS,
-                                    masks=bool(self.prefill_rows) and layer_tile_flag(None)) \
+                                    masks=bool(self.prefill_rows) and layer_tile_flag(None),
+                                    waitc=cfg.SEQ_WC) \
             if lookup else {}
         if lookup and spec.mtp:     # the MTP loop's chain area (opentpu/llm/mtp.py)
             from .mtp import gen_alloc
-            self.lookup["mtpgen"] = gen_alloc(b, cap, spec, imem_words=cfg.IMEM_WORDS)
+            self.lookup["mtpgen"] = gen_alloc(b, cap, spec, imem_words=cfg.IMEM_WORDS,
+                                              waitc=cfg.SEQ_WC)
         self.choices = {"embed_host": self.embed_host,          # (the compile worker's
                         "formats": self.formats}                # image)
         self.offload = None
@@ -1344,6 +1346,7 @@ class Image(EmbedHost):
             L = self.offload
             dev = SimpleNamespace(mbox=L.mbox, served=L.served, answer=L.answer, dir=L.dir,
                                   tag=L.tag, fmt=self.fmt, hint_off=L.layers * L.E,
+                                  slots=L.slot_bounds, ids=L.layers * L.E,
                                   scratch=self.io.get("moe_scratch"),
                                   need_off=2 * L.layers * L.E, em_base=L.slots[0][0],
                                   em_rec=MO.em_record(H, spec.moe.k),

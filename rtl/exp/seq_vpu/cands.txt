@@ -1,0 +1,94 @@
+# EXPERIMENTAL (docs/seq_vpu.md): the candidates of run_cosim.sh, "NAME K=V ...". otpu_seq's
+# simulation knobs (+hz_*, comma-separated in OTPU_SIM_PLUSARGS): tg / dg TMEM / DRAM granule
+# bits, rh / dh the reads' / DRAM ranges' hull, win the slots used, uq per-unit slot caps (DMA,
+# MXU, QUANT, VPU, COLL), ino in-order units, rob in-order slot release, wc wait counts.
+#
+# the card's sequencer: statistics and the wait-count oracle (run it before any WC candidate)
+i0 HZLOG=1 KOUT=1
+# ---- (b) the ISA unchanged, a cheaper conservative check
+rh OTPU_SIM_PLUSARGS=+hz_rh=1
+dh OTPU_SIM_PLUSARGS=+hz_dh=1
+rhdh OTPU_SIM_PLUSARGS=+hz_rh=1,+hz_dh=1 HZLOG=1
+# granules on top of the hulls: TMEM 2^G words, DRAM 2^G bytes
+g4 OTPU_SIM_PLUSARGS=+hz_rh=1,+hz_dh=1,+hz_tg=4,+hz_dg=12
+g6 OTPU_SIM_PLUSARGS=+hz_rh=1,+hz_dh=1,+hz_tg=6,+hz_dg=16 HZLOG=1
+g8 OTPU_SIM_PLUSARGS=+hz_rh=1,+hz_dh=1,+hz_tg=8,+hz_dg=20
+g10 OTPU_SIM_PLUSARGS=+hz_rh=1,+hz_dh=1,+hz_tg=10,+hz_dg=24
+g12 OTPU_SIM_PLUSARGS=+hz_rh=1,+hz_dh=1,+hz_tg=12,+hz_dg=28
+# one side at a time: TMEM alone coarse, DRAM alone coarse
+t8 OTPU_SIM_PLUSARGS=+hz_tg=8
+t11 OTPU_SIM_PLUSARGS=+hz_tg=11
+d20 OTPU_SIM_PLUSARGS=+hz_dg=20
+d26 OTPU_SIM_PLUSARGS=+hz_dg=26
+# extremes: TMEM as one region (a write conflicts with everything in TMEM), DRAM as one region
+t16 OTPU_SIM_PLUSARGS=+hz_tg=16 HZLOG=1
+d32 OTPU_SIM_PLUSARGS=+hz_dg=32 HZLOG=1
+# a smaller window
+w8 OTPU_SIM_PLUSARGS=+hz_win=8
+w12 OTPU_SIM_PLUSARGS=+hz_win=12
+# ---- (a) explicit dependencies: in-order units (exact dependencies = per-instance wait counts),
+# then per-pc wait counts from the oracle (what a compiler without loop peeling would emit)
+ino OTPU_SIM_PLUSARGS=+hz_ino=1 HZLOG=1
+# one unit at a time in order (the exact dependencies): DMA, QUANT, VPU, QUANT and VPU
+inod OTPU_SIM_PLUSARGS=+hz_inom=1
+inoq OTPU_SIM_PLUSARGS=+hz_inom=4
+inov OTPU_SIM_PLUSARGS=+hz_inom=8
+inoqv OTPU_SIM_PLUSARGS=+hz_inom=12
+wc OTPU_SIM_PLUSARGS=+hz_ino=1 WC=1 HZLOG=1
+# fewer bits a count: 2-bit fields (k clamped to 3), one bit a unit (k clamped to 1: wait for
+# all of the unit's older instructions)
+wc2 OTPU_SIM_PLUSARGS=+hz_ino=1,+hz_kclamp=3 WC=1
+wc1 OTPU_SIM_PLUSARGS=+hz_ino=1,+hz_kclamp=1 WC=1 HZLOG=1
+# a compiler that knows the ranges to 256-word / 1 MB granules only (its oracle: i0g8, run first)
+i0g8 OTPU_SIM_PLUSARGS=+hz_rh=1,+hz_dh=1,+hz_tg=8,+hz_dg=20,+hz_kc=1 KOUT=g8
+wcg8 OTPU_SIM_PLUSARGS=+hz_ino=1 WC=g8
+# the WAITC finalist (otpu_seq WAITC 1: no footprints, the counts from a sidecar word per
+# instruction, here the oracle's), bit-exact against the ISA where perf_qwen runs (--check);
+# wcr1: one bit a unit
+wcr OTPU_SEQ_WC=1 SYNC=1 HZLOG=1
+wcr1 OTPU_SEQ_WC=1 OTPU_SIM_PLUSARGS=+hz_kclamp=1 SYNC=1
+# the resident decode's counts from position 544 at 700 (lists/resident.txt)
+wcx OTPU_SEQ_WC=1 SYNCFROM=dr_q3
+# earlier designs, run on the trees that had them (OTPU_WC_OOO is gone): the compiler's counts
+# with every unit in order (8f6b749e: wcc, the run's arguments unknown; wcca: known), and with
+# the VPU out of order on a completion watermark (wcv)
+wcc OTPU_SEQ_WC=1 OTPU_WAITS=1 HZLOG=1 OTPU_WC_OOO=0
+wcca OTPU_SEQ_WC=1 OTPU_WAITS=args OTPU_WC_OOO=0
+wcv OTPU_SEQ_WC=1 OTPU_WAITS=1 HZLOG=1
+# WAITC as built: the VPU starts its oldest ready instruction and the others wait for its
+# producers by a mask; the compiler's entries (opentpu.waits: from the program alone, the run's
+# arguments bounded by their variables, compiler.Program; wcma: known), the RTL's check that
+# they cover every conflict on the window
+wcm OTPU_SEQ_WC=1 OTPU_WAITS=1 HZLOG=1
+wcma OTPU_SEQ_WC=1 OTPU_WAITS=args
+# v2's cost split (simulation): the VPU producers from today's range check instead of the
+# mask, the hold at 15 (wcmx: the mask's own cost is wcm - wcmx), at none (wcmx0: the hold's
+# cost is wcmx - wcmx0) or 24 back (wcmx24: what a 24-bit mask would give); the mask with the
+# hold at 8 (wcm8)
+wcmx OTPU_SEQ_WC=1 OTPU_WAITS=1 HZLOG=1 OTPU_SIM_PLUSARGS=+wc_vx=1
+wcmx0 OTPU_SEQ_WC=1 OTPU_WAITS=1 HZLOG=1 OTPU_SIM_PLUSARGS=+wc_vx=1,+wc_vgate=0
+wcmx24 OTPU_SEQ_WC=1 OTPU_WAITS=1 HZLOG=1 OTPU_SIM_PLUSARGS=+wc_vx=1,+wc_vgate=24
+wcm8 OTPU_SEQ_WC=1 OTPU_WAITS=1 HZLOG=1 OTPU_SIM_PLUSARGS=+wc_vgate=8
+# where WAITC's cost is: the oracle's counts with the DMA and the quantizer in order and the VPU
+# out of order (wc5), a VPU producer's dependencies exact instead of its count for every consumer
+# (wcvx1), for a VPU consumer only (wcvx2), for the other units' consumers only (wcvx3)
+wc5 OTPU_SIM_PLUSARGS=+hz_inom=5 WC=1
+wcvx1 OTPU_SIM_PLUSARGS=+hz_inom=5,+hz_wcvx=1 WC=1 HZLOG=1
+wcvx2 OTPU_SIM_PLUSARGS=+hz_inom=5,+hz_wcvx=2 WC=1
+wcvx3 OTPU_SIM_PLUSARGS=+hz_inom=5,+hz_wcvx=3 WC=1
+# per-unit queues instead of the shared window (caps per unit: DMA, MXU, QUANT, VPU, COLL)
+inoq4 OTPU_SIM_PLUSARGS=+hz_ino=1,+hz_uq=4:4:4:4:2
+wcq4 OTPU_SIM_PLUSARGS=+hz_ino=1,+hz_uq=4:4:4:4:2 WC=1
+inoq6 OTPU_SIM_PLUSARGS=+hz_ino=1,+hz_uq=6:4:6:6:2
+# a reorder buffer (slots freed in program order): what distance-based tags would need
+rob OTPU_SIM_PLUSARGS=+hz_rob=1
+# ---- the VPU at a narrower rate, today's latency (otpu_vpu +vt_*): composite chunks W columns
+# wide (+vt_cw: the composite path W lanes wide), elementwise chunks issued on one cycle in N,
+# reductions advancing on one cycle in N; DSTEP / STREAM unchanged
+v_cw4 OTPU_SIM_PLUSARGS=+vt_cw=4
+v_cw2 OTPU_SIM_PLUSARGS=+vt_cw=2
+v_cw1 OTPU_SIM_PLUSARGS=+vt_cw=1
+v_ew2 OTPU_SIM_PLUSARGS=+vt_ew=2
+v_red2 OTPU_SIM_PLUSARGS=+vt_red=2
+v_half OTPU_SIM_PLUSARGS=+vt_ew=2,+vt_cw=4,+vt_red=2
+v_quarter OTPU_SIM_PLUSARGS=+vt_ew=4,+vt_cw=2,+vt_red=4

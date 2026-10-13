@@ -463,6 +463,13 @@ class Layout:
                       tag)
 
     @property
+    def slot_bounds(self) -> tuple:
+        """The first and the last slot's addresses (a slot's word in the directory or the
+        answer is one of them: the kernels' RLD bound, isa.rld)."""
+        return (min(a for a, _ in self.slots),
+                max(a + (n - 1) * self.pitch for a, n in self.slots))
+
+    @property
     def max_ids(self) -> int:
         """The most ids a request carries."""
         return (2 if self.row2 else 1) * LINE // 4

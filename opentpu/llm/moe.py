@@ -399,7 +399,7 @@ def moe_hint(x, lw, mo: MoESpec, dev: SimpleNamespace, eps: float) -> None:
     r = b.scratch()
     lp = b.begin_loop(k)                # the k best, as the route picks them
     b.emit(I.argmax(pr.base, sel.base, 1, E, comment="hint: best"))
-    b.emit(I.rld(r, pr.base + 1, comment="its index"))
+    b.emit(I.rld(r, pr.base + 1, bound=(0, E - 1), comment="its index"))
     b.emit(I.vop(I.V_FILL, sel.base, 0, 0, 1, 1, 0, 0, 0, I.B_SCALAR, NEG, ra=r,
                  comment="knock out"))
     if k > 1:
@@ -442,7 +442,7 @@ def moe_hint_rows(x, lw, mo: MoESpec, dev: SimpleNamespace, eps: float) -> None:
             sel.set(sigmoid(lg[q, 0:E]) + ol.load(lw.ebias))
         lp = b.begin_loop(k)
         b.emit(I.argmax(pr.base, sel.base, 1, E, comment="hint: best"))
-        b.emit(I.rld(r, pr.base + 1, comment="its index"))
+        b.emit(I.rld(r, pr.base + 1, bound=(0, E - 1), comment="its index"))
         b.emit(I.vop(I.V_FILL, sel.base, 0, 0, 1, 1, 0, 0, 0, I.B_SCALAR, NEG, ra=r,
                      comment="knock out"))
         if k > 1:
@@ -461,19 +461,28 @@ def moe_hint_rows(x, lw, mo: MoESpec, dev: SimpleNamespace, eps: float) -> None:
     ol.store(Tensor(Affine(dev.mbox), (1,), (1,)), seq)
 
 
-def slot_of(r: int, word, off: int, dev: SimpleNamespace, missing: bool) -> None:
+def _ebound(dev):
+    """A directory entry's byte offset (8 a global id): its RLD bound, if the device says how
+    many ids there are."""
+    n = getattr(dev, "ids", None)
+    return (0, 8 * (n - 1)) if n else None
+
+
+def slot_of(r: int, word, off: int, dev: SimpleNamespace, missing: bool,
+            off_bound=None) -> None:
     """R[r] = the slot of the expert whose offset (TMEM word `off`: its directory entry's, or
     for a missing one its answer word's) the loop has at column 0, its data landed, and the
     slot's tag zeroed. Present: WAITW on its entry (at once). Missing: WAITW on its answer
     word (once the host has written the answer), then on the slot's tag (once the expert's
     DMA has landed: the host writes the tag in its last beat). The tag is zeroed for every
     expert the card uses, so a nonzero tag is always a later expert's (docs/offload.md 10.11).
-    word: a one-word TMEM tile."""
+    word: a one-word TMEM tile; off_bound: the offset's RLD bound (isa.rld); the slot's is the
+    pool's (dev.slots)."""
     b = current()
-    b.emit(I.rld(r, off, comment="answer word" if missing else "entry offset"))
+    b.emit(I.rld(r, off, bound=off_bound, comment="answer word" if missing else "entry offset"))
     b.waitw(word, dev.answer if missing else dev.dir, 0, I.C_NE, ra=r,
             comment="wait: its slot (the answer)" if missing else "its slot")
-    b.rld(r, word, raw=True, comment="its slot")
+    b.rld(r, word, raw=True, bound=getattr(dev, "slots", None), comment="its slot")
     if missing:
         b.waitw(word, dev.tag, 0, I.C_NE, ra=r, comment="wait: its data (the slot's tag)")
     ol.store(Tensor(Affine(dev.tag) + DevVar("expert slot", r), (1,), (1,)), ol.zeros((1,)))
@@ -541,7 +550,7 @@ def moe_ffn(x, lw, mo: MoESpec, dev: SimpleNamespace, eps: float, beside=None,
     # the k best: ARGMAX, knock-out; in the router's order, the new one to column k - 1
     lp = b.begin_loop(k)
     b.emit(I.argmax(pr.base, sel.base, 1, E, comment="moe: best"))
-    b.emit(I.rld(r, pr.base + 1, comment="its index"))
+    b.emit(I.rld(r, pr.base + 1, bound=(0, E - 1), comment="its index"))
     b.emit(I.vop(I.V_FILL, sel.base, 0, 0, 1, 1, 0, 0, 0, I.B_SCALAR, NEG, ra=r,
                  comment="knock out"))
     rotate(slice(WT, WT + 1))
@@ -581,7 +590,7 @@ def moe_ffn(x, lw, mo: MoESpec, dev: SimpleNamespace, eps: float, beside=None,
     # the directory: each entry's present flag
     col = lambda row: pe.base + row * pe.rs                       # noqa: E731 (column 0)
     lp = b.begin_loop(k)
-    b.emit(I.rld(r, col(OFF), comment="entry offset"))
+    b.emit(I.rld(r, col(OFF), bound=_ebound(dev), comment="entry offset"))
     b.emit(I.ld(dev.dir + 4, col(EP), 1, ra=r, comment="entry: present"))
     rotate()
     b.end_loop(lp)
@@ -592,15 +601,16 @@ def moe_ffn(x, lw, mo: MoESpec, dev: SimpleNamespace, eps: float, beside=None,
         """The expert whose slot is R[r], weighted, into its row of y."""
         o = swiglu_down(xe, ex.wg, ex.wu, ex.wd, act=ACTS[mo.act])
         b.check_live(o)
-        b.emit(I.rld(r, col(ROW), comment="its row"))
+        b.emit(I.rld(r, col(ROW), bound=(0, (k - 1) * y.rs), comment="its row"))
         b.emit(I.vop(I.V_MUL, y.base, o.base, col(WT), 1, H, 0, 0, 0, I.B_ROW, ra=r,
                      comment="weighted, to its row"))
 
     for flag, wait in ((EP, False), (MISS, True)):
         lp = b.begin_loop(k)
-        b.emit(I.rld(r, col(flag), comment="missing" if wait else "present"))
+        b.emit(I.rld(r, col(flag), bound=(0, 1), comment="missing" if wait else "present"))
         inner = b.begin_loop(0, rcount=r)               # (the count is read here: r is free)
-        slot_of(r, word, col(ANS) if wait else col(OFF), dev, wait)
+        slot_of(r, word, col(ANS) if wait else col(OFF), dev, wait,
+                (0, 4 * (k - 1)) if wait else _ebound(dev))
         expert()
         b.end_loop(inner)
         rotate()
@@ -661,7 +671,7 @@ def moe_ffn_rows(x, lw, mo: MoESpec, dev: SimpleNamespace, eps: float, beside=No
         wt = wts[q, :]
         lp = b.begin_loop(k)
         b.emit(I.argmax(pr.base, sel.base, 1, E, comment="moe: best"))
-        b.emit(I.rld(r, pr.base + 1, comment="its index"))
+        b.emit(I.rld(r, pr.base + 1, bound=(0, E - 1), comment="its index"))
         b.emit(I.vop(I.V_FILL, sel.base, 0, 0, 1, 1, 0, 0, 0, I.B_SCALAR, NEG, ra=r,
                      comment="knock out"))
         if k > 1:
@@ -731,7 +741,7 @@ def moe_ffn_rows(x, lw, mo: MoESpec, dev: SimpleNamespace, eps: float, beside=No
         r = b.scratch()
     col = lambda row: pe.base + row * pe.rs                       # noqa: E731 (column 0)
     lp = b.begin_loop(N)                                # the directory: present flags
-    b.emit(I.rld(r, col(OFF), comment="entry offset"))
+    b.emit(I.rld(r, col(OFF), bound=_ebound(dev), comment="entry offset"))
     b.emit(I.ld(dev.dir + 4, col(EP), 1, ra=r, comment="entry: present"))
     rotate()
     b.end_loop(lp)
@@ -746,14 +756,15 @@ def moe_ffn_rows(x, lw, mo: MoESpec, dev: SimpleNamespace, eps: float, beside=No
         o = swiglu_down(xe, ex.wg, ex.wu, ex.wd, act=ACTS[mo.act])
         b.check_live(o)
         for q in range(R):
-            b.emit(I.rld(r, col(TG + q), comment="its place for this row"))
+            b.emit(I.rld(r, col(TG + q), bound=(0, SINK), comment="its place for this row"))
             ol.store(Tensor(Affine(dev.scratch) + DevVar("place", r), (H,), (1,)), o[q, :])
 
     for flag, wait in ((EP, False), (MISS, True)):
         lp = b.begin_loop(N)
-        b.emit(I.rld(r, col(flag), comment="missing" if wait else "present"))
+        b.emit(I.rld(r, col(flag), bound=(0, 1), comment="missing" if wait else "present"))
         inner = b.begin_loop(0, rcount=r)               # (the count is read here: r is free)
-        slot_of(r, word, col(ANS) if wait else col(OFF), dev, wait)
+        slot_of(r, word, col(ANS) if wait else col(OFF), dev, wait,
+                (0, 4 * (N - 1)) if wait else _ebound(dev))
         expert()
         b.end_loop(inner)
         rotate()
@@ -866,7 +877,7 @@ def moe_prologue_rows(x, lw, mo: MoESpec, dev: SimpleNamespace, eps: float, row,
         wt = wts[q, :]
         lp = b.begin_loop(k)
         b.emit(I.argmax(pr.base, sel.base, 1, E, comment="moe: best"))
-        b.emit(I.rld(r, pr.base + 1, comment="its index"))
+        b.emit(I.rld(r, pr.base + 1, bound=(0, E - 1), comment="its index"))
         b.emit(I.vop(I.V_FILL, sel.base, 0, 0, 1, 1, 0, 0, 0, I.B_SCALAR, NEG, ra=r,
                      comment="knock out"))
         if k > 1:
@@ -1147,7 +1158,7 @@ def moe_expert_run(lw, mo: MoESpec, dev: SimpleNamespace, rows, entries, C: int 
     b.emit(I.rld(rs, PT.base, ra=rq, mul=8, comment="its directory entry"))
     b.waitw(word, dev.dir, 0, I.C_NE, ra=rs, timeout=MB.TIMEOUT,
             comment="wait: its slot (the entry)")
-    b.rld(rs, word, raw=True, comment="its slot")
+    b.rld(rs, word, raw=True, bound=getattr(dev, "slots", None), comment="its slot")
     ol.store(Tensor(Affine(dev.tag) + DevVar("expert slot", rs), (1,), (1,)), ol.zeros((1,)))
     if S:
         rf, rg = b.scratch(), b.scratch()

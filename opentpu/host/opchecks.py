@@ -42,12 +42,19 @@ A, B, RES, TE, TER = 0, 1024, 8192, 12288, 12352
 CHAIN_AT = 0x340000             # DRAM: the program the HALT CHAIN check starts
 
 
-def diag_image() -> np.ndarray:
+def diag_image(cfg=None) -> np.ndarray:
+    """The op checks' DRAM image: the demo's, the edge values and the program the HALT CHAIN
+    check chains to, with its wait entries after it on a configuration whose sequencer takes
+    them (cfg.SEQ_WC, EXPERIMENTAL: device_config's from the bitstream)."""
     img = demo_image()
     e = np.array(EDGE_BITS, np.uint32)
     img[EDGE:EDGE + 4 * NE] = e.view(np.uint8)
     img[EDGE + 4 * NE:EDGE + 8 * NE] = e[::-1].copy().view(np.uint8)
-    w = I.assemble(_chained())
+    prog = _chained()
+    w = np.asarray(I.assemble(prog), np.uint32)
+    if cfg is not None and getattr(cfg, "SEQ_WC", False):
+        from opentpu import waits as W
+        w = W.loadable(w, W.entries(w, cfg.D, cfg.S, prog=prog), cfg.D)
     img[CHAIN_AT:CHAIN_AT + 4 * len(w)] = w.view(np.uint8)
     return img
 
