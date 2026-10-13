@@ -694,6 +694,15 @@ Sessions (the lead runs them; scripts on this branch):
      - The analysis is linear in the instructions a run executes: it walks every iteration
        of each loop of known count (attend at 1,024 patches: 214,534 visits). Each visit
        checks ~68 footprints of the units' histories (75% of the time).
+     - The checks are now split by address space (waits._MemoPass, the default). A run's
+       TMEM and ACT footprints repeat while its DRAM addresses advance: attend has 977
+       distinct histories of local footprints in 214,534 visits.
+       - So a visit's local checks are kept by those histories, and the DRAM ranges are
+         checked only where an instruction has some.
+       - The entries are the same (tests: random programs over every unit, the tower's
+         programs resident and staged).
+       - Speed on the Mac: the tower's 13 programs at 1,024 patches 9.5 -> 2.4 s (attend
+         5.3x); Qwen3.5-0.8B's, Qwen3-0.6B's and LFM2.5-230M's decode programs 2.3-4.2x.
      - Since then (decision 9) `opentpu/host/vision_warm.py` computes them ahead. After the
        engine's load, a spawned process at nice 19 builds the image's layout and computes
        every count's programs' entries into the program cache's disk, most frequent first.

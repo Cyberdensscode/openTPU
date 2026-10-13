@@ -463,6 +463,25 @@ def test_the_real_towers_programs_fit_the_card():
             assert len(p) <= cfg.IMEM_WORDS // 8, (N, name, len(p))
 
 
+@pytest.mark.parametrize("staged", [False, True])
+def test_the_towers_wait_entries_are_the_exact_passes(staged):
+    """The real tower's programs at 256 patches, resident and staged (the pieces' addresses
+    from the table, RLD-bounded): waits' memoized pass (wait_counts' default) gives the exact
+    pass's entries."""
+    from opentpu import waits as WC
+    from opentpu.isasim import board_config
+    from opentpu.llm import minicpmv as MV
+    from opentpu.llm.qwen3 import _Bump
+    cfg = board_config()
+    vi = MV.VisionImage(MV.VisionSpec(), cfg, _Bump(), nmax=256, out_rows=16, resident=not staged)
+    if staged:
+        vi.set_bound(1 << 28, 1 << 30)
+    P, _ = vi.programs(256)
+    for name, (p, ra) in P.items():
+        a = WC.wait_counts(p, cfg.D, cfg.S, run_args=ra, memo=False)
+        assert np.array_equal(a, WC.wait_counts(p, cfg.D, cfg.S, run_args=ra)), name
+
+
 def test_the_warm_counts_are_the_processors():
     """vision_warm.counts: every crop's patch count the processor gives (minicpmv.crops: the
     thumbnail and the slices) of images of odd sizes at 1 and 9 slices is among them, each a
