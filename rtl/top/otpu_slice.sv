@@ -47,8 +47,10 @@ module otpu_slice
   parameter int ULANES     = LANES,   // TMEM lanes of the MXU and the quantizer (<= LANES)
   parameter int PQ_WIN     = 64,      // cycles per P/Q counter window (+bucket= in simulation)
   parameter bit HAS_DSTEP  = 1'b1,    // streams (DSTEP, STREAM): SE's tail in the VPU
-  parameter int TMEM_IMPL  = 0        // TMEM: 0 a copy per read port (FPGA block RAM), 1 banked
+  parameter int TMEM_IMPL  = 0,       // TMEM: 0 a copy per read port (FPGA block RAM), 1 banked
                                       //   (three copies of 1R1W RAMs: an ASIC; otpu_tmem)
+  parameter bit SW_REG     = 1'b0     // the SW port's outputs from a register (the ASIC block;
+                                      //   timing only: see "the SW port's output register")
 ) (
   input  logic          clk,
   input  logic          sys_rst,
@@ -108,6 +110,9 @@ module otpu_slice
   input  logic          dump
 );
   localparam int BW = $clog2(LANES);
+  // the DRAM's SW ready and write idle as the units and the arbiters see them (SW_REG: with the
+  // SW port's output register; see there)
+  logic sw_rdy_i, wr_idle_i;
   // the stream engine (docs/stream.md): the DMA moves a stream (DSTEP, STREAM) through SE in
   // the VPU; streams need 8 lanes on both sides (otpu_dma W = 8: D >= 32). Without it DSTEP and
   // STREAM are illegal instructions (otpu_seq STREAMS: the slice stops with ERROR)
@@ -161,7 +166,7 @@ module otpu_slice
   logic [2:0]  to_q;
   logic [31:0] c_addr, c_n, ic_base;
   assign srst = rst || c_rst || to_err;
-  assign halted = (sq_halted && !sq_ch) || (to_q[2] && wr_idle);
+  assign halted = (sq_halted && !sq_ch) || (to_q[2] && wr_idle_i);
   assign error = sq_err || to_err;
   assign wait_to = to_err;
   assign icount = ic_base + sq_icount;
@@ -174,7 +179,7 @@ module otpu_slice
       to_err <= 1'b1;
       if (to_err && !to_q[0]) ic_base <= ic_base + sq_icount;   // its last cycle out of reset
     end else if (!c_rst) begin
-      if (sq_halted && sq_ch && wr_idle) begin
+      if (sq_halted && sq_ch && wr_idle_i) begin
         c_rst <= 1'b1; c_ld <= 1'b1;
         c_addr <= sq_cha; c_n <= sq_chn;
         ic_base <= ic_base + sq_icount;
@@ -314,7 +319,7 @@ module otpu_slice
     .clk, .rst(rst_dma), .start(ustart[U_DMA]), .cmd(ucmd[U_DMA]), .rdy(r_dma), .done(d_dma),
     .err(dma_err), .ww_held(a_inval),
     .b_req(dma_breq), .b_gnt(b_rdy), .b_we(dma_bwe), .b_wmask(dma_bwmask), .b_wdata(dma_bwdata),
-    .b_addr(dma_baddr), .b_rvalid(b_rvalid && b_rtag), .b_rdata, .wr_idle,
+    .b_addr(dma_baddr), .b_rvalid(b_rvalid && b_rtag), .b_rdata, .wr_idle(wr_idle_i),
     .t_ren(dma_ren), .t_raddr(dma_raddr), .t_rdata(r_data[P_DMA]),
     .t_wen(dma_wen), .t_waddr(dma_waddr), .t_wdata(dma_wdata),
     .ss_req, .ss_gnt, .ss_cfg, .ss_pe, .ss_in_v, .ss_in_d, .ss_fk, .ss_fi, .ss_fd,
@@ -343,7 +348,7 @@ module otpu_slice
     .t_ren2(q_ren2), .t_raddr2(q_raddr2), .t_rdata2(r_data[P_Q2][ULANES-1:0]),
     .t_ren3(q3_en), .t_raddr3(q3_addr), .t_rdata3(r_data[P_Q3][0]),
     .act_we, .act_row, .act_idx, .act_data, .act_dup, .act_off, .asc_we, .asc_row, .asc_blk, .asc_data,
-    .a_want(q_awant), .wr_idle,
+    .a_want(q_awant), .wr_idle(wr_idle_i),
     .a_req(q_areq), .a_we(q_awe), .a_addr(q_aaddr), .a_wdata(q_awdata), .a_be(q_abe),
     .pf_u(q_u), .pf_frz(q_frz));
 
@@ -476,7 +481,7 @@ module otpu_slice
     for (int g = 0; g < NG; g++) begin
       aok[g] = 1'b1;
       for (int h = 0; h < g; h++) if (aok[h] && acf[g][h]) aok[g] = 1'b0;
-      if (g == G_Q && q_awant && !sw_rdy) aok[g] = 1'b0;   // QST write the DRAM cannot take
+      if (g == G_Q && q_awant && !sw_rdy_i) aok[g] = 1'b0;   // QST write the DRAM cannot take
       if ((g == G_Q && q3_blk) || (g == G_COLL && coll_blk)) aok[g] = 1'b0;
     end
     gnt_m = aok;
@@ -527,7 +532,7 @@ module otpu_slice
       ok = 1'b1;
       for (int b = 0; b < LANES; b++)
         if (rc[b] + ur[b] > RPB || wc[b] + uw[b] > WPB) ok = 1'b0;
-      if (g == G_Q && q_awant && !sw_rdy) ok = 1'b0;    // QST write the DRAM cannot take
+      if (g == G_Q && q_awant && !sw_rdy_i) ok = 1'b0;    // QST write the DRAM cannot take
       if ((g == G_Q && q3_blk) || (g == G_COLL && coll_blk)) ok = 1'b0;
       if (g == G_COLL) begin
         cgl_c = ok;
@@ -565,7 +570,7 @@ module otpu_slice
           for (int l = 0; l < LANES; l++)
             if (wq_en[p][l]) vk[w_addr[p][l][BW-1:0]] = 1'b1;
       if ((rk & uk) != '0 || (wk & vk) != '0) ok = 1'b0;
-      if (g == G_Q && q_awant && !sw_rdy) ok = 1'b0;    // QST write the DRAM cannot take
+      if (g == G_Q && q_awant && !sw_rdy_i) ok = 1'b0;    // QST write the DRAM cannot take
       if (g == G_COLL) begin
         cgl_k = ok;
         gnt_k[g] = coll_gnt;      // every slice must grant the collective
@@ -576,6 +581,41 @@ module otpu_slice
     end
   end
 
+  // ---- the SW port's output register (SW_REG: the ASIC block, docs/asic.md "The ports"): the
+  // QST writes leave the slice from flip-flops, not through the quantizer's scale-row words and
+  // the TMEM grant. The register takes a write when it is empty or drains this cycle (sw_rdy_i,
+  // what the arbiters see: sw_rdy does not depend on sw_req), and a write in it counts as one
+  // the DRAM has not taken (wr_idle_i), so a QST, a HALT CHAIN and a WAITW timeout still end
+  // only once the DRAM has every write. Only the loader's reset clears it: a write the
+  // quantizer gave before a run's reset (rst) still goes out, as without the register.
+  wire         sw_req_c = q_areq && q_awe;
+  if (SW_REG) begin : g_swr
+    logic sw_v;
+    assign sw_rdy_i  = !sw_v || sw_rdy;
+    assign wr_idle_i = wr_idle && !sw_v;
+    assign sw_req    = sw_v;
+    always_ff @(posedge clk) begin
+      if (sys_rst) sw_v <= 1'b0;
+      else if (sw_rdy_i) sw_v <= sw_req_c;
+      if (sw_rdy_i && sw_req_c) begin
+        sw_addr <= q_aaddr; sw_wdata <= q_awdata; sw_be <= q_abe;
+      end
+    end
+  end else begin : g_swc
+    assign sw_rdy_i  = sw_rdy;
+    assign wr_idle_i = wr_idle;
+    assign sw_req    = sw_req_c;
+    assign sw_addr   = q_aaddr;
+    assign sw_wdata  = q_awdata;
+    assign sw_be     = q_abe;
+  end
+`ifndef SYNTHESIS
+  // the arbiters withhold the quantizer's grant while the port cannot take its write
+  always @(posedge clk)
+    if (!sys_rst && sw_req_c && !sw_rdy_i)
+      $fatal(1, "otpu_slice: a QST write the SW port cannot take");
+`endif
+
   // ---- DRAM ports
   assign mxu_bgnt = !dma_breq && b_rdy;
   assign mxu_agnt = a_rdy;
@@ -585,10 +625,6 @@ module otpu_slice
     a_addr   = mxu_aaddr;
     a_wdata  = '0;
     a_be     = '0;
-    sw_req   = q_areq && q_awe;
-    sw_addr  = q_aaddr;
-    sw_wdata = q_awdata;
-    sw_be    = q_abe;
     b_req   = dma_breq | mxu_breq;
     b_tag   = dma_breq;
     b_we    = dma_bwe;

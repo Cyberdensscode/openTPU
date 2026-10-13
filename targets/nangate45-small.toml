@@ -34,6 +34,7 @@ FIFO_DEPTH = 64
 TRACE_DEPTH = 0
 PQ_WIN = 1024
 CHASH = false
+SW_REG = true
 
 [tech]
 family = "asic"

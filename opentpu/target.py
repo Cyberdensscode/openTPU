@@ -47,7 +47,7 @@ FAMILIES = ("generic", "xilinx7", "xilinxus", "asic")
 UARCH_KEYS = ("MXU_IMPL", "MXU_CL", "VPU_CL", "ULANES", "TMEM_IMPL", "RPB", "WPB", "WIN",
               "FIFO_DEPTH", "TRACE_DEPTH", "PQ_WIN", "CHASH")
 # and the optional ones (absent: the RTL's default): MXU_E, the MXU's epilogue lanes (0: MCOLS / 2;
-# above MCOLS: MCOLS)
+# above MCOLS: MCOLS); SW_REG, the slice's SW port (QST writes) from a register (otpu_slice)
 PLATFORM_KEYS = ("board", "core_mhz", "mem", "channels_per_slice", "channel_bytes", "beat_bytes",
                  "host")
 # The slice's TMEM read ports (otpu_slice NRP) and the most lanes a simulation may set
@@ -219,6 +219,8 @@ def sim_uarch(t: Target | str | None = None) -> dict:
         d["TMEM_IMPL"] = u["TMEM_IMPL"]
     if u.get("MXU_E"):
         d["MXU_E"] = u["MXU_E"]
+    if u.get("SW_REG"):
+        d["SW_REG"] = int(u["SW_REG"])
     return d
 
 
