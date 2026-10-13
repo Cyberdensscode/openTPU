@@ -533,6 +533,27 @@ Results (hwe-bench, ISA simulator):
 
   The ViT MLPs stay int8. The first token's dKL hardly moves with the rows; the reply's dKL
   (HF's greedy reply teacher-forced with each variant's rows) follows.
+- **The 0.776 row** is one row of 203: cats.jpg's second crop (40 x 28), output row 68, its
+  bottom edge (refract.png's worst is 0.957; the next worst of cats.jpg 0.978). Stage by stage
+  on the ISA simulator against the fp32 reference (scratch vit_stages2.py, the row's 16 patches
+  and 4 merged rows tracked):
+  - through layer 6 and the window merger every row stays at cosine >= 0.998, the row's own
+    16 and 4 at >= 0.9993;
+  - from layer 9 the residual holds a massive activation (|x| ~810, one row's channel 514), and
+    from layer 12 a few rows drift, the row's merged row from 0.9988 (layer 11) to 0.979
+    (12), 0.953 (15), 0.916 (24) and 0.718 (25); the error sits in its largest channels
+    (875: -30.6 against -19.9 at layer 25);
+  - the post LayerNorm brings it to 0.945 and the projector's 2 x 2 merge to 0.776.
+
+  It is int8's precision, not a fault of the card's: the fp32 reference with the MXU's numerics
+  (quant.fake_w, fake_act, mx_matmul; scratch vit_emul.py, the Mac, torchvision 0.28's crop)
+  gives the row 0.737 at layer 25 and 0.820 out, the worst row too. One operand at a time
+  (layer 25 / out): the weights int8 0.831 / 0.956, the LayerNorm outputs 0.928 / 0.994, the
+  MLP's hidden 0.928 / 0.994; Q, K, V, P and the attention output 0.990 or more. Of the
+  weights, fc2 (0.939) and layers 0-6 (0.855 alone; layers 18-26 0.9998) count most: a
+  perturbation of the row before the merge grows through the late layers. bf16 weights and
+  inputs (HF's own dtype) keep it at 0.998 / 0.9999. The language model hardly sees it (the
+  first token's dKL 3.3e-7); the reply's dKL is the measure.
 - End to end on a tiny MiniCPM-V with the real tokenizer: otpu-chat's prompt ids equal HF's
   processor's in a 3-turn conversation with 2 images.
 
