@@ -172,7 +172,8 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
            layer_ahead=None, expert_major: bool | None = None, em_rows: int | None = None,
            em_pass: int | None = None, ahead_part: int | None = None,
            idle_parts: str = "v2", willneed: bool = True, pool_map: bool = True,
-           release_weights: bool = True, create: bool = False, W=None, **kw):
+           release_weights: bool = True, create: bool = False, W=None,
+           vision_staged: bool | None = None, **kw):
     """The Engine of the MoE checkpoint at `model` on `backend` ("isa", or a backend factory
     as Engine takes: the card's BoardBackend) with configuration `cfg` (the card's 4 GiB), its
     experts streamed from `pool` (a path; DEFAULT: the checkpoint's, default_pool; None: packed
@@ -195,7 +196,8 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
     idle_parts: ExpertServer's read ahead and halt-aware parts (IDLE_PARTS); willneed: a
     request's disk reads queued at once (PoolFile.willneed); pool_map, release_weights:
     Engine's. create: a missing pool is made and each expert packed on its first use (else
-    check_pool). W: the weights (default LazyWeights of `model`). kw: Engine's own."""
+    check_pool). W: the weights (default LazyWeights of `model`). vision_staged: MiniCPM-V's
+    Spec.vision_staged (None: the Spec's). kw: Engine's own."""
     from opentpu.llm import load_spec
     from opentpu.llm.qwen3 import Engine, LazyWeights
     if idle_parts not in IDLE_PARTS:
@@ -209,6 +211,8 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
         spec = replace(spec, embed=embed)
     if hints is not None:                       # (default: the Spec's)
         spec = replace(spec, moe=replace(spec.moe, hint=hints))
+    if vision_staged is not None:               # (MiniCPM-V: its tower through the slots)
+        spec = replace(spec, vision_staged=vision_staged)
     W = LazyWeights(model) if W is None else W
     ekw = {} if embed_host is None else {"embed_host": embed_host}   # (default: the image's)
     img = probe(spec, cfg, cap, wformat=wformat, head_format=head_format, lookup=True, **ekw)

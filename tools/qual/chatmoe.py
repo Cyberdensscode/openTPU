@@ -132,7 +132,7 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
         experts: int = 0, layer_major: int | None = None, sample: bool = False,
         seed: int = 0, create: bool = False, tok=None, em_rows: int | None = None,
         trace: list | None = None, em_pass: int | None = None, images=(),
-        max_slices: int | None = None) -> dict:
+        max_slices: int | None = None, vision_staged: bool | None = None) -> dict:
     from opentpu.host import chat as C
     from opentpu.host import streamed as ST
     from opentpu.isasim import board_config
@@ -153,6 +153,7 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
     eng = ST.engine(path, cfg or board_config(), be, cap, pool or ST.DEFAULT, experts=experts,
                     wformat=wformat, head_format=head, formats=formats, layer_major=layer_major,
                     create=create, snapshots=C.SNAPSHOTS,     # (otpu-chat's: its turns roll back)
+                    vision_staged=vision_staged,              # (MiniCPM-V: None, the Spec's)
                     **({} if em_rows is None else {"em_rows": em_rows}),    # (13.16)
                     **({} if em_pass is None else {"em_pass": em_pass}))    # (13.18)
     load_s = time.time() - t
@@ -171,6 +172,7 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
                expert_major=eng.expert_major, em_rows=getattr(eng, "em_rows", 0),
                em_pass=getattr(eng, "em_pass", None),
                on_card=chat.on_card, load_s=round(load_s, 1), max_slices=max_slices,
+               vision_staged=getattr(getattr(eng.image, "vision", None), "resident", True) is False,
                images=[dict(turn=i, path=str(f), sha256=hashlib.sha256(
                    Path(f).read_bytes()).hexdigest()) for i, f in images], turns=[])
     for k, text in enumerate(turns, 1):
@@ -238,6 +240,9 @@ def main(argv=None) -> int:
                     help="an image for turn N (1-based; repeated): a model with a vision side")
     ap.add_argument("--max-slices", type=int, help="an image's slices at most (default the "
                                                    "processor's)")
+    ap.add_argument("--vision-staged", action="store_true",
+                    help="MiniCPM-V's tower weights staged through the expert slots "
+                         "(minicpmv.Spec.vision_staged; the pool grows by their entries)")
     ap.add_argument("--sample", action="store_true", help="the model's sampling defaults")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--check", help="a reference run's JSON: its tokens, turn by turn")
@@ -252,7 +257,8 @@ def main(argv=None) -> int:
         images.append((int(n), Path(f)))
     r = run(a.model, a.backend, a.cfg, a.dev, a.turn or TURNS, a.max_new, a.cap, a.pool,
             a.experts, a.layer_major, a.sample, a.seed, a.pool_create, em_rows=a.em_rows,
-            trace=tr, em_pass=a.em_pass, images=images, max_slices=a.max_slices)
+            trace=tr, em_pass=a.em_pass, images=images, max_slices=a.max_slices,
+            vision_staged=a.vision_staged or None)
     for i, t in enumerate(r["turns"]):
         print(f"turn {i + 1}: {t['reply']!r}\n  {t['line']}", flush=True)
         for c in t["calls"]:
