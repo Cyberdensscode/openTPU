@@ -11,7 +11,7 @@
 // Device     : xc7k480t-ffg1156-2
 // Hierarchy  : disabled
 // LiteX sha1 : --------
-// Date       : 2026-10-02 06:00:42
+// Date       : 2026-10-13 09:55:28
 //------------------------------------------------------------------------------
 
 `timescale 1ns / 1ps
@@ -335,22 +335,11 @@ OTPULiteDRAM
 │    ├── bitslip_152 (BitSlip) [Gen]
 │    ├── tappeddelayline_2 (TappedDelayLine) [Gen]
 │    ├── tappeddelayline_3 (TappedDelayLine) [Gen]
-│    ├── [BB:IOBUF]
-│    ├── [BB:ISERDESE2]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
@@ -363,12 +352,6 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
@@ -380,7 +363,6 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
@@ -407,61 +389,6 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
@@ -506,7 +433,6 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
@@ -571,26 +497,94 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
-│    ├── [BB:IOBUFDS]
 │    ├── [BB:FDRE]
-│    ├── [BB:IOBUFDS]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:IOBUF]
 │    ├── [BB:IOBUF]
 │    ├── [BB:IOBUFDS]
 │    ├── [BB:IOBUFDS]
+│    ├── [BB:IOBUF]
+│    ├── [BB:IOBUFDS]
+│    ├── [BB:IOBUFDS]
+│    ├── [BB:IOBUFDS]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:IOBUFDS]
+│    ├── [BB:IOBUF]
 │    ├── [BB:IOBUFDS]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:IOBUFDS]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:IOBUFDS]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
@@ -599,37 +593,33 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:IOBUFDS]
 │    ├── [BB:OSERDESE2]
-│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
 │    ├── [BB:IDELAYE2]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:ISERDESE2]
 │    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:ISERDESE2]
 │    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:ISERDESE2]
 │    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
 │    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
 │    ├── [BB:ISERDESE2]
 │    ├── [BB:IDELAYE2]
 │    ├── [BB:IOBUF]
@@ -709,7 +699,6 @@ OTPULiteDRAM
 │    ├── [BB:IDELAYE2]
 │    ├── [BB:IOBUF]
 │    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:ISERDESE2]
 │    ├── [BB:IDELAYE2]
@@ -742,33 +731,8 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
 │    ├── [BB:IOBUF]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
 │    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:ISERDESE2]
@@ -914,7 +878,43 @@ OTPULiteDRAM
 │    ├── [BB:ISERDESE2]
 │    ├── [BB:IDELAYE2]
 │    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
 │    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:ISERDESE2]
@@ -1281,9 +1281,8 @@ OTPULiteDRAM
 │    ├── bitslip_152 (BitSlip) [Gen]
 │    ├── tappeddelayline_2 (TappedDelayLine) [Gen]
 │    ├── tappeddelayline_3 (TappedDelayLine) [Gen]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
+│    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:OBUFDS]
 │    ├── [BB:FDRE]
@@ -1330,78 +1329,6 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
@@ -1515,10 +1442,77 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
-│    ├── [BB:IOBUFDS]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
-│    ├── [BB:IOBUFDS]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
 │    ├── [BB:IOBUFDS]
@@ -1532,6 +1526,12 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:IOBUFDS]
 │    ├── [BB:OSERDESE2]
+│    ├── [BB:IOBUFDS]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:IOBUFDS]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
 │    ├── [BB:IOBUFDS]
 │    ├── [BB:OSERDESE2]
@@ -1552,97 +1552,10 @@ OTPULiteDRAM
 │    ├── [BB:IDELAYE2]
 │    ├── [BB:IOBUF]
 │    ├── [BB:FDRE]
-│    ├── [BB:IOBUF]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:ISERDESE2]
 │    ├── [BB:IDELAYE2]
 │    ├── [BB:IOBUF]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:FDRE]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:IDELAYE2]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:ISERDESE2]
@@ -1746,7 +1659,29 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
 │    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:ISERDESE2]
 │    ├── [BB:IDELAYE2]
@@ -1801,6 +1736,71 @@ OTPULiteDRAM
 │    ├── [BB:ISERDESE2]
 │    ├── [BB:IDELAYE2]
 │    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:IDELAYE2]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:ISERDESE2]
@@ -2993,6 +2993,7 @@ reg     [3:0] crg_reset_counter = 4'd15;
 reg           crg_rst0 = 1'd0;
 (* max_fanout = 64 *)
 reg           crg_rst1 = 1'd1;
+reg           crg_rst_t0 = 1'd1;
 (* dont_touch = "true" *)
 wire          crg_s7mmcm_clkin_signal;
 wire          crg_s7mmcm_clkout;
@@ -3867,8 +3868,7 @@ wire          interface0_bank_bus_we;
 wire    [1:0] interface0_bte;
 wire    [2:0] interface0_cti;
 wire          interface0_cyc;
-reg    [31:0] interface0_dat_r0 = 32'd0;
-wire   [31:0] interface0_dat_r1;
+reg    [31:0] interface0_dat_r = 32'd0;
 wire   [31:0] interface0_dat_w0;
 reg    [31:0] interface0_dat_w1 = 32'd0;
 reg           interface0_err = 1'd0;
@@ -3936,25 +3936,38 @@ reg    [31:0] interface2_bank_bus_dat_r = 32'd0;
 wire   [31:0] interface2_bank_bus_dat_w;
 wire          interface2_bank_bus_re;
 wire          interface2_bank_bus_we;
-wire   [31:0] interface2_dat_r;
 reg    [31:0] interface2_dat_w = 32'd0;
 reg           interface2_re = 1'd0;
 reg           interface2_we = 1'd0;
+reg    [13:0] interface3_adr = 14'd0;
 wire   [13:0] interface3_bank_bus_adr;
 reg    [31:0] interface3_bank_bus_dat_r = 32'd0;
 wire   [31:0] interface3_bank_bus_dat_w;
 wire          interface3_bank_bus_re;
 wire          interface3_bank_bus_we;
+wire   [31:0] interface3_dat_r;
+reg    [31:0] interface3_dat_w = 32'd0;
+reg           interface3_re = 1'd0;
+reg           interface3_we = 1'd0;
+reg    [13:0] interface4_adr = 14'd0;
 wire   [13:0] interface4_bank_bus_adr;
 reg    [31:0] interface4_bank_bus_dat_r = 32'd0;
 wire   [31:0] interface4_bank_bus_dat_w;
 wire          interface4_bank_bus_re;
 wire          interface4_bank_bus_we;
+reg    [31:0] interface4_dat_w = 32'd0;
+reg           interface4_re = 1'd0;
+reg           interface4_we = 1'd0;
+reg    [13:0] interface5_adr = 14'd0;
 wire   [13:0] interface5_bank_bus_adr;
 reg    [31:0] interface5_bank_bus_dat_r = 32'd0;
 wire   [31:0] interface5_bank_bus_dat_w;
 wire          interface5_bank_bus_re;
 wire          interface5_bank_bus_we;
+wire   [31:0] interface5_dat_r;
+reg    [31:0] interface5_dat_w = 32'd0;
+reg           interface5_re = 1'd0;
+reg           interface5_we = 1'd0;
 wire   [13:0] interface6_bank_bus_adr;
 reg    [31:0] interface6_bank_bus_dat_r = 32'd0;
 wire   [31:0] interface6_bank_bus_dat_w;
@@ -5434,8 +5447,7 @@ reg     [7:0] litedramcore0_time0 = 8'd0;
 reg     [6:0] litedramcore0_time1 = 7'd0;
 wire   [10:0] litedramcore0_timer_count0;
 reg    [10:0] litedramcore0_timer_count1 = 11'd1041;
-wire          litedramcore0_timer_done0;
-wire          litedramcore0_timer_done1;
+reg           litedramcore0_timer_done = 1'd0;
 wire          litedramcore0_timer_wait;
 reg           litedramcore0_trrdcon_count = 1'd0;
 (* dont_touch = "true" *)
@@ -5458,8 +5470,7 @@ reg           litedramcore0_zqcs_executer_start = 1'd0;
 reg     [4:0] litedramcore0_zqcs_executer_trigger = 5'd0;
 wire   [26:0] litedramcore0_zqcs_timer_count0;
 reg    [26:0] litedramcore0_zqcs_timer_count1 = 27'd133332999;
-wire          litedramcore0_zqcs_timer_done0;
-wire          litedramcore0_zqcs_timer_done1;
+reg           litedramcore0_zqcs_timer_done = 1'd0;
 wire          litedramcore0_zqcs_timer_wait;
 reg           litedramcore1_bankmachine10_auto_precharge = 1'd0;
 reg    [14:0] litedramcore1_bankmachine10_cmd_payload_a = 15'd0;
@@ -6917,8 +6928,7 @@ reg     [7:0] litedramcore1_time0 = 8'd0;
 reg     [6:0] litedramcore1_time1 = 7'd0;
 wire   [10:0] litedramcore1_timer_count0;
 reg    [10:0] litedramcore1_timer_count1 = 11'd1041;
-wire          litedramcore1_timer_done0;
-wire          litedramcore1_timer_done1;
+reg           litedramcore1_timer_done = 1'd0;
 wire          litedramcore1_timer_wait;
 reg           litedramcore1_trrdcon_count = 1'd0;
 (* dont_touch = "true" *)
@@ -6941,8 +6951,7 @@ reg           litedramcore1_zqcs_executer_start = 1'd0;
 reg     [4:0] litedramcore1_zqcs_executer_trigger = 5'd0;
 wire   [26:0] litedramcore1_zqcs_timer_count0;
 reg    [26:0] litedramcore1_zqcs_timer_count1 = 27'd133332999;
-wire          litedramcore1_zqcs_timer_done0;
-wire          litedramcore1_zqcs_timer_done1;
+reg           litedramcore1_zqcs_timer_done = 1'd0;
 wire          litedramcore1_zqcs_timer_wait;
 wire   [24:0] litedramcrossbar0_cmd_payload_addr;
 wire          litedramcrossbar0_cmd_payload_we;
@@ -18233,6 +18242,12 @@ wire          nativeportsecc1_r_source_valid;
 wire          nativeportsecc1_sec_errors_rd_stb;
 reg    [31:0] nativeportsecc1_sec_errors_status = 32'd0;
 reg           nativeportsecc1_sec_errors_wr_stb = 1'd0;
+reg    [31:0] q0 = 32'd0;
+reg    [31:0] q1 = 32'd0;
+reg    [31:0] q2 = 32'd0;
+reg    [31:0] q3 = 32'd0;
+reg    [31:0] q4 = 32'd0;
+reg    [31:0] q5 = 32'd0;
 wire   [31:0] r_addr;
 wire   [35:0] r_cdc_cdc_asyncfifo_din;
 wire   [35:0] r_cdc_cdc_asyncfifo_dout;
@@ -18291,9 +18306,6 @@ wire   [31:0] r_cdc_source_source_payload_data;
 wire    [1:0] r_cdc_source_source_payload_resp;
 wire          r_cdc_source_source_ready;
 wire          r_cdc_source_source_valid;
-reg    [31:0] rd0 = 32'd0;
-reg    [31:0] rd1 = 32'd0;
-reg    [31:0] rd2 = 32'd0;
 wire    [1:0] request;
 reg     [1:0] reset_storage = 2'd0;
 reg           reset_wr_stb = 1'd0;
@@ -21092,7 +21104,7 @@ always @(*) begin
     shared_ack = 1'd0;
     shared_dat_r = 32'd0;
     shared_ack = interface0_ack;
-    shared_dat_r = ({32{slaves}} & interface0_dat_r0);
+    shared_dat_r = ({32{slaves}} & interface0_dat_r);
     if (done) begin
         shared_dat_r = 32'hffffffff;
         shared_ack = 1'd1;
@@ -26770,18 +26782,14 @@ assign litedramcore0_bankmachine7_req_addr = litedramcore0_interface_bank7_addr;
 assign litedramcore0_interface_bank7_lock = litedramcore0_bankmachine7_req_lock;
 assign litedramcore0_interface_bank7_wdata_ready = litedramcore0_bankmachine7_req_wdata_ready;
 assign litedramcore0_interface_bank7_rdata_valid = litedramcore0_bankmachine7_req_rdata_valid;
-assign litedramcore0_timer_wait = (~litedramcore0_timer_done0);
-assign litedramcore0_postponer_req_i = litedramcore0_timer_done0;
+assign litedramcore0_timer_wait = (~litedramcore0_timer_done);
+assign litedramcore0_postponer_req_i = litedramcore0_timer_done;
 assign litedramcore0_wants_refresh = litedramcore0_postponer_req_o;
-assign litedramcore0_wants_zqcs = litedramcore0_zqcs_timer_done0;
+assign litedramcore0_wants_zqcs = litedramcore0_zqcs_timer_done;
 assign litedramcore0_zqcs_timer_wait = (~litedramcore0_zqcs_executer_done);
-assign litedramcore0_timer_done1 = (litedramcore0_timer_count1 == 1'd0);
-assign litedramcore0_timer_done0 = litedramcore0_timer_done1;
 assign litedramcore0_timer_count0 = litedramcore0_timer_count1;
 assign litedramcore0_sequencer_start1 = (litedramcore0_sequencer_start0 | (litedramcore0_sequencer_count != 1'd0));
 assign litedramcore0_sequencer_done0 = (litedramcore0_sequencer_done1 & (litedramcore0_sequencer_count == 1'd0));
-assign litedramcore0_zqcs_timer_done1 = (litedramcore0_zqcs_timer_count1 == 1'd0);
-assign litedramcore0_zqcs_timer_done0 = litedramcore0_zqcs_timer_done1;
 assign litedramcore0_zqcs_timer_count0 = litedramcore0_zqcs_timer_count1;
 always @(*) begin
     litedramcore0_cmd_last = 1'd0;
@@ -45531,18 +45539,14 @@ assign litedramcore1_bankmachine15_req_addr = litedramcore1_interface_bank7_addr
 assign litedramcore1_interface_bank7_lock = litedramcore1_bankmachine15_req_lock;
 assign litedramcore1_interface_bank7_wdata_ready = litedramcore1_bankmachine15_req_wdata_ready;
 assign litedramcore1_interface_bank7_rdata_valid = litedramcore1_bankmachine15_req_rdata_valid;
-assign litedramcore1_timer_wait = (~litedramcore1_timer_done0);
-assign litedramcore1_postponer_req_i = litedramcore1_timer_done0;
+assign litedramcore1_timer_wait = (~litedramcore1_timer_done);
+assign litedramcore1_postponer_req_i = litedramcore1_timer_done;
 assign litedramcore1_wants_refresh = litedramcore1_postponer_req_o;
-assign litedramcore1_wants_zqcs = litedramcore1_zqcs_timer_done0;
+assign litedramcore1_wants_zqcs = litedramcore1_zqcs_timer_done;
 assign litedramcore1_zqcs_timer_wait = (~litedramcore1_zqcs_executer_done);
-assign litedramcore1_timer_done1 = (litedramcore1_timer_count1 == 1'd0);
-assign litedramcore1_timer_done0 = litedramcore1_timer_done1;
 assign litedramcore1_timer_count0 = litedramcore1_timer_count1;
 assign litedramcore1_sequencer_start1 = (litedramcore1_sequencer_start0 | (litedramcore1_sequencer_count != 1'd0));
 assign litedramcore1_sequencer_done0 = (litedramcore1_sequencer_done1 & (litedramcore1_sequencer_count == 1'd0));
-assign litedramcore1_zqcs_timer_done1 = (litedramcore1_zqcs_timer_count1 == 1'd0);
-assign litedramcore1_zqcs_timer_done0 = litedramcore1_zqcs_timer_done1;
 assign litedramcore1_zqcs_timer_count0 = litedramcore1_zqcs_timer_count1;
 always @(*) begin
     litedramcore1_cmd_last = 1'd0;
@@ -59088,7 +59092,7 @@ always @(*) begin
 end
 always @(*) begin
     interface0_ack = 1'd0;
-    interface0_dat_r0 = 32'd0;
+    interface0_dat_r = 32'd0;
     interface1_adr0_wishbone2csrwait_next_value2 = 14'd0;
     interface1_adr0_wishbone2csrwait_next_value_ce2 = 1'd0;
     interface1_dat_w0_wishbone2csrwait_next_value0 = 32'd0;
@@ -59113,10 +59117,10 @@ always @(*) begin
         end
         2'd2: begin
             interface0_ack = 1'd1;
-            interface0_dat_r0 = 1'd0;
+            interface0_dat_r = 1'd0;
             case (selected_r)
                 1'd0: begin
-                    interface0_dat_r0 = interface1_dat_r0;
+                    interface0_dat_r = interface1_dat_r0;
                 end
             endcase
             wishbone2csrwait_next_state = 1'd0;
@@ -59125,6 +59129,12 @@ always @(*) begin
             wishbone2csrwait_next_state = 3'd4;
         end
         3'd4: begin
+            wishbone2csrwait_next_state = 3'd5;
+        end
+        3'd5: begin
+            wishbone2csrwait_next_state = 3'd6;
+        end
+        3'd6: begin
             wishbone2csrwait_next_state = 2'd2;
         end
         default: begin
@@ -61583,78 +61593,78 @@ assign csrbank15_drp_dat_r_w = writeclocks1_drp_dat_r_status;
 assign writeclocks1_drp_dat_r_rd_stb = csrbank15_drp_dat_r_we;
 assign csrbank15_drp_drdy_w = writeclocks1_drp_drdy_status;
 assign writeclocks1_drp_drdy_rd_stb = csrbank15_drp_drdy_we;
-assign interface0_bank_bus_adr = interface0_adr1;
-assign interface2_bank_bus_adr = interface0_adr1;
-assign interface5_bank_bus_adr = interface0_adr1;
-assign interface7_bank_bus_adr = interface0_adr1;
-assign interface9_bank_bus_adr = interface0_adr1;
-assign interface11_bank_bus_adr = interface0_adr1;
-assign interface14_bank_bus_adr = interface0_adr1;
-assign interface0_bank_bus_re = interface0_re;
-assign interface2_bank_bus_re = interface0_re;
-assign interface5_bank_bus_re = interface0_re;
-assign interface7_bank_bus_re = interface0_re;
-assign interface9_bank_bus_re = interface0_re;
-assign interface11_bank_bus_re = interface0_re;
-assign interface14_bank_bus_re = interface0_re;
-assign interface0_bank_bus_we = interface0_we1;
-assign interface2_bank_bus_we = interface0_we1;
-assign interface5_bank_bus_we = interface0_we1;
-assign interface7_bank_bus_we = interface0_we1;
-assign interface9_bank_bus_we = interface0_we1;
-assign interface11_bank_bus_we = interface0_we1;
-assign interface14_bank_bus_we = interface0_we1;
-assign interface0_bank_bus_dat_w = interface0_dat_w1;
-assign interface2_bank_bus_dat_w = interface0_dat_w1;
-assign interface5_bank_bus_dat_w = interface0_dat_w1;
-assign interface7_bank_bus_dat_w = interface0_dat_w1;
-assign interface9_bank_bus_dat_w = interface0_dat_w1;
-assign interface11_bank_bus_dat_w = interface0_dat_w1;
-assign interface14_bank_bus_dat_w = interface0_dat_w1;
-assign interface0_dat_r1 = ((((((interface0_bank_bus_dat_r | interface2_bank_bus_dat_r) | interface5_bank_bus_dat_r) | interface7_bank_bus_dat_r) | interface9_bank_bus_dat_r) | interface11_bank_bus_dat_r) | interface14_bank_bus_dat_r);
-assign interface1_bank_bus_adr = interface1_adr1;
-assign interface3_bank_bus_adr = interface1_adr1;
-assign interface6_bank_bus_adr = interface1_adr1;
-assign interface8_bank_bus_adr = interface1_adr1;
-assign interface10_bank_bus_adr = interface1_adr1;
-assign interface12_bank_bus_adr = interface1_adr1;
-assign interface15_bank_bus_adr = interface1_adr1;
-assign interface1_bank_bus_re = interface1_re1;
-assign interface3_bank_bus_re = interface1_re1;
-assign interface6_bank_bus_re = interface1_re1;
-assign interface8_bank_bus_re = interface1_re1;
-assign interface10_bank_bus_re = interface1_re1;
-assign interface12_bank_bus_re = interface1_re1;
-assign interface15_bank_bus_re = interface1_re1;
-assign interface1_bank_bus_we = interface1_we1;
-assign interface3_bank_bus_we = interface1_we1;
-assign interface6_bank_bus_we = interface1_we1;
-assign interface8_bank_bus_we = interface1_we1;
-assign interface10_bank_bus_we = interface1_we1;
-assign interface12_bank_bus_we = interface1_we1;
-assign interface15_bank_bus_we = interface1_we1;
-assign interface1_bank_bus_dat_w = interface1_dat_w1;
-assign interface3_bank_bus_dat_w = interface1_dat_w1;
-assign interface6_bank_bus_dat_w = interface1_dat_w1;
-assign interface8_bank_bus_dat_w = interface1_dat_w1;
-assign interface10_bank_bus_dat_w = interface1_dat_w1;
-assign interface12_bank_bus_dat_w = interface1_dat_w1;
-assign interface15_bank_bus_dat_w = interface1_dat_w1;
-assign interface1_dat_r1 = ((((((interface1_bank_bus_dat_r | interface3_bank_bus_dat_r) | interface6_bank_bus_dat_r) | interface8_bank_bus_dat_r) | interface10_bank_bus_dat_r) | interface12_bank_bus_dat_r) | interface15_bank_bus_dat_r);
-assign interface4_bank_bus_adr = interface2_adr;
-assign interface13_bank_bus_adr = interface2_adr;
-assign sram_bus_adr = interface2_adr;
-assign interface4_bank_bus_re = interface2_re;
-assign interface13_bank_bus_re = interface2_re;
-assign sram_bus_re = interface2_re;
-assign interface4_bank_bus_we = interface2_we;
-assign interface13_bank_bus_we = interface2_we;
-assign sram_bus_we = interface2_we;
-assign interface4_bank_bus_dat_w = interface2_dat_w;
-assign interface13_bank_bus_dat_w = interface2_dat_w;
-assign sram_bus_dat_w = interface2_dat_w;
-assign interface2_dat_r = ((interface4_bank_bus_dat_r | interface13_bank_bus_dat_r) | sram_bus_dat_r);
-assign interface1_dat_r0 = ((rd0 | rd1) | rd2);
+assign interface0_bank_bus_adr = interface1_adr1;
+assign interface2_bank_bus_adr = interface1_adr1;
+assign interface5_bank_bus_adr = interface1_adr1;
+assign interface7_bank_bus_adr = interface1_adr1;
+assign interface9_bank_bus_adr = interface1_adr1;
+assign interface11_bank_bus_adr = interface1_adr1;
+assign interface14_bank_bus_adr = interface1_adr1;
+assign interface0_bank_bus_re = interface1_re1;
+assign interface2_bank_bus_re = interface1_re1;
+assign interface5_bank_bus_re = interface1_re1;
+assign interface7_bank_bus_re = interface1_re1;
+assign interface9_bank_bus_re = interface1_re1;
+assign interface11_bank_bus_re = interface1_re1;
+assign interface14_bank_bus_re = interface1_re1;
+assign interface0_bank_bus_we = interface1_we1;
+assign interface2_bank_bus_we = interface1_we1;
+assign interface5_bank_bus_we = interface1_we1;
+assign interface7_bank_bus_we = interface1_we1;
+assign interface9_bank_bus_we = interface1_we1;
+assign interface11_bank_bus_we = interface1_we1;
+assign interface14_bank_bus_we = interface1_we1;
+assign interface0_bank_bus_dat_w = interface1_dat_w1;
+assign interface2_bank_bus_dat_w = interface1_dat_w1;
+assign interface5_bank_bus_dat_w = interface1_dat_w1;
+assign interface7_bank_bus_dat_w = interface1_dat_w1;
+assign interface9_bank_bus_dat_w = interface1_dat_w1;
+assign interface11_bank_bus_dat_w = interface1_dat_w1;
+assign interface14_bank_bus_dat_w = interface1_dat_w1;
+assign interface1_dat_r1 = ((((((interface0_bank_bus_dat_r | interface2_bank_bus_dat_r) | interface5_bank_bus_dat_r) | interface7_bank_bus_dat_r) | interface9_bank_bus_dat_r) | interface11_bank_bus_dat_r) | interface14_bank_bus_dat_r);
+assign interface1_bank_bus_adr = interface3_adr;
+assign interface3_bank_bus_adr = interface3_adr;
+assign interface6_bank_bus_adr = interface3_adr;
+assign interface8_bank_bus_adr = interface3_adr;
+assign interface10_bank_bus_adr = interface3_adr;
+assign interface12_bank_bus_adr = interface3_adr;
+assign interface15_bank_bus_adr = interface3_adr;
+assign interface1_bank_bus_re = interface3_re;
+assign interface3_bank_bus_re = interface3_re;
+assign interface6_bank_bus_re = interface3_re;
+assign interface8_bank_bus_re = interface3_re;
+assign interface10_bank_bus_re = interface3_re;
+assign interface12_bank_bus_re = interface3_re;
+assign interface15_bank_bus_re = interface3_re;
+assign interface1_bank_bus_we = interface3_we;
+assign interface3_bank_bus_we = interface3_we;
+assign interface6_bank_bus_we = interface3_we;
+assign interface8_bank_bus_we = interface3_we;
+assign interface10_bank_bus_we = interface3_we;
+assign interface12_bank_bus_we = interface3_we;
+assign interface15_bank_bus_we = interface3_we;
+assign interface1_bank_bus_dat_w = interface3_dat_w;
+assign interface3_bank_bus_dat_w = interface3_dat_w;
+assign interface6_bank_bus_dat_w = interface3_dat_w;
+assign interface8_bank_bus_dat_w = interface3_dat_w;
+assign interface10_bank_bus_dat_w = interface3_dat_w;
+assign interface12_bank_bus_dat_w = interface3_dat_w;
+assign interface15_bank_bus_dat_w = interface3_dat_w;
+assign interface3_dat_r = ((((((interface1_bank_bus_dat_r | interface3_bank_bus_dat_r) | interface6_bank_bus_dat_r) | interface8_bank_bus_dat_r) | interface10_bank_bus_dat_r) | interface12_bank_bus_dat_r) | interface15_bank_bus_dat_r);
+assign interface4_bank_bus_adr = interface5_adr;
+assign interface13_bank_bus_adr = interface5_adr;
+assign sram_bus_adr = interface5_adr;
+assign interface4_bank_bus_re = interface5_re;
+assign interface13_bank_bus_re = interface5_re;
+assign sram_bus_re = interface5_re;
+assign interface4_bank_bus_we = interface5_we;
+assign interface13_bank_bus_we = interface5_we;
+assign sram_bus_we = interface5_we;
+assign interface4_bank_bus_dat_w = interface5_dat_w;
+assign interface13_bank_bus_dat_w = interface5_dat_w;
+assign sram_bus_dat_w = interface5_dat_w;
+assign interface5_dat_r = ((interface4_bank_bus_dat_r | interface13_bank_bus_dat_r) | sram_bus_dat_r);
+assign interface1_dat_r0 = ((q1 | q3) | q5);
 assign comb_slice_proxy0 = {bist0_dat_addr, (~bist0_dat_addr), bist0_dat_addr};
 assign comb_slice_proxy1 = {bist0_seed_storage, bist0_seed_storage};
 assign comb_slice_proxy2 = {bist0_dat_addr, (~bist0_dat_addr), bist0_dat_addr};
@@ -66001,11 +66011,12 @@ always @(posedge sys_clk_1) begin
     if (litedramcore0_csr_dfi_p3_rddata_valid) begin
         litedramcore0_phaseinjector3_rddata_status <= litedramcore0_csr_dfi_p3_rddata;
     end
-    if ((litedramcore0_timer_wait & (~litedramcore0_timer_done0))) begin
+    if ((litedramcore0_timer_wait & (~litedramcore0_timer_done))) begin
         litedramcore0_timer_count1 <= (litedramcore0_timer_count1 - 1'd1);
     end else begin
         litedramcore0_timer_count1 <= 11'd1041;
     end
+    litedramcore0_timer_done <= ((litedramcore0_timer_wait & (~litedramcore0_timer_done)) & (litedramcore0_timer_count1 == 1'd1));
     litedramcore0_postponer_req_o <= 1'd0;
     if (litedramcore0_postponer_req_i) begin
         litedramcore0_postponer_count <= (litedramcore0_postponer_count - 1'd1);
@@ -66062,11 +66073,12 @@ always @(posedge sys_clk_1) begin
             end
         end
     end
-    if ((litedramcore0_zqcs_timer_wait & (~litedramcore0_zqcs_timer_done0))) begin
+    if ((litedramcore0_zqcs_timer_wait & (~litedramcore0_zqcs_timer_done))) begin
         litedramcore0_zqcs_timer_count1 <= (litedramcore0_zqcs_timer_count1 - 1'd1);
     end else begin
         litedramcore0_zqcs_timer_count1 <= 27'd133332999;
     end
+    litedramcore0_zqcs_timer_done <= ((litedramcore0_zqcs_timer_wait & (~litedramcore0_zqcs_timer_done)) & (litedramcore0_zqcs_timer_count1 == 1'd1));
     litedramcore0_zqcs_executer_done <= 1'd0;
     if ((litedramcore0_zqcs_executer_start & (litedramcore0_zqcs_executer_trigger == 1'd0))) begin
         litedramcore0_cmd_payload_a <= 11'h400;
@@ -68368,11 +68380,12 @@ always @(posedge sys_clk_1) begin
     if (litedramcore1_csr_dfi_p3_rddata_valid) begin
         litedramcore1_phaseinjector7_rddata_status <= litedramcore1_csr_dfi_p3_rddata;
     end
-    if ((litedramcore1_timer_wait & (~litedramcore1_timer_done0))) begin
+    if ((litedramcore1_timer_wait & (~litedramcore1_timer_done))) begin
         litedramcore1_timer_count1 <= (litedramcore1_timer_count1 - 1'd1);
     end else begin
         litedramcore1_timer_count1 <= 11'd1041;
     end
+    litedramcore1_timer_done <= ((litedramcore1_timer_wait & (~litedramcore1_timer_done)) & (litedramcore1_timer_count1 == 1'd1));
     litedramcore1_postponer_req_o <= 1'd0;
     if (litedramcore1_postponer_req_i) begin
         litedramcore1_postponer_count <= (litedramcore1_postponer_count - 1'd1);
@@ -68429,11 +68442,12 @@ always @(posedge sys_clk_1) begin
             end
         end
     end
-    if ((litedramcore1_zqcs_timer_wait & (~litedramcore1_zqcs_timer_done0))) begin
+    if ((litedramcore1_zqcs_timer_wait & (~litedramcore1_zqcs_timer_done))) begin
         litedramcore1_zqcs_timer_count1 <= (litedramcore1_zqcs_timer_count1 - 1'd1);
     end else begin
         litedramcore1_zqcs_timer_count1 <= 27'd133332999;
     end
+    litedramcore1_zqcs_timer_done <= ((litedramcore1_zqcs_timer_wait & (~litedramcore1_zqcs_timer_done)) & (litedramcore1_zqcs_timer_count1 == 1'd1));
     litedramcore1_zqcs_executer_done <= 1'd0;
     if ((litedramcore1_zqcs_executer_start & (litedramcore1_zqcs_executer_trigger == 1'd0))) begin
         litedramcore1_cmd_payload_a <= 11'h400;
@@ -70919,17 +70933,32 @@ always @(posedge sys_clk_1) begin
     interface0_re <= interface1_re0;
     interface0_we1 <= interface1_we0;
     interface0_dat_w1 <= interface1_dat_w0;
-    rd0 <= interface0_dat_r1;
-    interface1_adr1 <= interface1_adr0;
-    interface1_re1 <= interface1_re0;
-    interface1_we1 <= interface1_we0;
-    interface1_dat_w1 <= interface1_dat_w0;
-    rd1 <= interface1_dat_r1;
+    interface1_adr1 <= interface0_adr1;
+    interface1_re1 <= interface0_re;
+    interface1_we1 <= interface0_we1;
+    interface1_dat_w1 <= interface0_dat_w1;
+    q0 <= interface1_dat_r1;
+    q1 <= q0;
     interface2_adr <= interface1_adr0;
     interface2_re <= interface1_re0;
     interface2_we <= interface1_we0;
     interface2_dat_w <= interface1_dat_w0;
-    rd2 <= interface2_dat_r;
+    interface3_adr <= interface2_adr;
+    interface3_re <= interface2_re;
+    interface3_we <= interface2_we;
+    interface3_dat_w <= interface2_dat_w;
+    q2 <= interface3_dat_r;
+    q3 <= q2;
+    interface4_adr <= interface1_adr0;
+    interface4_re <= interface1_re0;
+    interface4_we <= interface1_we0;
+    interface4_dat_w <= interface1_dat_w0;
+    interface5_adr <= interface4_adr;
+    interface5_re <= interface4_re;
+    interface5_we <= interface4_we;
+    interface5_dat_w <= interface4_dat_w;
+    q4 <= interface5_dat_r;
+    q5 <= q4;
     if (sys_rst_1) begin
         reset_storage <= 2'd0;
         reset_wr_stb <= 1'd0;
@@ -71199,12 +71228,14 @@ always @(posedge sys_clk_1) begin
         litedramcore0_dfi_p3_we_n <= 1'd1;
         litedramcore0_dfi_p3_wrdata_en <= 1'd0;
         litedramcore0_dfi_p3_rddata_en <= 1'd0;
+        litedramcore0_timer_done <= 1'd0;
         litedramcore0_timer_count1 <= 11'd1041;
         litedramcore0_postponer_req_o <= 1'd0;
         litedramcore0_postponer_count <= 2'd1;
         litedramcore0_sequencer_done1 <= 1'd0;
         litedramcore0_sequencer_trigger <= 5'd0;
         litedramcore0_sequencer_count <= 2'd1;
+        litedramcore0_zqcs_timer_done <= 1'd0;
         litedramcore0_zqcs_timer_count1 <= 27'd133332999;
         litedramcore0_zqcs_executer_done <= 1'd0;
         litedramcore0_zqcs_executer_trigger <= 5'd0;
@@ -71643,12 +71674,14 @@ always @(posedge sys_clk_1) begin
         litedramcore1_dfi_p3_we_n <= 1'd1;
         litedramcore1_dfi_p3_wrdata_en <= 1'd0;
         litedramcore1_dfi_p3_rddata_en <= 1'd0;
+        litedramcore1_timer_done <= 1'd0;
         litedramcore1_timer_count1 <= 11'd1041;
         litedramcore1_postponer_req_o <= 1'd0;
         litedramcore1_postponer_count <= 2'd1;
         litedramcore1_sequencer_done1 <= 1'd0;
         litedramcore1_sequencer_trigger <= 5'd0;
         litedramcore1_sequencer_count <= 2'd1;
+        litedramcore1_zqcs_timer_done <= 1'd0;
         litedramcore1_zqcs_timer_count1 <= 27'd133332999;
         litedramcore1_zqcs_executer_done <= 1'd0;
         litedramcore1_zqcs_executer_trigger <= 5'd0;
@@ -71869,13 +71902,22 @@ always @(posedge sys_clk_1) begin
         sel_r <= 1'd0;
         interface0_re <= 1'd0;
         interface0_we1 <= 1'd0;
-        rd0 <= 32'd0;
         interface1_re1 <= 1'd0;
         interface1_we1 <= 1'd0;
-        rd1 <= 32'd0;
+        q0 <= 32'd0;
+        q1 <= 32'd0;
         interface2_re <= 1'd0;
         interface2_we <= 1'd0;
-        rd2 <= 32'd0;
+        interface3_re <= 1'd0;
+        interface3_we <= 1'd0;
+        q2 <= 32'd0;
+        q3 <= 32'd0;
+        interface4_re <= 1'd0;
+        interface4_we <= 1'd0;
+        interface5_re <= 1'd0;
+        interface5_we <= 1'd0;
+        q4 <= 32'd0;
+        q5 <= 32'd0;
         litedramcore0_refresher0_state <= 2'd0;
         litedramcore0_bankmachine0_state <= 4'd0;
         litedramcore0_bankmachine1_state <= 4'd0;
@@ -71994,7 +72036,8 @@ always @(posedge sys_clk_1) begin
 end
 
 always @(posedge sys_ars_clk) begin
-    crg_rst1 <= sys_ars_rst;
+    crg_rst_t0 <= sys_ars_rst;
+    crg_rst1 <= crg_rst_t0;
     if (sys_ars_rst) begin
     end
 end
@@ -105022,7 +105065,7 @@ FDPE #(
 endmodule
 
 // -----------------------------------------------------------------------------
-//  Auto-Generated by LiteX on 2026-10-02 06:01:25.
+//  Auto-Generated by LiteX on 2026-10-13 09:56:11.
 //------------------------------------------------------------------------------
 
 // VexRiscv_Min.v (modules renamed otpu_selfcal_*)
