@@ -218,6 +218,31 @@ def test_r_max_holds_every_run_a_prompt_asks_for(monkeypatch):
     assert PF.r_max(a, 1) == 2 and PF.r_max(a, 2) == 2
 
 
+def test_a_bucket_takes_the_form_with_more_rows_a_run(monkeypatch):
+    """prefill.tiled: a bucket's P and L runs are tiled where a tile fits, unless today's
+    prompt runs, covering the bucket, take more rows (each run streams the weights once:
+    LFM2-2.6B's tile took 1-2 rows where today's runs take 4, half the chat prefill's speed);
+    tiled on a tie or where today's do not cover the bucket, and with a tile as large as
+    today's runs could be nothing more is probed."""
+    W, spec, cfg, _ = _model("qwen3")
+    a = Engine(spec, W, cap=512, cfg=cfg, resident=True, prompt_runs=True)
+    a.tile_runs = True                          # (this file's runs are today's: OTPU_TILE=0)
+    assert PF.tiling(a)
+    monkeypatch.setattr(PF, "_tile_fit", lambda eng, b: 2)
+    for fit, tiled in (((4, True), False), ((4, False), True), ((2, True), True)):
+        monkeypatch.setattr(PF, "_fit", lambda eng, b, fit=fit: fit)
+        assert PF.tiled(a, 1) == tiled and PF.r_max(a, 1) == (2 if tiled else 4)
+        assert PF._what(a, 300, 2, "P")[0][0] == ("prompt tile" if tiled else "prompt")
+    assert PF.covers(a, 0, 30)                  # (the tile)
+    monkeypatch.setattr(PF, "_tile_fit", lambda eng, b: PF._probe_top(eng, b))
+
+    def probed(eng, b):
+        raise AssertionError("today's runs probed")
+    monkeypatch.setattr(PF, "_fit", probed)
+    assert PF.tiled(a, 1) and PF.tiled(a, 2)
+    assert not PF.tiled(a, 0)                   # (a new context's first run: today's)
+
+
 @pytest.mark.parametrize("fp4", [True, False], ids=["fp4", "int8"])
 def test_odd_rows_take_one_less_where_pair_makes_it_cheaper(fp4):
     """qwen3.prefer_rows: with PAIR a 4-bit MM of at most MCOLS / 2 rows (h) streams two blocks

@@ -22,8 +22,8 @@ Tiled runs (opentpu/llm/tiled.py, docs/tiled_prefill.md), on by default (off wit
 tile_runs False, or OTPU_TILE=0 where the engine does not say: tile_flag): a bucket's P and L
 runs are tile_run's programs of up to T rows (_probe_tile: whole passes of MCOLS up to ACT_ROWS
 and the image's rows, every run a prompt can ask for in the bucket fitting TMEM and IMEM), each
-weight streamed once a run; a bucket where no tile fits takes today's prompt runs. MTP's M runs
-stay today's.
+weight streamed once a run; a bucket where no tile fits, or where today's prompt runs (covering
+it) take more rows than the tile (tiled), takes today's prompt runs. MTP's M runs stay today's.
 """
 from __future__ import annotations
 
@@ -120,7 +120,7 @@ def programs(eng, p: int, R: int, kind: str, hidden: bool = False, slot: int = 0
     a run of another program loads its words, not an assembly of them (3-5 ms a run; MTP's
     rows and M runs alternate). hidden, slot: MTP's rows (their hidden stored, the states'
     slot); M's take neither. tile: a tiled run (True), today's (False), or the bucket's
-    choice (None: tiled where tiling is on and a tile fits the bucket)."""
+    choice (None: tiled)."""
     done = eng.__dict__.setdefault("_prompt_progs", {})
     what, blocks, compile = _what(eng, p, R, kind, hidden, slot, tile)
     with _lock(eng):
@@ -143,7 +143,7 @@ def _what(eng, p: int, R: int, kind: str, hidden: bool = False, slot: int = 0,
     else:
         blocks = p // block + 1
         if tile is None:
-            tile = kind != "M" and tiling(eng) and _tile_fit(eng, blocks) > 0
+            tile = kind != "M" and tiled(eng, blocks)
         if tile and kind != "M":
             what = ("prompt tile", kind, R, blocks, hidden, slot)
             return what, blocks, lambda: TL.compile_tile_run(img, blocks, R, kind, block, **kw)
@@ -175,12 +175,40 @@ def r_max(eng, blocks: int = 1) -> int:
     compiled and fitting IMEM (kept by the engine). MTP's runs take the same R_max (their
     programs must fit it), so plain and MTP prefills of a model split alike. With the engine's program cache the answer is kept there
     too (progcache.fact), so a new process does not try the larger R again (the 4B's R = 4,
-    traced until TMEM runs out). Tiling on: the bucket's tile rows where a tile fits it."""
-    if blocks and tiling(eng):
-        T = _tile_fit(eng, blocks)
-        if T:
-            return T
+    traced until TMEM runs out). Tiled runs (tiled): the bucket's tile rows."""
+    if tiled(eng, blocks):
+        return _tile_fit(eng, blocks)
     return _fit(eng, blocks)[0]
+
+
+def tiled(eng, blocks: int) -> bool:
+    """Bucket `blocks`'s P and L runs tiled: tiling on, a tile fits the bucket, and today's
+    prompt runs (which cover it) take no more rows there. Each run is a pass of the weights, so
+    the form with more rows a run streams them less often; tiled on a tie (release r2:
+    LFM2-2.6B's tile takes 1 row at MCOLS 4 and 2 at 8 where today's runs take 4, and its chat
+    prefill ran at half the speed of the untiled one). Where a tile takes as many rows as today's
+    runs could (Qwen3-0.6B's 16) nothing more is compiled to know it."""
+    if not (blocks and tiling(eng)):
+        return False
+    T = _tile_fit(eng, blocks)
+    if not T:
+        return False
+    if T >= _probe_top(eng, blocks):
+        return True
+    try:
+        R, covered = _fit(eng, blocks)
+    except CompileError:                # (no prompt run of today's fits the bucket)
+        return True
+    return not (covered and R > T)
+
+
+def _probe_top(eng, blocks: int) -> int:
+    """The largest of _probe's run sizes in bucket `blocks` (blocks > 0)."""
+    from .qwen3 import _whole_passes
+    img, mc = eng.image, eng.image.cfg.MCOLS
+    p = max((blocks - 1) * eng.block, conv_k(eng) - 1)
+    return _whole_passes(min(img.rows, img.cap - p,
+                             mc if hasattr(eng.spec, "mtp") else img.rows), mc)
 
 
 def covers(eng, p0: int, P: int) -> bool:
@@ -189,8 +217,7 @@ def covers(eng, p0: int, P: int) -> bool:
     more often and run no more often (docs/prefill.md 7); else Engine.prefill_chunks and
     MTPDecoder.prefill take today's route for the prompt."""
     P = min(P, eng.cap)                 # (past the cache: the route's own error)
-    tile = tiling(eng)
-    return all((tile and _tile_fit(eng, b) > 0) or _fit(eng, b)[1]
+    return all(tiled(eng, b) or _fit(eng, b)[1]
                for b in range(p0 // eng.block + 1, (P - 1) // eng.block + 2))
 
 
