@@ -686,6 +686,45 @@ Sessions (the lead runs them; scripts on this branch):
        attend2 0.15 s, the rest 0.27 s.
      - Against 512 MAC a cycle: qkv 84%, wmerge 91%, out and out2 58%, attend 54%. The RTL
        co-simulation of each phase is in tools/minicpmv_tower.py cosim.
+     - **Where out's and out2's 42% went: TMEM banks.** Measured with `cosim --profile` at
+       28 x 36: the MXU's stall counters and the slice's activity windows. out has out2's
+       cycles per 16-row group.
+       - out2 took 9.60M cycles. The MXU popped 5.59M (58.2%, its nominal pops) and was
+         blocked 3.65M (38.0%): chunks in its FIFO, no pop.
+       - Nearly all of that is W_down's MMs (16x256 . 1152x256^T, ACC into the residual):
+         5.82M cycles for 2.35M pops, back-pressured 3.44M. W_up's MMs ran at 92% and W_o's
+         at 82%.
+       - The cause: vit_out_mlp loaded the residual x with ol.load, which keeps its DRAM row
+         stride, 1,152 words, a multiple of TMEM's 8 banks. A streamed row's 16 results then
+         sit in one bank, and the drain's lanes (a greedy pick up to the first bank conflict)
+         write one a cycle: 16 cycles an output column.
+       - W_down's array takes 8 (KB 2 at CHUNK 256, times 4 replay groups), the fewest pops
+         per column of any MM here, so only it was drain-bound.
+       - The drain also lost TMEM arbitration to the VPU (the next chunk's GELU, VPU-first):
+         12.9% of the cycles.
+       - The rest: gaps between MMs 3.6% (the QACTs of the LayerNorm operand and of the O rows
+         at each group's start). DRAM cost nothing: never starved, port B 15% busy.
+       - wmerge runs the same MLP into `ol.zeros`, whose row stride is odd (ol.empty, zeros
+         and full give 2-D tiles one, as does a fresh MM output), and it reaches 91%.
+     - **The fix** (`kernels/vit.py`): the residual is loaded into an `ol.empty` tile, whose
+       row stride (C + 1) is odd. `compiler.load` takes such a padded destination as one LD a
+       row.
+       - out2 went from 9.60M to 6.87M cycles (-28.5%, co-simulation); pops are 81.4% of it.
+       - The tower's rows are bit-identical: same arithmetic, another TMEM layout. Checked on
+         the tiny tower on the ISA at 4 crop sizes.
+       - vit_embed keeps its one dense LD: its MM is KB 5, 20 cycles a column against the
+         drain's 16, and the per-row LDs made it 4% slower.
+       - Left in out2: the drain still loses TMEM arbitration to the VPU on W_down (18% of
+         the cycles), and 5.3% of gaps (the LayerNorm operand's QACT, the 16 per-row LDs).
+       - Test: test_the_towers_mms_drain_at_the_arrays_rate. Every MM whose array takes fewer
+         cycles a column than its rows must spread them over distinct banks.
+     - **attend** (13.34M cycles at 28 x 36) is VPU-bound: VPU busy 97%, MXU pops 47.9%.
+       - The MXU's drain lost TMEM arbitration 27.5% of the cycles.
+       - The gaps between its MMs, 24%, are blamed on the P operand's QACTs and the row
+         maxima.
+       - The softmax's EXP2SUB leads the VPU, followed by ~60K one-word-a-row VOPs (fill,
+         copy, recip, max).
+       - On the efficiency list.
    - **The first crop of a patch count.** It takes ~23 s more on the card host (doc.png's
      first 32 x 32: 28.9 s). BoardBackend.start computes each new program's WAITC wait
      entries (waits.entries) the first time it is started: attend 14.1 s, wmerge 2.5 s, qkv

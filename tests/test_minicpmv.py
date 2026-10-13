@@ -300,6 +300,31 @@ def test_the_tower_on_the_card_is_the_reference(tiny_tower, size):
     assert np.abs(got - ref).max() < 0.05 * np.abs(ref).max()
 
 
+@pytest.mark.parametrize("size", [(8, 12), (16, 12)])
+def test_the_odd_stride_residual_gives_the_same_rows(tiny_tower, size, monkeypatch):
+    """vit_out_mlp's residual at an odd row stride (its default: W_down's drain at the array's
+    rate) and at its DRAM stride (one LD, the layout before) give the tower's rows bit for bit:
+    the same arithmetic in another TMEM layout."""
+    from opentpu import isa as I
+    from opentpu.kernels import vit as VK
+    from opentpu.kernels.lib import gelu_tanh
+    vs, W, vi, be = tiny_tower
+    h, w = size
+    P = np.random.default_rng(7).uniform(-1, 1, (h * w, 3 * vs.patch ** 2)).astype(np.float32)
+    lds = lambda: sum(i.op == I.LD for i in vi.programs(h * w)[0]["out"][0])
+    n_odd = lds()
+    odd = vi.encode(be, P, size, proj_gelu=gelu_tanh)
+    real = VK.vit_out_mlp
+
+    class Dense:
+        def trace(self, cfg, sid, bound):
+            return real.trace(cfg, sid, {**bound, "odd": False})
+    monkeypatch.setattr(VK, "vit_out_mlp", Dense())
+    assert lds() < n_odd
+    dense = vi.encode(be, P, size, proj_gelu=gelu_tanh)
+    assert np.array_equal(odd.view(np.uint32), dense.view(np.uint32))
+
+
 @pytest.mark.parametrize("fmt", ["int8", "attn=fp4,mlp=fp4,wm=fp4,proj=fp4"])
 def test_the_piece_table_is_the_static_layout(fmt):
     """The pieced weights' table (kernels/pieces.py): the tower's rows with every piece address
@@ -474,6 +499,34 @@ def test_the_real_towers_programs_fit_the_card():
         assert len(runs) == 1 + 3 * 7 + 4 + 3 * 20 + 1
         for name, (p, _) in progs.items():
             assert len(p) <= cfg.IMEM_WORDS // 8, (N, name, len(p))
+
+
+def test_the_towers_mms_drain_at_the_arrays_rate():
+    """An MM whose array takes fewer cycles an output column (KB x ceil(M / MCOLS) replay
+    groups) than its M rows writes (or adds) them at a row stride that puts them in
+    min(M, LANES) distinct TMEM banks: the drain's lanes take them together. In one bank they
+    go one a cycle, M cycles a column. W_down's ACC into the residual (vit_out_mlp: KB 2, 8
+    cycles a column for 16 rows) is loaded into an odd-stride tile; at its DRAM stride (C =
+    1152, a multiple of the banks) W_down's MMs ran at 40% of their pops (docs/minicpmv.md 6).
+    vit_embed's (KB 5: 20 cycles a column) keeps the dense stride and its one LD."""
+    from opentpu import isa as I
+    from opentpu.isasim import board_config
+    from opentpu.llm import minicpmv as MV
+    from opentpu.llm.qwen3 import _Bump
+    cfg = board_config()
+    vi = MV.VisionImage(MV.VisionSpec(), cfg, _Bump(), nmax=256, out_rows=16)
+    P, _ = vi.programs(256)
+    n = 0
+    for name, (p, _) in P.items():
+        for ins in p:
+            if ins.op == I.MM:
+                ors, M = ins.w[5] & 0xFFFF, (ins.w[5] >> 16) & 0xFF
+                KB = (ins.w[3] >> 16) & 0xFF
+                if KB * -(-M // cfg.MCOLS) < M:
+                    k = min(M, cfg.LANES)
+                    assert len({r * ors % cfg.LANES for r in range(k)}) == k, (name, ins.comment)
+                    n += 1
+    assert n > 10
 
 
 @pytest.mark.parametrize("staged", [False, True])

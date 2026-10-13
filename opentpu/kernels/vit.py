@@ -284,10 +284,11 @@ def vit_window_attend(v, N: int, G: int, scale: float, heads=None):
 
 @ol.jit
 def vit_out_mlp(v, lw, dst, N: int, R: int, eps: float, chunk: int, mlp: bool = True,
-                post=None):
+                post=None, odd: bool = True):
     """dst rows x (the residual, in place): x += O Wo^T + bo, then (mlp) x += W2 gelu(W1
     LayerNorm(x) + b1) + b2; post (w, b): the rows stored LayerNorm'd with it (the tower's
-    post_layernorm after its last layer)."""
+    post_layernorm after its last layer). odd: x at an odd row stride, one LD a row (False: at
+    its DRAM stride, one LD; the same rows, the tests' check of that)."""
     lw = PC.bind(lw)
     bo = ol.load(lw.bo)
     if mlp:
@@ -298,7 +299,11 @@ def vit_out_mlp(v, lw, dst, N: int, R: int, eps: float, chunk: int, mlp: bool = 
 
     def body(r0, n):
         os = ol.quantize(ol.load(v.O[r0:r0 + n, :]), free=True)
-        x = ol.load(dst[r0:r0 + n, :])
+        # the residual at an odd row stride (ol.empty's): W_o's and W_down's drains add a
+        # streamed row's results into distinct TMEM banks, several a cycle (at the rows' own
+        # stride, C a multiple of the banks, they share one: one a cycle, W_down's MMs then
+        # take twice their pops)
+        x = ol.load(dst[r0:r0 + n, :], out=ol.empty([n, v.C]) if odd else None)
         for a, c in _row_parts(lw.wo, 0, lw.wo.shape[0]):      # (a piece's output columns)
             ol.dot(os, lw.wo[a:c, :], acc=x[:, a:c])
         x.set(x + bo[None, :])

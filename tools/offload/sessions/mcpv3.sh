@@ -14,7 +14,9 @@
 #   text      chatmoe.py's two text turns, token-exact
 #   tower     tools/minicpmv_tower.py time on cats.jpg (one crop) and doc.png: each crop's start
 #             seconds (a first crop's ~23 s of wait entries computed at its start, before
-#             vision_warm)
+#             vision_warm), and the odd-stride residual's gain (vit_out_mlp, docs/minicpmv.md 6):
+#             out, out2 and last's device time a run against the co-simulation's expected
+#             (3.27 ms a 16-row group; mcpv2's 4.57) and each crop's against mcpv2's ~5.77 s
 #   pooldisk  tools/offload/pool_disk.py: one warm process, the same text turn with the pool in the
 #             page cache and dropped from it (ABBA): decode tok/s and a miss's read time from the
 #             disk against the page cache
@@ -61,7 +63,8 @@ fail=0
 echo "mcpv3 start $(date +%T) T $T ($rev) O $O RF $RF mem $(mem) GB, /data $(df -BG --output=avail /data | tail -1 | tr -d ' ') free; $(uptime)"
 [ -f $T/opentpu/host/vision_warm.py ] && grep -q '_MemoPass' $T/opentpu/waits.py \
   && grep -q 'vision_staged: bool = True' $T/opentpu/llm/minicpmv.py \
-  || { echo "STOP: T is not the minicpmv tree with vision_warm, waits._MemoPass and staged by default"; exit 2; }
+  && grep -q 'odd: bool = True' $T/opentpu/kernels/vit.py \
+  || { echo "STOP: T is not the minicpmv tree with vision_warm, waits._MemoPass, staged by default and the odd-stride residual"; exit 2; }
 python -c "import torchvision, PIL, transformers; print('  python:', torchvision.__version__, PIL.__version__,
   transformers.__version__)" || { echo "STOP: no torchvision / pillow / transformers under PYLIB $PYLIB"; exit 2; }
 [ -f $O/$MD/config.json ] && [ -f $O/$POOL ] && [ -f $O/$POOL.key ] && [ -f $O/img/cats.jpg ] && \
@@ -144,7 +147,19 @@ for m in $RUNS; do
         --pool $O/$POOL --image $O/img/cats.jpg:1 --image $O/img/doc.png --reps 1 --out $R/tower.json \
         > $R/tower.log 2>&1
       rc=$?; echo "  exit $rc $(date +%T)"; grep -vE "^\[transformers" $R/tower.log | grep -vE "^    " | tail -12
-      [ $rc = 0 ] || fail=1 ;;
+      [ $rc = 0 ] || fail=1
+      [ -f $R/tower.json ] && python - $R/tower.json <<'PY'
+import json, math, sys
+G, G0 = 3.27e-3, 4.57e-3    # s a 16-row group of vit_out_mlp with the MLP: co-sim after the fix, mcpv2's card
+for im in json.load(open(sys.argv[1]))["images"]:
+    for c in im["crops"]:
+        h, w = c["size"]
+        g = {"out": math.ceil(h * w / 16), "out2": math.ceil(h * w / 64), "last": math.ceil(h * w / 64)}
+        ph = " ".join(f"{k} {1e3 * x['device_s'] / x['runs']:.1f} ms a run (expected {1e3 * g[k] * G:.1f}, "
+                      f"mcpv2 ~{1e3 * g[k] * G0:.1f})" for k, x in c["phases"].items() if k in g)
+        print(f"  crop {h}x{w}: device {c['device_s']:.3f} s (mcpv2 ~5.77 at 1,008-1,024 patches, expected ~4.8); {ph}")
+PY
+      ;;
     pooldisk)
       timeout 2400 python tools/offload/pool_disk.py $O/$MD --pool $O/$POOL --backend board \
         --cfg $R/cfg-dev.pkl --out $R/pooldisk.json > $R/pooldisk.log 2>&1
