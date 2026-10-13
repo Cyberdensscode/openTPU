@@ -104,6 +104,14 @@ of three pin-to-pin channels, the DMA's line buffers under the band next to port
 quantizer's RAMs in the bottom-right corner, ACT RAM and MXU FIFOs facing each other bottom
 left. *candB* puts TMEM in two corner blocks.
 
+| candA: top band | candB: two top corners |
+|---|---|
+| ![candA's macro placement](img/asic-small-candA-macros.png) | ![candB's macro placement](img/asic-small-candB-macros.png) |
+
+The macros as the checker saw them (`macro_pin_side`): red, each macro's pin edge; the numbers,
+the macros; on the die's edges, the I/O pin groups (left: port A and the SW writes; right: port B
+data; bottom: controls and the clock).
+
 | routed, 3.0 ns | candA | candB |
 |---|---|---|
 | setup WNS / TNS / violators | -0.698 / -12.84 / 21 | -0.753 / -968.29 / 4170 |
@@ -141,7 +149,9 @@ fuzz, partial-beat order, write gather, beside DMA writes); `tests/test_quant_rt
 | DRC | 1 | 0 |
 | flip-flops / std-cell area / power | 106,887 / 2,823,324 um² / 0.691 W | 106,954 / 2,822,395 um² / 0.680 W |
 
-The same die, macro placement, constraints and scripts; P&R 2 h 12 min, 25 GB. The earlier
+![candA routed, iteration 1](img/asic-small-candA-routed.png)
+
+candA after routing, iteration 1. The same die, macro placement, constraints and scripts; P&R 2 h 12 min, 25 GB. The earlier
 implementation of this block (an older RTL, before main's MXU and quantizer rewrites, and other
 P&R scripts) closed at 3.3 ns and missed 3.0 ns by 0.107 ns (219 endpoints).
 
