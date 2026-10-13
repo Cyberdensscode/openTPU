@@ -755,25 +755,237 @@ class VisionImage:
 
     def encode(self, backend, P: np.ndarray, size, vis_row: int = 0, proj_gelu=None,
                cache: dict | None = None, s: int = 0) -> np.ndarray:
-        """One crop through the tower and projector on `backend` (a qwen3 backend: write, run,
-        read); its rows go to vis[vis_row:]; returns them ([h w / 16, out] fp32)."""
-        from ..compiler import arg_words
+        """One crop through the tower and projector on `backend` (a qwen3 backend: write, run
+        or start / wait, read; one that runs words gets each program assembled once); its
+        rows go to vis[vis_row:]; returns them ([h w / 16, out] fp32). cache: the programs by
+        patch count (and the projector's GELU)."""
+        from ..compiler import Words, arg_words
+        from .. import isa as I
         h, w = size
         key = (h * w, proj_gelu)
         progs = None if cache is None else cache.get(key)
         if progs is None:
-            progs = self.programs(h * w, proj_gelu=proj_gelu)
+            P_, runs = self.programs(h * w, proj_gelu=proj_gelu)
+            if getattr(backend, "runs_words", False):
+                P_ = {k: (Words.of(I.assemble(p), ra), ra) for k, (p, ra) in P_.items()}
+            else:
+                P_ = {k: ([p], ra) for k, (p, ra) in P_.items()}
+            progs = (P_, runs)
             if cache is not None:
                 cache[key] = progs
         P_, runs = progs
         p, e = self.host_rows(P, size)
         backend.write(s, self.work["P"], p)
         backend.write(s, self.work["E"], e)
+        start = getattr(backend, "start", None)
         for name, vals in runs:
             prog, ra = P_[name]
             if "vis_row" in vals:
                 vals = {"vis_row": vis_row}
-            backend.run([prog], args=arg_words(ra, vals))
+            if start is None:
+                backend.run(prog, args=arg_words(ra, vals))
+            else:
+                start(prog, args=arg_words(ra, vals))
+                backend.wait()
         n = h * w // 16
         return backend.read(s, self.work["vis"] + 4 * vis_row * self.vs.out,
                             4 * n * self.vs.out).view(np.float32).reshape(n, self.vs.out)
+
+
+# =============================================================================== the model's image
+from . import qwen35 as QW              # noqa: E402  (qwen35 does not import this module)
+from .. import language as ol           # noqa: E402
+# the family's module-level names, which tools and tiled.py look up by the image's module
+from .qwen35 import ATTN_BLOCK, RUN_ROWS, emulated_logits, reference_logits  # noqa: E402
+FAMILY = (ATTN_BLOCK, RUN_ROWS, emulated_logits, reference_logits)
+
+
+@dataclass(frozen=True)
+class Spec(QW.Spec):
+    """MiniCPM-V 4.7: its language model qwen35's Spec (Qwen3.5-MoE), its vision side
+    `vision` (VisionSpec) in the model's image before the expert slots (Image): the tower's
+    weights in `vision_fmt` (VisionImage.formats), a crop's work area of `vision_patches`
+    patches, `vision_rows` rows of image tokens (the projector's output rows a prompt's
+    images take, docs/minicpmv.md 4.3)."""
+    vision: VisionSpec | None = VisionSpec()   # None: the language model alone
+    vision_fmt: str = "int8"
+    vision_patches: int = 2048
+    vision_rows: int = 2048
+
+    @staticmethod
+    def from_hf(model_dir) -> "Spec":
+        from dataclasses import fields
+        base = QW.Spec.from_hf(model_dir)
+        return Spec(**{f.name: getattr(base, f.name) for f in fields(QW.Spec)},
+                    vision=VisionSpec.from_hf(model_dir))
+
+    def image(self, cfg, cap: int, batch: int = 1, rows: int = 1, wformat: str = "int8",
+              head_format: str | None = None, lookup: bool | str = False,
+              experts: int | None = None, embed_host: bool | None = None,
+              formats: str | None = None, prefill_rows: int | None = None) -> "Image":
+        return Image(self, cfg, cap, batch, rows, wformat, head_format, lookup, experts,
+                     embed_host, formats, prefill_rows)
+
+
+class Image(QW.Image):
+    """qwen35's image with MiniCPM-V's vision side (`vision`: a VisionImage, its weights and a
+    crop's work area) after the model's DRAM and before the expert slots; its `vis` rows are
+    the prompt's image rows, which vis_copy_run puts in a prefill chunk's residual rows
+    (layer 0's input, qwen35_layer_run embedded). The text path's programs are qwen35's: a
+    text-only prompt runs exactly qwen35-35b's."""
+
+    def before_slots(self, b) -> None:
+        sp = self.spec
+        self.vision = None if sp.vision is None else \
+            VisionImage(sp.vision, self.cfg, b, nmax=sp.vision_patches, out_rows=sp.vision_rows,
+                        fmt=sp.vision_fmt)
+
+    def build(self, W: dict) -> list:
+        """qwen35's DRAM image, then the vision side's weights: load_vision's tensors of the
+        checkpoint W reads (LazyWeights' model_dir), or W's own under their names."""
+        imgs = super().build(W)
+        if self.vision is None:
+            return imgs
+        Wv = load_vision(W.model_dir) if hasattr(W, "model_dir") else W
+
+        def put(addr, a):
+            v = np.ascontiguousarray(a).view(np.uint8).reshape(-1)
+            imgs[0][addr:addr + v.size] = v
+        self.vision.build(Wv, put)
+        return imgs
+
+    def descriptors(self, sid: int, slot: int = 0):
+        m = super().descriptors(sid, slot)
+        if self.vision is not None:
+            m.vis = self.vision.descriptors().vis
+        return m
+
+    def compile_vis_run(self, n: int, em: bool = False):
+        """(programs, run_args): vis_copy_run of n rows, the chunk's row ("row") and the vis
+        row ("src") run arguments."""
+        from ..compiler import RunVar
+        b = vis_copy_run.trace(self.cfg, 0, {"m": self.descriptors(0), "n": n,
+                                             "row": RunVar("row", self.prefill_rows),
+                                             "src": RunVar("src", self.spec.vision_rows),
+                                             "em": em})
+        return [b.finish()], list(b.run_args)
+
+    def rope_table(self) -> tuple:
+        """The image's RoPE tables as the host built them (qwen3.rope_tables at slots 0 .. cap
+        - 1): cos, sin [cap, rope_dim / 2]."""
+        if not hasattr(self, "_rope"):
+            from .qwen3 import rope_tables
+            cs = [rope_tables(self.spec, p) for p in range(self.cap)]
+            self._rope = (np.stack([c for c, _ in cs]), np.stack([x for _, x in cs]))
+        return self._rope
+
+
+@ol.jit
+def vis_copy_run(m, n: int, row, src, em: bool = False):
+    """n image rows of a layer-major prefill chunk: the projector's rows m.vis[src:src + n] ->
+    the chunk's residual rows m.xbuf[row:row + n] (em: their records' X, moe.em_x), layer 0's
+    input (qwen35_layer_run with embedded): a DMA through TMEM, no arithmetic."""
+    from . import moe as MO
+    X = MO.em_x(m.moe_dev, row, n, m.spec.hidden) if em else m.xbuf[row:row + n, :]
+    ol.store(X, ol.load(m.vis[src:src + n, :]))
+
+
+def mrope_rows(table: tuple, pos: np.ndarray) -> tuple:
+    """The RoPE rows of positions pos [3, n] (t, h, w; rope_index's) from the image's tables
+    (Image.rope_table): Qwen3.5's interleaved M-RoPE (mrope_section [11, 11, 10]) takes
+    frequency i from h's position where i % 3 == 1, w's where i % 3 == 2, t's else, so each
+    entry is the table's entry of that position and frequency: a gather, no arithmetic. A text
+    position (t = h = w) gives the table's row itself, bit for bit."""
+    cos, sin = table
+    half = cos.shape[1]
+    sec = np.arange(half) % 3
+    rows = np.asarray(pos)[sec]                     # [half, n]: each frequency's position
+    if rows.min() < 0 or rows.max() >= len(cos):
+        raise ValueError(f"M-RoPE positions {rows.min()} .. {rows.max()} outside the table "
+                         f"({len(cos)})")
+    cols = np.arange(half)[:, None]
+    return np.ascontiguousarray(cos[rows, cols].T), np.ascontiguousarray(sin[rows, cols].T)
+
+
+# =============================================================================== the host's images
+class Vision:
+    """MiniCPM-V's images on an Engine whose image is a minicpmv.Image (docs/minicpmv.md 4.3):
+    each image's crops through the card's tower and projector into the image's vis rows
+    (encode), each prompt token's vis row (rows), and the RoPE table's rows at every slot's
+    M-RoPE positions (positions). The host only moves data: the patch rows it cut, the vis
+    rows the card computed (by their index), the table entries the image was built with."""
+
+    def __init__(self, eng):
+        img = eng.image
+        if getattr(img, "vision", None) is None:
+            raise ValueError("the engine's image has no vision side (minicpmv.Spec.vision)")
+        self.eng, self.img, self.vs = eng, img, eng.spec.vision
+        self.table = img.rope_table()
+        self.cache = {}                     # VisionImage's programs by patch count
+        self.dev = np.tile(np.arange(img.cap), (3, 1))  # the device table's positions, a slot
+        self.seconds = 0.0                  # the encodes' wall time
+
+    def encode(self, images: list, row: int = 0) -> int:
+        """Each ImageInput's crops in order (thumbnail, slices) into vis rows from `row`: their
+        rows follow one another as the prompt's image tokens do. Returns the rows."""
+        import time
+        t, r = time.time(), row
+        n = sum(im.tokens for im in images)
+        if row + n > self.img.vision.out_rows:
+            raise ValueError(f"{n} image rows from {row}: the image holds "
+                             f"{self.img.vision.out_rows} (Spec.vision_rows)")
+        for im in images:
+            for P, size in zip(im.patches, im.sizes):
+                self.img.vision.encode(self.eng.backend, P, size, vis_row=r, cache=self.cache)
+                r += size[0] * size[1] // 16
+        self.seconds += time.time() - t
+        return r - row
+
+    def rows(self, ids, row: int = 0) -> list:
+        """Each token's vis row (prefill_layers' vis): the image tokens' in order from `row`,
+        -1 for the others."""
+        out, r = [], row
+        for t in ids:
+            if int(t) == self.vs.image_token:
+                out.append(r)
+                r += 1
+            else:
+                out.append(-1)
+        return out
+
+    def positions(self, ids, sizes) -> int:
+        """The RoPE table's rows for a sequence (every token since slot 0, every crop's (h, w)
+        in order): slot s < T at rope_index's position, s >= T at s + delta (the decode's).
+        Writes the rows that differ from what the table holds (none for text after text: the
+        image's own rows); returns delta."""
+        pos, delta = rope_index(ids, sizes, self.vs)
+        cap = self.img.cap
+        T = pos.shape[1]
+        if T > cap:
+            raise ValueError(f"{T} tokens: the cache holds {cap}")
+        self._write(np.concatenate([pos, np.tile(np.arange(T, cap) + delta, (3, 1))], axis=1))
+        return int(delta)
+
+    def pristine(self) -> None:
+        """The table's own rows back at every slot (a text-only sequence: a chat's reset)."""
+        self._write(np.tile(np.arange(self.img.cap), (3, 1)))
+
+    def _write(self, want: np.ndarray) -> None:
+        cap = self.img.cap
+        diff = (want != self.dev).any(0)
+        lk = self.img.lookup
+        half = lk["half"]
+        i = 0
+        while i < cap:
+            if not diff[i]:
+                i += 1
+                continue
+            j = i
+            while j < cap and diff[j]:
+                j += 1
+            c, s_ = mrope_rows(self.table, want[:, i:j])
+            for sl in range(self.eng.cfg.S):
+                self.eng.backend.write(sl, lk["cos_t"] + 4 * half * i, c)
+                self.eng.backend.write(sl, lk["sin_t"] + 4 * half * i, s_)
+            i = j
+        self.dev = want

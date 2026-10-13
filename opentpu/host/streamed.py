@@ -66,7 +66,10 @@ def streams(spec) -> bool:
 
 
 def _family(spec) -> str:
-    return type(spec).__module__.rsplit(".", 1)[-1]
+    """A Spec's family: its module's name, or a subclass's first base's in FORMATS (MiniCPM-V's
+    Spec, minicpmv.py: qwen35's)."""
+    names = [c.__module__.rsplit(".", 1)[-1] for c in type(spec).__mro__]
+    return next((n for n in names if n in FORMATS), names[0])
 
 
 def defaults(spec) -> tuple:
@@ -263,12 +266,12 @@ def gate_expert_major(eng, rows: int) -> None:
     runs = {True: (eng._layer_runs, eng._layer_next), False: ({}, {})}
     eng.em_rows, eng.em_last, eng.em_calls = rows, None, [0, 0]
 
-    def prefill_layers(tokens, logits: bool = True):
+    def prefill_layers(tokens, logits: bool = True, **kw):
         on = len(tokens) >= rows
         eng.expert_major = on
         eng._layer_runs, eng._layer_next = runs[on]
         try:
-            return base(tokens, logits)
+            return base(tokens, logits, **kw)
         finally:
             eng.expert_major = True
             eng._layer_runs, eng._layer_next = runs[True]

@@ -202,19 +202,27 @@ def card_tower(vs, W, fmt: str = "int8"):
     return vi, IsaBackend(cfg, [img])
 
 
-def _first_token(model, x, feats=None) -> np.ndarray:
-    """The logits of the reply's first token; feats: every crop's rows to use instead of HF's
-    get_image_features (its pooler_output)."""
+def _reply_logits(model, x, reply, feats=None) -> np.ndarray:
+    """The logits [len(reply) + 1, V] of the reply's positions, teacher-forced on `reply` (HF's
+    greedy tokens): the first token's and each next one's; feats: every crop's rows to use
+    instead of HF's get_image_features (its pooler_output)."""
     from types import SimpleNamespace
+    x = dict(x)
+    if reply:
+        add = torch.tensor([reply], dtype=x["input_ids"].dtype)
+        x["input_ids"] = torch.cat([x["input_ids"], add], 1)
+        x["attention_mask"] = torch.ones_like(x["input_ids"])
+        if "mm_token_type_ids" in x:
+            x["mm_token_type_ids"] = torch.cat([x["mm_token_type_ids"], torch.zeros_like(add)], 1)
     if feats is not None:
         t = [torch.from_numpy(np.asarray(f, np.float32)).to(model.dtype) for f in feats]
         model.model.get_image_features = lambda *a, **k: SimpleNamespace(pooler_output=t)
     try:
-        out = model(**x, use_cache=False, logits_to_keep=1)
+        out = model(**x, use_cache=False, logits_to_keep=len(reply) + 1)
     finally:
         if feats is not None:
             del model.model.get_image_features
-    return out.logits[0, -1].double().numpy()
+    return out.logits[0].double().numpy()
 
 
 def _dkl(p_logits, q_logits) -> float:
@@ -233,9 +241,10 @@ def _cos(a, b) -> np.ndarray:
 def vision(a) -> None:
     """docs/minicpmv.md 5: per image, HF's crop features (fp32) against vision_reference with
     the projector's exact GELU (erf) and with its tanh form, and against the card's tower on
-    the ISA simulator in each of --card's formats: every crop's row cosines (min / mean); then
-    the reply's first token with each variant's rows put in HF's place: dKL against HF's own
-    (and whether its top token is HF's)."""
+    the ISA simulator in each of --card's formats: every crop's row cosines (min / mean / 1st
+    percentile); then HF's greedy reply (-n tokens) teacher-forced with each variant's rows put
+    in HF's place: the dKL against HF's own at the reply's first token and over the reply, and
+    the share of positions whose top token is HF's."""
     from opentpu.llm import minicpmv as MV
     model, proc = load(a.model, torch.float32)
     vs = MV.VisionSpec.from_hf(a.model)
@@ -260,14 +269,20 @@ def vision(a) -> None:
                 secs[f] += time.time() - t
                 print(f"{Path(img).name}: crop {list(size)} {f} {time.time() - t:.0f} s",
                       file=sys.stderr, flush=True)
-        base = _first_token(model, x)
+        g = model.generate(**x, max_new_tokens=a.n, do_sample=False)
+        reply = [int(t) for t in g[0, x["input_ids"].shape[1]:]][:-1]   # (the last: no logits)
+        base = _reply_logits(model, x, reply)
         r = dict(image=str(img), crops=[list(s) for s in im.sizes], rows=sum(len(h) for h in hf),
-                 top=int(base.argmax()), isa_s={f: round(v, 1) for f, v in secs.items()})
+                 reply=proc.tokenizer.decode(reply), top=int(base[0].argmax()),
+                 isa_s={f: round(v, 1) for f, v in secs.items()})
         for k, v in var.items():
             c = np.concatenate([_cos(p, q) for p, q in zip(v, hf)])
-            lg = _first_token(model, x, v)
+            lg = _reply_logits(model, x, reply, v)
+            d = [_dkl(p, q) for p, q in zip(base, lg)]
             r[k] = dict(cos_min=round(float(c.min()), 6), cos_mean=round(float(c.mean()), 6),
-                        dkl=_dkl(base, lg), top=int(lg.argmax()) == r["top"])
+                        cos_p1=round(float(np.percentile(c, 1)), 6),
+                        dkl_first=d[0], dkl_reply=float(np.mean(d)),
+                        top_reply=float(np.mean(lg.argmax(-1) == base.argmax(-1))))
             z[f"{ii}/{k}"] = np.concatenate(v)
         z[f"{ii}/hf"] = np.concatenate(hf)
         report.append(r)

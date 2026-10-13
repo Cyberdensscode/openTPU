@@ -808,6 +808,7 @@ class Image(EmbedHost):
                                               waitc=cfg.SEQ_WC)
         self.choices = {"embed_host": self.embed_host,          # (the compile worker's
                         "formats": self.formats}                # image)
+        self.before_slots(b)
         self.offload = None
         if mo is not None:          # path (a)'s words and expert slots (docs/offload.md)
             self.fmt = MO.ExpertFormat(H, mo.ffn, D, wformat)
@@ -821,6 +822,10 @@ class Image(EmbedHost):
         if self.nbytes > cfg.DRAM_BYTES:
             raise MemoryError(f"model image needs {self.nbytes / 2**20:.0f} MiB per slice, "
                               f"DRAM_BYTES is {cfg.DRAM_BYTES / 2**20:.0f} MiB")
+
+    def before_slots(self, b) -> None:
+        """A subclass's own DRAM, allocated from `b` (qwen3._Bump) after the model's and before
+        the expert slots (which take the rest): MiniCPM-V's vision side (minicpmv.Image)."""
 
     @property
     def mtp_fc(self) -> str:

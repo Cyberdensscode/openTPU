@@ -61,9 +61,9 @@ def tiny(tmp_path_factory):
     tc["model_type"] = "qwen3_5_moe_text"
     (d / "config.json").write_text(json.dumps({
         "architectures": ["MiniCPMV4_7ForConditionalGeneration"], "model_type": "minicpmv4_7",
-        "tie_word_embeddings": False, "text_config": tc, "insert_layer_id": 6,
+        "tie_word_embeddings": False, "text_config": tc, "insert_layer_id": 0,
         "downsample_mode": "16x", "mrope_mode": "canvas",
-        "vision_config": {"hidden_size": 32, "intermediate_size": 64, "num_hidden_layers": 1,
+        "vision_config": {"hidden_size": 128, "intermediate_size": 256, "num_hidden_layers": 2,
                           "num_attention_heads": 2, "image_size": 56, "patch_size": 14,
                           "model_type": "minicpmv4_7_vision"},
         "image_token_id": 248056, "image_start_id": 248078, "image_end_id": 248079,
@@ -101,9 +101,9 @@ def test_a_partial_head_block_is_the_padded_heads_logits(tiny):
     """The device's logits for a vocabulary of V = 8 x 128 + 56 rows are bit for bit those of
     the same head padded with zero rows to 9 x 128 (the padding's logits 0): the LM head's
     partial last D block, MiniCPM-V's 248,144 = 1938 x 128 + 80, needs no padding of its own.
-    Its last real id is checked on its own too."""
+    Its last real id is checked on its own too. (The language model alone: vision None.)"""
     m, d = tiny
-    spec = load_spec(d)
+    spec = replace(load_spec(d), vision=None)
     W = dict(load_weights(d).items())
     Vp = -(-V // 128) * 128
     Wp = dict(W)
@@ -341,3 +341,64 @@ def test_the_card_tower_is_hfs(hf_tiny):
         got = vi.encode(be, P, (h, w))
         cos = (got * hf).sum(-1) / np.linalg.norm(got, axis=-1) / np.linalg.norm(hf, axis=-1)
         assert cos.min() >= 0.999, cos.min()
+
+
+# =============================================================================== image rows
+@pytest.mark.parametrize("em", [False, True])
+def test_image_rows_are_layer_zeros_input(tiny, em, monkeypatch):
+    """A prompt's image rows (Engine.prefill_layers' vis: each its row of the image's projector
+    output, minicpmv.Image's vis) enter layer 0 as those rows: a copy run into the chunk's
+    residual rows (em: expert-major's records) and an embedded layer run. Image rows whose
+    values an int8 embedding row holds exactly (each D block q 2^-7 with a 127 in it) give
+    the logits, bit for bit, of the same prompt with text ids whose (host-gathered) embedding
+    rows are those values; then three decode steps too. 20 image rows from vis row 5, after 9
+    text rows, in chunks of 24 rows (the image crosses a chunk), runs of 2 rows."""
+    from opentpu.llm import qwen35 as Q35
+    monkeypatch.setattr(Q35, "PREFILL_CHUNK", 24)
+    m, d = tiny
+    spec = replace(load_spec(d), vision_patches=128, vision_rows=64)
+    rng = np.random.default_rng(3)
+    W = dict(load_weights(d).items())
+    W.update(_tiny_vision_weights(spec.vision, rng))
+    n, at, v0 = 20, 9, 5
+    q = rng.integers(-127, 128, (n, spec.hidden))
+    q[:, ::128] = 127
+    rows = (q * 2.0 ** -7).astype(np.float32)
+    fake = list(range(V - 5 - n, V - 5))       # ids whose embedding rows are the image rows
+    W["model.embed_tokens.weight"] = W["model.embed_tokens.weight"].copy()
+    W["model.embed_tokens.weight"][fake] = rows
+    toks = [int(t) for t in rng.integers(0, V - 40, 31)]
+    cfg = device_config(spec, 256, rows=1, lookup=True, S=1, experts=2 * K)
+    kw = dict(cap=256, cfg=cfg, rows=1, resident=True, experts=2 * K, layer_major=2)
+    if em:
+        kw["expert_major"] = True
+    a, b = Engine(spec, W, **kw), Engine(spec, W, **kw)
+    assert a.image.vision is not None and a.expert_major == em
+    a.backend.write(0, a.image.vision.work["vis"] + 4 * v0 * spec.hidden, rows)
+    vis = [-1] * at + list(range(v0, v0 + n)) + [-1] * (len(toks) - at)
+    la = a.prefill_layers(toks[:at] + [0] * n + toks[at:], vis=vis)
+    lb = b.prefill_layers(toks[:at] + fake + toks[at:])
+    assert ("v", 2) in a._layer_runs and not any(k[0] == "v" for k in b._layer_runs)
+    assert np.array_equal(la.view(np.uint32), lb.view(np.uint32))
+    t = int(np.argmax(la))
+    for _ in range(3):
+        ga, gb = a.step(t), b.step(t)
+        assert np.array_equal(ga.view(np.uint32), gb.view(np.uint32))
+        t = int(np.argmax(ga))
+
+
+def test_mrope_rows_gather_the_table():
+    """mrope_rows: frequency i of a row is the table's entry at the position of section i % 3
+    (t, h, w): the rows of a text position are the table's rows bit for bit, an image row's
+    entries each the table's at its own section's position."""
+    from opentpu.llm import minicpmv as MV
+    rng = np.random.default_rng(0)
+    cos, sin = rng.standard_normal((2, 50, 32)).astype(np.float32)
+    pos = np.array([[3, 3, 7], [3, 4, 9], [3, 5, 11]])
+    c, s_ = MV.mrope_rows((cos, sin), pos)
+    assert np.array_equal(c[0], cos[3]) and np.array_equal(s_[0], sin[3])
+    for j in (1, 2):
+        for i in range(32):
+            assert c[j, i] == cos[pos[i % 3, j], i] and s_[j, i] == sin[pos[i % 3, j], i]
+    with pytest.raises(ValueError):
+        MV.mrope_rows((cos, sin), np.array([[50], [0], [0]]))

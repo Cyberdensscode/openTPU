@@ -43,8 +43,10 @@ def load_spec(path):
         from .qwen3 import Spec
     elif t in ("lfm2", "lfm2_moe"):
         from .lfm2 import Spec
-    elif t in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "minicpmv4_7"):
+    elif t in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"):
         from .qwen35 import Spec
+    elif t == "minicpmv4_7":            # (qwen35's Spec with the vision side)
+        from .minicpmv import Spec
     elif t in ("gemma4", "gemma4_text"):
         from .gemma4 import Spec
     else:
