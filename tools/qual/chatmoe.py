@@ -240,9 +240,13 @@ def main(argv=None) -> int:
                     help="an image for turn N (1-based; repeated): a model with a vision side")
     ap.add_argument("--max-slices", type=int, help="an image's slices at most (default the "
                                                    "processor's)")
-    ap.add_argument("--vision-staged", action="store_true",
-                    help="MiniCPM-V's tower weights staged through the expert slots "
-                         "(minicpmv.Spec.vision_staged; the pool grows by their entries)")
+    vis = ap.add_mutually_exclusive_group()
+    vis.add_argument("--vision-staged", action="store_true",
+                     help="MiniCPM-V's tower weights staged through the expert slots "
+                          "(minicpmv.Spec.vision_staged, the default; the pool grows by their "
+                          "entries)")
+    vis.add_argument("--vision-resident", action="store_true",
+                     help="MiniCPM-V's tower weights resident in the image")
     ap.add_argument("--sample", action="store_true", help="the model's sampling defaults")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--check", help="a reference run's JSON: its tokens, turn by turn")
@@ -258,7 +262,7 @@ def main(argv=None) -> int:
     r = run(a.model, a.backend, a.cfg, a.dev, a.turn or TURNS, a.max_new, a.cap, a.pool,
             a.experts, a.layer_major, a.sample, a.seed, a.pool_create, em_rows=a.em_rows,
             trace=tr, em_pass=a.em_pass, images=images, max_slices=a.max_slices,
-            vision_staged=a.vision_staged or None)
+            vision_staged=True if a.vision_staged else False if a.vision_resident else None)
     for i, t in enumerate(r["turns"]):
         print(f"turn {i + 1}: {t['reply']!r}\n  {t['line']}", flush=True)
         for c in t["calls"]:

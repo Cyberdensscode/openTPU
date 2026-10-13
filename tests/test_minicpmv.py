@@ -460,6 +460,59 @@ def test_the_real_towers_programs_fit_the_card():
             assert len(p) <= cfg.IMEM_WORDS // 8, (N, name, len(p))
 
 
+def test_the_warm_counts_are_the_processors():
+    """vision_warm.counts: every crop's patch count the processor gives (minicpmv.crops: the
+    thumbnail and the slices) of images of odd sizes at 1 and 9 slices is among them, each a
+    multiple of 16 (two 2 x 2 merges), 1,008 and 1,024 among the four most frequent."""
+    from opentpu.host import vision_warm as VW
+    from opentpu.llm import minicpmv as MV
+    vs = MV.VisionSpec()
+    ns = VW.counts(vs, step=100)
+    assert all(n % 16 == 0 for n in ns) and {1008, 1024} <= set(ns[:4])
+    for H, W in ((300, 500), (1080, 1920), (3000, 400), (777, 777), (250, 3900)):
+        for ms in (1, 9):
+            cs, _ = MV.crops(torch.zeros((3, H, W), dtype=torch.uint8), vs, ms)
+            for c in cs:
+                assert (c.shape[-2] // vs.patch) * (c.shape[-1] // vs.patch) in ns, (H, W, ms)
+
+
+def test_warm_entries_are_found_by_the_first_start(tiny, tmp_path, monkeypatch):
+    """vision_warm.warm: the tower's programs at a patch count traced and their wait entries
+    computed into the program cache's disk, where a first start's (BoardBackend._entries:
+    waits.entries of the assembled words alone) finds every one, none computed; a second warm
+    finds its marker and computes nothing; with an entry gone it computes them again. start()
+    leaves a backend that takes no entries (the ISA simulator's) alone."""
+    from types import SimpleNamespace
+    from opentpu import isa as I
+    from opentpu import waits as WC
+    from opentpu.compiler import Words
+    from opentpu.host import vision_warm as VW
+    monkeypatch.setenv("OTPU_PROG_CACHE", str(tmp_path))
+    m, d = tiny
+    spec = replace(load_spec(d), vision_patches=128, vision_rows=64)
+    cfg = device_config(spec, 256, rows=1, lookup=True, S=1, experts=E)
+    image = spec.image(cfg, 256, 1, 1, experts=E)
+    layout = ("test", spec, cfg)
+    assert VW.warm(image, layout, 64)
+    WC._mem.clear()
+    c0, d0 = WC.stats["computed"], WC.stats["disk"]
+    P, _ = image.vision.programs(64)
+    for p, ra in P.values():
+        WC.entries(Words.of(I.assemble(p), ra), cfg.D, cfg.S)
+    assert WC.stats["computed"] == c0 and WC.stats["disk"] == d0 + len(P)
+    assert not VW.warm(image, layout, 64)
+    next(tmp_path.glob("*/*.npz")).unlink()
+    assert VW.warm(image, layout, 64)
+    assert VW.start(SimpleNamespace(image=image, backend=SimpleNamespace())) is None
+    # the process (spawned: the engine's arguments pickled, opentpu imported anew); the
+    # processor's counts exceed this work area's 128 patches, so it builds the image and ends
+    p = VW.start(SimpleNamespace(image=image, backend=SimpleNamespace(waitc=True), spec=spec,
+                                 cfg=cfg, cap=256, batch=1, rows=1, _image_kw={"experts": E},
+                                 layout=layout))
+    p.join(120)
+    assert p.exitcode == 0
+
+
 def test_the_card_tower_is_hfs(hf_tiny):
     """HF's tiny MiniCPM-V (its own weights, load_vision's reading of them) on the card's
     tower (int8, ISA simulator): HF's get_image_features rows to within int8's error, two

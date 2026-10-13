@@ -173,7 +173,7 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
            em_pass: int | None = None, ahead_part: int | None = None,
            idle_parts: str = "v2", willneed: bool = True, pool_map: bool = True,
            release_weights: bool = True, create: bool = False, W=None,
-           vision_staged: bool | None = None, **kw):
+           vision_staged: bool | None = None, vision_warm: bool = True, **kw):
     """The Engine of the MoE checkpoint at `model` on `backend` ("isa", or a backend factory
     as Engine takes: the card's BoardBackend) with configuration `cfg` (the card's 4 GiB), its
     experts streamed from `pool` (a path; DEFAULT: the checkpoint's, default_pool; None: packed
@@ -197,7 +197,9 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
     request's disk reads queued at once (PoolFile.willneed); pool_map, release_weights:
     Engine's. create: a missing pool is made and each expert packed on its first use (else
     check_pool). W: the weights (default LazyWeights of `model`). vision_staged: MiniCPM-V's
-    Spec.vision_staged (None: the Spec's). kw: Engine's own."""
+    Spec.vision_staged (None: the Spec's); vision_warm: its tower programs' wait entries
+    computed ahead in a background process (opentpu/host/vision_warm.py; the engine's
+    `vision_warm`, the process or None). kw: Engine's own."""
     from opentpu.llm import load_spec
     from opentpu.llm.qwen3 import Engine, LazyWeights
     if idle_parts not in IDLE_PARTS:
@@ -256,6 +258,9 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
     pf = getattr(srv, "pool_file", None)
     if willneed and pf is not None:             # a request's misses read from the disk at once
         srv.ahead = pf.willneed
+    if vision_warm:                             # (MiniCPM-V on a WAITC card: ~23 s a new crop
+        from opentpu.host import vision_warm as VW      # size's first run, docs/minicpmv.md 6)
+        eng.vision_warm = VW.start(eng)
     return eng
 
 

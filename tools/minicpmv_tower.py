@@ -1,7 +1,8 @@
 """MiniCPM-V's vision tower timed (docs/minicpmv.md 6): where an image's seconds go.
 
     python3 tools/minicpmv_tower.py time MODEL [--backend board|isa] [--cfg PKL] [--pool POOL]
-        [--cap 2048] [--vision-staged] --image PATH[:SLICES]... [--reps 2] [--settle S]
+        [--cap 2048] [--vision-staged | --vision-resident] [--no-warm]
+        --image PATH[:SLICES]... [--reps 2] [--settle S]
         [--out JSON]
     python3 tools/minicpmv_tower.py cosim MODEL --cfg PKL [--size 28x36] [--phases a,b]
         [--profile] [--out JSON]
@@ -12,9 +13,10 @@ through the tower as VisionImage.encode runs it, every step timed: the programs'
 assemble: once per patch count), the host rows (patch and position-table rows) and their writes,
 each run's start (program load, arguments) and wait (the expert server's host hook while the
 card runs) against its device time (CYCLES / CORE_KHZ), by phase, and the projector rows' read;
-staged (--vision-staged), the pieces' placement (Vision.stage) and the slots' release. Then the
-image through the engine's own path (minicpmv.Vision.encode, its programs cached) as a whole,
-`reps` times. --settle: seconds to wait after the load (the engine's compiles in the
+staged (the Spec's default, or --vision-staged; --vision-resident: resident), the pieces'
+placement (Vision.stage) and the slots' release. Then the image through the engine's own path
+(minicpmv.Vision.encode, its programs cached) as a whole, `reps` times. --no-warm: without the
+engine's tower wait entries computed ahead (opentpu/host/vision_warm.py). --settle: seconds to wait after the load (the engine's compiles in the
 background) before the first image.
 
 cosim: each phase's program once on the RTL with the card's LiteDRAM controllers (DDR3-1066,
@@ -22,7 +24,8 @@ the core at 133.33 MHz; tools/moe_prefill_cosim.py's harness), the configuration
 crop of --size patches, the weights zero (timing does not depend on the data) at their resident
 addresses: its cycles, and the crop's total over the runs (VisionImage.programs' order, an
 encoder layer's phases at layer 0 for every layer). --profile: each phase's cycles by function
-with the VPU's and the MXU's busy cycles (moe_prefill_cosim.print_profile, on stderr).
+with the VPU's and the MXU's busy cycles (moe_prefill_cosim.print_profile, on stderr), and its
+units' busy cycles, DRAM ports and roofline (opentpu/profile.py; the JSON's "profile").
 
 JSON: per crop the phases' runs, wall and device seconds (time), or cycles (cosim).
 """
@@ -61,7 +64,8 @@ def _engine(a):
     t = time.time()
     eng = ST.engine(path, cfg or board_config(), be, a.cap, a.pool or ST.DEFAULT,
                     wformat=wformat, head_format=head, formats=formats,
-                    vision_staged=a.vision_staged or None)
+                    vision_staged=True if a.vision_staged else False if a.vision_resident
+                    else None, vision_warm=not a.no_warm)
     return eng, time.time() - t
 
 
@@ -202,7 +206,7 @@ def cosim(a) -> dict:
     dram[vi.table:vi.table + t.size] = t
     P_, runs = vi.programs(N)
     want = a.phases.split(",") if a.phases else list(P_)
-    seen = {}
+    seen, prof = {}, {}
     for name, vals in runs:
         if name in want and name not in seen:
             prog, ra = P_[name]
@@ -212,11 +216,19 @@ def cosim(a) -> dict:
             seen[name] = st["cycles"]
             print(f"{name:8s} {st['cycles']:11d} cycles {st['cycles'] / MHZ / 1e3:8.2f} ms "
                   f"(RTL {time.time() - t0:.0f} s)", flush=True)
+            if a.profile:               # the units' busy cycles and the ports' bound
+                from opentpu.profile import parse
+                pf = parse(st["trace"], cfg, [prog], name)
+                pf.cycles = st["cycles"]
+                rl = pf.roofline()
+                prof[name] = {"busy": pf.unit_busy(0), "roofline": rl["per_slice"][0],
+                              "ports": {k: int(v) for k, v in pf.ports[0].items()}}
+                print(pf.summary(), f"\n  roofline {rl['per_slice'][0]}", flush=True)
     count: dict = {}
     for name, _ in runs:
         count[name] = count.get(name, 0) + 1
     tot = sum(seen[k] * count[k] for k in seen)
-    out = {"size": [h, w], "fmt": a.fmt, "cycles": seen, "runs": count,
+    out = {"size": [h, w], "fmt": a.fmt, "cycles": seen, "runs": count, "profile": prof,
            "crop_cycles": tot if len(seen) == len(count) else None,
            "crop_ms": round(tot / MHZ / 1e3, 1) if len(seen) == len(count) else None}
     print(f"crop {h}x{w}: " + (f"{out['crop_ms']} ms ({tot} cycles)" if out["crop_ms"] else
@@ -233,8 +245,14 @@ def main(argv=None) -> int:
     ap.add_argument("--cfg", help="the card's configuration, pickled (tools/qual/refs.py cfg)")
     ap.add_argument("--pool", help="the expert pool (default: the checkpoint's)")
     ap.add_argument("--cap", type=int, default=2048)
-    ap.add_argument("--vision-staged", action="store_true",
-                    help="the tower's weights staged through the expert slots (Spec)")
+    vis = ap.add_mutually_exclusive_group()
+    vis.add_argument("--vision-staged", action="store_true",
+                     help="the tower's weights staged through the expert slots (the Spec's "
+                          "default)")
+    vis.add_argument("--vision-resident", action="store_true",
+                     help="the tower's weights resident in the image")
+    ap.add_argument("--no-warm", action="store_true",
+                    help="no wait entries computed ahead (opentpu/host/vision_warm.py)")
     ap.add_argument("--image", action="append", default=[], metavar="PATH[:SLICES]")
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--settle", type=float, default=0.0)
