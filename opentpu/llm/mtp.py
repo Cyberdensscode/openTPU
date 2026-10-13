@@ -164,6 +164,12 @@ class MTPDecoder:
             a0, draft = PF.mtp(self, toks, st, pick, on_run, follow)    # docs/prefill.md
             self.draft = draft
             return a0, draft
+        K = self.img.spec.conv_k
+        if self.by_layers and P > K - 1:    # a streamed MoE's prompt layer by layer: the rows
+            n = max(0, K - 1 - p0)          # before conv_k - 1 in the rows kernel's runs first
+            if n:
+                self.prefill(toks[:n], st, chunk, follow=toks[n])
+            return self._prefill_layers(toks[n:], st, pick, on_run, follow)
         a0 = draft = None
         fit = self.img.rows
         head = follow is None
@@ -194,6 +200,37 @@ class MTPDecoder:
                 self.draft = None
                 return None, None
         self.eng.pos = P
+        self.draft = draft
+        return a0, draft
+
+    @property
+    def by_layers(self) -> bool:
+        """The prompt goes layer by layer (a streamed MoE's Engine with layer_major and its
+        embedding rows from the host, _prefill_layers)."""
+        return (getattr(self.img.spec, "moe", None) is not None and bool(self.eng.layer_major)
+                and bool(getattr(self.img, "embed_host", False)))
+
+    def _prefill_layers(self, toks, st: MTPStats, pick, on_run, follow):
+        """prefill on a streamed MoE whose Engine runs the prompt layer by layer
+        (Engine.prefill_layers with the MTP layer's K / V, docs/mtp.md 12), from conv_k - 1
+        on: each chunk's rows through the model a layer at a time (the expert slots pooled),
+        then the MTP layer's K / V of its rows that have their next token (the prompt's, or
+        `follow`); then, the slots back to decode's, the last row's draft: qwen35_mtp over the
+        head's hidden row and a0 (its MoE a request in the MTP layer's slots). The states in
+        the committed slot. on_run(tokens) once, after it."""
+        eng = self.eng
+        head = follow is None
+        P, n0 = eng.pos + len(toks), len(eng.stats)
+        lg = eng.prefill_layers(toks, logits=head, mtp=toks[1:] + [follow], slot=self.slot)
+        st.runs.append(("prefill", len(toks),
+                        {"cycles": sum((s or {}).get("cycles", 0) for s in eng.stats[n0:])}))
+        if on_run is not None:
+            on_run(toks)
+        if not head:
+            self.draft = None
+            return None, None
+        a0 = int(np.argmax(lg)) if pick is None else int(pick(lg))
+        draft = self._draft(P - 1, [a0], st, "mtp prefill")[0]
         self.draft = draft
         return a0, draft
 

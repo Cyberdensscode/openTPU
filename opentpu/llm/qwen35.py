@@ -1159,7 +1159,7 @@ class Image(EmbedHost):
 
     def compile_layer_run(self, li: int, blocks: int, block: int = ATTN_BLOCK, R: int = 1,
                           embedded: bool = False, at: int | None = None, hint: bool = False,
-                          em: bool = False):
+                          em: bool = False, slot: int = 0):
         """(programs, run_args): qwen35_layer_run of layer li, R rows at a run-time position of
         bucket `blocks` (from conv_k - 1: the convolutions' taps) and a run-time row of the
         prefill chunk (run arguments: RunPos.values and "row"), or at the compile-time
@@ -1167,7 +1167,7 @@ class Image(EmbedHost):
         the run ends with the next MoE layer's hint (qwen35_layer_run); em: expert-major
         (docs/offload.md 13.11: the rows in the scratch's records, the MoE's prologue and the
         last layer's combine; compile_expert_run). The image needs lookup tables and its
-        prefill rows."""
+        prefill rows. slot: the DeltaNet states' and windows' (an MTP image's, Spec.mtp)."""
         from ..compiler import RunVar
         spec, K = self.spec, self.spec.conv_k
         if not self.lookup or not self.prefill_rows:
@@ -1194,7 +1194,7 @@ class Image(EmbedHost):
             lo = max((blocks - 1) * block, K - 1 if li >= 0 else 0)
             pos = RunPos(blocks, block, lo, self.lookup["zmask"], self.cap)
             pos.tpos.bound -= R - 1     # the run's last row in the block too: tpos <= block - R
-        m = self.descriptors(0)
+        m = self.descriptors(0, slot)   # (slot: the DeltaNet states' of an MTP image)
         if li < 0:
             b = qwen35_embed_run.trace(self.cfg, 0, {"m": m, "pos": pos, "row": row, "em": em})
         else:
@@ -1202,6 +1202,28 @@ class Image(EmbedHost):
                                                      "block": block, "R": R,
                                                      "embedded": embedded, "hint": hint,
                                                      "em": em})
+        return [b.finish()], list(b.run_args)
+
+    def compile_mtp_kv_run(self, blocks: int, block: int = ATTN_BLOCK, R: int = 1,
+                           em: bool = False):
+        """(programs, run_args): qwen35_mtp_kv_run, R rows at a run-time position of bucket
+        `blocks` (from conv_k - 1) and a run-time row of the prefill chunk (RunPos.values and
+        "row"); em: expert-major's records. An MTP image's (Spec.mtp) with lookup tables, its
+        prefill rows and the embedding rows from the host's slot (embed_host)."""
+        from ..compiler import RunVar
+        if not (self.spec.mtp and self.lookup and self.prefill_rows and self.embed_host):
+            raise ValueError("an MTP prefill run needs an MTP image's lookup tables, its prefill "
+                             "rows and the embedding rows from the host's slot (embed_host)")
+        if self.cfg.S != 1:
+            raise ValueError("an MTP prefill run is one slice's (S = 1)")
+        if not 1 <= R <= self.grows:
+            raise ValueError(f"{R} rows an MTP prefill run: the host's slot holds {self.grows}")
+        lo = max((blocks - 1) * block, self.spec.conv_k - 1)
+        pos = RunPos(blocks, block, lo, self.lookup["zmask"], self.cap)
+        pos.tpos.bound -= R - 1     # the run's last row in the block too: tpos <= block - R
+        b = qwen35_mtp_kv_run.trace(self.cfg, 0, {"m": self.descriptors(0), "pos": pos,
+                                                  "row": RunVar("row", self.prefill_rows),
+                                                  "block": block, "R": R, "em": em})
         return [b.finish()], list(b.run_args)
 
     def compile_prefill_head(self, em: bool = False):
@@ -2465,15 +2487,59 @@ def qwen35_embed_run(m, pos, row, em: bool = False):
 def qwen35_prefill_head(m, row, em: bool = False):
     """After a layer-major prefill's last layer: the final norm and the LM head of the residual
     stream row m.xbuf[row] (a run-time value) -> m.logits, as qwen35_step's. em: the row's
-    record's X, after the last layer's combine (expert-major: its MoE ends here)."""
+    record's X, after the last layer's combine (expert-major: its MoE ends here). An MTP image
+    (Spec.mtp) also stores the row's final-normed hidden to m.hid[0]: the prompt's last row
+    drafts after the head (qwen35_mtp, its token the head's pick)."""
     spec = m.spec
-    if not em:
+    if not em and not spec.mtp:
         _lm_head(ol.load(m.xbuf[row:row + 1, :]), m, spec)
         return
-    x = ol.load(MO.em_x(m.moe_dev, row, 1, spec.hidden))
-    if m.layer(spec.layers - 1).moe:
-        x.set(MO.moe_combine_rows(x, spec.moe, m.moe_dev, row))
+    if em:
+        x = ol.load(MO.em_x(m.moe_dev, row, 1, spec.hidden))
+        if m.layer(spec.layers - 1).moe:
+            x.set(MO.moe_combine_rows(x, spec.moe, m.moe_dev, row))
+    else:
+        x = ol.load(m.xbuf[row:row + 1, :])
+    if spec.mtp:
+        ol.store(m.hid[0:1, :], rmsnorm(x, ol.load(m.g_final), spec.eps))
     _lm_head(x, m, spec)
+
+
+@ol.jit
+def qwen35_mtp_kv_run(m, pos, row, block: int = ATTN_BLOCK, R: int = 1, em: bool = False):
+    """A layer-major prefill's MTP rows (Spec.mtp, docs/mtp.md 12): after a chunk's last layer,
+    its R rows from `row` (a run-time value) at the positions pos .. pos + R - 1 (a RunPos, in
+    one attention block) append the MTP layer's K / V as qwen35_mtp's rows do: row r's
+    final-normed hidden (the residual row m.xbuf[row + r]; em: its record's X after the last
+    layer's combine) and the embedding row of the token after it (the host's slot rows 0 .. R -
+    1, embed_host) -> fc -> the MTP layer's K and V. Its queries, MoE and draft head are left
+    out (nothing reads them: only the prompt's last row drafts, qwen35_mtp after the head, its
+    token the head's pick), so the run posts no expert request."""
+    spec, mt = m.spec, m.mtp
+    H, eps, p = spec.hidden, spec.eps, pos.pos
+    if em:
+        x = ol.load(MO.em_x(m.moe_dev, row, R, H))
+        if m.layer(spec.layers - 1).moe:
+            x.set(MO.moe_combine_rows(x, spec.moe, m.moe_dev, row))
+    else:
+        x = ol.load(m.xbuf[row:row + R, :])
+    c, s_ = ol.load(m.cos_t[p:p + R, :]), ol.load(m.sin_t[p:p + R, :])
+    e = ol.empty([R, H], dense=True)
+    for r, g in enumerate(_gather(m, m.embed_q, range(R))):     # the next tokens' rows
+        e[r:r + 1, :].set(g)
+    cat = ol.empty([R, 2 * H], dense=True)
+    cat[:, 0:H].set(rmsnorm(e, ol.load(mt.ge), eps))
+    del e
+    g = ol.load(m.g_final)          # the final norm row by row (qwen35_rows' hidden rows)
+    for r in range(R):
+        x[r:r + 1, :].set(rmsnorm(x[r:r + 1, :], g, eps))
+    del g
+    cat[:, H:2 * H].set(rmsnorm(x, ol.load(mt.gh), eps))
+    del x
+    y = ol.dot(ol.quantize(cat), mt.fc)                 # [R, H] (one slice: Spec.check)
+    del cat
+    _attention_rows(y, mt.layer, c, s_, [(0, pos.offset(r)) for r in range(R)], spec, block,
+                    gated=True, kv_only=True)
 
 
 @ol.jit

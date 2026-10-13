@@ -206,3 +206,74 @@ def test_moe_mtp_sampled_loop_is_plain_sampling(tiny_moe_mtp, P, drafter, sp):
     assert eng.pos == ref.pos == P + len(want) - 1
     assert all(np.array_equal(a, b) for a, b in
                zip(_states(eng, spec, dec.slot), _states(ref, spec, 0)))
+
+
+def _layered(spec, W, em, cfg=CFG, **kw):
+    """An MTP engine whose prompt goes layer by layer (runs of 2 rows), expert-major or not,
+    6 slots a layer (expert-major's scratch beside 2 k)."""
+    return mtp_engine(spec, W, cap=512, cfg=cfg, rows=2, experts=6, layer_major=2,
+                      expert_major=em, **kw)
+
+
+@pytest.mark.parametrize("em, fmt, drafter", [(False, "int8", "mtp"), (True, "int8", "mtp"),
+                                              (True, "fp4", "mixed"), (False, "int8", "wrong")])
+def test_moe_mtp_layer_major_prefill(tiny_moe_mtp, em, fmt, drafter, monkeypatch):
+    """A streamed MoE's prompt layer by layer under MTP (Engine.prefill_layers with the MTP
+    layer's K / V, docs/mtp.md 12): the rows before conv_k - 1 in the rows kernel's runs, then
+    chunks of 24 rows through the model a layer at a time (expert-major or not), after each
+    chunk's last layer runs of up to 4 rows append the MTP layer's K / V (no queries, no MoE),
+    and the last row drafts after the head (its hidden row the head's): the loop's tokens equal
+    plain greedy decode's. int8: the MTP layer's KV cache and the first draft equal those of
+    the 2-row runs' prefill (the MTP layer over every row) bit for bit."""
+    from opentpu.llm import qwen35 as Q35
+    from opentpu.llm.mtp import MTPStats
+    from test_mtp import _mtp_kv
+    monkeypatch.setattr(Q35, "PREFILL_CHUNK", 24)
+    W, spec = tiny_moe_mtp
+    kw = FP4 if fmt == "fp4" else {}
+    prompt = [int(t) for t in np.random.default_rng(11).integers(0, 1000, 40)]
+    P, N = len(prompt), 12
+    want = _plain(spec, W, prompt, N, **kw)
+    right = np.zeros(514, np.float32)
+    right[P:P + len(want)] = want
+    drafts = {"mtp": None, "wrong": (right + 1) % 1000,
+              "mixed": np.where(np.arange(514) % 3, right, (right + 7) % 1000)}[drafter]
+    eng = _layered(spec, W, em, **kw)
+    dec = MTPDecoder(eng)
+    assert dec.by_layers and eng.image.prefill_rows == 24 and eng.expert_major == em
+    st = dec.generate_card(prompt, max_new=N, stop=[], drafts=drafts)
+    assert st.tokens == want
+    m = sorted(k for k in eng._layer_runs if k[0] == "m")
+    assert m and max(k[2] for k in m) == 4      # (the host's slot rows)
+    if drafter == "wrong":
+        assert not any(st.accepted)
+    if fmt == "int8" and drafter == "mtp":
+        a, b = MTPDecoder(_layered(spec, W, em)), MTPDecoder(mtp_engine(
+            spec, W, cap=512, cfg=CFG, rows=2, experts=6))
+        assert not b.by_layers
+        ra, rb = a.prefill(prompt, MTPStats()), b.prefill(prompt, MTPStats())
+        assert ra == rb and ra[0] == want[0]
+        assert all(np.array_equal(x, y) for x, y in zip(_mtp_kv(a.eng, P), _mtp_kv(b.eng, P)))
+
+
+def test_moe_mtp_layer_major_continues_from_slot_1(tiny_moe_mtp, monkeypatch):
+    """A chat's next turn on the layer-major path: the first turn's loop (drafts all right)
+    leaves the states committed in slot 1, and the next prompt's layer runs read and write that
+    slot (the runs of slot 1, compiled apart). The tokens equal one fresh decoder's over the
+    whole conversation, and plain greedy decode's."""
+    from opentpu.llm import qwen35 as Q35
+    monkeypatch.setattr(Q35, "PREFILL_CHUNK", 24)
+    W, spec = tiny_moe_mtp
+    r = np.random.default_rng(3)
+    p1, p2 = [int(t) for t in r.integers(0, 1000, 30)], [int(t) for t in r.integers(0, 1000, 9)]
+    w1 = _plain(spec, W, p1, 12)
+    right = np.zeros(514, np.float32)
+    right[len(p1):len(p1) + 12] = w1
+    dec = MTPDecoder(_layered(spec, W, True))
+    t1 = dec.generate_card(p1, max_new=12, stop=[], drafts=right).tokens
+    assert t1 == w1 and dec.slot == 1
+    ctx = p1 + t1 + p2
+    st = dec.generate_card([t1[-1]] + p2, max_new=10, stop=[])
+    assert any(k[1:] == ("slot", 1) for k in dec.eng._layer_runs if len(k) == 3)
+    fresh = MTPDecoder(_layered(spec, W, True)).generate_card(ctx, max_new=10, stop=[])
+    assert st.tokens == fresh.tokens == _plain(spec, W, ctx, 10)

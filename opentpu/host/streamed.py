@@ -280,7 +280,7 @@ def gate_expert_major(eng, rows: int) -> None:
     runs = {True: (eng._layer_runs, eng._layer_next), False: ({}, {})}
     eng.em_rows, eng.em_last, eng.em_calls = rows, None, [0, 0]
 
-    def prefill_layers(tokens, logits: bool = True, **kw):
+    def prefill_layers(tokens, logits: bool = True, **kw):     # (kw: an MTP image's, vis)
         on = len(tokens) >= rows
         eng.expert_major = on
         eng._layer_runs, eng._layer_next = runs[on]
