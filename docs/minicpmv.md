@@ -567,18 +567,34 @@ first card sessions.
 ## 6. Card plan
 
 On opentpu, `/data/otpu/minicpmv/` holds:
-- the slim checkpoint: 6,021,430,313 bytes (sha256 sums in `SUMS-slim`);
-- the MX pool: 17,532,190,720 bytes with its .packed, .format and .key (`SUMS-pool`). Staged
-  vision adds its 446 entries after the experts (763.6 MB): packed by the first staged run, or
-  in the one repack that also adds the MTP layer (les's pool-extend: the experts byte for byte,
-  then layer 40, then the vision pieces from 41 x E).
+- the slim checkpoint: 6,021,430,313 bytes (sha256 sums in `SUMS-slim`, all checked there on
+  2026-10-13);
+- the MX pool: 17,532,190,720 bytes with its .packed, .format and .key (`SUMS-pool`, checked).
+  Staged vision adds its 446 entries after the experts (763.6 MB): packed by the first staged
+  run, or in the one repack that also adds the MTP layer (les's pool-extend: the experts byte
+  for byte, then layer 40, then the vision pieces from 41 x E);
+- `img/` (the sessions' images) and `refs/` (their ISA references);
+- `pylib/`: torchvision 0.29.1+cpu, pillow 12.3.0 and transformers 5.18.0 over the venv's torch
+  2.14.0 (hwe-bench's `~/mcpv/tf518`, file for file). Neither host's venv has torchvision or
+  pillow, and without torchvision the resize falls back to torch's (not bit for bit HF's): the
+  card's image rows would not be the references'. The processor's crops of the sessions'
+  images hash the same on hwe-bench and opentpu with it.
 
 Relays go hwe-bench -> Mac -> opentpu, between card sessions. Nothing large goes on /home.
 
-Sessions (the lead runs them; scripts prepared on this branch):
-1. Text only: the qwen35-35b qualification's prompts on this checkpoint (otpu-chat, MoE path).
-2. One image at `--max-slices 1` (the thumbnail), then a sliced one at the default 9.
-3. otpu-serve with image_url requests, the KV store reusing a context past the same image.
+Sessions (the lead runs them; scripts on this branch):
+1. **mcpv1** (`tools/offload/sessions/mcpv1.sh`; production's bitstream and configuration):
+   through otpu-chat's engine and Chat (`tools/qual/chatmoe.py --image N:PATH`), each run
+   token-exact against the ISA simulator's (REF=1 on hwe-bench):
+   - text: chatmoe.py's two text turns;
+   - thumb: cats.jpg at `--max-slices 1` (one crop), two turns;
+   - sliced: doc.png at the default 9 slices (7 crops), one turn;
+   - serve: otpu-serve with `tools/serve_bench.py`'s images part (data: URLs, max_slices 1):
+     the first reply must be thumb's; the repeat and the next turn reuse the context past the
+     image, another image does not.
+   Each turn reports the crops' seconds through the card's tower, TTFT, prefill and decode
+   tok/s and the slots' hits.
+2. Staged vision (`Spec.vision_staged`) against resident: decode hit rate and TTFT with images.
 
 ## 7. Decisions
 
