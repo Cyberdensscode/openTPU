@@ -317,3 +317,27 @@ def test_the_real_towers_programs_fit_the_card():
         assert len(runs) == 1 + 3 * 7 + 4 + 3 * 20 + 1
         for name, (p, _) in progs.items():
             assert len(p) <= cfg.IMEM_WORDS // 8, (N, name, len(p))
+
+
+def test_the_card_tower_is_hfs(hf_tiny):
+    """HF's tiny MiniCPM-V (its own weights, load_vision's reading of them) on the card's
+    tower (int8, ISA simulator): HF's get_image_features rows to within int8's error, two
+    crops of a 12 x 16 and a 16 x 8 grid."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    import minicpmv_hf
+    from opentpu.llm import minicpmv as MV
+    m, d = hf_tiny
+    vs = MV.VisionSpec.from_hf(d)
+    vi, be = minicpmv_hf.card_tower(vs, MV.load_vision(d))
+    for h, w in ((12, 16), (16, 8)):
+        P = np.random.default_rng(h + w).uniform(-1, 1, (h * w, 3 * vs.patch ** 2)).astype(
+            np.float32)
+        pv = torch.from_numpy(P.reshape(h * w, 3, vs.patch, vs.patch).transpose(1, 2, 0, 3)
+                              .reshape(1, 3, vs.patch, h * w * vs.patch))
+        with torch.no_grad():
+            hf = m.model.get_image_features(pv, torch.tensor([[h, w]])).pooler_output[0].numpy()
+        got = vi.encode(be, P, (h, w))
+        cos = (got * hf).sum(-1) / np.linalg.norm(got, axis=-1) / np.linalg.norm(hf, axis=-1)
+        assert cos.min() >= 0.999, cos.min()

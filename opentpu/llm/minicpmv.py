@@ -493,13 +493,13 @@ class VisionImage:
     """The vision tower's and projector's part of a MiniCPM-V image in one slice's DRAM
     (docs/minicpmv.md 4.2): the weights in MXU formats (the checkpoint's shapes, but the MLPs'
     widths padded to their chunks with zero rows and columns and the patch rows' 588 to 640;
-    each LayerNorm's bias folded into the next linear's), each encoder layer a block of
-    `lstride` bytes (a run-time layer index
-    addresses any of them; block `layers` is the window merger's attention); the work area of
-    a crop of up to `nmax` patches (the host's patch rows P and position-table rows E, the
-    residual rows X and X2, the Q and O scratch, the KV scratch) and the projector's output
-    rows `vis` (`out_rows`: the prompt's image rows). `b`: the image's allocator
-    (qwen3._Bump), from its next byte."""
+    each LayerNorm's bias folded into the next linear's; `fmt`: their formats, formats()),
+    each encoder layer a block of `lstride` bytes (a run-time layer index addresses any of
+    them; block `layers` is the window merger's attention); the work area of a crop of up to
+    `nmax` patches (the host's patch rows P and position-table rows E, the residual rows X and
+    X2, the Q and O scratch, the KV scratch) and the projector's output rows `vis`
+    (`out_rows`: the prompt's image rows). `b`: the image's allocator (qwen3._Bump), from its
+    next byte."""
 
     CHUNK = 256         # the MLPs' F chunk (a 4-bit W2's column slices: whole 2D)
     WCHUNK = 512        # the window merger's (17216 -> 17408)
@@ -509,7 +509,9 @@ class VisionImage:
     def __init__(self, vs: VisionSpec, cfg, b, nmax: int = 2048, out_rows: int = 2048,
                  fmt: str = "int8"):
         D = cfg.D
-        self.vs, self.cfg, self.fmt = vs, cfg, fmt
+        self.vs, self.cfg = vs, cfg
+        self.fmts = self.formats(fmt)
+        F_ = self.fmts
         C, H = vs.hidden, vs.heads
         self.C, self.heads, self.dv = C, H, vs.head_dim
         self.dp = _up(vs.head_dim, D)
@@ -520,29 +522,30 @@ class VisionImage:
         self.nmax, self.out_rows = _up(nmax, D), out_rows     # V^T rows: whole D stretches
         HP = H * self.dp
 
-        def mat(bump, n, k):
-            return (bump.alloc(n * Q.row_bytes(k, fmt, D)),
-                    bump.alloc(n * Q.scale_bytes(k, fmt, D)), n, k)
+        def mat(bump, n, k, f):
+            return (bump.alloc(n * Q.row_bytes(k, f, D)), bump.alloc(n * Q.scale_bytes(k, f, D)),
+                    n, k, f)
         from .qwen3 import _Bump
         lb = _Bump()                                    # a layer block's offsets
         self.lofs = dict(ln1w=lb.alloc(4 * C), ln2w=lb.alloc(4 * C),
-                         wq=mat(lb, C, C), bq=lb.alloc(4 * C),
-                         wk=mat(lb, C, C), bk=lb.alloc(4 * C), wv=mat(lb, C, C),
-                         bv=lb.alloc(4 * C), wo=mat(lb, C, C), bo=lb.alloc(4 * C),
-                         w1=mat(lb, self.F, C), b1=lb.alloc(4 * self.F),
-                         w2=mat(lb, C, self.F), b2=lb.alloc(4 * C))
+                         wq=mat(lb, C, C, F_["attn"]), bq=lb.alloc(4 * C),
+                         wk=mat(lb, C, C, F_["attn"]), bk=lb.alloc(4 * C),
+                         wv=mat(lb, C, C, F_["attn"]), bv=lb.alloc(4 * C),
+                         wo=mat(lb, C, C, F_["attn"]), bo=lb.alloc(4 * C),
+                         w1=mat(lb, self.F, C, F_["mlp"]), b1=lb.alloc(4 * self.F),
+                         w2=mat(lb, C, self.F, F_["mlp"]), b2=lb.alloc(4 * C))
         self.lstride = _up(lb.next, 4096)
         self.layer0 = _up(b.next, 4096)
         b.next = self.layer0 + (vs.layers + 1) * self.lstride
         self.start = self.layer0
         self.wm = dict(pre_w=b.alloc(16 * C), pre_b=b.alloc(16 * C),
-                       w1=mat(b, self.FW, 4 * C), b1=b.alloc(4 * self.FW),
-                       w2=mat(b, C, self.FW), b2=b.alloc(4 * C))
+                       w1=mat(b, self.FW, 4 * C, F_["wm"]), b1=b.alloc(4 * self.FW),
+                       w2=mat(b, C, self.FW, F_["wm"]), b2=b.alloc(4 * C))
         self.post = (b.alloc(4 * C), b.alloc(4 * C))
         self.proj = dict(pre_w=b.alloc(16 * C), pre_b=b.alloc(16 * C),
-                         w1=mat(b, 4 * C, 4 * C), b1=b.alloc(16 * C),
-                         w2=mat(b, vs.out, 4 * C), b2=b.alloc(4 * vs.out))
-        self.emb = dict(wp=mat(b, C, self.KP), bp=b.alloc(4 * C))
+                         w1=mat(b, 4 * C, 4 * C, F_["proj"]), b1=b.alloc(16 * C),
+                         w2=mat(b, vs.out, 4 * C, F_["proj"]), b2=b.alloc(4 * vs.out))
+        self.emb = dict(wp=mat(b, C, self.KP, F_["embed"]), bp=b.alloc(4 * C))
         self.weights_end = b.next
         n = self.nmax
         self.work = dict(P=b.alloc(4 * n * self.KP), E=b.alloc(4 * n * C),
@@ -553,11 +556,29 @@ class VisionImage:
                         "vt": b.alloc(self.dp * n), "vs": b.alloc(4 * n)} for h in range(H)}
         self.end = b.next
 
+    KINDS = ("attn", "mlp", "wm", "proj", "embed")
+
+    @classmethod
+    def formats(cls, fmt: str) -> dict:
+        """The weights' MXU formats by kind: "int8" (every kind), or "kind=fmt,..." over the
+        others' int8 (attn: the encoder layers' and the window merger's attention; mlp: the
+        encoder layers' MLPs; wm: the window merger's MLP; proj: the projector; embed: the
+        patch embedding)."""
+        if "=" not in fmt:
+            return dict.fromkeys(cls.KINDS, fmt)
+        out = dict.fromkeys(cls.KINDS, "int8")
+        for part in fmt.split(","):
+            k, f = part.split("=")
+            if k not in out:
+                raise ValueError(f"vision format kind {k!r}: one of {cls.KINDS}")
+            out[k] = f
+        return out
+
     # ---- descriptors
     def _w(self, base, m):
         from ..compiler import QTensor
-        a, s, n, k = m
-        return QTensor.weight(base + a, base + s, n, k, self.fmt, self.cfg.D)
+        a, s, n, k, _ = m
+        return QTensor.weight(base + a, base + s, n, k, m[4], self.cfg.D)
 
     @staticmethod
     def _v(base, a, n):
@@ -613,7 +634,7 @@ class VisionImage:
         f32 = np.float32
 
         def put_m(base, m, a):
-            q, s = Q.quantize_mxu(np.asarray(a, f32), self.fmt, D)
+            q, s = Q.quantize_mxu(np.asarray(a, f32), m[4], D)
             put(base + m[0], q)
             put(base + m[1], s)
 

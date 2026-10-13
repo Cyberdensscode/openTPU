@@ -19,6 +19,10 @@ its 64 GB of bf16 experts.
     python3 tools/minicpmv_hf.py procheck MODEL --images IMG... [--slices 9 1]
         the host's image port (opentpu.llm.minicpmv) against HF's processor and canvas
         positions, bit for bit (the model directory's tokenizer and configs; no weights)
+    python3 tools/minicpmv_hf.py vision MODEL [OUT.npz] --images IMG... [--card int8 F...]
+        [--prompt P] [--max-slices 9]
+        the vision side against HF's: vision_reference (erf, tanh) and the card's tower on the
+        ISA simulator per format, row cosines and the first reply token's dKL (OUT.json too)
 
 MODEL: a checkpoint directory (models/MiniCPM-V-4.7-35B-A3B). transformers 5.18 may sit on its
 own path (PYTHONPATH=~/mcpv/tf518 on hwe-bench, with pillow and torchvision 0.29.1+cpu for
@@ -180,6 +184,99 @@ def logits(a) -> None:
     print(f"{a.out}: {len(z['ids'])} positions", file=sys.stderr)
 
 
+# =============================================================================== vision
+def card_tower(vs, W, fmt: str = "int8"):
+    """(VisionImage, IsaBackend): the card's vision tower and projector in `fmt`
+    (VisionImage.formats) on the ISA simulator, the board's configuration with 1 GiB of DRAM."""
+    from opentpu.isasim import board_config
+    from opentpu.llm import minicpmv as MV
+    from opentpu.llm.qwen3 import IsaBackend, _Bump
+    cfg = board_config(DRAM_BYTES=1 << 30)
+    vi = MV.VisionImage(vs, cfg, _Bump(), nmax=2048, out_rows=128, fmt=fmt)
+    img = np.zeros(cfg.DRAM_BYTES, np.uint8)
+
+    def put(addr, a):
+        v = np.ascontiguousarray(a).view(np.uint8).reshape(-1)
+        img[addr:addr + v.size] = v
+    vi.build(W, put)
+    return vi, IsaBackend(cfg, [img])
+
+
+def _first_token(model, x, feats=None) -> np.ndarray:
+    """The logits of the reply's first token; feats: every crop's rows to use instead of HF's
+    get_image_features (its pooler_output)."""
+    from types import SimpleNamespace
+    if feats is not None:
+        t = [torch.from_numpy(np.asarray(f, np.float32)).to(model.dtype) for f in feats]
+        model.model.get_image_features = lambda *a, **k: SimpleNamespace(pooler_output=t)
+    try:
+        out = model(**x, use_cache=False, logits_to_keep=1)
+    finally:
+        if feats is not None:
+            del model.model.get_image_features
+    return out.logits[0, -1].double().numpy()
+
+
+def _dkl(p_logits, q_logits) -> float:
+    lp = p_logits - p_logits.max()
+    lp = lp - np.log(np.exp(lp).sum())
+    lq = q_logits - q_logits.max()
+    lq = lq - np.log(np.exp(lq).sum())
+    return float((np.exp(lp) * (lp - lq)).sum())
+
+
+def _cos(a, b) -> np.ndarray:
+    a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
+    return (a * b).sum(-1) / np.linalg.norm(a, axis=-1) / np.linalg.norm(b, axis=-1)
+
+
+def vision(a) -> None:
+    """docs/minicpmv.md 5: per image, HF's crop features (fp32) against vision_reference with
+    the projector's exact GELU (erf) and with its tanh form, and against the card's tower on
+    the ISA simulator in each of --card's formats: every crop's row cosines (min / mean); then
+    the reply's first token with each variant's rows put in HF's place: dKL against HF's own
+    (and whether its top token is HF's)."""
+    from opentpu.llm import minicpmv as MV
+    model, proc = load(a.model, torch.float32)
+    vs = MV.VisionSpec.from_hf(a.model)
+    W = MV.load_vision(a.model)
+    cards = {f: card_tower(vs, W, f) for f in a.card}
+    z, report = {}, []
+    for ii, img in enumerate(a.images):
+        x = inputs(proc, a.prompt, img, a.max_slices)
+        im = MV.prepare(img, vs, a.max_slices)
+        assert [list(t) for t in x["target_sizes"].tolist()] == [list(s) for s in im.sizes]
+        hf = [t.float().numpy() for t in model.model.get_image_features(
+            x["pixel_values"], x["target_sizes"]).pooler_output]
+        var = {"erf": [], "tanh": []}
+        var.update({"card-" + f: [] for f in a.card})
+        secs = {f: 0.0 for f in a.card}
+        for P, size in zip(im.patches, im.sizes):
+            var["erf"].append(MV.vision_reference(vs, W, P, size))
+            var["tanh"].append(MV.vision_reference(vs, W, P, size, gelu=MV._gelu_tanh))
+            for f, (vi, be) in cards.items():
+                t = time.time()
+                var["card-" + f].append(vi.encode(be, P, size))
+                secs[f] += time.time() - t
+                print(f"{Path(img).name}: crop {list(size)} {f} {time.time() - t:.0f} s",
+                      file=sys.stderr, flush=True)
+        base = _first_token(model, x)
+        r = dict(image=str(img), crops=[list(s) for s in im.sizes], rows=sum(len(h) for h in hf),
+                 top=int(base.argmax()), isa_s={f: round(v, 1) for f, v in secs.items()})
+        for k, v in var.items():
+            c = np.concatenate([_cos(p, q) for p, q in zip(v, hf)])
+            lg = _first_token(model, x, v)
+            r[k] = dict(cos_min=round(float(c.min()), 6), cos_mean=round(float(c.mean()), 6),
+                        dkl=_dkl(base, lg), top=int(lg.argmax()) == r["top"])
+            z[f"{ii}/{k}"] = np.concatenate(v)
+        z[f"{ii}/hf"] = np.concatenate(hf)
+        report.append(r)
+        print(json.dumps(r), flush=True)
+    if a.out:
+        np.savez(a.out, **z)
+        Path(a.out).with_suffix(".json").write_text(json.dumps(report, indent=1))
+
+
 # =============================================================================== check
 def tiny_checkpoint(d: Path, vocab: int = 1080) -> Path:
     """A tiny random MiniCPM-V 4.7 checkpoint in d (config, safetensors, the real tokenizer's
@@ -198,8 +295,8 @@ def tiny_checkpoint(d: Path, vocab: int = 1080) -> Path:
                                           "partial_rotary_factor": 0.25,
                                           "mrope_interleaved": True,
                                           "mrope_section": [11, 11, 10]}),
-        vision_config=dict(hidden_size=64, intermediate_size=128, num_hidden_layers=3,
-                           num_attention_heads=4, image_size=70, patch_size=14),
+        vision_config=dict(hidden_size=128, intermediate_size=192, num_hidden_layers=3,
+                           num_attention_heads=2, image_size=70, patch_size=14),
         insert_layer_id=1, image_token_id=1000, video_token_id=1001, image_start_id=1002,
         image_end_id=1003, slice_start_id=1004, slice_end_id=1005, newline_id=198)
     m = MiniCPMV4_7ForConditionalGeneration(cfg).float().eval()
@@ -288,7 +385,7 @@ def load_model_only(model_dir, dtype):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("mode", choices=("greedy", "logits", "check", "procheck"))
+    ap.add_argument("mode", choices=("greedy", "logits", "check", "procheck", "vision"))
     ap.add_argument("model", nargs="?")
     ap.add_argument("out", nargs="?")
     ap.add_argument("--prompt", default="What is the capital of France? Answer in one sentence.")
@@ -299,7 +396,9 @@ def main():
     ap.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"))
     ap.add_argument("--think", action="store_true")
     ap.add_argument("--hidden", action="store_true")
-    ap.add_argument("--images", nargs="*", default=[], help="procheck: the images")
+    ap.add_argument("--images", nargs="*", default=[], help="procheck, vision: the images")
+    ap.add_argument("--card", nargs="*", default=["int8"],
+                    help="vision: the card tower's formats (VisionImage.formats) to check")
     ap.add_argument("--slices", nargs="*", type=int, default=[9, 1],
                     help="procheck: the max-slices to check")
     a = ap.parse_args()
@@ -308,6 +407,8 @@ def main():
         check()
     elif a.mode == "procheck":
         procheck(a)
+    elif a.mode == "vision":
+        vision(a)
     elif a.mode == "greedy":
         r = greedy(a)
         Path(a.out).write_text(json.dumps(r))
