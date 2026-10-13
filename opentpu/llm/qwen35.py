@@ -153,8 +153,9 @@ class Spec:
         c = top.get("text_config", top)
         rope = rope_parameters(c, model_dir)        # (mRoPE: 1-D RoPE for text)
         d = c.get("head_dim") or c["hidden_size"] // c["num_attention_heads"]
-        eos = c.get("eos_token_id", 248044)
-        eos = tuple(eos) if isinstance(eos, list) else (eos,)
+        eos = c.get("eos_token_id")             # (a null one: the default's)
+        eos = tuple(e for e in (eos if isinstance(eos, list) else [eos]) if e is not None) \
+            or (248044,)
         moe = None
         if "num_experts" in c:                  # Qwen3.5-MoE: softmax top-k, a shared expert
             moe = MO.MoESpec(E=c["num_experts"], k=c["num_experts_per_tok"],

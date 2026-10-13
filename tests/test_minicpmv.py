@@ -81,6 +81,19 @@ def test_a_minicpmv_checkpoint_is_a_qwen35_moe(tiny):
     assert s.kinds == tuple("attn" if k == "attn" else "linear" for k in KINDS)
 
 
+def test_a_null_eos_id_is_the_default(tiny, tmp_path):
+    """A config whose eos_token_id is null (the tiny checkpoints': HF's default) gives the
+    language model's end tokens, no None among them (otpu-serve's stops refused one)."""
+    m, d = tiny
+    top = json.loads((d / "config.json").read_text())
+    top["text_config"]["eos_token_id"] = None
+    (tmp_path / "config.json").write_text(json.dumps(top))
+    assert load_spec(tmp_path).eos == (248046, 248044)
+    top["text_config"]["eos_token_id"] = [248046, None]
+    (tmp_path / "config.json").write_text(json.dumps(top))
+    assert load_spec(tmp_path).eos == (248046,)
+
+
 @pytest.mark.parametrize("lazy", [False, True])
 def test_the_weights_are_the_language_models_alone(tiny, lazy):
     """The loaders give the language model under a text-only checkpoint's names, and none of
