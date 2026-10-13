@@ -166,3 +166,43 @@ def test_moe_mtp_loop_on_the_device_is_plain_greedy(tiny_moe_mtp, P, drafter, fm
     assert eng.pos == ref.pos == P + len(want) - 1
     assert all(np.array_equal(a, b) for a, b in
                zip(_states(eng, spec, dec.slot), _states(ref, spec, 0)))
+
+
+@pytest.mark.parametrize("P, drafter, sp", [
+    (250, "right", (0.8, 5, 0.9, 1.1)),     # penalty: row 1's counts the draft
+    (251, "mixed", (1.5, 20, 1.0, 1.0)),    # E at 255; no penalty, top-k 20
+    (249, "mtp", (0.8, 5, 0.9, 1.1))])
+def test_moe_mtp_sampled_loop_is_plain_sampling(tiny_moe_mtp, P, drafter, sp):
+    """The sampled MTP loop on the device on the streamed MoE gives plain sampled decode's
+    tokens for the same uniforms whatever the drafts (the verify samples a0 with p + 1's
+    uniform and accepts iff a0 is the draft, a1 with p + 2's), and leaves the committed
+    states as plain decode does."""
+    from opentpu.llm import generate as G
+    from test_mtp import _states
+    W, spec = tiny_moe_mtp
+    samp, N, seed = G.Sampling(*sp), 15, 5
+    prompt = [int(t) for t in np.random.default_rng(P).integers(0, 1000, P)]
+    ref = Engine(spec, W, cap=512, cfg=CFG, rows=1, resident=True, experts=SLOTS)
+    u = np.minimum(np.random.default_rng(seed).random(N).astype(np.float32),
+                   np.float32(1 - 2.0 ** -24))
+    c, want, lg = list(prompt), [], ref.prefill(prompt)
+    for i in range(N):
+        want.append(G.reference_pick(lg, samp, c, u[i]))
+        c.append(want[-1])
+        if i < N - 1:
+            lg = ref.step(want[-1])
+    assert len(set(want)) > len(want) // 2
+    right = np.zeros(514, np.float32)
+    right[P:P + len(want)] = want
+    drafts = {"right": right, "mtp": None,
+              "mixed": np.where(np.arange(514) % 3, right, (right + 7) % 1000)}[drafter]
+    eng = mtp_engine(spec, W, cap=512, cfg=CFG, rows=2, experts=SLOTS)
+    dec = MTPDecoder(eng)
+    st = dec.generate_card(prompt, max_new=N, stop=[], drafts=drafts, sampling=samp,
+                           rng=np.random.default_rng(seed))
+    assert st.tokens == want
+    if drafter == "right":
+        assert sum(st.accepted) >= len(want) // 2 - 2
+    assert eng.pos == ref.pos == P + len(want) - 1
+    assert all(np.array_equal(a, b) for a, b in
+               zip(_states(eng, spec, dec.slot), _states(ref, spec, 0)))
