@@ -68,6 +68,11 @@ if {![regexp {otpu_mxu_place: (MCOLS \d+ x D \d+|off)} $ilog]} {
   error "otpu_mxu_place.tcl did not place the MXU (no summary line in impl_1/runme.log; its error is\
          a critical warning there; OTPU_MXU_PLACE=0 builds without it; below MCOLS 8 it says off)"
 }
+# and the memory PHY's flops (constraints/otpu_ddr_phy_place.tcl), the same way
+if {![regexp {otpu_ddr_phy_place: (\d+ flops|off)} $ilog]} {
+  error "otpu_ddr_phy_place.tcl did not place the PHY's flops (no summary line in impl_1/runme.log;\
+         OTPU_DDR_PHY_PLACE=0 builds without it)"
+}
 open_run impl_1
 
 # ---- PCIe Gen2: the PCIe block's 500 MHz paths into its own block RAMs (userclk1_reroute.tcl)
