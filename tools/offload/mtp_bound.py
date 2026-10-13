@@ -93,18 +93,22 @@ def main():
     ap.add_argument("--dhead", type=float, default=1.0)
     ap.add_argument("--cdraft", type=float, default=9.1, help="ms a step, the MTP draft")
     ap.add_argument("--accept", default="0.75,0.78,0.8,0.85,1.0")
-    ap.add_argument("--slots", type=int, default=41)
+    ap.add_argument("--slots", type=int, default=41, help="slots a layer of the MTP image")
+    ap.add_argument("--slots-plain", type=int, default=None,
+                    help="slots a layer of plain decode's image (default --slots)")
     a = ap.parse_args()
+    sp = a.slots if a.slots_plain is None else a.slots_plain
     tr = [load(x) for x in a.traces]
     p = dict(LS.MODELS["q35"])
     E = tr[0]["E"]
     base = []
     for i, t in enumerate(tr):
-        warm = LS.warm_set(tr, i, a.slots * t["req"].shape[1])
-        base.append(run2(t["req"], a.slots, warm, E, p, 0.0, 0, 0, 0, 0, rows=1))
+        warm = LS.warm_set(tr, i, sp * t["req"].shape[1])
+        base.append(run2(t["req"], sp, warm, E, p, 0.0, 0, 0, 0, 0, rows=1))
     b = np.mean(base, 0)
-    print(f"plain decode: {b[0]:.1f} ms a token ({1000 / b[0]:.2f} tok/s), {b[1]:.1f} misses a "
-          f"token; DMIX {a.dmix} X {a.x:.4f} DHEAD {a.dhead} CDRAFT {a.cdraft}")
+    print(f"plain decode ({sp} slots a layer): {b[0]:.1f} ms a token ({1000 / b[0]:.2f} tok/s), "
+          f"{b[1]:.1f} misses a token; MTP at {a.slots} slots: DMIX {a.dmix} X {a.x:.4f} DHEAD "
+          f"{a.dhead} CDRAFT {a.cdraft}")
     print(f"{'a':>5s} {'ms/token':>9s} {'tok/s':>6s} {'speedup':>7s} {'misses/token':>12s} "
           f"{'tokens/step':>11s} {'experts/request':>15s} {'c_2+c_draft':>11s}")
     for acc in [float(x) for x in a.accept.split(",")]:

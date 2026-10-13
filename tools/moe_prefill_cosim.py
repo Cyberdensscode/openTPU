@@ -7,6 +7,7 @@ on the data, so the images are zeros: no checkpoint is read (config.json only).
     python3 tools/moe_prefill_cosim.py expert MODEL_DIR --M 1,2,3,4,8
     python3 tools/moe_prefill_cosim.py em MODEL_DIR --rows 16,131,512 [--used N | --route IDS.npy]
         [--set MCOLS=16] [--isa] [--profile]
+    python3 tools/moe_prefill_cosim.py mtp MODEL_DIR --prefix 4:8 [--pos 256]
 
 rows: the model cut to each prefix of layers (Gemma 4: checkpoint layers, ':' between
 prefixes; Qwen3.5: a count), R rows at positions pos.. (no logits); `dense`: the MoE block
@@ -29,6 +30,14 @@ bucketing), cycles, ms, ms a pass, the experts' bytes streamed (each pass stream
 the run's DRAM bytes by kind and a row (em_bytes), and layer-major's passes on the same ids in
 runs of 2 rows (lm2: each run's union; the synthetic routing's adjacent rows are independent,
 so against a prompt's it overstates them).
+mtp (Qwen3.5-MoE, docs/offload.md 15.6): the decode loop's programs on the card at a prefix of
+layers, the production formats (streamed.FORMATS), every expert present and the host's
+mailboxes served (the timing hack): the plain loop's one token (compile_generate: the step and
+its argmax) and the MTP loop's iteration (opentpu/llm/mtp.py compile_gen: V, the verify of the
+token and its draft, then D, the MTP layer over both rows and the 32K draft head, on V's DRAM),
+their HALT CHAINs made HALTs. The image's head is the whole vocabulary's; a layer's cost is the
+difference of two prefixes. Also the slots a layer that fill the card's DRAM (fit_experts) for
+the plain image and the MTP one (its MTP layer's MoE one more layer of the slots).
 --set KEY=VALUE overrides the board configuration (MCOLS=16, ...). One JSON line per run.
 """
 from __future__ import annotations
@@ -255,6 +264,71 @@ def cmd_expert(a):
 
 EM_USED = {"qwen35": 144, "gemma4": 75}    # a layer's distinct experts in a prompt chunk
 EM_SENT = 7.0                               # an output place the run has not written
+
+
+def _no_chain(progs):
+    """The programs with each HALT CHAIN a plain HALT (one program timed alone)."""
+    return [[I.halt(comment="(chain)") if x.op == I.HALT and x.flags & I.F_CHAIN else x
+             for x in p] for p in progs]
+
+
+def _put(dram, at: int, v) -> None:
+    b = np.ascontiguousarray(v).view(np.uint8).ravel()
+    dram[at:at + b.size] = b
+
+
+def cmd_mtp(a):
+    """The plain decode loop's token against the MTP loop's iteration (V then D) at each
+    prefix of layers; the slots a layer of the whole model's images."""
+    from opentpu.host import streamed as ST
+    from opentpu.host.offload import LINE
+    from opentpu.llm import generate as G
+    from opentpu.llm import mtp as MT
+    kind, M, spec = load_model(a.model)
+    if kind != "qwen35":
+        raise SystemExit("mtp: a Qwen3.5-MoE model")
+    wformat, head, formats = ST.defaults(spec)
+    full = board_config(PAIR=True, DSTEP=True, STREAM=True)      # the card's 4 GiB
+    out = dict(model=Path(a.model).name, cap=a.cap_slots)
+    for name, sp, rows in (("plain", spec, 1), ("mtp", dataclasses.replace(spec, mtp=True), 2)):
+        img = ST.probe(sp, full, a.cap_slots, rows=rows, wformat=wformat, head_format=head,
+                       formats=formats, lookup=True)
+        out[f"slots_{name}"] = ST.fit_experts(sp, full, a.cap_slots, img)
+        out[f"layers_{name}"] = img.offload.layers
+    print(json.dumps(out), flush=True)
+    cfg = cfg_of()
+    blk, pos = 256, a.pos
+    b = pos // blk + 1
+    for prefix in a.prefix.split(":"):
+        n = int(prefix)
+        rec = dict(model=Path(a.model).name, prefix=n, pos=pos, formats=formats)
+        for name, mtp in (("plain", False), ("mtp", True)):
+            s = dataclasses.replace(spec, kinds=spec.kinds[:n], mtp=mtp)
+            img = s.image(cfg, a.cap, rows=2 if mtp else 1, wformat=wformat, head_format=head,
+                          formats=formats, lookup=True, experts=s.moe.k)
+            dram = np.zeros(img.nbytes, np.uint8)
+            timing_hack(img, dram)
+            _put(dram, img.lookup["mbox"] + 2 * LINE, np.float32(1e6))     # rows served
+            g = img.lookup["gen"]
+            st = G.state_words(s, 791, pos, 8, [], blk)
+            K = s.conv_k
+            if not mtp:
+                _put(dram, g["state"], st)
+                progs = img.compile_generate(b, max((b - 1) * blk, K - 1), blk, chain=False)
+                t = time.time()
+                _, r = _rtl(cfg, progs, dram)
+                rec.update(plain=r["cycles"], plain_ms=round(r["cycles"] / (MHZ * 1e3), 3),
+                           plain_ins=len(progs[0]), plain_sim_s=round(time.time() - t))
+                continue
+            st[MT.S_DRAFT], st[MT.S_PAR] = 792, 0
+            _put(dram, g["state"], st)
+            for k in ("V0", "D"):
+                progs = _no_chain(MT.compile_gen(img, b, MT.KINDS.index(k), blk))
+                t = time.time()
+                dram, r = _rtl(cfg, progs, dram)
+                rec.update({k: r["cycles"], f"{k}_ms": round(r["cycles"] / (MHZ * 1e3), 3),
+                            f"{k}_ins": len(progs[0]), f"{k}_sim_s": round(time.time() - t)})
+        print(json.dumps(rec), flush=True)
 
 
 def em_ids(rows: int, k: int, E: int, used: int, seed: int, route=None) -> np.ndarray:
@@ -495,8 +569,17 @@ def main():
                    "many entries on the same DRAM; the outputs must be equal")
     m.add_argument("--em-pass", type=int, default=None, help="entries a pass (default: the "
                    "configuration's, moe.em_pass_rows)")
+    t = sub.add_parser("mtp")
+    t.add_argument("model")
+    t.add_argument("--prefix", default="4:8", help="layer counts (':' between)")
+    t.add_argument("--pos", type=int, default=256, help="the token's position (the verify's "
+                   "rows at pos, pos + 1)")
+    t.add_argument("--cap", type=int, default=1024)
+    t.add_argument("--cap-slots", type=int, default=2048, help="the KV capacity of the slot "
+                   "count (otpu-chat's, chatmoe's)")
     a = ap.parse_args()
-    {"rows": cmd_rows, "expert": cmd_expert, "layer": cmd_layer, "em": cmd_em}[a.cmd](a)
+    {"rows": cmd_rows, "expert": cmd_expert, "layer": cmd_layer, "em": cmd_em,
+     "mtp": cmd_mtp}[a.cmd](a)
 
 
 if __name__ == "__main__":
