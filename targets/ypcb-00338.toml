@@ -15,7 +15,10 @@ D = 128
 MCOLS = 8                       # release r2: 8 MX columns (docs/mx_mxu.md 9; production 8b33206e: 4)
 ACT_BLOCKS = 128
 ACT_ROWS = 16                   # the MX build's: MMs of up to 16 rows (replay); 0: MCOLS
-TMEM_WORDS = 65536
+TMEM_WORDS = 131072             # release r2: 128K (128 RAMB36 at TMEM_IMPL 3). At MCOLS 8 and 64K
+#                                 Qwen3.5-0.8B's MTP prompt runs held 5-7 rows and Gemma 4 E2B's 4-6
+#                                 (next-fit and best-fit alike); 128K runs 8: every row short of
+#                                 MCOLS is another pass of the weights (production 8b33206e: 64K)
 IMEM_WORDS = 32768
 DRAM_BYTES = 4294967296         # per slice
 LANES = 8
@@ -34,7 +37,7 @@ VPU_CL = 2
 ULANES = 8
 TMEM_IMPL = 3                   # 0: one copy per read port (block RAM); 1: banked 1R1W macros;
                                 # 3: one copy (docs/tmem_nocopy.md), the pick r2pgRs below:
-TMEM_NSB = 2                    #   2 RAMs a bank (64 RAMB36 at 64K words, against 384),
+TMEM_NSB = 2                    #   2 RAMs a bank (64 RAMB36 at 64K words, 128 at 128K; against 384),
 TMEM_RPL = true                 #   lost reads replayed under the board's arbiter,
 TMEM_TDP = true                 #   true dual-port RAMs,
 TMEM_GST = true                 #   QUANT 3 and COLL the DMA's guests,

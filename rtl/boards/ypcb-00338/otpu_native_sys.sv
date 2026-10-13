@@ -29,6 +29,7 @@ module otpu_native_sys #(
   parameter int TMEM_PMP = 0,
   parameter int TMEM_PRK = 0,
   parameter int TMEM_SDM = -1,
+  parameter int TMEM_WORDS = 1 << 16,    // TMEM words (otpu_board; the CFG_TMEM register)
   parameter int LANES = 8,
   parameter int ULANES = 8,
   parameter int CORE_KHZ = 100000,
@@ -194,6 +195,7 @@ module otpu_native_sys #(
                .TMEM_IMPL(TMEM_IMPL), .TMEM_RQ(TMEM_RQ),
                .TMEM_NSB(TMEM_NSB), .TMEM_SBP(TMEM_SBP), .TMEM_SBH(TMEM_SBH), .TMEM_RPL(TMEM_RPL), .TMEM_TDP(TMEM_TDP),
                .TMEM_GST(TMEM_GST), .TMEM_PMP(TMEM_PMP), .TMEM_PRK(TMEM_PRK), .TMEM_SDM(TMEM_SDM),
+               .TMEM_WORDS(TMEM_WORDS),
                .CORE_KHZ(CORE_KHZ), .BUILD_ID(BUILD_ID), .DDR_MTS(DDR_MTS), .DSTEP(DSTEP),
                .HOSTCAL(HOSTCAL), .SEQ_WC(SEQ_WC), .PLATFORM(PLATFORM), .ARCH_HASH(ARCH_HASH),
                .TRACE_DEPTH(TRACE_DEPTH), .COLL_GATHER(COLL_GATHER)) u_board (

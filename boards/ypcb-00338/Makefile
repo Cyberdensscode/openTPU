@@ -23,6 +23,7 @@ DDR ?= 1066
 #   8b33206e), 1 banked (three copies, docs/tmem_pump.md; TMEM_RQ=1 with it: the banks' addresses
 #   from the requests by priority), 3 one copy (docs/tmem_nocopy.md; TMEM_X its knobs over the
 #   target's pick, vivado/tmem_knobs.tcl; pumped on core_clk2x: CORE_MHZ's divider even)
+# TMEM_WORDS: the TMEM's words (default the target's: 131072, release r2; 65536 r2's 64 RAMB36 TMEM)
 # BUILD_ID: the BUILD_ID register (8 hex digits; default: the git commit)
 # PCIE_GEN: 2 (Gen2 x8, xdma_aclk 250 MHz, the default) or 1 (Gen1 x8), from the environment
 ifeq ($(FAST),1)
@@ -59,7 +60,7 @@ lint:
 lint-ld: lint
 
 bit:
-	MCOLS=$(MCOLS) $(if $(ACT_ROWS),ACT_ROWS=$(ACT_ROWS)) $(if $(MXU_E),MXU_E=$(MXU_E)) VPU_CL=$(VPU_CL) LANES=$(LANES) CORE_MHZ=$(CORE_MHZ) $(if $(TMEM_IMPL),TMEM_IMPL=$(TMEM_IMPL)) $(if $(TMEM_RQ),TMEM_RQ=$(TMEM_RQ)) $(if $(TMEM_X),TMEM_X=$(TMEM_X)) $(if $(BUILD_ID),BUILD_ID=$(BUILD_ID)) ./run_vivado.sh $(DDR)
+	MCOLS=$(MCOLS) $(if $(ACT_ROWS),ACT_ROWS=$(ACT_ROWS)) $(if $(MXU_E),MXU_E=$(MXU_E)) VPU_CL=$(VPU_CL) LANES=$(LANES) CORE_MHZ=$(CORE_MHZ) $(if $(TMEM_IMPL),TMEM_IMPL=$(TMEM_IMPL)) $(if $(TMEM_RQ),TMEM_RQ=$(TMEM_RQ)) $(if $(TMEM_X),TMEM_X=$(TMEM_X)) $(if $(TMEM_WORDS),TMEM_WORDS=$(TMEM_WORDS)) $(if $(BUILD_ID),BUILD_ID=$(BUILD_ID)) ./run_vivado.sh $(DDR)
 
 impl:
 	STEP=impl ./run_vivado.sh $(DDR)

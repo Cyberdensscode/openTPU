@@ -376,8 +376,8 @@ def test_a_host_without_seq_wc_refuses_a_waitc_bitstream():
 
     from opentpu import target as T
     card = dataclasses.replace(T.config("ypcb-00338"), SEQ_WC=False)
-    # MX production 8b33206e's (MCOLS 4, no entries): every earlier build's hash
-    assert f"{T.arch_hash(dataclasses.replace(card, MCOLS=4)):08x}" == "89417856"
+    # MX production 8b33206e's (MCOLS 4 and 64K TMEM words, no entries): every earlier build's hash
+    assert f"{T.arch_hash(dataclasses.replace(card, MCOLS=4, TMEM_WORDS=1 << 16)):08x}" == "89417856"
     on = dataclasses.replace(card, SEQ_WC=True)
     assert T.arch_hash(on) != T.arch_hash(card)
     assert on == T.config("ypcb-00338")                 # release r2's card takes the entries

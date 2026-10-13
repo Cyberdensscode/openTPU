@@ -49,6 +49,12 @@ if {![regexp {^[0-9]+$} $TRACE_DEPTH] || ($TRACE_DEPTH != 0 && ($TRACE_DEPTH & (
 # alone: CAPS2 bit0 = 0; the host refuses GATHER programs; docs/infra_hunt.md 5)
 set COLL_GATHER [expr {[info exists ::env(COLL_GATHER)] && $::env(COLL_GATHER) ne "" ? $::env(COLL_GATHER) : 1}]
 if {$COLL_GATHER ni {0 1}} { error "COLL_GATHER $COLL_GATHER: 0 or 1" }
+# TMEM_WORDS (environment, run_vivado.sh: the target's [arch] TMEM_WORDS, in its CFG_HASH): the
+# TMEM's words, a power of two (the CFG_TMEM register; release r2: 128K, 128 RAMB36 at TMEM_IMPL 3)
+set TMEM_WORDS [expr {[info exists ::env(TMEM_WORDS)] && $::env(TMEM_WORDS) ne "" ? $::env(TMEM_WORDS) : 131072}]
+if {![regexp {^[0-9]+$} $TMEM_WORDS] || $TMEM_WORDS < 1024 || ($TMEM_WORDS & ($TMEM_WORDS - 1))} {
+  error "TMEM_WORDS $TMEM_WORDS: a power of two, 1024 or more"
+}
 # TMEM_IMPL: the TMEM (otpu_tmem): 0 a copy per read port (production), 1 banked (three copies;
 # the slice's banked arbiter, docs/tmem_pump.md), 3 one copy (docs/tmem_nocopy.md; TMEM_X its
 # knobs, tmem_knobs.tcl: by default 2 RAMs a bank pumped at 2x on core_clk2x). Timing only: the
@@ -68,7 +74,7 @@ if {![regexp {^[0-9a-fA-F]{1,8}$} $BUILD_ID]} { error "BUILD_ID $BUILD_ID: 1 to 
 # divider steps of its 800 MHz VCO), for the CORE_KHZ register
 set VCO 800
 set CORE_KHZ [expr {round($VCO * 1000.0 / (round(double($VCO) / $CORE_MHZ * 8) / 8.0))}]
-puts "CORE_KHZ $CORE_KHZ, BUILD_ID $BUILD_ID, MXU_IMPL $MXU_IMPL, MXU_E $MXU_E, TMEM_IMPL $TMEM_IMPL, TMEM_RQ $TMEM_RQ, PLATFORM $PLATFORM, ARCH_HASH $ARCH_HASH, TRACE_DEPTH $TRACE_DEPTH, COLL_GATHER $COLL_GATHER"
+puts "CORE_KHZ $CORE_KHZ, BUILD_ID $BUILD_ID, MXU_IMPL $MXU_IMPL, MXU_E $MXU_E, TMEM_IMPL $TMEM_IMPL, TMEM_RQ $TMEM_RQ, PLATFORM $PLATFORM, ARCH_HASH $ARCH_HASH, TRACE_DEPTH $TRACE_DEPTH, COLL_GATHER $COLL_GATHER, TMEM_WORDS $TMEM_WORDS"
 
 create_project -force otpu $out -part xc7k480tffg1156-2
 # The block design's IP synthesis (minutes: xdma above all) in a cache shared by every build on
@@ -115,7 +121,7 @@ add_files -norecurse [glob $out/otpu.gen/sources_1/bd/otpu_bd/hdl/otpu_bd_wrappe
 set_property top otpu_fpga_top_ld [current_fileset]
 # otpu_seq WAITC (run_vivado.sh: the target's [arch] SEQ_WC, or SEQ_WC=1; CFG_UARCH bit24)
 set SEQ_WC [expr {[info exists ::env(OTPU_SEQ_WC_GEN)] && $::env(OTPU_SEQ_WC_GEN) eq "1" ? 1 : 0}]
-set_property generic "SEQ_WC=1'b$SEQ_WC MCOLS=$MCOLS ACT_ROWS=$ACT_ROWS VPU_CL=$VPU_CL LANES=$LANES CORE_KHZ=$CORE_KHZ BUILD_ID=32'h$BUILD_ID DDR_MTS=$DDR_SPEED DSTEP=1'b$DSTEP MXU_IMPL=$MXU_IMPL MXU_E=$MXU_E TMEM_IMPL=$TMEM_IMPL TMEM_RQ=1'b$TMEM_RQ PCIE_GEN=$PCIE_GEN PLATFORM=$PLATFORM ARCH_HASH=32'h$ARCH_HASH TRACE_DEPTH=$TRACE_DEPTH COLL_GATHER=1'b$COLL_GATHER$TMEM_GEN" [current_fileset]
+set_property generic "SEQ_WC=1'b$SEQ_WC MCOLS=$MCOLS ACT_ROWS=$ACT_ROWS VPU_CL=$VPU_CL LANES=$LANES CORE_KHZ=$CORE_KHZ BUILD_ID=32'h$BUILD_ID DDR_MTS=$DDR_SPEED DSTEP=1'b$DSTEP MXU_IMPL=$MXU_IMPL MXU_E=$MXU_E TMEM_IMPL=$TMEM_IMPL TMEM_RQ=1'b$TMEM_RQ PCIE_GEN=$PCIE_GEN PLATFORM=$PLATFORM ARCH_HASH=32'h$ARCH_HASH TRACE_DEPTH=$TRACE_DEPTH COLL_GATHER=1'b$COLL_GATHER TMEM_WORDS=$TMEM_WORDS$TMEM_GEN" [current_fileset]
 
 # ---- constraints: the board (otpu_top_ld.xdc) and the core's pads, VREF and synchronizers
 # (otpu_litedram.xdc); then, after the IP's constraints, as unmanaged Tcl on the implemented

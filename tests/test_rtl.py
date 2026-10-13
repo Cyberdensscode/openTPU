@@ -141,13 +141,14 @@ def _wf(rng):
     return [I.W8, I.W4I, I.W4F, I.WNV][int(rng.choice([0, 0, 0, 1, 2, 3]))]
 
 
-def _random_program(rng, cfg: Config, n_ops=40):
+def _random_program(rng, cfg: Config, n_ops=40, t0: int = 0):
     """A valid, hazard-free random program. The same program runs on every slice (so the
-    collectives line up); the slices differ by their DRAM contents."""
+    collectives line up); the slices differ by their DRAM contents. t0: its TMEM words from
+    there (every TMEM address the program names is t0 or more)."""
     D = cfg.D
-    prog = [I.ld(DATA, 0, 4096)]
-    src = [(0, 4096)]                 # TMEM regions holding finite "input" data
-    nxt = 4096                        # fresh TMEM destinations (never read by VOPs again)
+    prog = [I.ld(DATA, t0, 4096)]
+    src = [(t0, 4096)]                # TMEM regions holding finite "input" data
+    nxt = t0 + 4096                   # fresh TMEM destinations (never read by VOPs again)
     mm_outs = []
     scratch = SCRATCH
 
@@ -307,6 +308,23 @@ def test_one_copy_replays_make_progress(have_verilator, mcols, rows, seed):
     prog = _random_program(rng, cfg, n_ops=60)
     imgs = _images(rng, 1)
     m = Machine(cfg, [prog], [i.copy() for i in imgs]).run()
+    drams, tmems, _ = rtlsim.run(cfg, [prog], [i.copy() for i in imgs],
+                                 uarch={**rtlsim.BOARD_UARCH, **R2_TMEM}, max_cycles=1_000_000)
+    assert np.array_equal(drams[0], m.slices[0].dram)
+    assert np.array_equal(tmems[0], m.slices[0].tmem)
+
+
+@pytest.mark.parametrize("mcols,rows,seed", [(8, 16, 0), (2, 8, 1)])
+def test_one_copy_tmem_of_128k_words(have_verilator, mcols, rows, seed):
+    """Release r2's TMEM: 128K words (targets/ypcb-00338.toml) in the single pumped copy (R2_TMEM:
+    128 RAMB36), a random program's TMEM data across the first 64K words' end and past it (the
+    sequencer's TAW, the banks' rows, the replays' addresses); the results are the ISA's."""
+    rng = np.random.default_rng(4000 + seed)
+    cfg = Config(S=1, MCOLS=mcols, ACT_ROWS=rows, TMEM_WORDS=1 << 17)
+    prog = _random_program(rng, cfg, n_ops=60, t0=(1 << 16) - 2048)
+    imgs = _images(rng, 1)
+    m = Machine(cfg, [prog], [i.copy() for i in imgs]).run()
+    assert m.slices[0].tmem[1 << 16:].any()                 # (words past 64K written)
     drams, tmems, _ = rtlsim.run(cfg, [prog], [i.copy() for i in imgs],
                                  uarch={**rtlsim.BOARD_UARCH, **R2_TMEM}, max_cycles=1_000_000)
     assert np.array_equal(drams[0], m.slices[0].dram)

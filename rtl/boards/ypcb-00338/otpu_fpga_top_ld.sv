@@ -50,6 +50,8 @@ module otpu_fpga_top_ld #(
   parameter int TMEM_PMP = 1,
   parameter int TMEM_PRK = 0,
   parameter int TMEM_SDM = -1,
+  parameter int TMEM_WORDS = 1 << 17,       // TMEM words (the target's [arch] TMEM_WORDS, the CFG_TMEM
+                                            //   register; release r2: 128K, 128 RAMB36 at TMEM_IMPL 3)
   parameter int LANES = 8,                  // VPU lanes / TMEM banks (8 or 16)
   parameter int ULANES = 8,                 // TMEM lanes of the MXU and the quantizer
   parameter int CORE_KHZ = 100000,          // core_clk as the block design makes it (CORE_KHZ register)
@@ -285,6 +287,7 @@ module otpu_fpga_top_ld #(
                     .TMEM_IMPL(TMEM_IMPL), .TMEM_RQ(TMEM_RQ),
                     .TMEM_NSB(TMEM_NSB), .TMEM_SBP(TMEM_SBP), .TMEM_SBH(TMEM_SBH), .TMEM_RPL(TMEM_RPL), .TMEM_TDP(TMEM_TDP),
                     .TMEM_GST(TMEM_GST), .TMEM_PMP(TMEM_PMP), .TMEM_PRK(TMEM_PRK), .TMEM_SDM(TMEM_SDM),
+                    .TMEM_WORDS(TMEM_WORDS),
                     .ULANES(ULANES), .CORE_KHZ(CORE_KHZ), .BUILD_ID(BUILD_ID), .DDR_MTS(DDR_MTS),
                     .DSTEP(DSTEP), .HOSTCAL(1'b1), .XREG(PCIE_GEN == 2),
                     .SEQ_WC(SEQ_WC), .PLATFORM(PLATFORM), .ARCH_HASH(ARCH_HASH),

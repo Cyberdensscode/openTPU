@@ -277,11 +277,11 @@ def sources(t: Target | str | None = None, family: str | None = None) -> list[st
 
 def build_config(t: Target | str | None = None, **knobs):
     """The Config of an FPGA build of `t` with the board flow's knobs (run_vivado.sh MCOLS,
-    LANES, ACT_ROWS, DSTEP, SEQ_WC; the CFG_HASH it reports): ACT_ROWS equal to MCOLS is 0 (no
-    replay), DSTEP 0 leaves out the stream engine too (STREAM)."""
+    LANES, ACT_ROWS, TMEM_WORDS, DSTEP, SEQ_WC; the CFG_HASH it reports): ACT_ROWS equal to
+    MCOLS is 0 (no replay), DSTEP 0 leaves out the stream engine too (STREAM)."""
     t = t if isinstance(t, Target) else load(t)
     a = dict(t.arch)
-    for k in ("MCOLS", "LANES", "ACT_ROWS"):
+    for k in ("MCOLS", "LANES", "ACT_ROWS", "TMEM_WORDS"):
         if knobs.get(k) is not None:
             a[k] = int(knobs[k])
     if a["ACT_ROWS"] == a["MCOLS"]:
