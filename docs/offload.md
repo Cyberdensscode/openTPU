@@ -4355,37 +4355,64 @@ Expert-major against layer-major after the prompt (the A and B runs against L):
 | 26B | 3 | -1.083 s | +0.0070 | -6.35 |
 | 26B | 4 | -3.014 s | +0.0147 | -13.46 |
 
-Next: the slots expert-major leaves (not built).
+Next steps (deferred to the release after r2; branch emc2, nothing built yet).
+
+1. The slots expert-major leaves for the decode.
 - The 35B's long expert-major prompt leaves worse slots for the decode: -0.035 hits, +18.9
   MB/token on its first 16 tokens.
-- The likely cause:
-  - The expert run takes its passes in the order of each expert's first entry in the chunk,
-    and the server loads the experts in that order. The slots therefore end holding the experts
-    first seen late in the prompt, often rare ones.
-  - Layer-major ends with the experts of the prompt's last rows, which the decode's first
-    tokens tend to reuse.
-- Proposal: order the last chunk's passes, and the server's loads for it, by each expert's last
-  row in the chunk.
-  - The kernel side: bucket the entries from the last row back, then run the pass table from
-    its end.
-  - The server side: it has every need line of the chunk before the expert run waits.
-  - Every expert is still loaded once, so it costs no bytes, and the slots end as layer-major's.
-- An offline check on the router traces supports it (tools/offload/em_slotsim.py: 41 slots a
-  layer on the 35B, 16 on the 26B; a 157-row prompt, its last 4 rows layer-major as the chat's; then the trace's next
-  rows as the decode, under LRU; all windows, layers and texts):
-  - 35B, first 16 decode rows: layer-major's end state 0.696 hits, 166.5 MB/token;
-    first-appearance order 0.677, 177.0 MB; last-row order 0.696, 166.7 MB.
-    - So the reorder saves ~10.5 MB/token, 6 %, the card's sign at about half its size.
+- The cause, from the server (opentpu/host/offload.py). Two things differ from layer-major:
+  - Use. ExpertServer.need counts no use, while serve counts one per run for each id (t[j] and
+    the decayed use[j]). end_prefill keeps, per layer, the experts of most decayed use, so after
+    an expert-major prompt that choice rests only on the layer-major tail rows and earlier turns.
+  - Recency. A need joins the pooled slots' LRU order (`order`) when it lands, in arrival order:
+    each expert's first entry in the chunk, rare ones landing last. serve moves every id it
+    names to the order's end on each run, so layer-major keeps the experts its latest rows use
+    over the later layers' misses.
+  - The expert run's own pass order does not decide what stays; the landings and use do.
+- Next step, server-only and with no extra bytes:
+  - need counts each line as serve counts a request: t[j] += 1, and a use for each id.
+  - When the next layer's first need line arrives (need's layer switch), the finished layer's
+    experts move to the end of `order` by the last need line that named them.
+  - The slots then end with layer-major's accounting. No kernel change, and the outputs are
+    unchanged.
+- An offline bound on the router traces (tools/offload/em_slotsim.py).
+  - The model:
+    - 41 slots a layer on the 35B, 16 on the 26B;
+    - a 157-row prompt, its last 4 rows layer-major as in the chat's;
+    - then the trace's next rows as the decode, under LRU;
+    - all windows, layers and texts.
+  - It models per-layer LRU slots, not the pooled slots or end_prefill's use, so it
+    approximates.
+  - 35B, first 16 decode rows:
+
+    | slots at the prompt's end | hits | MB/token |
+    |:--|--:|--:|
+    | layer-major | 0.696 | 166.5 |
+    | first-appearance order (today's) | 0.677 | 177.0 |
+    | last-row order | 0.696 | 166.7 |
+    | the prompt's S most frequent | 0.706 | 161.1 |
+
+    - Matching layer-major saves ~10.5 MB/token (6 %), the card's sign at about half its size.
     - Over 64 decode rows the loss shrinks to 3.0 MB/token, as the decode refills the slots.
-    - The prompt's S most frequent experts do slightly better than either: 0.706, 161.1 MB.
   - 26B: the four layer-major tail rows' 32 entries cover its 16 slots, so every order gives the
-    same 0.623. The card's em gain there (turns 2-4) is not modeled.
-- Bytes it would save: on the card, 18.9 MB/token over a reply's first tokens after a long
-  expert-major prompt on the 35B. That is ~0.3 GB of H2C a 16-token reply (~0.1 s at the link's
-  placed ~3 GB/s), and nothing on short prompts (layer-major already).
-- A post-prompt refill instead would cost what it loads: the 35B's 41 slots x 40 layers x 1.71
-  MB = 2.8 GB to refill every slot, about 150 tokens of the saving. Only a targeted refill of the
-  last rows' experts missing from the slots could pay, and the reorder makes it unnecessary.
+    same 0.623. The card's expert-major gain there (turns 2-4) is not modeled.
+- Bytes it would save:
+  - On the card, 18.9 MB/token over a reply's first tokens after a long expert-major prompt on
+    the 35B: ~0.3 GB of H2C a 16-token reply (~0.1 s at the link's placed ~3 GB/s).
+  - Nothing on short prompts, which run layer-major already.
+- A post-prompt refill instead costs what it loads. Refilling every slot of the 35B (41 x 40
+  layers x 1.71 MB) is 2.8 GB, about 150 tokens of the saving.
+
+2. Overlap a pass's rows with the previous pass's MM.
+- The rows' load, norm, quantize and store are 18-20 % of the expert run (the profile above),
+  in series with the expert's stream.
+- First a co-sim bound: the per-row work timed as free (its instructions made NOPs), on the 35B
+  at 131 rows.
+- Then:
+  - a second [C, H] row tile where TMEM allows (16K words on the 35B; the 26B only if it fits,
+    else today's serial order), chosen from the configuration and TMEM;
+  - the next pass's rows quantized to a second ACT RAM block range while the current pass's MMs
+    read the first.
 
 ## 14. Chatting with a streamed MoE (otpu-chat)
 
