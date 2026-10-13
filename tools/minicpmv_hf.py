@@ -20,9 +20,11 @@ its 64 GB of bf16 experts.
         the host's image port (opentpu.llm.minicpmv) against HF's processor and canvas
         positions, bit for bit (the model directory's tokenizer and configs; no weights)
     python3 tools/minicpmv_hf.py vision MODEL [OUT.npz] --images IMG... [--card int8 F...]
-        [--prompt P] [--max-slices 9]
+        [--prompt P] [--max-slices 9] [-n 32] [--rows PREV.npz]
         the vision side against HF's: vision_reference (erf, tanh) and the card's tower on the
-        ISA simulator per format, row cosines and the first reply token's dKL (OUT.json too)
+        ISA simulator per format, row cosines, and the dKL of HF's greedy reply (through its
+        first end token) with each variant's rows (OUT.json too); --rows takes the card's rows
+        of a previous run's OUT.npz (its card-<format> arrays) instead of running the tower
 
 MODEL: a checkpoint directory (models/MiniCPM-V-4.7-35B-A3B). transformers 5.18 may sit on its
 own path (PYTHONPATH=~/mcpv/tf518 on hwe-bench, with pillow and torchvision 0.29.1+cpu for
@@ -242,14 +244,19 @@ def vision(a) -> None:
     """docs/minicpmv.md 5: per image, HF's crop features (fp32) against vision_reference with
     the projector's exact GELU (erf) and with its tanh form, and against the card's tower on
     the ISA simulator in each of --card's formats: every crop's row cosines (min / mean / 1st
-    percentile); then HF's greedy reply (-n tokens) teacher-forced with each variant's rows put
-    in HF's place: the dKL against HF's own at the reply's first token and over the reply, and
-    the share of positions whose top token is HF's."""
+    percentile); then HF's greedy reply (-n tokens, through its first end token: the positions
+    after it are not a reply) teacher-forced with each variant's rows put in HF's place: the
+    dKL against HF's own at the reply's first token and over the reply, and the share of
+    positions whose top token is HF's. a.rows: a previous run's npz, whose card-<format> rows
+    (each image's, its crops' in order) stand for the tower's on the ISA simulator."""
+    from opentpu.llm import load_spec
     from opentpu.llm import minicpmv as MV
     model, proc = load(a.model, torch.float32)
     vs = MV.VisionSpec.from_hf(a.model)
     W = MV.load_vision(a.model)
-    cards = {f: card_tower(vs, W, f) for f in a.card}
+    eos = set(load_spec(a.model).eos)
+    prev = None if a.rows is None else np.load(a.rows)
+    cards = {f: None if prev is not None else card_tower(vs, W, f) for f in a.card}
     z, report = {}, []
     for ii, img in enumerate(a.images):
         x = inputs(proc, a.prompt, img, a.max_slices)
@@ -260,20 +267,28 @@ def vision(a) -> None:
         var = {"erf": [], "tanh": []}
         var.update({"card-" + f: [] for f in a.card})
         secs = {f: 0.0 for f in a.card}
-        for P, size in zip(im.patches, im.sizes):
+        at = np.cumsum([0] + [h * w // 16 for h, w in im.sizes])
+        for ci, (P, size) in enumerate(zip(im.patches, im.sizes)):
             var["erf"].append(MV.vision_reference(vs, W, P, size))
             var["tanh"].append(MV.vision_reference(vs, W, P, size, gelu=MV._gelu_tanh))
-            for f, (vi, be) in cards.items():
+            for f, card in cards.items():
+                if card is None:            # (a previous run's rows)
+                    var["card-" + f].append(prev[f"{ii}/card-{f}"][at[ci]:at[ci + 1]])
+                    continue
+                vi, be = card
                 t = time.time()
                 var["card-" + f].append(vi.encode(be, P, size))
                 secs[f] += time.time() - t
                 print(f"{Path(img).name}: crop {list(size)} {f} {time.time() - t:.0f} s",
                       file=sys.stderr, flush=True)
         g = model.generate(**x, max_new_tokens=a.n, do_sample=False)
-        reply = [int(t) for t in g[0, x["input_ids"].shape[1]:]][:-1]   # (the last: no logits)
+        gen = [int(t) for t in g[0, x["input_ids"].shape[1]:]]
+        gen = gen[:next((i + 1 for i, t in enumerate(gen) if t in eos), len(gen))]
+        reply = gen[:-1]                    # (the logits of its positions predict all of gen)
         base = _reply_logits(model, x, reply)
         r = dict(image=str(img), crops=[list(s) for s in im.sizes], rows=sum(len(h) for h in hf),
-                 reply=proc.tokenizer.decode(reply), top=int(base[0].argmax()),
+                 reply=proc.tokenizer.decode(gen), reply_tokens=len(gen),
+                 top=int(base[0].argmax()),
                  isa_s={f: round(v, 1) for f, v in secs.items()})
         for k, v in var.items():
             c = np.concatenate([_cos(p, q) for p, q in zip(v, hf)])
@@ -416,6 +431,8 @@ def main():
                     help="vision: the card tower's formats (VisionImage.formats) to check")
     ap.add_argument("--slices", nargs="*", type=int, default=[9, 1],
                     help="procheck: the max-slices to check")
+    ap.add_argument("--rows", help="vision: a previous run's OUT.npz, whose card rows to take "
+                                   "instead of the ISA simulator's tower")
     a = ap.parse_args()
     torch.set_grad_enabled(False)
     if a.mode == "check":
