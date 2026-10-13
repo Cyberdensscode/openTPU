@@ -9,12 +9,19 @@
 
 set here [file normalize [file dirname [info script]]]
 set root [file normalize $here/../../..]
+# hexarg I: argument I as given ("" when absent). Not through expr's ?:, which reads a
+# numeric-looking string as a number: BUILD_ID 83740e79 came out 8.374e+83, failed the hex
+# check and was built as 0 (dev build 83740e79, 2026-10-12); 01234567 would be octal
+proc hexarg {i} {
+  if {[llength $::argv] > $i} { return [lindex $::argv $i] }
+  return ""
+}
 set DDR_SPEED [expr {[llength $argv] > 0 ? [lindex $argv 0] : 1066}]
 if {$DDR_SPEED != 1066} { error "DDR3-$DDR_SPEED: the LiteDRAM core is generated for DDR3-1066" }
 set out [expr {[llength $argv] > 1 ? [file normalize [lindex $argv 1]] : "$root/build/vivado"}]
 set MCOLS [expr {[llength $argv] > 2 ? [lindex $argv 2] : 4}]
 set CORE_MHZ [expr {[llength $argv] > 3 ? [lindex $argv 3] : 133.33}]
-set BUILD_ID [expr {[llength $argv] > 4 ? [lindex $argv 4] : ""}]
+set BUILD_ID [hexarg 4]
 set VPU_CL [expr {[llength $argv] > 5 ? [lindex $argv 5] : 2}]
 set LANES [expr {[llength $argv] > 6 ? [lindex $argv 6] : 8}]
 set ACT_ROWS [expr {[llength $argv] > 7 ? [lindex $argv 7] : $MCOLS}]
@@ -27,10 +34,11 @@ set MXU_IMPL 2
 # PLATFORM, ARCH_HASH: the CFG_PLATFORM / CFG_HASH registers (run_vivado.sh: the target file,
 # targets/ypcb-00338.toml, through opentpu/target.py; ARCH_HASH 8 hex digits)
 set PLATFORM [expr {[llength $argv] > 10 ? [lindex $argv 10] : 1}]
-set ARCH_HASH [expr {[llength $argv] > 11 ? [lindex $argv 11] : 0}]
+set ARCH_HASH [hexarg 11]
+if {$ARCH_HASH eq ""} { set ARCH_HASH 0 }
 # MXU_E: the MXU's epilogue lanes (timing only; the target's [uarch] MXU_E, 0: MCOLS / 2)
 set MXU_E [expr {[llength $argv] > 12 ? [lindex $argv 12] : 4}]
-if {![regexp {^[0-9a-fA-F]{1,8}$} $ARCH_HASH]} { set ARCH_HASH 0 }
+if {![regexp {^[0-9a-fA-F]{1,8}$} $ARCH_HASH]} { error "ARCH_HASH $ARCH_HASH: 1 to 8 hex digits" }
 # TRACE_DEPTH (environment, run_vivado.sh): the trace buffer's records, a power of two; 0 leaves
 # it out (CAPS trace bit 0: 32 RAMB36, ~2.3K LUT, ~3.9K FF; docs/infra_hunt.md)
 set TRACE_DEPTH [expr {[info exists ::env(TRACE_DEPTH)] && $::env(TRACE_DEPTH) ne "" ? $::env(TRACE_DEPTH) : 16384}]
@@ -55,7 +63,7 @@ if {$BUILD_ID eq ""} {
   if {[catch {exec git -C $root rev-parse HEAD} BUILD_ID]} { set BUILD_ID 0 }
   set BUILD_ID [string range $BUILD_ID 0 7]
 }
-if {![regexp {^[0-9a-fA-F]{1,8}$} $BUILD_ID]} { set BUILD_ID 0 }
+if {![regexp {^[0-9a-fA-F]{1,8}$} $BUILD_ID]} { error "BUILD_ID $BUILD_ID: 1 to 8 hex digits" }
 # the core clock the block design makes (bd_native.tcl: CORE_MHZ rounded to the MMCM's 1/8
 # divider steps of its 800 MHz VCO), for the CORE_KHZ register
 set VCO 800

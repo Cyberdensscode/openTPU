@@ -13,10 +13,17 @@
 
 set here [file normalize [file dirname [info script]]]
 set root [file normalize $here/../../..]
+# hexarg I: argument I as given ("" when absent). Not through expr's ?:, which reads a
+# numeric-looking string as a number: BUILD_ID 83740e79 came out 8.374e+83, failed the hex
+# check and was built as 0 (dev build 83740e79, 2026-10-12); 01234567 would be octal
+proc hexarg {i} {
+  if {[llength $::argv] > $i} { return [lindex $::argv $i] }
+  return ""
+}
 set out [expr {[llength $argv] > 0 ? [file normalize [lindex $argv 0]] : "$root/build/vivado_bcu1525"}]
 set MCOLS [expr {[llength $argv] > 1 ? [lindex $argv 1] : 4}]
 set CORE_MHZ [expr {[llength $argv] > 2 ? [lindex $argv 2] : 100}]
-set BUILD_ID [expr {[llength $argv] > 3 ? [lindex $argv 3] : ""}]
+set BUILD_ID [hexarg 3]
 set VPU_CL [expr {[llength $argv] > 4 ? [lindex $argv 4] : 2}]
 set LANES [expr {[llength $argv] > 5 ? [lindex $argv 5] : 8}]
 set ACT_ROWS [expr {[llength $argv] > 6 ? [lindex $argv 6] : $MCOLS}]
@@ -25,8 +32,9 @@ set S [expr {[llength $argv] > 8 ? [lindex $argv 8] : 2}]
 # PLATFORM, ARCH_HASH: the CFG_PLATFORM / CFG_HASH registers (run_vivado.sh: targets/bcu1525.toml
 # through opentpu/target.py; ARCH_HASH 8 hex digits); DDR_MTS: the cores' data rate (mem_mts)
 set PLATFORM [expr {[llength $argv] > 9 ? [lindex $argv 9] : 2}]
-set ARCH_HASH [expr {[llength $argv] > 10 ? [lindex $argv 10] : 0}]
-if {![regexp {^[0-9a-fA-F]{1,8}$} $ARCH_HASH]} { set ARCH_HASH 0 }
+set ARCH_HASH [hexarg 10]
+if {$ARCH_HASH eq ""} { set ARCH_HASH 0 }
+if {![regexp {^[0-9a-fA-F]{1,8}$} $ARCH_HASH]} { error "ARCH_HASH $ARCH_HASH: 1 to 8 hex digits" }
 set DDR_MTS [expr {[llength $argv] > 11 ? [lindex $argv 11] : 1600}]
 # TMEM_IMPL, TMEM_X: the TMEM (the YPCB's vivado/tmem_knobs.tcl: 3 one copy, its knobs; CLK2X)
 set TMEM_IMPL [expr {[llength $argv] > 12 ? [lindex $argv 12] : 0}]
@@ -39,7 +47,7 @@ if {$BUILD_ID eq ""} {
   if {[catch {exec git -C $root rev-parse HEAD} BUILD_ID]} { set BUILD_ID 0 }
   set BUILD_ID [string range $BUILD_ID 0 7]
 }
-if {![regexp {^[0-9a-fA-F]{1,8}$} $BUILD_ID]} { set BUILD_ID 0 }
+if {![regexp {^[0-9a-fA-F]{1,8}$} $BUILD_ID]} { error "BUILD_ID $BUILD_ID: 1 to 8 hex digits" }
 # the core clock as bd.tcl makes it (1/8 steps of the MMCM's 1200 MHz VCO), for CORE_KHZ
 set VCO 1200
 set CORE_KHZ [expr {round($VCO * 1000.0 / (round(double($VCO) / $CORE_MHZ * 8) / 8.0))}]
