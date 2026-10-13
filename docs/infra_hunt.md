@@ -42,13 +42,14 @@ that openTPU is the architecture of, the bigger finding is data that moves more 
 - **LiteDRAM**: about a third of the core (~7K LUT, ~5K FF, 4 RAMB36 + 3 RAMB18) is
   calibration hardware that idles after configuration. Each channel has its own copy. Sharing it
   is core surgery on the PHY's tightest paths, not a parameter: a future lever, not now.
-- **The ready levers**, both on this branch with the defaults unchanged:
+- **The ready levers**, both on this branch (the collective's default changed in release r2):
   - **The trace buffer** (32 RAMB36, ~2.3K LUT, ~3.9K FF; no workload cycles): the build knob
     `TRACE_DEPTH=0`. Production keeps 16,384 records, the card's debugging tool; the MCOLS 8
     build takes 0 if it is short of block RAM.
   - **The collective unit at S = 1** (~2.0K LUT, ~0.9K FF): GATHER is never compiled at
     S = 1. `COLL_GATHER=0` builds a BAR-only unit, announced by CAPS2 bit0 (register map 5); the
-    host refuses a GATHER program on it (the lead's ISA decision, for the MCOLS 8 build).
+    host refuses a GATHER program on it (the lead's ISA decision, for the MCOLS 8 build). Since
+    release r2 the card builds it by default (section 5).
 - **The quantizer, the ACT RAM and IMEM are not over-provisioned.**
   - The ACT RAM is width-bound, and ACT_ROWS 16 fills it for free.
   - IMEM binds long-context prefill. An 8K IMEM would cost what the trace frees; it is parked
@@ -360,9 +361,20 @@ address adders' upper halves. A narrower `otpu_coll` would save little.
 **The cut: a BAR-only unit at S = 1.** The lead approved it on 2026-10-12, as an ISA call under
 the user's grant: GATHER only at S > 1, with a capability bit so the host knows, behind a
 parameter, for the MCOLS 8 build. It is built on this branch:
-- **`otpu_board` `COLL_GATHER`** (default 1: the netlist's unit as before). Set it with
-  `COLL_GATHER=0 ./run_vivado.sh`, which `create_project.tcl` passes through `otpu_fpga_top_ld`
-  and `otpu_native_sys`. It is S = 1 only; elsewhere it is a `$fatal`.
+- **`otpu_board` `COLL_GATHER`** (the parameter's default 1: the netlist's unit as before; the
+  simulations keep it). `run_vivado.sh` passes it through `create_project.tcl`,
+  `otpu_fpga_top_ld` and `otpu_native_sys`. It is S = 1 only; elsewhere it is a `$fatal`.
+- **The card's default is 0 since release r2** (`run_vivado.sh`; `COLL_GATHER=1 ./run_vivado.sh`
+  builds the GATHER unit). The reason is timing, not only area. In r2's m4 build (r2m4_d352e53d,
+  133.33 MHz) the GATHER unit's read select (`ssel`) and the write-bank mask fed the slice's
+  TMEM arbiter, so they reached the MXU's grant and the MXU's pipeline enables. That group is
+  ~330 endpoints, -0.261 ns worst and 12% of core_clk's TNS, plus 2% of clk -> clk2x through
+  the pumped banks' read pins. With the unit BAR-only, the collective's port is tied off, and
+  the only reader left on P_COLL is RLD, which reads from flip-flops.
+  - Nothing the card runs changes: no compiled program has a GATHER at S = 1.
+  - The ISA references hold: GATHER is not a Config field. The host's `device_config` of such a
+    card equals r2's m4 configuration, and so do the references' keys (`tools/qual/refs.py`).
+  - CFG_HASH holds too: `run_vivado.sh` hashes the arch knobs, and `COLL_GATHER` is not one.
 - **`otpu_coll_bar`** replaces the unit:
   - BAR is acknowledged two cycles after the request, then a cycle's cool-down, as before;
   - the TMEM read and write ports are tied off, so the collective's write port and its muxing
@@ -575,7 +587,7 @@ uses.
 |---|---|---|---|---|---|---|---|
 | **Trace buffer out** (`TRACE_DEPTH=0`, this branch) | 32 RAMB36, ~2.3K LUT, ~3.9K FF (measured) | 0 / 0 / 0 / 0 | the block RAM of an 8K IMEM (28.5 RAMB36); slack in a full build | none: CAPS bit0 = 0; the hardware lens and `batch_bench --trace` refuse such a bitstream | low: a generic, default unchanged, lint at 0 | **taken as a knob** (the lead): production keeps 16,384, the card's debugging tool | the MCOLS 8 build, if it is short of block RAM |
 | **Trace at 4K records** | 25 RAMB36 (measured) | 0 | as above, less | none (CAPS reports the depth) | low | the lens sees 2% of a token, not 8% | no: the BRAM is not short |
-| **Collective unit BAR-only at S = 1** (`COLL_GATHER=0`, this branch) | ~2.0K LUT, ~0.9K FF (measured: the unit's ~1.4K, the TMEM write port's 601) | 0 / 0 / 0 / 0 | slack | **ISA**: GATHER only at S > 1; CAPS2 bit0 (register map 5); the host refuses GATHER programs on such a bitstream | low: a parameter, default unchanged; lint at 0 and 1; board-model test | **approved** (the lead, an ISA call under the user's grant) | the MCOLS 8 build |
+| **Collective unit BAR-only at S = 1** (`COLL_GATHER=0`, this branch) | ~2.0K LUT, ~0.9K FF (measured: the unit's ~1.4K, the TMEM write port's 601) | 0 / 0 / 0 / 0 | slack | **ISA**: GATHER only at S > 1; CAPS2 bit0 (register map 5); the host refuses GATHER programs on such a bitstream | low: a parameter (the card's build default 0 since release r2, section 5); lint at 0 and 1; board-model test | **approved** (the lead, an ISA call under the user's grant); the card's default in r2 | the MCOLS 8 build; r2's m4 card (timing) |
 | Memory path depths (RD 64, ARD 32, AD 32) | up to ~3.3K LUT (measured) | +0.25 to +1.0% decode, +0.7% batched (simulated) | | none | | **rejected** (the lead) | no: each lowers DRAM efficiency |
 | DMA stream runs (RUN 32 / 16) | 2.1K / 2.7K LUT (measured) | Qwen3.5 decode +0.27% / +0.93%; prefill +0.10% / +0.11%; batched 0; MoE +0.14% / +0.35% (simulated) | | none (timing only) | low | **rejected** (the lead) | no: lowers Qwen3.5's DRAM efficiency |
 | XDMA options (C2H IDs 8; the hidden resource reduction) | 73 LUT + 1 RAMB36; 0.6K LUT with the hidden option (measured) | 0 | | none | the hidden option is undocumented | **no change** (the lead) | no |

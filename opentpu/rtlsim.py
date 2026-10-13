@@ -166,6 +166,12 @@ UARCH = {"WIN": 32, "RPB": 4, "WPB": 2}
 # write-mask arbiter, as on the board. The values are the selected target's (OTPU_TARGET,
 # default the card: targets/ypcb-00338.toml; opentpu.target.sim_uarch).
 BOARD_UARCH = _target.sim_uarch(_target.current())
+# A one-slice board builds its collective unit without GATHER (COLL_GATHER 0: BAR alone,
+# otpu_coll_bar; boards/ypcb-00338/run_vivado.sh's default since release r2, docs/infra_hunt.md
+# 5): no compiled program has a GATHER at S = 1, and the host refuses one there. Its simulations
+# build the same unit (tb_top / tb_board COLL_GATHER; at S > 1 the unit runs GATHER).
+if _target.current().kind == "fpga" and _target.current().arch["S"] == 1:
+    BOARD_UARCH["COLL_GATHER"] = 0
 if os.environ.get("OTPU_UARCH") == "board":
     UARCH = dict(BOARD_UARCH)
 # The MXU: the MX column's 2D systolic array, as the board builds it (weights hop column to
@@ -266,6 +272,12 @@ def top_params(cfg, dram_lat: int = 8, uarch: dict | None = None, axi: bool | in
         # the pick's SBP 3 is LANES 8's, a LANES 16 configuration's 4
         p["TMEM_SBP"] = max(3, (cfg.LANES - 1).bit_length())
     return p
+
+
+def gathers(S: int, uarch: dict | None = None) -> bool:
+    """The simulated collective unit runs GATHER: at S > 1 always, at S = 1 unless the uarch
+    (UARCH, with `uarch` over it: BOARD_UARCH's COLL_GATHER 0) builds it BAR-only."""
+    return S > 1 or bool(int({**UARCH, **(uarch or {})}.get("COLL_GATHER", 1)))
 
 
 def build_top(cfg, dram_lat: int = 8, uarch: dict | None = None, axi: bool = False,

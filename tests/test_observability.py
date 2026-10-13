@@ -106,7 +106,10 @@ def test_cfg_registers(have_verilator):
     t = SimTransport(ch_bytes=1 << 20)
     info = Board(t).info()
     c = info["cfg"]
-    assert info["regmap"] == 5 and info["caps2"] == {"gather": True}
+    # CAPS2 bit0: the full collective unit, but BAR alone on the board's uarch (the card's
+    # build, rtlsim.BOARD_UARCH COLL_GATHER 0)
+    assert info["regmap"] == 5 and info["caps2"] == {"gather": rtlsim.gathers(1)}
+    assert t.gather == rtlsim.gathers(1)
     assert (c["S"], c["TMEM_WORDS"], c["IMEM_WORDS"], c["ACT_BLOCKS"]) == (1, 1 << 16, 1 << 15, 128)
     assert (c["DRAM_BYTES"], c["channels"], c["channel_bytes"]) == (1 << 32, 2, 1 << 31)
     # the TMEM as the target builds it (the board model's: release r2, one copy, TMEM_IMPL 3)
@@ -150,8 +153,12 @@ def test_caps2_coll_bar(have_verilator):
     the host refuse a program with GATHER, and on one loaded past the host moves no data and
     raises ERROR."""
     from opentpu.host.board import NoGather
-    assert SimTransport(ch_bytes=1 << 20).reg_read_many([R_REGMAP, R.R_CAPS2]) == [5, 1]
-    t = SimTransport(ch_bytes=1 << 20, params={"COLL_GATHER": 0}, plusargs=["+coll_gerr_ok"])
+    # (the full unit named: the board's uarch builds the card's, BAR alone; rtlsim.BOARD_UARCH)
+    full = SimTransport(ch_bytes=1 << 20, params={"COLL_GATHER": 1})
+    assert full.gather and full.reg_read_many([R_REGMAP, R.R_CAPS2]) == [5, 1]
+    # (SEQ_WC 0: the raw load below loads no wait entries, which the board's uarch would need)
+    t = SimTransport(ch_bytes=1 << 20, params={"COLL_GATHER": 0, "SEQ_WC": 0},
+                     plusargs=["+coll_gerr_ok"])
     assert not t.gather
     assert t.reg_read_many([R_REGMAP, R.R_CAPS2]) == [5, 0]
     b = Board(t, check=False)

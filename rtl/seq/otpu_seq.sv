@@ -587,6 +587,15 @@ module otpu_seq
   logic [CW-1:0]    wt [WIN][NWT];
   logic [NWT-1:0]   wv [WIN];
   logic [WIN-1:0]   w_all, w_dram;            // the slot's waits (all / the stream's) are met
+  // ... registered (release r2): what the starts, the MXU's release and the ready stamp test.
+  // The counts' compares (wc_n - wt per slot and wait) end at these flip-flops instead of
+  // running on through the start selection into every unit's command register (r2m4, 133.33
+  // MHz: wc_n -> g_cmd q, 358 endpoints, -0.482 ns, 11.5 levels, 16% of core_clk's TNS). A wait
+  // is released a cycle after its count is reached. A slot's readiness only rises while it holds
+  // its instruction (the counts and the VPU mask only move towards its targets), so last cycle's
+  // is never wrong for this one, except for the slot written this cycle: its flag clears, and
+  // an instruction starts two cycles after its dispatch at the earliest
+  logic [WIN-1:0]   w_all_q, w_dram_q;
 `ifndef SYNTHESIS
   // EXPERIMENTAL, simulation only (docs/seq_vpu.md): +wc_vx=1 takes a slot's VPU producers from
   // today's range check (fp_seg, conf_s: vxd) instead of its mask; +wc_vgate=G holds a VOP
@@ -633,6 +642,14 @@ module otpu_seq
       if (wc_vx) w_all[i] = &ok[NUNITS-1:0] && vxd[i] == '0;
 `endif
       w_dram[i] = ok[NUNITS] && ok[NUNITS+1];
+    end
+  always_ff @(posedge clk)
+    if (rst) begin
+      w_all_q <= '0;
+      w_dram_q <= '0;
+    end else begin
+      w_all_q <= w_all & ~(c_go ? WIN'(1) << free_slot : '0);
+      w_dram_q <= w_dram & ~(c_go ? WIN'(1) << free_slot : '0);
     end
 
   // ---- loop-end handling for the instruction at pc
@@ -720,8 +737,8 @@ module otpu_seq
   // in parallel with the selection and AND-ORed with sel -- no slot id on the can_start path
   always_comb begin
     for (int i = 0; i < WIN; i++) begin
-      mrdy[i] = WAITC ? w_dram[i] : (sdepd[i] & ~same_started[U_MXU]) == '0;
-      crdy[i] = WAITC ? w_all[i] : (sdep[i] & ~same_started[U_COLL]) == '0;
+      mrdy[i] = WAITC ? w_dram_q[i] : (sdepd[i] & ~same_started[U_MXU]) == '0;
+      crdy[i] = WAITC ? w_all_q[i] : (sdep[i] & ~same_started[U_COLL]) == '0;
     end
     for (int u = 0; u < NUNITS; u++) begin
       logic [WIN-1:0] cand;
@@ -751,13 +768,13 @@ module otpu_seq
           logic [WIN-1:0] c2;
           start_slot[u] = '0;
           for (int i = 0; i < WIN; i++)
-            c2[i] = sv[i] && !sstarted[i] && soh[i][u] && (u != U_VPU || w_all[i]);
+            c2[i] = sv[i] && !sstarted[i] && soh[i][u] && (u != U_VPU || w_all_q[i]);
           for (int i = 0; i < WIN; i++) begin
             sel[u][i] = c2[i] && (older[i] & c2) == '0;
             if (sel[u][i]) start_slot[u] |= SW'(i);
           end
           cand_any[u] = |c2;
-          can_start[u] = |(sel[u] & w_all) && urdy[u] && !ustart[u];
+          can_start[u] = |(sel[u] & w_all_q) && urdy[u] && !ustart[u];
         end
 `ifndef SYNTHESIS
     // +hz_ino: the DMA, the quantizer and the VPU start their oldest instruction only, as the
@@ -785,7 +802,7 @@ module otpu_seq
   // MXU release: the oldest started, unreleased MM once all its dependencies are clear
   wire [SW-1:0] rel_slot = uq[U_MXU][uq_r[SW-1:0]];
   wire          can_rel  = (uq_r != uq_t[U_MXU]) &&
-                           (WAITC ? w_all[rel_slot] : (sdep[rel_slot] & ~same_started[U_MXU]) == '0);
+                           (WAITC ? w_all_q[rel_slot] : (sdep[rel_slot] & ~same_started[U_MXU]) == '0);
 
   // Each unit's command is read from the window as the unit starts, at the slot it starts, into a
   // register (ucmd): a slot's command is written only at dispatch and stays until the slot
@@ -979,7 +996,7 @@ module otpu_seq
       end
       // readiness (for the profiler: when did the dependencies clear)
       for (int i = 0; i < WIN; i++)
-        if (sv[i] && !sready[i] && (WAITC ? w_all[i] : sdep[i] == '0)) begin
+        if (sv[i] && !sready[i] && (WAITC ? w_all_q[i] : sdep[i] == '0)) begin
           sready[i] <= 1'b1;
           srdy_c[i] <= cyc;
         end

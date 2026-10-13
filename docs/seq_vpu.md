@@ -385,6 +385,25 @@ command. The same flow as section 2.1 (xc7k480t-2 at 7.5 ns, placed and routed; 
   same path in the 15-bit build. On the 7-series device (74,650 slices) the final build frees
   3.7% of the slices, 7 DSPs and the timing offender of the banked-TMEM and MX column builds
   (`u_seq q_cmd -> c_fp`).
+- **The wait test, registered (release r2).** In the full build, r2's m4 at 133.33 MHz
+  (`r2m4_d352e53d`), that worst path failed:
+  - `wc_n` -> `g_cmd q`: 358 endpoints, -0.482 ns, 11.5 levels, 16% of core_clk's TNS.
+  - The fix registers the per-slot results as `w_all_q` / `w_dram_q`. The starts, the MXU's
+    release and the ready stamp read those, and the per-slot compares end at flip-flops.
+  - A wait releases a cycle after its count is reached. A slot's readiness only rises while it
+    holds its instruction, so last cycle's value is never wrong. The slot written this cycle
+    clears its flag, so an instruction starts two cycles after its dispatch at the earliest.
+  - Co-simulated on m4 (LiteDRAM DDR3-1066, against d352e53d), the cost is noise:
+
+    | run | change |
+    |---|---|
+    | Qwen3.5-0.8B tiled P, b1, T4 | +0.011% |
+    | Qwen3.5-0.8B decode at 544 | -0.013% |
+    | Qwen3-0.6B decode at 544 | -0.012% |
+    | Qwen3-0.6B decode at 1800 | -0.008% |
+
+  - The same runs with the scoreboard (`SEQ_WC` 0) are -0.57% to +0.19% against WAITC.
+  - WAITC stays for its area and for the hazard check it removed.
 
 ### 4.5 Where v2's remaining cycles go (simulated)
 

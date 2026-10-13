@@ -375,7 +375,9 @@ module otpu_slice
   // The quantizer's row-factor port (one word) and the collective's read port, rarely busy,
   // share the DMA's copy (ST reads): 6 copies of the memory instead of 8.
   // (TMEM_IMPL 2, simulation: IMPL 0 with a copy per read port, so any grant reads the right
-  // words; otpu_tmem_model decides the grants)
+  // words; otpu_tmem_model decides the grants). IQ: TMEM's input stage (release r2,
+  // docs/tmem_nocopy.md 7): the granted writes registered in TMEM, the units' read requests in
+  // the units (each a cycle after it forms), so both move a cycle and the order holds.
   otpu_tmem #(.WORDS(TMEM_WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .WPB(WPB),
               .GEN_R(NRP'(1) << P_MXU), .GEN_W(NWP'(1) << W_MXU),
               .SH_HOST(P_DMA),
@@ -384,7 +386,7 @@ module otpu_slice
               .PRANK((TMEM_IMPL == 3) ? PRANK3 : PRANK), .NSB(TMEM_NSB), .SBP(TMEM_SBP),
               .GRP(RGRP), .SBH(TMEM_SBH), .RPL(TMEM_RPL), .RPLM(~(NRP'(1) << P_COLL)),
               .TOPP(P_DMA), .TDP(TMEM_TDP), .SIDE(TM_SIDE), .GST(TMEM_GST),
-              .PMP(TMEM_PMP)) u_tmem (
+              .PMP(TMEM_PMP), .IQ(1'b1)) u_tmem (
     .clk, .clk_f, .r_en, .r_req(rq_t), .r_addr, .r_data, .w_en, .w_req(wq_en), .w_gnt, .w_addr,
     .w_data, .blk_x(tm_bx), .blk_s(tm_bs), .lost(tm_lost), .frz(tm_frz), .dump);
   assign coll_rdata = r_data[P_COLL];
@@ -522,23 +524,27 @@ module otpu_slice
   // RLD: the word through the collective's read port (lane 0) once granted; the lane has it
   // the next cycle (rl_got), registered (rl_cv), converted (rl_c1), times the multiplier
   // (1 without MUL) as two partial products (rl_c2: the low 32 bits of x * m[15:0] and the
-  // low 16 of x[15:0] * m[31:16]), summed and handed to the sequencer (rl_v)
-  logic        rl_pend, rl_got, rl_cv, rl_c1, rl_c2, rl_raw;
+  // low 16 of x[15:0] * m[31:16]), summed and handed to the sequencer (rl_v). The read is asked
+  // from rl_pend's second cycle (rl_pq): TMEM's input stage puts every unit's read a cycle after
+  // it forms, and the writes a cycle after their grant, so RLD's read moves with them
+  // (release r2, docs/tmem_nocopy.md 7)
+  logic        rl_pend, rl_pq, rl_got, rl_cv, rl_c1, rl_c2, rl_raw;
   logic [31:0] rl_a, rl_w, rl_m, rl_x, rl_pl;
   logic [15:0] rl_ph;
   wire         rl_busy = rl_pend || rl_got || rl_cv || rl_c1 || rl_c2 || rl_v;
   always_ff @(posedge clk) begin
     if (srst) begin
-      rl_pend <= 1'b0; rl_got <= 1'b0; rl_cv <= 1'b0; rl_c1 <= 1'b0; rl_c2 <= 1'b0;
+      rl_pend <= 1'b0; rl_pq <= 1'b0; rl_got <= 1'b0; rl_cv <= 1'b0; rl_c1 <= 1'b0; rl_c2 <= 1'b0;
       rl_v <= 1'b0;
     end else begin
-      rl_got <= rl_pend && r_en[P_COLL][0];
+      rl_got <= rl_pq && r_en[P_COLL][0];
+      rl_pq <= rl_pend && !(rl_pq && r_en[P_COLL][0]);
       if (rl_start) begin
         rl_pend <= 1'b1;
         rl_a <= ucmd[U_COLL].w1;
         rl_raw <= ucmd[U_COLL].flags[RF_RAW];
         rl_m <= ucmd[U_COLL].flags[RF_MUL] ? ucmd[U_COLL].w2 : 32'd1;
-      end else if (rl_pend && r_en[P_COLL][0]) rl_pend <= 1'b0;
+      end else if (rl_pq && r_en[P_COLL][0]) rl_pend <= 1'b0;
       rl_cv <= rl_got;
       if (rl_got) rl_w <= r_data[P_COLL][0];
       rl_c1 <= rl_cv;
@@ -563,7 +569,7 @@ module otpu_slice
     rq_en[P_VA] = va_ren;     r_addr[P_VA] = va_raddr;
     rq_en[P_VB] = vb_ren;     r_addr[P_VB] = vb_raddr;
     rq_en[P_COLL] = coll_ren; r_addr[P_COLL] = coll_raddr;
-    if (rl_pend) begin rq_en[P_COLL][0] = 1'b1; r_addr[P_COLL][0] = rl_a; end
+    if (rl_pq) begin rq_en[P_COLL][0] = 1'b1; r_addr[P_COLL][0] = rl_a; end
     wq_en[W_DMA] = dma_wen;   w_addr[W_DMA] = dma_waddr;   w_data[W_DMA] = dma_wdata;
     wq_en[W_MXU][ULANES-1:0] = mxu_wen;
     w_addr[W_MXU][ULANES-1:0] = mxu_waddr;

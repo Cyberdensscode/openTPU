@@ -328,21 +328,33 @@ module otpu_vpu
   // is, so the lane tests (ic + l < cols, the issue checks) reach the enables but not the
   // addresses, and TMEM's bank addresses no longer wait for them (133.33 MHz, fused-133
   // c2830d6: cols -> the lane test -> tb_en -> the address multiplexer -> port 4's bank rows
-  // -> block RAM ADDRB, 9-10 levels, +0.130 ns)
+  // -> block RAM ADDRB, 9-10 levels, +0.130 ns).
+  // TMEM's input stage (release r2, docs/tmem_nocopy.md 7): the request (ta_/tb_*_c) goes to
+  // TMEM from flip-flops, a cycle after it is formed, advancing with the enable: the chunk's
+  // address arithmetic, its lane tests and the issue checks end at the register, not at the
+  // TMEM's ranks and pumped banks (r2m4: cols / ic -> the request address -> the pump banks'
+  // read pins, clk -> clk2x, 55% of its TNS). The chunk (mi) waits a cycle in mi2 for it.
+  logic [LANES-1:0]       ta_en_c, tb_en_c;
+  logic [LANES-1:0][31:0] ta_addr_c, tb_addr_c;
+  always_ff @(posedge clk)
+    if (rst) begin ta_en <= '0; tb_en <= '0; end
+    else if (en) begin
+      ta_en <= ta_en_c; tb_en <= tb_en_c; ta_addr <= ta_addr_c; tb_addr <= tb_addr_c;
+    end
   logic [LANES-1:0] imask;
   logic             irow_last, iall_last;
   always_comb begin
-    ta_en = '0; tb_en = '0;
+    ta_en_c = '0; tb_en_c = '0;
     imask = '0;
     irow_last = (ch + 1 == nch);
     iall_last = irow_last && (ir + 1 == rows);
     for (int l = 0; l < LANES; l++) begin
       if (filling) begin
-        ta_addr[l] = od_sc ? 32'(od_a) : tm_addr(od_a, ic, l);
-        tb_addr[l] = tm_addr(oc_a, ic, l);
+        ta_addr_c[l] = od_sc ? 32'(od_a) : tm_addr(od_a, ic, l);
+        tb_addr_c[l] = tm_addr(oc_a, ic, l);
       end else begin
-        ta_addr[l] = tm_addr(a_row, ic, l);
-        tb_addr[l] = (bmode == B_COL) ? tm_addr(b, ic, l) :
+        ta_addr_c[l] = tm_addr(a_row, ic, l);
+        tb_addr_c[l] = (bmode == B_COL) ? tm_addr(b, ic, l) :
                      (bmode == B_ROW && l == 0) ? 32'(b_row) : tm_addr(b_row, ic, l);
       end
     end
@@ -350,19 +362,19 @@ module otpu_vpu
       // OUTER fill: C on port B; D on port A (one word on lane 0 for DSCALAR, none for DONE)
       for (int l = 0; l < LANES; l++) begin
         if (32'(ic) + 32'(l) < 32'(cols)) begin
-          tb_en[l] = 1'b1;
-          if (!od_one && (!od_sc || l == 0)) ta_en[l] = 1'b1;
+          tb_en_c[l] = 1'b1;
+          if (!od_one && (!od_sc || l == 0)) ta_en_c[l] = 1'b1;
         end
       end
     end else if (issuing && iss_ok) begin
       for (int l = 0; l < LANES; l++) begin
         if (32'(ic) + 32'(l) < 32'(cols) && 16'(l) < iwid) begin
           imask[l] = 1'b1;
-          ta_en[l] = (func != V_FILL);
-          if (reads_b(func) && (bmode == B_FULL || bmode == B_COL)) tb_en[l] = 1'b1;
+          ta_en_c[l] = (func != V_FILL);
+          if (reads_b(func) && (bmode == B_FULL || bmode == B_COL)) tb_en_c[l] = 1'b1;
         end
       end
-      if (bmode == B_ROW && reads_b(func) && imask[0]) tb_en[0] = 1'b1;
+      if (bmode == B_ROW && reads_b(func) && imask[0]) tb_en_c[0] = 1'b1;
     end
   end
 `ifndef SYNTHESIS
@@ -375,7 +387,7 @@ module otpu_vpu
         rb = filling ? tm_addr(oc_a, ic, l) :
              (bmode == B_FULL) ? tm_addr(b_row, ic, l) :
              (bmode == B_COL) ? tm_addr(b, ic, l) : 32'(b_row);
-        if ((ta_en[l] && ta_addr[l] != ra) || (tb_en[l] && tb_addr[l] != rb))
+        if ((ta_en_c[l] && ta_addr_c[l] != ra) || (tb_en_c[l] && tb_addr_c[l] != rb))
           $fatal(1, "otpu_vpu: lane %0d's read address is not its mode's", l);
       end
 `endif
@@ -400,10 +412,12 @@ module otpu_vpu
     logic [CBW-1:0]   cb;        // OUTER: the column-buffer word of the chunk (chunk in row)
     logic [15:0]      col;       // the chunk's first column (ARGMAX's index)
   } meta_t;
-  // mi: the chunk read this cycle; m0: that chunk one granted cycle later, together with its
-  // TMEM data registered (xa, xb), so no path runs from the TMEM block RAMs into the lanes'
+  // mi: the chunk whose read request forms this cycle; mi2: that chunk with its request in the
+  // request register (TMEM reads it then); m0: the chunk one granted cycle later, together with
+  // its TMEM data registered (xa, xb), so no path runs from the TMEM block RAMs into the lanes'
   // multipliers in one cycle
-  meta_t m0, mi;
+  meta_t m0, mi, mi2;
+  always_ff @(posedge clk) if (rst) mi2 <= '0; else if (en) mi2 <= mi;
   logic [LANES-1:0][31:0] xa, xb;
   f32_t xc [LANES], xd [LANES];               // OUTER: C(c), D(c) from the buffers, with xa/xb
   // stream mode: m0 is an RDOT with no chunk (slot 0 on the partial loop, fed by the tail)
@@ -439,8 +453,8 @@ module otpu_vpu
       m0 <= '0;
       m0d <= fdec(8'd0);
     end else if (en) begin
-      m0 <= (SE && ss_act) ? M_SS : mi;
-      m0d <= fdec((SE && ss_act) ? M_SS.func : mi.func);
+      m0 <= (SE && ss_act) ? M_SS : mi2;
+      m0d <= fdec((SE && ss_act) ? M_SS.func : mi2.func);
       xa <= ta_data;
       xb <= tb_data;
     end
@@ -460,8 +474,8 @@ module otpu_vpu
         cbuf[m0.cb] <= xb[l];
         dbuf[m0.cb] <= od_one ? F_ONE : od_sc ? xa[0] : xa[l];
       end
-      xc[l] <= cbuf[mi.cb];
-      xd[l] <= dbuf[mi.cb];
+      xc[l] <= cbuf[mi2.cb];
+      xd[l] <= dbuf[mi2.cb];
     end
   end
 
@@ -890,7 +904,7 @@ module otpu_vpu
     assign sy[0] = c_s0y;
     assign sy[1] = c_uy;
     assign sy[2] = c_qy;
-    otpu_se_comp #(.LANES(LANES), .MW(AW + 1), .NS(CNS), .HA(2), .EXT(1'b1)) u_comp (
+    otpu_se_comp #(.LANES(LANES), .MW(AW + 1), .NS(CNS), .HA(3), .EXT(1'b1)) u_comp (
       .clk, .rst, .en, .in_v(m0.v && m0d.cf), .in_c(m0d.cc), .in_a(c_ia),
       .in_b(c_ib), .in_m(m0.mask), .in_meta({m0.waddr, m0.all_last}), .hold(c_hold),
       .st_sel(c_sel), .st_a(c_sa), .st_b(c_sb), .st_c(c_sc), .st_e(c_se), .st_y(sy),
@@ -1040,11 +1054,11 @@ module otpu_vpu
     if (RMA) begin : g_ma
       // through slot 0's u_ma (term + prev: the add is commutative bit for bit), fed back by
       // fbq, which slot 0 reads (as c) the cycle after it's written: cleared on the chunks that
-      // are on m0 then (mi), the first ones' +0. rc keeps the adder's c off a shift register.
-      // A stream clears c instead, on its X segment's first flag (mi is idle then).
+      // are on m0 then (mi2), the first ones' +0. rc keeps the adder's c off a shift register.
+      // A stream clears c instead, on its X segment's first flag (mi2 is idle then).
       f32_t fbq, fbd;
       otpu_delay #(.W(32), .N(DF - 1)) u_fb (.clk, .en, .d(pacc[l]), .q(fbd));
-      always_ff @(posedge clk) if (en) fbq <= mi.first ? F_ZERO : fbd;
+      always_ff @(posedge clk) if (en) fbq <= mi2.first ? F_ZERO : fbd;
       assign rfb[l] = s_first ? F_ZERO : fbq;
     end else begin : g_acc
       f32_t tq, prev;

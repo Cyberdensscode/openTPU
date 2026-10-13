@@ -483,8 +483,15 @@ class SimTransport:
     @property
     def gather(self) -> bool:
         """The model's collective unit runs GATHER (CAPS2 bit0): every multi-slice build, and a
-        one-slice build unless its COLL_GATHER parameter is 0."""
-        return self.slices > 1 or str(self.params.get("COLL_GATHER", 1)) not in ("0", "1'b0")
+        one-slice build unless its COLL_GATHER parameter is 0 (`params`', else the simulation's
+        uarch: rtlsim.UARCH, under OTPU_UARCH=board the card's BAR-only unit)."""
+        return self.slices > 1 or str(self._coll_gather()) not in ("0", "1'b0")
+
+    def _coll_gather(self):
+        if "COLL_GATHER" in self.params:
+            return self.params["COLL_GATHER"]
+        from opentpu import rtlsim              # (the simulator's: not on the card's path)
+        return rtlsim.UARCH.get("COLL_GATHER", 1)
 
     def mem_write(self, ch: int, off: int, data: np.ndarray) -> None:
         self.flush()
@@ -547,6 +554,8 @@ class SimTransport:
              "MEM_NATIVE": 2 if native == "ld" else 1}
         if rtlsim.UARCH.get("SEQ_WC"):              # (EXPERIMENTAL: WAITC, CFG_UARCH bit24)
             p["SEQ_WC"] = 1
+        if "COLL_GATHER" in rtlsim.UARCH:           # the board's: BAR alone at S = 1 (gather)
+            p["COLL_GATHER"] = int(rtlsim.UARCH["COLL_GATHER"])
         # the TMEM as the target builds it (TMEM_IMPL 3: the one copy and its knobs, pumped on
         # tb_board's clk_f with PMP 1); OTPU_TMEM_* (rtlsim.UARCH) override
         from opentpu.target import sim_uarch

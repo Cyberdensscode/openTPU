@@ -34,7 +34,8 @@ module tb_board;
   parameter logic [31:0] BUILD_ID = 32'h0B0A_4D00;
   parameter int DDR_MTS    = 0;
   parameter int TRACE_DEPTH = 16384;
-  parameter bit COLL_GATHER = 1'b1;       // 0: the BAR-only collective unit (otpu_coll_bar)
+  parameter bit COLL_GATHER = 1'b1;       // 0: the BAR-only collective unit (otpu_coll_bar) at
+                                          // S = 1 (rtlsim.BOARD_UARCH); S > 1 has GATHER
   parameter int TRACE_QD   = 32;
   parameter int PQ_WIN     = 1024;
   parameter bit DSTEP      = 1'b1;
@@ -103,7 +104,7 @@ module tb_board;
                .IMEM_WORDS(IMEM_WORDS), .LANES(LANES), .VPU_CL(VPU_CL), .MXU_IMPL(MXU_IMPL), .MXU_E(MXU_E), .ULANES(ULANES), .WIN(WIN), .CORE_KHZ(CORE_KHZ),
                .BUILD_ID(BUILD_ID), .DDR_MTS(DDR_MTS), .TRACE_DEPTH(TRACE_DEPTH), .TRACE_QD(TRACE_QD),
                .PQ_WIN(PQ_WIN), .DSTEP(DSTEP), .HOSTCAL(HOSTCAL), .SEQ_WC(SEQ_WC), .PLATFORM(PLATFORM),
-               .ARCH_HASH(ARCH_HASH), .COLL_GATHER(COLL_GATHER), .TMEM_IMPL(TMEM_IMPL),
+               .ARCH_HASH(ARCH_HASH), .COLL_GATHER(COLL_GATHER || S > 1), .TMEM_IMPL(TMEM_IMPL),
                .TMEM_NSB(TMEM_NSB), .TMEM_SBP(TMEM_SBP), .TMEM_SBH(TMEM_SBH), .TMEM_RPL(TMEM_RPL),
                .TMEM_TDP(TMEM_TDP), .TMEM_GST(TMEM_GST), .TMEM_PMP(TMEM_PMP), .TMEM_PRK(TMEM_PRK),
                .TMEM_SDM(TMEM_SDM)) dut (

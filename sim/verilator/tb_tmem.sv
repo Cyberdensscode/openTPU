@@ -15,9 +15,13 @@
 // and 1 on port B. GST: port 2 is port 0's guest (it reads only while port 0 asks nothing; its
 // group is not granted otherwise, as the slice's q3_blk). PMP (with TDP): 1 the RAMs pumped on clk_f
 // (2 x clk: every core edge a fast edge, the writes at the fast edge between), 2 its model.
+// IQ: TMEM's input stage (the granted writes registered): a write is seen by the reads two
+// cycles after its own, not one (in the slice the reads move a cycle too; here they do not).
+// Not with RPL: the testbench keeps a write off the words read in its own cycle, and with IQ
+// the write meets the reads of the next.
 module tb_tmem #(parameter int IMPL = 0, parameter int NSB = 4, parameter int SBP = 2,
                  parameter int SBH = 0, parameter bit RPL = 1'b0, parameter bit TDP = 1'b0,
-                 parameter bit GST = 1'b0, parameter int PMP = 0);
+                 parameter bit GST = 1'b0, parameter int PMP = 0, parameter bit IQ = 1'b0);
   localparam int WORDS = 256, LANES = 4, NRP = 3, NWP = 2, WPB = 1, CYCLES = 20000;
   localparam int BW = $clog2(LANES);
   localparam int NCP = 2;
@@ -35,7 +39,7 @@ module tb_tmem #(parameter int IMPL = 0, parameter int NSB = 4, parameter int SB
   otpu_tmem #(.WORDS(WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .WPB(WPB), .IMPL(IMPL),
               .NCP(NCP), .CPY(CPY), .NSB(NSB), .SBP(SBP), .PRANK({3'd2, 3'd1, 3'd0}),
               .GRP(GRP), .SBH(SBH), .RPL(RPL), .TOPP(0), .TDP(TDP), .SIDE(3'b100), .GST(GST),
-              .SH_HOST(0), .SH_MASK(GST ? 3'b100 : 3'b000), .PMP(PMP)) dut (
+              .SH_HOST(0), .SH_MASK(GST ? 3'b100 : 3'b000), .PMP(PMP), .IQ(IQ)) dut (
     .clk, .clk_f, .r_en, .r_req, .r_addr, .r_data, .w_en, .w_req, .w_gnt, .w_addr, .w_data,
     .blk_x, .blk_s, .lost, .frz, .dump(1'b0));
 
@@ -43,7 +47,9 @@ module tb_tmem #(parameter int IMPL = 0, parameter int NSB = 4, parameter int SB
   logic [31:0] expect_q [NRP][LANES];
   bit          valid_q [NRP][LANES];
   int unsigned recent [8];              // addresses written in the last cycles
-  int unsigned last_wrote [$];          // the previous cycle's writes (still registered in TMEM)
+  int unsigned last_wrote [$];          // the writes still registered in TMEM's write stage
+  int unsigned iq_a [$], iq_d [$];      // IQ: the previous cycle's writes (in the input stage)
+  initial if (IQ && RPL) $fatal(1, "tb_tmem: IQ without RPL only");
   int          hits = 0, checks = 0, blocked = 0, replays = 0, guest = 0;
   localparam int MINB = GST ? 50 : 1000;   // (GST: one port left to lose, to the host)
   logic [NRP-1:0] lostc;
@@ -149,14 +155,26 @@ module tb_tmem #(parameter int IMPL = 0, parameter int NSB = 4, parameter int SB
             expect_q[p][l] = ref_mem[r_addr[p][l]];
             valid_q[p][l] = 1;
           end
-      for (int p = 0; p < NWP; p++)
-        for (int l = 0; l < LANES; l++)
-          if (w_en[p][l]) begin
-            ref_mem[w_addr[p][l]] = w_data[p][l];
-            wrote.push_back(w_addr[p][l]);
-          end
+      begin
+        int unsigned na [$], nd [$], landed [$];
+        na.delete(); nd.delete(); landed.delete();      // (static: the loop's every cycle)
+        for (int p = 0; p < NWP; p++)
+          for (int l = 0; l < LANES; l++)
+            if (w_en[p][l]) begin
+              na.push_back(w_addr[p][l]);
+              nd.push_back(w_data[p][l]);
+              wrote.push_back(w_addr[p][l]);
+            end
+        if (IQ) begin                   // last cycle's writes leave the input stage
+          foreach (iq_a[i]) begin ref_mem[iq_a[i]] = iq_d[i]; landed.push_back(iq_a[i]); end
+          iq_a = na; iq_d = nd;
+        end else begin
+          foreach (na[i]) ref_mem[na[i]] = nd[i];
+          landed = na;
+        end
+        last_wrote = landed;
+      end
       for (int i = 0; i < wrote.size() && i < 8; i++) recent[(cyc * 3 + i) % 8] = wrote[i];
-      last_wrote = wrote;
       clk = 1; clk_f = 1; #1; clk_f = 0; #1; clk = 0; clk_f = 1; #1; clk_f = 0; #1;
       // ---- every lane shows its last granted read
       for (int p = 0; p < NRP; p++)

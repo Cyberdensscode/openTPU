@@ -275,7 +275,8 @@ module otpu_mxu
   wire        c_act = (q_n != 0) && h.go;
   wire [7:0]  c_G = h.G;
   logic [31:0] alpha [MCOLS];
-  logic [1:0]  al_st;                       // ASCALE factors: 0 to load, 1 loading, 2 loaded
+  logic [1:0]  al_st;                       // ASCALE factors: 0 to load, 1 requested (in TMEM's
+                                            // request register), 3 read (the words arrive), 2 loaded
   logic [7:0]  al_i, mx_i;                  // next ASCALE factor to load / RMAX value to write
 
   // FIFOs of chunks and of their scale entries (one per chunk; the two DRAM ports return
@@ -1002,7 +1003,8 @@ module otpu_mxu
   end
   logic [3:0] ln_n;                          // picks in the lanes (any nonzero = busy)
 
-  // read-modify-write pipeline for ACC: read now, data next cycle, (old*alpha)+new, write
+  // read-modify-write pipeline for ACC: request now, read from the request register next cycle
+  // (rA, TMEM's input stage), data the cycle after (r0), (old*alpha)+new, write
   typedef struct packed {
     logic                   v;
     logic [NL-1:0]          m;
@@ -1010,6 +1012,7 @@ module otpu_mxu
     logic [NL-1:0][7:0]     col;
   } rmw_t;
   rmw_t r0, rw;                               // r0: data arriving now; rw: at the write stage
+  rmw_t rA;                                   // the read in the request register (t_ren)
   rmw_t rx;                                   // RMAX (no ACC): written lanes, compared next cycle
   f32_t ry [NL];
   // r1: r0 one granted cycle later, with the old values registered (xo): no path from the TMEM
@@ -1088,7 +1091,7 @@ module otpu_mxu
 `endif
 
   wire c_drained = c_act && !cl_ld && (pn || c_left == 0) && (rows_live == 0) && (rmw_n == 0) &&
-                   (ln_n == 0) && !r0.v && !r1.v && !rx.v;
+                   (ln_n == 0) && !rA.v && !r0.v && !r1.v && !rx.v;
   // RMAX writes start a cycle after the head has drained: mx_q registers the test, so the
   // drained compares (c_left == 0, rows_live, rmw_n, ...) are off the TMEM write request and the
   // grant it feeds. The test holds while drained (nothing new enters the head until it
@@ -1118,13 +1121,22 @@ module otpu_mxu
         $fatal(1, "otpu_mxu: RMAX lane %0d address %0h, mxo %0h, mx_i %0d", k, mxl[k], h.mxo, mx_i);
 `endif
 
+  // TMEM's input stage (release r2, docs/tmem_nocopy.md 7): the read request is a register, a
+  // stage of the grant's pipeline (it advances with t_gnt), so no unit logic (the ASCALE
+  // addresses' adder and compare, the drain's lane mux) precedes TMEM's lane routing, ranks and
+  // block RAM pins; the word arrives a cycle later (rA, al_st 3)
+  logic [LANES-1:0]       t_ren_c;
+  logic [LANES-1:0][31:0] t_raddr_c;
+  always_ff @(posedge clk)
+    if (rst) t_ren <= '0;
+    else if (t_gnt) begin t_ren <= t_ren_c; t_raddr <= t_raddr_c; end
   always_comb begin
-    t_ren = '0; t_raddr = '0; t_wen = '0; t_waddr = '0; t_wdata = '0;
+    t_ren_c = '0; t_raddr_c = '0; t_wen = '0; t_waddr = '0; t_wdata = '0;
     if (lo.v) begin
       for (int k = 0; k < NL; k++) begin
         if (c_acc) begin
-          t_ren[k] = lo.m[k];
-          t_raddr[k] = lo.ad[k];
+          t_ren_c[k] = lo.m[k];
+          t_raddr_c[k] = lo.ad[k];
         end else begin
           t_wen[k] = lo.m[k];
           t_waddr[k] = lo.ad[k];
@@ -1146,8 +1158,8 @@ module otpu_mxu
     if (al_go) begin
       for (int k = 0; k < LANES; k++) begin
         if (32'(al_i) + 32'(k) < 32'(c_M)) begin
-          t_ren[k] = 1'b1;
-          t_raddr[k] = c_asa + 32'(al_i) + 32'(k);
+          t_ren_c[k] = 1'b1;
+          t_raddr_c[k] = c_asa + 32'(al_i) + 32'(k);
         end
       end
     end
@@ -1191,7 +1203,7 @@ module otpu_mxu
       dj <= '0; mx_done <= 1'b0; mx_have <= '0;
       d_last <= 1'b0; d_fin <= 1'b0; ncnt <= '0; dln <= '0; mxm <= '0;
       al_st <= 2'd0; al_i <= '0; mx_i <= '0;
-      r0 <= '0; rx <= '0; rmw_n <= '0; ln_n <= '0;
+      r0 <= '0; rA <= '0; rx <= '0; rmw_n <= '0; ln_n <= '0;
       st_starve <= '0; st_bp <= '0; st_frz <= '0; st_deny <= '0;
       st_c <= '0; st_f <= 1'b0; mx_q <= 1'b0;
     end else begin
@@ -1351,15 +1363,16 @@ module otpu_mxu
       end
       // ---- drain (holds while the TMEM grant is withheld)
       if (t_gnt) begin
-        r0 <= '0;
+        r0 <= rA;
+        rA <= '0;
         rx <= '0;
         if (lo.v) begin
           if (c_acc) begin
-            r0.v <= 1'b1;
-            r0.m <= lo.m;
-            r0.ad <= lo.ad;
-            for (int k = 0; k < NL; k++) r0.nv[k] <= lo_y[k];
-            r0.col <= lo.col;
+            rA.v <= 1'b1;
+            rA.m <= lo.m;
+            rA.ad <= lo.ad;
+            for (int k = 0; k < NL; k++) rA.nv[k] <= lo_y[k];
+            rA.col <= lo.col;
           end
           if (c_rmax && !c_acc) begin
             rx.v <= 1'b1;
@@ -1408,7 +1421,8 @@ module otpu_mxu
           else mx_i <= mx_i + 8'(LANES);
         end
         if (al_go) al_st <= 2'd1;
-        if (al_st == 2'd1) begin
+        if (al_st == 2'd1) al_st <= 2'd3;     // the read leaves the request register
+        if (al_st == 2'd3) begin
           // one write per entry (a constant index): a variable-index write of several lanes makes
           // Vivado try, and crash while dissolving, a RAM for these MCOLS registers
           for (int j = 0; j < MCOLS; j++)

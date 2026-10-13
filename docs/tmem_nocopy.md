@@ -727,6 +727,66 @@ worst workload (section 6.4: 2.5x the replays of the 4-row run). A wider MXU mak
 (the MXU's accumulation, QUANT's data) heavier, which is why fewer consumers (section 6.6) matter
 more as the columns grow, and placement less.
 
+### 7.1 The input stage (release r2)
+
+**Why.** r2's m4 build (`r2m4_d352e53d`: MCOLS 4, one pumped copy, 133.33 MHz) missed on two
+kinds of path, both from the units' request logic straight into the TMEM:
+- clk -> clk2x: 926 endpoints, TNS -146.2 ns, all into the pumped banks' pins. By source: the
+  VPU's chunk address (cols / ic, 55%), the MXU's ASCALE address (31%), QUANT (4%), the DMA (2%),
+  the collective (2%), and the write stage pw_* (4%). Worst -0.39 ns.
+- core_clk: 65% of its TNS was one path, worst -0.536 ns at 16 levels. It runs from the MXU's
+  ASCALE adder through the TMEM's address compare and rank to `lost`, then to the VPU's enables.
+- The words (RAM -> unit) pass at m4: +0.02 to +0.26 ns.
+
+**What.** Every read request goes to the TMEM from flip-flops, a cycle after it forms, and the
+writes are registered at the TMEM's input. Each unit gets the request register, so its own
+arithmetic ends there; the grants still come from the requests the TMEM sees.
+- **MXU:** t_ren/t_raddr advance with t_gnt; the RMW gains a stage (rA) before r0; ASCALE takes
+  its words a cycle later (al_st 3).
+- **VPU:** ta_/tb_* advance with the enable; the chunk waits in mi2; the composite path's hold
+  lookahead goes from HA 2 to 3.
+- **QUANT:** all three ports advance with the enable; the chunk waits in m0a; the byte address
+  is delayed by QL + 2; an unbuffered row's group word is delayed by a cycle (grd_d).
+- **DMA:** the request advances with adv. The ST tags gain a stage (pa0). The stream fill's tags
+  gain a stage (fr_k0), and the run starts a cycle after the fill. A STREAM's descriptor is
+  captured a cycle later.
+- **RLD:** asked from rl_pend's second cycle.
+- **The collective:** on its own ports (otpu_top; otpu_board at S = 1), otpu_coll RQ: a request
+  register (stage a) before stage p. Through the hub (S > 1), otpu_coll_port asks a held read
+  from its second cycle (hq). The held read waits there until granted, with no replay: the guest
+  rule `coll_blk` is evaluated on the same staged requests, and the DMA and QUANT never wait on
+  the collective, so the hold adds no wait edge.
+- **TMEM `IQ`:** the granted writes (lanes, addresses, data, grants) are registered, and the
+  routing, selection and write stage run on them a cycle later.
+- **PMP 1:** each pumped RAM gets its own copy of the write stage (`pk_*`, 16 at 64K words with
+  NSB 2). The sub-bank decode and the RAM row are formed before the register, so the bank's
+  write pins come straight from flip-flops. The bank-level `pw` stays for the bypass, the
+  replays' check and the dump.
+
+**Order.** Every read and every write moves exactly one cycle, so what a read sees is what it saw
+before. This holds for the units', RLD's and the collective's reads, and for every write port's
+writes. The registered write stage, its bypass and the replays' premise (section 5.1) are
+unchanged relative to the reads. The scoreboard and the wait counts are completion-based and see
+nothing. No new bypass is needed.
+
+**Cost** (co-simulated on m4, LiteDRAM DDR3-1066; the reads +1 in every unit, the hack `rq3`,
+against d352e53d):
+
+| run | d352e53d | rq3 | change |
+|---|---|---|---|
+| Qwen3.5-0.8B tiled P (b1, T4, 4 layers) | 1,140,615 | 1,141,252 | +0.056% |
+| Qwen3.5-0.8B decode at 544 | 2,538,092 | 2,536,681 | -0.056% |
+| Qwen3-0.6B decode at 544 | 1,617,977 | 1,618,224 | +0.015% |
+| Qwen3-0.6B decode at 1800 | 1,710,331 | 1,710,177 | -0.009% |
+
+A second cycle for the words (a data register beside the TMEM, `rq4`) cost +0.138% on the P run.
+m4 does not need it.
+
+**With it in r2.** The other core_clk groups of r2m4 are not the TMEM's:
+- The sequencer's wait test is registered (`otpu_seq` w_all_q / w_dram_q; docs/seq_vpu.md), at
+  -0.013 to +0.011% on the same four runs.
+- The card builds the collective unit without GATHER (`COLL_GATHER` 0, docs/infra_hunt.md 5).
+
 ## 8. Ranking
 
 By SRAM first, then the bytes the TMEM moves (its reads, the replays among them), then logic,

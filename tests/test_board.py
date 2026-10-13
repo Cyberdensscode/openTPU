@@ -5,6 +5,8 @@ control registers, program loader, slice, DRAM adapter, two-channel AXI memory -
 same register and memory protocol the PCIe driver uses, and require the ISA simulator's
 results bit for bit.
 """
+import re
+
 import numpy as np
 import pytest
 
@@ -554,6 +556,48 @@ def test_bar_and_gather_across_slrs_on_board_model(have_verilator, nreg, seed):
         for o, _, n in _COUTS:
             got = b.read(_COUT + o, 4 * n, s)
             assert np.array_equal(got, m.slices[s].dram[_COUT + o:_COUT + o + 4 * n]), (s, hex(o))
+
+
+def test_collective_reads_held_behind_dma_reads_on_board_model(have_verilator):
+    """test_rtl's held collective on the BCU1525's board (S = 2: the collective through
+    otpu_coll_hub and a port per slice) with release r2's TMEM (the collective the DMA's guest):
+    each port asks its held read from its second cycle (TMEM's input stage, otpu_coll_port hq)
+    and holds it while the guest rule blocks it (an ST beside the GATHERs); the results and the
+    instruction counts are the ISA simulator's."""
+    from opentpu import isa as I
+    from opentpu.isasim import Machine
+    from test_rtl import R2_TMEM, held_collective_program
+    cfg = board_config(DRAM_BYTES=1 << 23, S=2)
+    out = 0x100000
+    progs = [held_collective_program(out) for _ in range(2)]
+    rng = np.random.default_rng(12)
+    xs = [rng.standard_normal(4096).astype(np.float32) for _ in range(2)]
+    drams = []
+    for x in xs:
+        d = np.zeros(cfg.DRAM_BYTES, np.uint8)
+        d[:x.nbytes] = x.view(np.uint8)
+        drams.append(d)
+    m = Machine(cfg, progs, drams).run()
+    b = Board(SimTransport(ch_bytes=cfg.DRAM_BYTES // 2, stall=20, seed=3, target="bcu1525",
+                           params=dict(R2_TMEM)))
+    assert b.slices == 2
+    for s, x in enumerate(xs):
+        b.write(0, x.view(np.uint8), s)
+    words = [np.asarray(I.assemble(p), np.uint32) for p in progs]
+    if b.waitc:                                         # WAITC: each slice's program its entries
+        from opentpu import waits as W
+        b.load_program(_CPROG, words, [W.entries(w, cfg.D, cfg.S) for w in words])
+    else:
+        b.load_program(_CPROG, words)
+    st = b.run()
+    held = {int(a): int(c) for a, c in re.findall(r"TMEMSTAT sid=(\d+) cyc=\d+ lose=\d+,\d+,\d+,(\d+)",
+                                                  b.t.out)}    # the run's simulation
+    assert sorted(held) == [0, 1] and held[0] > 0, held  # (slice 0's segment is read first)
+    assert st["instructions"] == [sl.icount for sl in m.slices]
+    for s in range(2):
+        for o, n in ((0, 4096), (0x8000, 512), (0x9000, 160)):
+            got = b.read(out + o, 4 * n, s)
+            assert np.array_equal(got, m.slices[s].dram[out + o:out + o + 4 * n]), (s, hex(o))
 
 
 def test_tiny_qwen3_generate_on_board_model(have_verilator):

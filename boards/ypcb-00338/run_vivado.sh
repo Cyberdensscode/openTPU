@@ -23,8 +23,12 @@
 #                                         # (250 MHz; vivado/bd_native.tcl, docs/offload.md section 6)
 #   TRACE_DEPTH=0 ./run_vivado.sh         # no hardware trace buffer (CAPS trace bit 0; the default is the
 #                                         # target's 16384 records: 32 RAMB36, docs/infra_hunt.md)
-#   COLL_GATHER=0 ./run_vivado.sh         # the collective unit without GATHER: BAR alone (CAPS2 bit0 = 0;
-#                                         # the host refuses GATHER programs; docs/infra_hunt.md 5)
+#   COLL_GATHER=1 ./run_vivado.sh         # the collective unit with GATHER (CAPS2 bit0 = 1). The default
+#                                         # since release r2 is 0, BAR alone: the card has one slice, where
+#                                         # no compiled program has a GATHER and the host refuses one, and
+#                                         # the GATHER unit's read select and write-bank mask fed the MXU's
+#                                         # TMEM grant (r2m4: -0.261 ns, 12% of core_clk's TNS;
+#                                         # docs/infra_hunt.md 5)
 #   TMEM_WORDS=131072 ./run_vivado.sh     # a 128K-word TMEM (the target's variant's; in CFG_HASH)
 #   VIVADO_DOCKER=image ./run_vivado.sh   # Docker (e.g. Apple Silicon with Rosetta), see docs/board.md
 #   VIVADO_AS_USER=1                      # Docker on Linux: run as the calling user (see run())
@@ -119,7 +123,7 @@ export OTPU_FAST="${FAST:-0}"
 export OTPU_SEQ_WC_GEN="$seq_wc"
 export PCIE_GEN="${PCIE_GEN:-2}"    # read by vivado/bd_native.tcl and userclk1_reroute.tcl
 export TRACE_DEPTH="${TRACE_DEPTH:-${T_TRACE_DEPTH:-16384}}"   # read by vivado/create_project.tcl
-export COLL_GATHER="${COLL_GATHER:-1}"                          # read by vivado/create_project.tcl
+export COLL_GATHER="${COLL_GATHER:-0}"                          # read by vivado/create_project.tcl
 if [[ "${STEP:-}" == impl ]]; then
   run "$here/vivado/build.tcl" "$out" "$jobs" impl "${IMPL_STRATEGY:-}"
 else

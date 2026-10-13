@@ -342,6 +342,23 @@ def test_rtl_file_lists_agree():
         [f for f in bcu if not f.endswith("otpu_fpga_top_bcu.sv")]
 
 
+def test_board_uarch_builds_the_cards_collective_unit():
+    """The card's build has no GATHER (run_vivado.sh's COLL_GATHER default, and
+    create_project.tcl's: 0 since release r2, docs/infra_hunt.md 5), and the board uarch
+    simulates the same unit (rtlsim.BOARD_UARCH: tb_top / tb_board COLL_GATHER), so the gates'
+    board runs are of the BAR-only unit; S > 1 and the default uarch keep GATHER."""
+    from opentpu import rtlsim
+    if T.current().name != "ypcb-00338":
+        pytest.skip("the card's target only")
+    sh = (ROOT / "boards/ypcb-00338/run_vivado.sh").read_text()
+    tcl = (ROOT / "boards/ypcb-00338/vivado/create_project.tcl").read_text()
+    build = re.findall(r'^export COLL_GATHER="\$\{COLL_GATHER:-(\d)\}"', sh, re.M)
+    fallback = re.findall(r'^set COLL_GATHER \[expr .* : (\d)\}\]$', tcl, re.M)
+    assert build == fallback == [str(rtlsim.BOARD_UARCH["COLL_GATHER"])] == ["0"]
+    assert not rtlsim.gathers(1, rtlsim.BOARD_UARCH) and rtlsim.gathers(2, rtlsim.BOARD_UARCH)
+    assert rtlsim.gathers(1, {"COLL_GATHER": 1})
+
+
 def test_bcu1525_target_matches_its_rtl_defaults():
     """The BCU1525's top and sys wrapper default to its target's values (run_vivado.sh passes
     them as generics too), with the channel layout otpu_board and otpu_ctrl assume (two channels

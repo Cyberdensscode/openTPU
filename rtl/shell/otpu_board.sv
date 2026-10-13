@@ -326,7 +326,9 @@ module otpu_board #(
 `endif
   initial if (S > 1 && !COLL_GATHER) $fatal(1, "otpu_board: COLL_GATHER 0 needs S = 1");
   if (COLL_GATHER) begin : g_coll
-    otpu_coll #(.S(S), .LANES(LANES)) u_coll (
+    // RQ: its reads from its own request register on the slice's port at S = 1; at S > 1 each
+    // slice's otpu_coll_port presents them a cycle later (TMEM's input stage)
+    otpu_coll #(.S(S), .LANES(LANES), .RQ(S == 1)) u_coll (
       .clk, .rst(coll_rst), .req(coll_req), .cmds(coll_cmds), .gnt(coll_gnt), .ack(coll_ack),
       .r_en(coll_ren), .r_addr(coll_raddr), .r_data(coll_rdata),
       .w_en(coll_wen), .w_addr(coll_waddr), .w_data(coll_wdata));

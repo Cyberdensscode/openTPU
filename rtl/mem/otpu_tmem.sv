@@ -74,8 +74,9 @@ module otpu_tmem #(
   parameter bit   TDP   = 1'b0,           // IMPL 3: true dual-port RAMs (see IMPL 3 below)
   parameter logic [NRP-1:0] SIDE = '0,    // TDP: each read port's RAM port (1: A, the writes')
   parameter bit   GST   = 1'b0,           // IMPL 3: SH_MASK's ports are SH_HOST's guests (see IMPL 3)
-  parameter int   PMP   = 0               // TDP: 1 the RAMs pumped at 2x on clk_f (otpu_pump_bank), 2
+  parameter int   PMP   = 0,              // TDP: 1 the RAMs pumped at 2x on clk_f (otpu_pump_bank), 2
                                           //   its model at the core clock (see IMPL 3)
+  parameter bit   IQ    = 1'b0            // the input stage: the granted writes registered (below)
 ) (
   input  logic                                clk,
   input  logic                                clk_f,    // PMP 1: 2 x clk, aligned (else unused)
@@ -116,6 +117,36 @@ module otpu_tmem #(
   endfunction
 
 
+  // ---- IQ, the input stage (release r2, docs/tmem_nocopy.md 7): the granted writes (their
+  // lanes, addresses and data, the ports' grants) are registered here, and the lane routing, the
+  // write selection and the registered write stage run on them a cycle later, so the selection
+  // starts at flip-flops instead of at the units' write logic and the arbiter's grants. The units
+  // register their read requests (the reads come a cycle after they form, with the same grants),
+  // so reads and writes both move a cycle and the memory's order is unchanged: no bypass of the
+  // stage. Without IQ the inputs pass through.
+  logic [NWP-1:0][LANES-1:0]       wi_en;
+  logic [NWP-1:0]                  wi_gnt;
+  logic [NWP-1:0][LANES-1:0][31:0] wi_addr, wi_data;
+  if (IQ) begin : g_iq
+    always_ff @(posedge clk) begin
+      wi_en <= w_en;
+      wi_gnt <= w_gnt;
+      for (int p = 0; p < NWP; p++)
+        if (w_gnt[p]) begin
+          wi_addr[p] <= w_addr[p];
+          wi_data[p] <= w_data[p];
+        end
+    end
+`ifndef SYNTHESIS
+    initial begin wi_en = '0; wi_gnt = '0; end
+`endif
+  end else begin : g_niq
+    assign wi_en = w_en, wi_gnt = w_gnt, wi_addr = w_addr, wi_data = w_data;
+  end
+  // (the selection takes each port's lanes from its requests and the port by its grant: with IQ
+  // the registered granted lanes and grants)
+  wire [NWP-1:0][LANES-1:0] wi_req = IQ ? wi_en : w_req;
+
   // ---- write selection: per bank, the enabled lanes of all write ports. The arbiter admits at
   // most WPB of them, so with WPB = 1 a flat AND-OR tree selects the one (no priority chain).
   logic [LANES-1:0][WPB-1:0]         bw_v;
@@ -137,19 +168,19 @@ module otpu_tmem #(
           pv[p] = '0; pa[p] = '0; pdt[p] = '0;
           for (int b = 0; b < LANES; b++)
             for (int l = 0; l < LANES; l++)
-              if (w_req[p][l] && w_addr[p][l][BW-1:0] == BW'(b)) begin
+              if (wi_req[p][l] && wi_addr[p][l][BW-1:0] == BW'(b)) begin
                 pv[p][b] = 1'b1;
-                pa[p][b] = pa[p][b] | w_addr[p][l][BW +: IW];
-                pdt[p][b] = pdt[p][b] | w_data[p][l];
+                pa[p][b] = pa[p][b] | wi_addr[p][l][BW +: IW];
+                pdt[p][b] = pdt[p][b] | wi_data[p][l];
               end
         end
       end else begin : g_r
-        wire [BW+IW-1:0] a0 = w_addr[p][0][BW+IW-1:0];
+        wire [BW+IW-1:0] a0 = wi_addr[p][0][BW+IW-1:0];
         wire [BW-1:0]    rot = a0[BW-1:0];
         always_comb begin
           logic [LANES-1:0]       v, tv;
           logic [LANES-1:0][31:0] d, td;
-          v = w_req[p]; d = w_data[p]; tv = '0; td = '0;
+          v = wi_req[p]; d = wi_data[p]; tv = '0; td = '0;
           for (int k = 0; k < BW; k++)
             if (rot[k]) begin
               tv = v; td = d;
@@ -166,7 +197,7 @@ module otpu_tmem #(
     always_comb begin
       bw_v = '0; bw_a = '0; bw_d = '0;
       for (int p = 0; p < NWP; p++)
-        if (w_gnt[p])
+        if (wi_gnt[p])
           for (int b = 0; b < LANES; b++)
             if (pv[p][b]) begin
               bw_v[b][0] = 1'b1;
@@ -182,10 +213,10 @@ module otpu_tmem #(
         bw_v[b] = '0; bw_a[b] = '0; bw_d[b] = '0;
         for (int p = 0; p < NWP; p++)
           for (int l = 0; l < LANES; l++)
-            if (w_en[p][l] && w_addr[p][l][BW-1:0] == BW'(b) && n < WPB) begin
+            if (wi_en[p][l] && wi_addr[p][l][BW-1:0] == BW'(b) && n < WPB) begin
               bw_v[b][n] = 1'b1;
-              bw_a[b][n] = w_addr[p][l][BW +: IW];
-              bw_d[b][n] = w_data[p][l];
+              bw_a[b][n] = wi_addr[p][l][BW +: IW];
+              bw_d[b][n] = wi_data[p][l];
               n = n + 1;
             end
       end
@@ -196,7 +227,9 @@ module otpu_tmem #(
   // data of the writes landing now is kept one more cycle (pd) for the reads that bypass them.
   // Each pw bit reaches every copy of its bank (the copies' block RAMs spread over the die):
   // synthesis replicates the registers so each copy gets nearby ones (one copy's net to the
-  // block RAM address pins was the worst core_clk path at 120 MHz, 0 logic levels)
+  // block RAM address pins was the worst core_clk path at 120 MHz, 0 logic levels). With PMP 1
+  // each pumped RAM takes its own copy instead (pk_*, IMPL 3); pw stays for the bypass, the
+  // replays' checks and the dump.
   (* max_fanout = 16 *) logic [LANES-1:0][WPB-1:0]         pw_v;
   (* max_fanout = 16 *) logic [LANES-1:0][WPB-1:0][IW-1:0] pw_a;
   (* max_fanout = 16 *) logic [LANES-1:0][WPB-1:0][31:0]   pw_d;
@@ -611,9 +644,33 @@ module otpu_tmem #(
         // front end, an internal fault; the cell is this RAM)
         if (PMP == 1) begin : g_pmp
           // pumped at 2x: port A reads side 1, port B side 0 at the core edge, the write lands at
-          // the fast edge between (P3's bank)
+          // the fast edge between (P3's bank). The write's inputs are this RAM's own copy of the
+          // registered write stage (pk_*, release r2): its sub-bank's decode and the RAM row are
+          // taken before the register, so the bank's write pins (on clk_f, a half core cycle
+          // from the register) come straight from flip-flops kept next to it, not through the
+          // bank-level pw's decode and fanout (r2m4: pw_* -> the pumped banks, clk -> clk2x)
+          (* keep = "true" *) logic          pk_v;
+          (* keep = "true" *) logic [RW-1:0] pk_a;
+          (* keep = "true" *) logic [31:0]   pk_d;
+          always_ff @(posedge clk) begin
+            pk_v <= bw_v[b][0] && sub_of(bw_a[b][0]) == LW'(k);
+            pk_a <= ram_row(bw_a[b][0]);
+            pk_d <= bw_d[b][0];
+          end
+          logic [31:0] pkd;
+`ifdef SYNTHESIS
+          assign pkd = pk_d;
+`else
+          assign pkd = pk_d ^ fault(0, b, pw_a[b][0]);
+          initial pk_v = 1'b0;
+          // the copy is the bank's write stage at this RAM
+          always @(posedge clk)
+            if (pk_v != wh || (wh && (pk_a != ram_row(pw_a[b][0]) || pk_d != pw_d[b][0])))
+              $fatal(1, "TMEM%0d: bank %0d RAM %0d's write copy differs from the write stage", SID,
+                     b, k);
+`endif
           otpu_pump_bank #(.N(RD), .STYLE("block"), .FW(1'b1)) u_pb (
-            .clk, .clk_f, .wv(wh), .wa(ram_row(pw_a[b][0])), .wd,
+            .clk, .clk_f, .wv(pk_v), .wa(pk_a), .wd(pkd),
             .rena(s_en[b][k][1]), .ra(s_a[b][k][1]), .renb(s_en[b][k][0]), .rb(s_a[b][k][0]),
             .qa(s_q[b][k][1]), .qb(s_q[b][k][0]));
 `ifndef SYNTHESIS
@@ -623,7 +680,7 @@ module otpu_tmem #(
           always @(posedge clk) begin
             if (dump)
               for (int r = 0; r < RD; r++) img[row_of(k, r) * LANES + b] = shd[r];
-            if (wh) shd[ram_row(pw_a[b][0])] <= wd;
+            if (pk_v) shd[pk_a] <= pkd;
           end
 `endif
         end else begin : g_ram

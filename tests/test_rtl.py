@@ -3,6 +3,7 @@
 Every test runs the same program on the same DRAM images through both and requires identical
 DRAM and TMEM contents in every slice.
 """
+import re
 import subprocess
 
 import numpy as np
@@ -141,11 +142,22 @@ def _wf(rng):
     return [I.W8, I.W4I, I.W4F, I.WNV][int(rng.choice([0, 0, 0, 1, 2, 3]))]
 
 
-def _random_program(rng, cfg: Config, n_ops=40, t0: int = 0):
+def _kinds(kinds: list, cfg: Config, gather: bool | None) -> list:
+    """The fuzzers' instruction kinds, without GATHER where the simulated collective unit has
+    none (gather None: rtlsim.gathers, the simulation's uarch; the board's at S = 1 is BAR-only,
+    as the card builds it)."""
+    if not (rtlsim.gathers(cfg.S) if gather is None else gather):
+        kinds = [k for k in kinds if k != "gather"]
+    return kinds
+
+
+def _random_program(rng, cfg: Config, n_ops=40, t0: int = 0, gather: bool | None = None):
     """A valid, hazard-free random program. The same program runs on every slice (so the
     collectives line up); the slices differ by their DRAM contents. t0: its TMEM words from
-    there (every TMEM address the program names is t0 or more)."""
+    there (every TMEM address the program names is t0 or more). gather: GATHERs among its
+    instructions (None: where the simulation's collective unit runs them, _kinds)."""
     D = cfg.D
+    kinds = _kinds(["vop", "vop", "vop", "qact_mm", "qst", "ldst", "loop", "gather"], cfg, gather)
     prog = [I.ld(DATA, t0, 4096)]
     src = [(t0, 4096)]                # TMEM regions holding finite "input" data
     nxt = t0 + 4096                   # fresh TMEM destinations (never read by VOPs again)
@@ -164,7 +176,7 @@ def _random_program(rng, cfg: Config, n_ops=40, t0: int = 0):
         return base + int(rng.integers(0, size - n + 1))
 
     for _ in range(n_ops):
-        kind = rng.choice(["vop", "vop", "vop", "qact_mm", "qst", "ldst", "loop", "gather"])
+        kind = rng.choice(kinds)
         if kind == "vop":
             rows, cols = int(rng.integers(1, 6)), int(rng.integers(1, 40))
             func = int(rng.choice([I.V_ADD, I.V_SUB, I.V_RSUB, I.V_MUL, I.V_MAX, I.V_MIN,
@@ -302,14 +314,16 @@ def test_one_copy_replays_make_progress(have_verilator, mcols, rows, seed):
     read waited behind QUANT 3's request while QUANT held for a replay, the DMA's asker asked for
     the collective's words every cycle, and the replay, on that RAM side, lost to it for good
     (QUANT 2's; VPU B's too in [2-8-1]). The results are the ISA's, and they come within a
-    million cycles (about 3,000 with the fix)."""
+    million cycles (about 3,000 with the fix). The collective's read is a GATHER's: the unit
+    with GATHER (COLL_GATHER 1, every S > 1 build's; the card's one slice builds it BAR-only)."""
     rng = np.random.default_rng(3000 + seed)
     cfg = Config(S=1, MCOLS=mcols, ACT_ROWS=rows)
-    prog = _random_program(rng, cfg, n_ops=60)
+    prog = _random_program(rng, cfg, n_ops=60, gather=True)
     imgs = _images(rng, 1)
     m = Machine(cfg, [prog], [i.copy() for i in imgs]).run()
     drams, tmems, _ = rtlsim.run(cfg, [prog], [i.copy() for i in imgs],
-                                 uarch={**rtlsim.BOARD_UARCH, **R2_TMEM}, max_cycles=1_000_000)
+                                 uarch={**rtlsim.BOARD_UARCH, **R2_TMEM, "COLL_GATHER": 1},
+                                 max_cycles=1_000_000)
     assert np.array_equal(drams[0], m.slices[0].dram)
     assert np.array_equal(tmems[0], m.slices[0].tmem)
 
@@ -318,17 +332,58 @@ def test_one_copy_replays_make_progress(have_verilator, mcols, rows, seed):
 def test_one_copy_tmem_of_128k_words(have_verilator, mcols, rows, seed):
     """Release r2's TMEM: 128K words (targets/ypcb-00338.toml) in the single pumped copy (R2_TMEM:
     128 RAMB36), a random program's TMEM data across the first 64K words' end and past it (the
-    sequencer's TAW, the banks' rows, the replays' addresses); the results are the ISA's."""
+    sequencer's TAW, the banks' rows, the replays' addresses); the results are the ISA's. Its
+    GATHERs' addresses too: the unit with GATHER (COLL_GATHER 1, as the progress test's)."""
     rng = np.random.default_rng(4000 + seed)
     cfg = Config(S=1, MCOLS=mcols, ACT_ROWS=rows, TMEM_WORDS=1 << 17)
-    prog = _random_program(rng, cfg, n_ops=60, t0=(1 << 16) - 2048)
+    prog = _random_program(rng, cfg, n_ops=60, t0=(1 << 16) - 2048, gather=True)
     imgs = _images(rng, 1)
     m = Machine(cfg, [prog], [i.copy() for i in imgs]).run()
     assert m.slices[0].tmem[1 << 16:].any()                 # (words past 64K written)
     drams, tmems, _ = rtlsim.run(cfg, [prog], [i.copy() for i in imgs],
-                                 uarch={**rtlsim.BOARD_UARCH, **R2_TMEM}, max_cycles=1_000_000)
+                                 uarch={**rtlsim.BOARD_UARCH, **R2_TMEM, "COLL_GATHER": 1},
+                                 max_cycles=1_000_000)
     assert np.array_equal(drams[0], m.slices[0].dram)
     assert np.array_equal(tmems[0], m.slices[0].tmem)
+
+
+def held_collective_program(out: int = SCRATCH) -> list:
+    """Every slice: an ST of 4,096 TMEM words (the DMA asking TMEM for its words nearly every
+    cycle) and, with no dependency on it, two GATHERs of other words back to back, then the
+    gathered words to DRAM (at out + 0x8000 and out + 0x9000)."""
+    return [I.ld(DATA, 0, 4096),
+            I.st(out, 0, 4096),
+            I.gather(1024, 8192, 4, 64, 256, 128, 64),
+            I.gather(3000, 10240, 2, 37, 40, 80, 40),
+            I.bar(),
+            I.st(out + 0x8000, 8192, 512), I.st(out + 0x9000, 10240, 160),
+            I.halt()]
+
+
+@pytest.mark.parametrize("seed", [0, 1])
+def test_collective_reads_held_behind_dma_reads(have_verilator, seed, tmp_path, monkeypatch):
+    """Two slices on release r2's TMEM (R2_TMEM: the collective the DMA's guest, GST). Each
+    GATHER's read is presented a cycle after it forms (TMEM's input stage: otpu_coll's request
+    register, RQ) and held there while the guest rule blocks it, with no replay (coll_blk: the
+    DMA asks, here for an ST of 4,096 words running beside the GATHERs: slice 0's collective
+    loses cycles, TMEMSTAT). The hold must not stall the DMA or lose a word, and the results are
+    the ISA's (docs/tmem_nocopy.md 7.1)."""
+    log = tmp_path / "tmemstat.log"
+    monkeypatch.setenv("OTPU_TMEMSTAT_LOG", str(log))
+    rng = np.random.default_rng(7000 + seed)
+    cfg = Config(S=2)
+    progs = [held_collective_program() for _ in range(2)]
+    imgs = _images(rng, 2)
+    m = Machine(cfg, progs, [i.copy() for i in imgs]).run()
+    drams, tmems, _ = rtlsim.run(cfg, progs, [i.copy() for i in imgs],
+                                 uarch={**rtlsim.BOARD_UARCH, **R2_TMEM}, max_cycles=1_000_000)
+    for s in range(2):
+        assert np.array_equal(tmems[s], m.slices[s].tmem), f"slice {s} TMEM"
+        assert np.array_equal(drams[s], m.slices[s].dram), f"slice {s} DRAM"
+    held = {int(a): int(b) for a, b in
+            re.findall(r"TMEMSTAT sid=(\d+) cyc=\d+ lose=\d+,\d+,\d+,(\d+)", log.read_text())}
+    # (slice 0's collective port: the GATHERs read slice 0's segment first, while its ST runs)
+    assert sorted(held) == [0, 1] and held[0] > 0, held
 
 
 @pytest.mark.parametrize("mcols,rows", [(4, 8), (8, 16)])
@@ -379,11 +434,13 @@ def test_lane_count_does_not_change_results(have_verilator, lanes):
 
 
 # ------------------------------------------------------------------ scoreboard stress fuzzing
-def _hazard_program(rng, cfg: Config, n_ops=60):
+def _hazard_program(rng, cfg: Config, n_ops=60, gather: bool | None = None):
     """Random programs whose instructions read and write a small shared pool of TMEM, ACT RAM
     and DRAM addresses, so that RAW, WAR and WAW hazards between concurrently running units are
-    everywhere. Only NaN-free-by-construction ops are used (ADD/SUB/MUL/COPY/ABS/FILL/RSUM)."""
+    everywhere. Only NaN-free-by-construction ops are used (ADD/SUB/MUL/COPY/ABS/FILL/RSUM).
+    gather: as _random_program's."""
     D = cfg.D
+    kinds = _kinds(["vop", "vop", "vop", "mm", "qst", "ld", "st", "gather"], cfg, gather)
     POOL = 1536 * max(1, D // 32)                 # TMEM words everybody fights over
     SCR = SCRATCH                                 # DRAM bytes everybody fights over
     prog = [I.ld(DATA, 0, 4096)]
@@ -392,7 +449,7 @@ def _hazard_program(rng, cfg: Config, n_ops=60):
         return int(rng.integers(0, POOL - n))
 
     for _ in range(n_ops):
-        kind = rng.choice(["vop", "vop", "vop", "mm", "qst", "ld", "st", "gather"])
+        kind = rng.choice(kinds)
         if kind == "vop":
             rows, cols = int(rng.integers(1, 5)), int(rng.integers(1, 40))
             func = int(rng.choice([I.V_ADD, I.V_SUB, I.V_MUL, I.V_COPY, I.V_ABS, I.V_FILL,
@@ -1160,6 +1217,22 @@ def test_tmem_random_traffic(have_verilator, impl, nsb, sbp, sbh, rpl, tdp, gst,
                        {"IMPL": impl, **({"NSB": nsb, "SBP": sbp, "SBH": sbh, "RPL": rpl, "TDP": tdp,
                                           "GST": gst, "PMP": pmp}
                                          if impl == 3 else {})})
+    r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0 and "PASS" in r.stdout, r.stdout[-2000:] + r.stderr[-2000:]
+
+
+@pytest.mark.parametrize("impl,nsb,sbp,tdp", [(0, 4, 2, 0), (1, 4, 2, 0), (3, 4, 2, 0), (3, 2, 2, 1)])
+def test_tmem_random_traffic_input_stage(have_verilator, impl, nsb, sbp, tdp):
+    """test_tmem_random_traffic with TMEM's input stage (IQ, release r2: the granted writes
+    registered before the selection): a write is seen two cycles after its own, the reads of the
+    words still in the write stage take its bypass as before (no replays: the testbench keeps a
+    write off its own cycle's reads only)."""
+    exe = rtlsim.build("tb_tmem", [rtlsim.RTL / "mem/otpu_tmem.sv",
+                                   rtlsim.RTL / "tech/generic/otpu_tech_ram.sv",
+                                   rtlsim.RTL / "exp/tmem_pump/otpu_tmem_pump.sv",
+                                   rtlsim.TB / "tb_tmem.sv"],
+                       {"IMPL": impl, "IQ": 1,
+                        **({"NSB": nsb, "SBP": sbp, "TDP": tdp} if impl == 3 else {})})
     r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=120)
     assert r.returncode == 0 and "PASS" in r.stdout, r.stdout[-2000:] + r.stderr[-2000:]
 

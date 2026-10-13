@@ -41,7 +41,9 @@ module otpu_top
   parameter int TMEM_PMP   = 0,       // TMEM_TDP: 2 the pumped RAMs' model (otpu_slice)
   parameter int TMEM_PRK   = 0,       // TMEM_IMPL 3: the read ports' ranks (otpu_slice)
   parameter int TMEM_SDM   = -1,      // TMEM_TDP: the read ports' RAM sides (otpu_slice)
-  parameter bit SEQ_WC     = 1'b0     // EXPERIMENTAL: otpu_seq's wait counts (otpu_slice)
+  parameter bit SEQ_WC     = 1'b0,    // EXPERIMENTAL: otpu_seq's wait counts (otpu_slice)
+  parameter bit COLL_GATHER = 1'b1    // 0 (S = 1 only): the collective unit runs BAR alone
+                                      // (otpu_coll_bar), as the card builds it (otpu_board)
 ) (
   input  logic          clk,
   input  logic          clk_f,         // TMEM_PMP 1: 2 x clk, rising with it (otpu_slice)
@@ -149,11 +151,21 @@ module otpu_top
       .halted(halted[s]), .error(error[s]), .wait_to(), .a_inval, .icount(icount[s]), .pf(), .dump);
   end
 
-  otpu_coll #(.S(S), .LANES(LANES)) u_coll (
-    .clk, .rst, .req(coll_req), .cmds(coll_cmd), .gnt(coll_gnt), .ack(coll_ack),
-    .r_en(coll_ren), .r_addr(coll_raddr), .r_data(coll_rdata),
-    .w_en(coll_wen), .w_addr(coll_waddr), .w_data(coll_wdata));
+  logic coll_gerr;                    // a GATHER on the BAR-only collective unit
+  initial if (S > 1 && !COLL_GATHER) $fatal(1, "otpu_top: COLL_GATHER 0 needs S = 1");
+  if (COLL_GATHER) begin : g_coll
+    otpu_coll #(.S(S), .LANES(LANES)) u_coll (
+      .clk, .rst, .req(coll_req), .cmds(coll_cmd), .gnt(coll_gnt), .ack(coll_ack),
+      .r_en(coll_ren), .r_addr(coll_raddr), .r_data(coll_rdata),
+      .w_en(coll_wen), .w_addr(coll_waddr), .w_data(coll_wdata));
+    assign coll_gerr = 1'b0;
+  end else begin : g_coll_bar
+    otpu_coll_bar #(.S(S), .LANES(LANES)) u_coll (
+      .clk, .rst, .req(coll_req), .cmds(coll_cmd), .gnt(coll_gnt), .ack(coll_ack),
+      .r_en(coll_ren), .r_addr(coll_raddr), .r_data(coll_rdata),
+      .w_en(coll_wen), .w_addr(coll_waddr), .w_data(coll_wdata), .gerr(coll_gerr));
+  end
 
   assign all_halted = &halted;
-  assign any_error  = |error;
+  assign any_error  = |error || coll_gerr;
 endmodule

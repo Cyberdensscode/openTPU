@@ -261,29 +261,46 @@ module otpu_quant
     logic [15:0]      row;
     logic [LANES-1:0] mask;
   } rm_t;
-  rm_t m0, mp;                               // data arriving now / after the prescale
+  // m0a: the chunk whose read request is in the request register (TMEM reads it this cycle);
+  // m0: the chunk whose data arrives now; mp: after the prescale
+  rm_t m0a, m0, mp;
+  always_ff @(posedge clk) if (rst) m0 <= '0; else if (en) m0 <= m0a;
   // buffered pass 1: a chunk popped (its data and group word arriving), then +1, +2 (the writer's
   // stage, like mp); the offsets' stages take their chunk from mb0 or m0
   rm_t mb0, mb1, mb2;
   rm_t m1s;
   assign m1s = bm ? mb0 : m0;
 
+  // TMEM's input stage (release r2, docs/tmem_nocopy.md 7): the three read requests (t_*_c) go
+  // to TMEM from flip-flops, a cycle after they are formed, advancing with the enable; the
+  // position's arithmetic (row_src + e + l, csb + e + l, rsb + r) and the issue test end at the
+  // register, not at the TMEM's ranks and pumped banks. The chunk waits a cycle in m0a for it.
+  logic [LANES-1:0]       t_ren_c, t_ren2_c;
+  logic [LANES-1:0][31:0] t_raddr_c, t_raddr2_c;
+  logic                   t_ren3_c;
+  logic [31:0]            t_raddr3_c;
+  always_ff @(posedge clk)
+    if (rst) begin t_ren <= '0; t_ren2 <= '0; t_ren3 <= 1'b0; end
+    else if (en) begin
+      t_ren <= t_ren_c; t_ren2 <= t_ren2_c; t_ren3 <= t_ren3_c;
+      t_raddr <= t_raddr_c; t_raddr2 <= t_raddr2_c; t_raddr3 <= t_raddr3_c;
+    end
   // (the addresses follow the position alone: a lane's counts only while its enable is up)
   always_comb begin
-    t_ren = '0; t_ren2 = '0; t_ren3 = 1'b0;
+    t_ren_c = '0; t_ren2_c = '0; t_ren3_c = 1'b0;
     for (int l = 0; l < LANES; l++) begin
-      t_raddr[l] = row_src + e + 32'(l);
-      t_raddr2[l] = csb + e + 32'(l);
+      t_raddr_c[l] = row_src + e + 32'(l);
+      t_raddr2_c[l] = csb + e + 32'(l);
     end
-    t_raddr3 = rsb + 32'(r);
+    t_raddr3_c = rsb + 32'(r);
     if (riss) begin
       for (int l = 0; l < LANES; l++) begin
         if (rmask[l]) begin
-          t_ren[l] = 1'b1;
-          if (csf) t_ren2[l] = 1'b1;
+          t_ren_c[l] = 1'b1;
+          if (csf) t_ren2_c[l] = 1'b1;
         end
       end
-      if (rsf) t_ren3 = 1'b1;
+      if (rsf) t_ren3_c = 1'b1;
     end
   end
 `ifndef SYNTHESIS
@@ -315,9 +332,9 @@ module otpu_quant
   otpu_delay #(.W($bits(rm_t)), .N(QL)) u_mp (.clk, .en, .d(m0), .q(mp));
 
   // QST's byte address dst + row*drs + e*es: the reader's running sum badr, taken in the issue
-  // cycle like m0 (one register) and delayed with it through the prescale (QL)
+  // cycle like m0a and delayed with the chunk (m0a, m0: two registers) through the prescale (QL)
   logic [31:0] mp_baddr;
-  otpu_delay #(.W(32), .N(QL + 1)) u_ba (.clk, .en, .d(badr), .q(mp_baddr));
+  otpu_delay #(.W(32), .N(QL + 2)) u_ba (.clk, .en, .d(badr), .q(mp_baddr));
 
   // fp_gt for the max path: every operand there is a non-negative flushed value (an otpu_fmul
   // result with the sign cleared, +0, or one taken from those), where fkey is {1, a[30:0]}, so
@@ -390,7 +407,11 @@ module otpu_quant
   // the group RAMs' reads: the chunk's group word at a pass 1 read (QACT: the block's four
   // groups; QST: the word of its block; buffered: at a pop), the next scale-row word in QST's
   // scale row phase; NB banks of GWN words, row r in bank r % NB
-  logic [3:0][30:0] grd;
+  // grd: the group word read at the chunk's issue (the group RAMs are not behind TMEM's input
+  // stage), the cycle its read request is in the request register; grd_d: a cycle later, with
+  // m0 (the TMEM data). A buffered pass 1 reads it at the pop, with mb0 (no TMEM read).
+  logic [3:0][30:0] grd, grd_d;
+  always_ff @(posedge clk) if (en) grd_d <= grd;
   wire [GA+1:0] gr_a = sw_ph ? {r[1:0], GA'(sw_i)} : is_st ? {r[1:0], GA'(e >> (DL + 2))}
                      : bm ? {r1[1:0], GA'(e1c >> DL)} : {r[1:0], GA'(e >> DL)};
   for (genvar s = 0; s < 4; s++) begin : g_gr
@@ -433,7 +454,7 @@ module otpu_quant
   logic [31:0]     e1;
   logic [1:0]      b1;                       // the chunk's row bank
   always_ff @(posedge clk) if (en) begin
-    for (int s = 0; s < 4; s++) dq[s] <= dval(grd[s], amx_q[m1s.row[1:0]], rowm);
+    for (int s = 0; s < 4; s++) dq[s] <= dval(bm ? grd[s] : grd_d[s], amx_q[m1s.row[1:0]], rowm);
     e1 <= m1s.e;
     b1 <= m1s.row[1:0];
   end
@@ -671,12 +692,12 @@ module otpu_quant
       busy <= 1'b0;
       ackw <= 1'b0;
       sw_ph <= 1'b0;
-      m0 <= '0;
+      m0a <= '0;
       mb0 <= '0;
       p1a <= 1'b0;
       bm <= 1'b0;
     end else if (ackw) begin
-      m0 <= '0;
+      m0a <= '0;
       mb0 <= '0;
       if (wr_idle) begin
         ackw <= 1'b0;
@@ -720,7 +741,7 @@ module otpu_quant
       sbase <= cmd.w3;                           // QST sdst
       row_src <= cmd.w1;
       pass <= 1'b0; rd_wait <= 1'b0; wide <= 1'b0; sw_ph <= 1'b0; sw_i <= '0;
-      m0 <= '0;
+      m0a <= '0;
       st_frz <= '0;
       bm <= XD > 0 && !qst && 32'(kb) * D <= 32'(XD) * LANES;
       p1a <= 1'b0; r1 <= '0; e1c <= '0; xw <= '0; xr <= '0; xocc <= '0; dr <= '0; sv <= '0;
@@ -736,15 +757,15 @@ module otpu_quant
       logic fin;
       fin = 1'b0;
       // ---- reader
-      m0 <= '0;
+      m0a <= '0;
       if (riss) begin
-        m0.v <= 1'b1;
-        m0.pass <= pass;
-        m0.e <= e;
-        m0.last <= rlast;
-        m0.row <= r;
-        m0.mask <= rmask;
-        m0.glast <= pass && rlast && (32'(r) + 1 == 32'(rows));
+        m0a.v <= 1'b1;
+        m0a.pass <= pass;
+        m0a.e <= e;
+        m0a.last <= rlast;
+        m0a.row <= r;
+        m0a.mask <= rmask;
+        m0a.glast <= pass && rlast && (32'(r) + 1 == 32'(rows));
         if (!rlast) begin
           e <= e + ew;
           rem <= rem - ew;

@@ -45,9 +45,10 @@ set TRACE_DEPTH [expr {[info exists ::env(TRACE_DEPTH)] && $::env(TRACE_DEPTH) n
 if {![regexp {^[0-9]+$} $TRACE_DEPTH] || ($TRACE_DEPTH != 0 && ($TRACE_DEPTH & ($TRACE_DEPTH - 1)))} {
   error "TRACE_DEPTH $TRACE_DEPTH: a power of two, or 0"
 }
-# COLL_GATHER (environment, run_vivado.sh): 0 builds the collective unit without GATHER (BAR
-# alone: CAPS2 bit0 = 0; the host refuses GATHER programs; docs/infra_hunt.md 5)
-set COLL_GATHER [expr {[info exists ::env(COLL_GATHER)] && $::env(COLL_GATHER) ne "" ? $::env(COLL_GATHER) : 1}]
+# COLL_GATHER (environment, run_vivado.sh): 0, the default since release r2, builds the collective
+# unit without GATHER (BAR alone: CAPS2 bit0 = 0; the host refuses GATHER programs); 1 with it
+# (docs/infra_hunt.md 5)
+set COLL_GATHER [expr {[info exists ::env(COLL_GATHER)] && $::env(COLL_GATHER) ne "" ? $::env(COLL_GATHER) : 0}]
 if {$COLL_GATHER ni {0 1}} { error "COLL_GATHER $COLL_GATHER: 0 or 1" }
 # TMEM_WORDS (environment, run_vivado.sh: the target's [arch] TMEM_WORDS, in its CFG_HASH): the
 # TMEM's words, a power of two (the CFG_TMEM register; the card's m4 64K, m8 128K: 128 RAMB36)
