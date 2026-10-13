@@ -21,7 +21,7 @@
 # - OTPU_MXU_PLACE=0 skips the whole file.
 # It stops the run (error) when a name pattern matches no cells, when the PEs are not MCOLS x D,
 # or when a cascade chain is not in position order. The LOCs it sets are also written to
-# otpu_mxu_place.xdc in the run's directory.
+# otpu_mxu_place.xdc in the implementation run's directory (or to OTPU_MXU_PLACE_XDC).
 #
 #   project:      constrs_1, PROCESSING_ORDER LATE, USED_IN_SYNTHESIS false (create_project.tcl)
 #   non-project:  source otpu_mxu_place.tcl on the linked netlist, before place_design
@@ -232,15 +232,24 @@ proc ::otpu_mxu_place::run {} {
     ram $c $wcol [expr {int(($base + ($k + 0.5) * $d / $n) / 2)}] $nb
     incr k
   }
-  # ---- the record
-  set f [open [file join [pwd] otpu_mxu_place.xdc] w]
-  puts $f "# otpu_mxu_place.tcl on $part: MCOLS $mc, D $d ($heads cascade chains), PE rows $base..[expr {$base + $d - 1}],\
-           column ends above; DSP columns $dcols, ACT block RAM columns $bcols, weight RAMs column $wcol"
-  puts $f [join $lines \n]
-  close $f
+  # ---- the record: in an implementation run's directory, or OTPU_MXU_PLACE_XDC; not where
+  # build.tcl opens the synthesized design for its reports (the build's working directory)
+  set rec ""
+  if {[info exists ::env(OTPU_MXU_PLACE_XDC)]} {
+    set rec $::env(OTPU_MXU_PLACE_XDC)
+  } elseif {[string match *.runs/impl_* [pwd]]} {
+    set rec [file join [pwd] otpu_mxu_place.xdc]
+  }
+  if {$rec ne ""} {
+    set f [open $rec w]
+    puts $f "# otpu_mxu_place.tcl on $part: MCOLS $mc, D $d ($heads cascade chains), PE rows $base..[expr {$base + $d - 1}],\
+             column ends above; DSP columns $dcols, ACT block RAM columns $bcols, weight RAMs column $wcol"
+    puts $f [join $lines \n]
+    close $f
+  }
   puts "otpu_mxu_place: MCOLS $mc x D $d PEs ($heads chains) and [llength $ce(0)] column-end DSPs a column on\
         DSP48_X{$dcols} rows $base..[expr {$base + $h - 1}]; $nact ACT RAMs on RAMB36_X{$bcols};\
-        $n weight RAMs on RAMB36_X$wcol ([llength $lines] LOCs, [file join [pwd] otpu_mxu_place.xdc])"
+        $n weight RAMs on RAMB36_X$wcol ([llength $lines] LOCs[expr {$rec ne "" ? ", $rec" : ""}])"
 }
 
 ::otpu_mxu_place::run
