@@ -200,8 +200,7 @@ class Spec:
                 (max(self.ffn, self.n_q * self.head_dim, self.hidden) <= cfg.ACT_BLOCKS * D,
                  "an inner dimension exceeds ACT RAM")]
         if self.mtp:
-            need += [(self.moe is None, "MTP decoding of a MoE model"),
-                     (S == 1, "MTP decoding runs on one slice")]
+            need += [(S == 1, "MTP decoding runs on one slice")]
         if self.moe is not None:
             mo = self.moe
             need += [(S == 1, "MoE layers run on one slice"),
@@ -361,8 +360,12 @@ def mtp_reference(spec: Spec, W: dict, hid, tokens) -> np.ndarray:
 
 def _expert(W, p: str, e: int):
     """Routed expert e of layer prefix p: W_gate, W_up [F, H], W_down [H, F] (the checkpoint's
-    fused tensors; a LazyWeights reads the one expert)."""
+    fused tensors; a LazyWeights reads the one expert; the MTP layer's, mtp.layers.0., are
+    tensors of their own per expert)."""
     m = p + "mlp.experts."
+    one = f"{m}{e}."
+    if one + "gate_proj.weight" in W:
+        return W[one + "gate_proj.weight"], W[one + "up_proj.weight"], W[one + "down_proj.weight"]
     get = getattr(W, "part", None)
     gu, dn = ((get(m + "gate_up_proj", e), get(m + "down_proj", e)) if get is not None else
               (W[m + "gate_up_proj"][e], W[m + "down_proj"][e]))
@@ -816,8 +819,9 @@ class Image(EmbedHost):
             n = mo.E if experts is None else experts
             if not mo.k <= n <= mo.E:
                 raise ValueError(f"{n} expert slots per layer: from top-k {mo.k} to {mo.E}")
-            self.offload = Layout.build((b.next + 4095) // 4096 * 4096, mo.E, mo.k,
-                                        [n] * spec.layers, self.fmt.nbytes)
+            self.offload = Layout.build((b.next + 4095) // 4096 * 4096, mo.E, mo.k,  # (Spec.mtp:
+                                        [n] * (spec.layers + spec.mtp),  # the MTP layer's MoE,
+                                        self.fmt.nbytes)                 # one layer more)
             b.next = self.offload.end
         self.nbytes = b.next
         if self.nbytes > cfg.DRAM_BYTES:
@@ -1064,9 +1068,11 @@ class Image(EmbedHost):
 
     # ---- path (a): the expert pool and its server (docs/offload.md)
     def expert(self, W: dict, g: int) -> np.ndarray:
-        """Global expert g (layer g // E, expert g % E) in its slot's bytes."""
-        E = self.spec.moe.E
-        return self.fmt.pack(*_expert(W, f"model.layers.{g // E}.", g % E))
+        """Global expert g (layer g // E, expert g % E; Spec.mtp: layer `layers` is the MTP
+        layer's) in its slot's bytes."""
+        E, j = self.spec.moe.E, g // self.spec.moe.E
+        p = "mtp.layers.0." if j == self.spec.layers else f"model.layers.{j}."
+        return self.fmt.pack(*_expert(W, p, g % E))
 
     def serve(self, W: dict, backend, pool_file=None) -> ExpertServer:
         """The host's expert server on the backend's DRAM (moe.serve)."""
@@ -1112,9 +1118,14 @@ class Image(EmbedHost):
                      slot: int = 0, fork: bool = False, hidden: bool = False) -> list:
         """One program per slice: consecutive positions of the sequence at once
         (qwen35_rows); slot, fork, hidden: MTP decoding's (qwen35_rows, docs/mtp.md 9)."""
-        if self.spec.moe is not None:
+        mo = self.spec.moe
+        if mo is not None and not self.spec.mtp:
             raise ValueError("a MoE model runs its prompt through the decode step (its MoE "
                              "block routes one token): rows=1")
+        if mo is not None and len(rows) * mo.k > LINE // 4:   # (MTP's verify: 2 rows, one
+                                                               # request for their union)
+            raise ValueError(f"{len(rows)} rows of a MoE model: one request names their "
+                             f"{len(rows) * mo.k} ids, a request row holds {LINE // 4}")
         if len(rows) > self.rows:
             raise ValueError(f"{len(rows)} rows, the image's I/O area holds {self.rows}")
         if any(r != (0, rows[0][1] + i) for i, r in enumerate(rows)):
@@ -2248,6 +2259,17 @@ def _deltanet_rows(x, lw, p0: int, spec: Spec, gr, on, fork: bool = False, xs=No
     return x + ol.all_reduce(y)
 
 
+def _moe_or_mlp(x, lw, m, spec):
+    """x + the layer's MLP on x's rows: the dense one, or a MoE layer's routed experts and
+    shared expert (one row: moe.moe_ffn, the decode step's; more: moe.moe_ffn_rows, one request
+    for the rows' union, each row moe_ffn's bit for bit)."""
+    if not lw.moe:
+        return _mlp(x, lw, spec)
+    if x.rows == 1:
+        return MO.moe_ffn(x, lw, spec.moe, m.moe_dev, spec.eps)
+    return MO.moe_ffn_rows(x, lw, spec.moe, m.moe_dev, spec.eps)
+
+
 @ol.jit
 def qwen35_rows(m, p0: int, R: int, logit_rows, block: int = ATTN_BLOCK, tokens=None,
                 fork: bool = False, hidden: bool = False):
@@ -2281,7 +2303,7 @@ def qwen35_rows(m, p0: int, R: int, logit_rows, block: int = ATTN_BLOCK, tokens=
             x.set(_deltanet_rows(x, lw, pd, spec, m.gr[0:R, :], m.on[0:R, :], fork))
         else:
             x.set(_attention_rows(x, lw, c, s_, rows, spec, block, gated=True))
-        x.set(_mlp(x, lw, spec))
+        x.set(_moe_or_mlp(x, lw, m, spec))
 
     run_layers(m.plan, layer)
     if hidden:                  # row by row: one row of TMEM (a prompt run's R rows fit)
@@ -2325,7 +2347,8 @@ def qwen35_mtp(m, p0: int, R: int, block: int = ATTN_BLOCK, keep: bool = False, 
     del cat
     lw = mt.layer
     x.set(_attention_rows(x, lw, c, s_, rows, spec, block, gated=True))
-    x.set(_mlp(x, lw, spec))
+    x.set(_moe_or_mlp(x, lw, m, spec))      # (Qwen3.5-MoE's: the MTP layer's MoE, a layer of
+                                            # the expert server's after the model's)
     xs = ol.quantize(rmsnorm(x, ol.load(mt.gm), eps))
     del x
     chunk = min(HEAD_CHUNK, ol.tmem_words() // (8 * R))

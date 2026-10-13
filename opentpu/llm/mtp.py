@@ -42,6 +42,8 @@ from .. import language as ol
 from ..compiler import CompileError, current
 from . import generate as G
 from . import prefill as PF
+from ..host.offload import LINE
+from ..kernels import mailbox as MB
 from .qwen3 import ATTN_BLOCK, Engine, RunRows, fit_chunk, head_rows_chunk
 
 MTP_ROWS = 4            # the MTP layer's rows per run in the prefill (its TMEM: [R, 2H] input)
@@ -92,12 +94,22 @@ class MTPDecoder:
             raise ValueError("with PAIR and 4-bit weights a 2-row verify run pairs its MMs as "
                              "the decode steps do only at MCOLS >= 4 (qwen35_rows): its tokens "
                              "would not be plain decode's bit for bit")
+        mo = getattr(img.spec, "moe", None)
+        if mo is not None and (img.rows < 2 or 2 * mo.k > LINE // 4):
+            raise ValueError("MTP decoding of a MoE model needs an image of 2 rows and a "
+                             "request row for both rows' experts (2 k ids)")
         self.eng, self.img = engine, img
         self.slot = 0
         self.draft = None           # the draft after the token at Engine.pos (prefill, the loop)
+        # the MTP layer's rows a prefill run (a MoE's: its experts' request names R k ids)
+        self.mtp_rows = MTP_ROWS if mo is None else max(1, min(MTP_ROWS, LINE // 4 // mo.k))
 
     # ---- runs
-    def _run(self, progs, kind: str, rows: int, st: MTPStats) -> None:
+    def _run(self, progs, kind: str, rows: int, st: MTPStats, tokens=None) -> None:
+        """A run; `tokens`: its rows' tokens, whose embedding rows the host writes first when
+        the int8 table is on the host (embed_host: a MoE's)."""
+        if tokens is not None and getattr(self.img, "embed_host", False):
+            self.eng._write_host_rows(tokens)
         r = self.eng.backend.run(progs)
         st.runs.append((kind, rows, r))
 
@@ -117,17 +129,17 @@ class MTPDecoder:
         st.compile_s += time.perf_counter() - t0
         if fork:
             st.slots.append(self.slot)
-        self._run(progs, kind, len(toks), st)
+        self._run(progs, kind, len(toks), st, toks)
 
     def _draft(self, p: int, toks, st: MTPStats, kind: str, h0: int = 0) -> list:
         t0 = time.perf_counter()
         progs = self.img.compile_mtp(p, len(toks), toks, self.eng.block, h0=h0)
         st.compile_s += time.perf_counter() - t0
-        self._run(progs, kind, len(toks), st)
+        self._run(progs, kind, len(toks), st, toks)
         return self._drafts(len(toks))
 
     # ---- generation
-    def prefill(self, tokens, st: MTPStats, chunk: int = MTP_ROWS, pick=None, on_run=None,
+    def prefill(self, tokens, st: MTPStats, chunk: int | None = None, pick=None, on_run=None,
                 follow: int | None = None):
         """Feed `tokens` from Engine.pos in plain prefill's runs (qwen3.fit_chunk,
         Engine.prefill's: their rows and so their MMs' pairing are its), each storing its rows'
@@ -140,6 +152,7 @@ class MTPDecoder:
         prefill feeds the rest). follow: the token after `tokens` (a part of a prompt, the rest
         fed later): the last row's MTP input, no logits, a0 None."""
         toks = [int(t) for t in tokens]
+        chunk = self.mtp_rows if chunk is None else chunk
         p0 = p = self.eng.pos
         P = p0 + len(toks)
         if not toks or P > self.img.cap - 1:
@@ -164,7 +177,7 @@ class MTPDecoder:
                                               self.eng.block, tokens=toks[i:i + 1],
                                               slot=self.slot, hidden=True)
             st.compile_s += time.perf_counter() - t0
-            self._run(progs, "prefill", n, st)
+            self._run(progs, "prefill", n, st, toks[i:i + n])
             nxt = toks[i + 1:i + n + 1]
             if n == left and head:
                 lg = self._logits(n)[n - 1]
@@ -348,6 +361,8 @@ class MTPDecoder:
             d = int(dt[P + 1])
         words = G.state_words(spec, a0, P, n, ids, block, samp)
         words[S_DRAFT], words[S_PAR] = d, self.slot
+        if getattr(img, "embed_host", False):   # the first V's rows (the E's row 0); then
+            eng._write_host_rows([a0, d])       # each program posts the next one's
         for s_ in range(img.cfg.S):
             eng.backend.write(s_, g["state"], words)
             eng.backend.write(s_, g["out"] + 4 * (P + 1), np.full(n, G.OUT_MARK, np.uint32))
@@ -455,6 +470,21 @@ def _args(b, at, words: dict) -> None:
     b.run_words = None
 
 
+def _post_rows(m, toks) -> None:
+    """With the int8 embedding table on the host (embed_host: a MoE's), the post of the next
+    program's tokens (one request of their ids and count: RowServer writes their rows to the
+    slot's rows 0 .. n - 1, which the next program's rows gather once served). The verify's
+    (a0, a1) for the D (a0 for the D1), the draft's (t, d) for the next V (row 0 the E's)."""
+    mbox = getattr(m, "embed_mbox", None)
+    if mbox is None:
+        return
+    ids = ol.empty((len(toks),))
+    for r, t in enumerate(toks):
+        ids[r:r + 1].set(t)
+    MB.post(mbox, ids, count=True)
+    del ids
+
+
 def _store_state(g, st) -> None:
     """The state block to DRAM, but the host's stop word and the sampler's."""
     ol.store(g.state[:G.S_HALT], st[:G.S_HALT])
@@ -494,6 +524,7 @@ def _verify_gen(m, pos, block: int, c: int, R: int, samp: G.Sampling | None = No
     toks = [sk.token() for sk in m.lm_sinks]
     sinks, m.lm_sinks = m.lm_sinks, None
     a0, a1 = toks[0], toks[-1]
+    _post_rows(m, toks)                 # embed_host: the D's rows (a0, a1), D1's (a0)
     left, tpos = st[G.S_LEFT:G.S_LEFT + 1], st[G.S_TPOS:G.S_TPOS + 1]
     stop = _hit(st, a0)
     ol.store(g.out[pos.pos + 1:pos.pos + 2], a0)
@@ -587,6 +618,7 @@ def _draft_gen(m, pos, block: int, R: int, forced: bool = False):
         b.emit(I.ld(a["dtab"] + 4 * (pos.t0 + 2), st.base + S_DRAFT, 1, ra=r,
                     comment="the host's draft"))
         b.unscratch(r)
+    _post_rows(m, [st[G.S_TOK:G.S_TOK + 1], st[S_DRAFT:S_DRAFT + 1]])   # the next V's (E's)
     tp = st[G.S_TPOS:G.S_TPOS + 1]                      # the next position's: 1 .. block
     wrap = _flag(tp - float(block - 1))                 # block: the next bucket's first
     tp.set(tp - wrap * float(block))

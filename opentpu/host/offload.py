@@ -1589,21 +1589,32 @@ class RowServer:
         return True
 
     def poll(self) -> int:
-        """Serve the card's request if it posted one since the last served; returns 1 if so."""
-        seq = int(np.frombuffer(bytes(self.mem.read(self.L.mbox, 4)), np.float32)[0])
+        """Serve the card's request if it posted one since the last served; returns 1 if so.
+        A request of n ids (the count in the word after seq; 0: one, the plain post's) takes
+        the slot's rows 0 .. n - 1 (the MTP loop's two rows, docs/mtp.md 12); the count goes
+        back to 0 before served (the card posts again only after it)."""
+        seq, n = (int(v) for v in np.frombuffer(bytes(self.mem.read(self.L.mbox, 8)),
+                                                np.float32))
         if seq == self.seq:
             return 0
         if seq != self.seq + 1:
             raise RuntimeError(f"the card posted row request {seq} with {self.seq} served: "
                                f"its fence (WAITW served >= seq) is missing")
-        g = int(np.frombuffer(bytes(self.mem.read(self.L.row, 4)), np.float32)[0])
-        if self.history is not None:
-            self.history.append(g)
-        data = self.rows(g)
-        if len(data) != self.L.row_bytes:
-            raise ValueError(f"row {g}: {len(data)} bytes, the slot holds {self.L.row_bytes}")
-        self.mem.write(self.L.slot, data)
-        self.bytes += len(data)
+        if not 0 <= n <= LINE // 4:
+            raise RuntimeError(f"row request {seq} of {n} ids")
+        ids = np.frombuffer(bytes(self.mem.read(self.L.row, 4 * max(1, n))), np.float32)
+        for i, v in enumerate(ids):
+            g = int(v)
+            if self.history is not None:
+                self.history.append(g)
+            data = self.rows(g)
+            if len(data) != self.L.row_bytes:
+                raise ValueError(f"row {g}: {len(data)} bytes, the slot holds "
+                                 f"{self.L.row_bytes}")
+            self.mem.write(self.L.slot + i * self.L.row_bytes, data)
+            self.bytes += len(data)
+        if n:
+            self.mem.write(self.L.mbox + 4, _f32(0.0))
         self.seq = seq
         self.mem.write(self.L.served, _f32(seq))
         return 1

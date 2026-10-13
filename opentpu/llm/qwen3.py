@@ -1584,6 +1584,14 @@ def _inputs_rows(m, rows, tokens=None):
             for r in range(R):
                 x[r:r + 1, :].set(_embed_word(m, tk[r:r + 1]))
             del tk
+        mbox = getattr(m, "embed_mbox", None)
+        if mbox is not None and rows.toks:  # embed_host: the slot's rows 0 .. R - 1, which the
+            MB.wait_served(mbox)            # host writes for the run's tokens (before it, or
+            for t in rows.toks:             # served for a post of the program before it in the
+                ol.release(t)               # chain: the MTP loop's, docs/mtp.md 12)
+            for r, g in enumerate(_gather(m, m.embed_q, range(R))):
+                x[r:r + 1, :].set(g)
+            return x, c, s_
         for r, t in enumerate(rows.toks):
             x[r:r + 1, :].set(_embed(m, t))
             ol.release(t)
