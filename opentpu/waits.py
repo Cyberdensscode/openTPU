@@ -30,7 +30,9 @@ registers may hold, and per unit the last 15 instructions' footprints (the VPU's
 where paths meet (a loop's exits, a count the program does not know). A pc's count is the smallest
 over all its visits, its mask the union. Loops the budget cannot run (or whose count is unknown
 beyond CAP iterations) run on widened registers to a fixed point, which covers every later
-iteration.
+iteration. The pass visits every instruction a run executes; _MemoPass (the default) keeps
+each visit's checks of the TMEM and ACT footprints, which repeat, and checks the DRAM ranges
+apart: the same entries, 2-5 times faster (MiniCPM-V's tower at 1,024 patches: 9.5 -> 2.4 s).
 
 Checker checks entries against a concrete execution (the ISA simulator's): every conflict otpu_pkg
 conflict() finds with an older instruction that may still be running is waited for.
@@ -305,11 +307,12 @@ def _fjoin(a: Fp, b: Fp) -> Fp:
 # ------------------------------------------------------------------------- abstract state
 class _State:
     """Registers (intervals) and, per unit, its last DEPTH[u] instructions' footprints
-    (newest first: KMAX, the VPU's VMAX)."""
-    __slots__ = ("R", "H")
+    (newest first: KMAX, the VPU's VMAX). HL, HD: the same histories' local projections' ids and
+    DRAM footprints (_MemoPass's; None: not computed yet, e.g. after a join)."""
+    __slots__ = ("R", "H", "HL", "HD")
 
-    def __init__(self, R, H):
-        self.R, self.H = R, H
+    def __init__(self, R, H, HL=None, HD=None):
+        self.R, self.H, self.HL, self.HD = R, H, HL, HD
 
     def key(self):
         return (tuple(self.R), self.H)
@@ -466,6 +469,120 @@ class _Pass:
         return exits
 
 
+class _MemoPass(_Pass):
+    """_Pass with each visit's checks split by address space: conflict(n, e) is a conflict in
+    the TMEM and ACT ranges (or `all`) or in the DRAM ranges. A run's TMEM and ACT footprints
+    repeat (its tiles, the ACT RAM's blocks) where its DRAM addresses advance (attend at 1,024
+    patches: 977 distinct histories of local footprints in 214,534 visits), so the local part
+    of a visit, each unit's first conflicting rank and the VPU mask, is kept by (the local
+    footprint, the unit, MM or not, the histories' local footprints), and the DRAM ranges are
+    checked only for an instruction that has some, against the entries that do. The entries
+    are _Pass's (tests/test_waits.py), in a quarter of its time on the tower's programs."""
+    MEMO_N = 1 << 18                # kept visits; past it the memo starts again
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.memo = {}
+        self.pj = {}                # Fp -> (its local projection's id, its DRAM Fp or None)
+        self.lfp = []               # local id -> its local Fp
+        self.lids = {}
+
+    def proj(self, fp: Fp):
+        v = self.pj.get(fp)
+        if v is None:
+            lrd = tuple(r for r in fp.rd if r[0] != SP_DRAM)
+            lwr = tuple(r for r in fp.wr if r[0] != SP_DRAM)
+            k = (fp.all, lrd, lwr)
+            lid = self.lids.get(k)
+            if lid is None:
+                lid = self.lids[k] = len(self.lfp)
+                self.lfp.append(Fp(fp.all, lrd, lwr))
+            drd = tuple(r for r in fp.rd if r[0] == SP_DRAM)
+            dwr = tuple(r for r in fp.wr if r[0] == SP_DRAM)
+            v = self.pj[fp] = (lid, Fp(False, drd, dwr) if drd or dwr else None)
+        return v
+
+    def _local(self, lid, u, mm, HL):
+        """Each count's first conflicting rank over the local footprints (WIN: none), and the
+        VPU mask's bits."""
+        n = self.lfp[lid]
+        first = [WIN] * NW
+        for j in range(NW):
+            uj = WUNIT[j]
+            if (j >= NUNITS and not mm) or uj == u or uj == U_VPU:
+                continue
+            for i, e in enumerate(HL[uj]):
+                f = self.lfp[e]
+                # (the stream start's counts: DRAM conflicts only, but `all` conflicts)
+                if (n.all or f.all) if j >= NUNITS else conflict(n, f):
+                    first[j] = i
+                    break
+        m = 0
+        for i, e in enumerate(HL[U_VPU]):
+            if conflict(n, self.lfp[e]):
+                m |= 1 << i
+        return first, m
+
+    def visit(self, pc, st: _State) -> _State | None:
+        ins = self.prog[pc]
+        op = ins.op
+        u = UNIT.get(op)
+        if u is None:
+            r = super().visit(pc, st)
+            if r is not None and r is not st and r.H is st.H:
+                r.HL, r.HD = st.HL, st.HD
+            return r
+        self.visits += 1
+        if st.HL is None:
+            st.HL = tuple(tuple(self.proj(e)[0] for e in h) for h in st.H)
+            st.HD = tuple(tuple(self.proj(e)[1] for e in h) for h in st.H)
+        fp = footprint(ins, st.R, self.D, self.S)
+        lid, dfp = self.proj(fp)
+        self.seen[pc] = True
+        mm = op == I.MM
+        key = (lid, u, mm, st.HL)
+        res = self.memo.get(key)
+        if res is None:
+            if len(self.memo) >= self.MEMO_N:
+                self.memo.clear()
+            res = self.memo[key] = self._local(lid, u, mm, st.HL)
+        first, m = res
+        km = self.kmin[pc]
+        for j in range(NW):
+            uj = WUNIT[j]
+            if (j >= NUNITS and not mm) or uj == u or uj == U_VPU:
+                continue
+            f = first[j]
+            if dfp is not None:
+                lim = min(f, km[j] - 1)
+                for i, e in enumerate(st.HD[uj]):
+                    if i >= lim:
+                        break
+                    if e is not None and conflict(dfp, e):
+                        f = i
+                        break
+            if f + 1 < km[j]:
+                km[j] = f + 1
+        if dfp is not None:
+            for i, e in enumerate(st.HD[U_VPU]):
+                if e is not None and not m >> i & 1 and conflict(dfp, e):
+                    m |= 1 << i
+        self.vmask[pc] |= m
+        d = DEPTH[u]
+        H, HL, HD = list(st.H), list(st.HL), list(st.HD)
+        H[u] = (fp,) + H[u][:d - 1]
+        HL[u] = (lid,) + HL[u][:d - 1]
+        HD[u] = (dfp,) + HD[u][:d - 1]
+        R = st.R
+        if op == I.RLD and ins.rd:
+            R = list(R)
+            v = self.rld.get(pc)
+            if v is None:
+                v = (ins.w[2] & M32, ins.w[3] & M32) if ins.flags & I.F_BOUND else TOP
+            R[ins.rd] = v
+        return _State(R, tuple(H), tuple(HL), tuple(HD))
+
+
 def arg_ranges(run_args) -> dict:
     """{register: values} of a program's run-time arguments (compiler.Builder.run_args: argument
     k, c * var, in R15 - k): c * [0, var.bound) where the variable has a bound, else any."""
@@ -480,13 +597,14 @@ def arg_ranges(run_args) -> dict:
 
 def wait_counts(prog: list, D: int = 128, S: int = 1, args=None, rld: dict | None = None,
                 budget: int = BUDGET, stats: dict | None = None,
-                run_args=None) -> np.ndarray:
+                run_args=None, memo: bool = True) -> np.ndarray:
     """The wait entries of a program (uint64 per instruction: the counts' word, the VPU mask's
     word above it). args: the run's arguments if known (R8..R15); else run_args (default: the
     program's own, compiler.Program.run_args) bounds those whose variable has a bound, and the
     others are unknown. rld: {pc: (lo, hi)} the values an RLD may load (default: its own
     bound, isa.rld's, else unknown).
-    stats: filled with the visits and the loops run on widened registers."""
+    stats: filled with the visits and the loops run on widened registers. memo: _MemoPass (the
+    same entries as _Pass's, faster)."""
     R = [(0, 0)] * 8 + [TOP] * 8
     if args is not None:
         a = list(args) + [0] * (8 - len(args))
@@ -495,7 +613,7 @@ def wait_counts(prog: list, D: int = 128, S: int = 1, args=None, rld: dict | Non
         for r, v in arg_ranges(run_args if run_args is not None
                                else getattr(prog, "run_args", None)).items():
             R[r] = v
-    p = _Pass(prog, D, S, rld, budget)
+    p = (_MemoPass if memo else _Pass)(prog, D, S, rld, budget)
     p.block(0, len(prog), _State(R, ((),) * NUNITS))
     k = np.where(p.kmin > KMAX, 0, p.kmin).astype(np.uint64)
     words = p.vmask.astype(np.uint64) << np.uint64(32)

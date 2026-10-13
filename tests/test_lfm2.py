@@ -304,6 +304,24 @@ def test_tiny_lfm2_on_board_model(tiny, have_verilator, resident, formats):
         assert sorted(brd._decodes) == [1] and brd.backend._resident[0] is brd._decodes[1][0]
 
 
+@pytest.mark.parametrize("wformat", ["int8", "fp4"])
+def test_waits_memo_is_exact_on_its_programs(tiny, wformat):
+    """The waits pass's memoized entries (opentpu/waits.py _MemoPass) are the exact pass's on
+    every program LFM2 runs (the short convolutions' state rings, attention): the chunked
+    prefill's, the step and resident decode programs (across the conv ring's first positions
+    and a chunk), the decode loop's (GEN, RLD)."""
+    from conftest import assert_waits_exact, waits_programs
+    _, W, spec = tiny
+    toks = [int(t) for t in np.random.default_rng(3).integers(0, 1000, 40)]
+    e = Engine(spec, W, cap=512, resident=True, wformat=wformat)
+    progs = waits_programs(e)
+    e.step(toks[0])
+    e.prefill(toks[1:30])
+    e.step(toks[30])
+    e.generate_card(toks[31], 6, stop_ids=[])
+    assert len(progs) >= 4 and assert_waits_exact(progs, e.cfg) > 500
+
+
 def test_tiny_resident_decode_is_bit_exact(tiny):
     """Resident decode (one program per 256-position attention bucket, the token and position
     as run arguments, the inputs from the image's tables) gives the per-position programs'

@@ -1140,3 +1140,27 @@ def test_expert_major_prefill_is_bit_exact(tiny, R, skew, wformat, b, C, monkeyp
         ga, gb = a.step(t), ref.step(t)
         assert np.array_equal(ga.view(np.uint32), gb.view(np.uint32))
         t = int(np.argmax(ga))
+
+
+@pytest.mark.parametrize("wformat, b", [("int8", False), ("fp4", True)])
+def test_waits_memo_is_exact_on_its_programs(tiny, wformat, b, monkeypatch):
+    """The waits pass's memoized entries (opentpu/waits.py _MemoPass) are the exact pass's on
+    every program the streamed Qwen3.5-MoE runs from 6 slots a layer: expert-major's layer runs
+    (DeltaNet and attention) and expert runs, the embedding rows from the host's table, the
+    step and resident decode programs, the decode loop's (GEN, RLD; the expert requests' WAITW);
+    b: build B's PAIR, DSTEP and STREAM."""
+    from conftest import assert_waits_exact, waits_programs
+    from opentpu.llm import qwen35 as Q35
+    monkeypatch.setattr(Q35, "PREFILL_CHUNK", 24)
+    spec, W = _untied(tiny)
+    kw = dict(MCOLS=4, PAIR=True, DSTEP=True, STREAM=True) if b else {}
+    cfg = device_config(spec, 256, rows=1, lookup=True, S=1, experts=6, wformat=wformat, **kw)
+    e = Engine(spec, W, cap=256, cfg=cfg, rows=1, resident=True, experts=6, wformat=wformat,
+               layer_major=2, expert_major=True)
+    progs = waits_programs(e)
+    toks = [int(t) for t in np.random.default_rng(11).integers(0, 1000, 40)]
+    e.prefill(toks[:30])
+    e.step(toks[30])
+    e.generate_card(toks[31], 6, stop_ids=[])
+    assert any(k[0] == "x" for k in e._layer_runs)
+    assert len(progs) >= 4 and assert_waits_exact(progs, e.cfg) > 1000

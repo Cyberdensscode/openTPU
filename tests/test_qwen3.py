@@ -284,6 +284,26 @@ def test_tiny_reset_reuses_cache(tiny):
     assert all(np.array_equal(x, y) for x, y in zip(a, b))
 
 
+@pytest.mark.parametrize("wformat", ["int8", "fp4"])
+def test_waits_memo_is_exact_on_its_programs(tiny, wformat):
+    """The waits pass's memoized entries (opentpu/waits.py _MemoPass) are the exact pass's on
+    every program a dense model runs, int8 and fp4: the chunked prefill's and the prompt runs'
+    (docs/prefill.md), the step and resident decode programs, the decode loop's (GEN, RLD)."""
+    from conftest import assert_waits_exact, waits_programs
+    _, W, spec = tiny
+    toks = [int(t) for t in np.random.default_rng(3).integers(0, 1000, 40)]
+    n = 0
+    for kw in ({}, {"prompt_runs": True}):
+        e = Engine(spec, W, cap=512, resident=True, wformat=wformat, **kw)
+        progs = waits_programs(e)
+        e.prefill(toks[:30])
+        e.step(toks[30])
+        e.generate_card(toks[31], 6, stop_ids=[])
+        assert len(progs) >= 3
+        n += assert_waits_exact(progs, e.cfg)
+    assert n > 1000
+
+
 def test_weights_refuse_non_finite_values(tmp_path):
     """A checkpoint tensor with a NaN or an infinity is refused where the weight classes convert
     it (load_weights, LazyWeights, gemma4.Weights: whole tensors, one expert, PLE rows), naming

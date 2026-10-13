@@ -556,6 +556,26 @@ def test_ple_on_host_is_bit_exact(tiny, resident, monkeypatch):
                           b.backend.machine.slices[0].dram[lo:hi])
 
 
+@pytest.mark.parametrize("wf, host", [("int8", "0"), ("fp4", "0"), ("fp4", "1")],
+                         ids=["int8", "fp4", "ple-host"])
+def test_waits_memo_is_exact_on_its_programs(tiny, wf, host, monkeypatch):
+    """The waits pass's memoized entries (opentpu/waits.py _MemoPass) are the exact pass's on
+    every program Gemma 4 E2B's parts run (sliding and global layers, the KV-shared ones, the
+    per-layer inputs on the card or the host's slot): the prompt runs' (docs/prefill.md), the
+    step and resident decode programs, the decode loop's (GEN, RLD)."""
+    from conftest import assert_waits_exact, waits_programs
+    _, W, spec = tiny
+    monkeypatch.setenv("OTPU_PLE_HOST", host)
+    toks = [int(t) for t in np.random.default_rng(5).integers(0, 1000, 40)]
+    e = Engine(spec, W, cap=1024, cfg=_cfg(), resident=True, prompt_runs=True, wformat=wf,
+               head_format="int8" if wf == "fp4" else None)
+    progs = waits_programs(e)
+    e.prefill(toks[:30])
+    e.step(toks[30])
+    e.generate_card(toks[31], 6, stop_ids=[])
+    assert len(progs) >= 3 and assert_waits_exact(progs, e.cfg) > 1000
+
+
 @pytest.mark.parametrize("split", [None, True], ids=["one", "split"])
 def test_generate_with_ple_on_host(tiny, split, monkeypatch):
     """The card's generate loop with the PLE table on the host (docs/gemma4_e4b.md): after

@@ -160,6 +160,59 @@ def test_counts_cover_every_conflict_of_a_run(seed):
         assert W.check_isasim(m, [words]) > 0
 
 
+def _rich_prog(rng, n):
+    """A random program over every unit: LD / ST, VOPs, MMs (weights and scales in DRAM, the
+    ACT RAM's blocks, a TMEM tile), QACTs, RLDs (bounded or not), BARs, in two nested loops
+    whose counts are known or the run's argument, registers advancing."""
+    def t():
+        return int(rng.integers(0, 12)) * 8
+
+    def r():
+        return int(rng.integers(0, 3))
+
+    def one():
+        c = rng.integers(0, 10)
+        if c == 0:
+            return I.ld(int(rng.integers(0, 6)) * 64, t(), 8, ra=r(), rb=r())
+        if c == 1:
+            return I.st(int(rng.integers(0, 6)) * 64, t(), 8, ra=r())
+        if c in (2, 3):
+            return vop(I.V_ADD, t(), t(), t(), ra=r(), rb=r())
+        if c == 4:
+            return vop(I.V_RSUM, t(), t(), 0)
+        if c == 5:
+            return I.mm(int(rng.integers(0, 6)) * 64, 0x4000 + int(rng.integers(0, 4)) * 64,
+                        t(), 1, 1, 0, 1, 1, int(rng.integers(0, 3)), 0, ra=r(), rc=r())
+        if c == 6:
+            return I.qact(t(), 1, int(rng.integers(0, 3)), 1, 0, ra=r())
+        if c == 7:
+            return I.rld(2, t(), bound=(0, 64) if rng.integers(0, 2) else None)
+        if c == 8:
+            return I.addi(1, 1, 8)
+        return I.bar() if rng.integers(0, 4) == 0 else I.addi(2, 2, 64)
+
+    inner = [one() for _ in range(n // 2)]
+    outer = [one() for _ in range(n // 2)]
+    body = outer[:2] + [I.loop(len(inner), int(rng.integers(1, 5)))] + inner + outer[2:]
+    head = [I.li(1, int(rng.integers(0, 4)) * 8), I.li(2, 0)]
+    cnt = (I.loop(len(body), 0, rcount=8) if rng.integers(0, 2) else
+           I.loop(len(body), int(rng.integers(1, 6))))
+    return head + [cnt] + body + [I.halt()]
+
+
+@pytest.mark.parametrize("seed", range(60))
+def test_the_memoized_pass_is_the_exact_one(seed):
+    """_MemoPass (wait_counts' default: the local footprints' checks kept, the DRAM ranges
+    checked apart) gives _Pass's entries on random programs over every unit, the run's argument
+    known or not."""
+    rng = np.random.default_rng(seed)
+    prog = _rich_prog(rng, 20)
+    for args in (None, [3] + [0] * 7):
+        a = W.wait_counts(prog, args=args, memo=False)
+        b = W.wait_counts(prog, args=args)
+        assert np.array_equal(a, b), seed
+
+
 def test_checker_finds_a_missing_wait():
     from opentpu.isasim import Machine, board_config
     prog = [I.ld(0, 100, 8), vop(I.V_ADD, 200, 100, 100), vop(I.V_ADD, 300, 500, 500),

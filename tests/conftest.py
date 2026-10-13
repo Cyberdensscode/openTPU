@@ -129,6 +129,45 @@ def assert_fill_is_transparent(make, toks):
         assert np.array_equal(sa.dram, sb.dram)
 
 
+def waits_programs(eng) -> list:
+    """Every program eng runs from now on, each once (slice 0's): its backend's runs (the steps,
+    the decode, prompt, layer and expert runs, the generate loop's first) and its generate
+    programs (every bucket's: the ones HALT CHAIN chains to as well)."""
+    seen, progs = set(), []
+
+    def keep(ps):
+        for part in ps if isinstance(ps, tuple) else (ps,):     # (a split generate program)
+            if id(part[0]) not in seen:
+                seen.add(id(part[0]))
+                progs.append(part[0])
+    run = eng.backend.run
+
+    def run_(programs, *a, **kw):
+        keep(programs)
+        return run(programs, *a, **kw)
+    eng.backend.run = run_
+    gen = eng._generate_prog
+
+    def gen_(*a, **kw):
+        ps = gen(*a, **kw)
+        keep(ps)
+        return ps
+    eng._generate_prog = gen_
+    return progs
+
+
+def assert_waits_exact(progs, cfg) -> int:
+    """The waits pass's entries (opentpu/waits.py: _MemoPass, wait_counts' default) are the
+    exact pass's (_Pass, memo=False) on every program; returns the instructions compared."""
+    from opentpu import waits as W
+    n = 0
+    for p in progs:
+        a, b = W.wait_counts(p, cfg.D, cfg.S, memo=False), W.wait_counts(p, cfg.D, cfg.S)
+        assert np.array_equal(a, b), f"{int((a != b).sum())} of {len(p)} entries differ"
+        n += len(p)
+    return n
+
+
 GUARD = 1 << 16       # bytes: more than an attention block's tokens of any KV region
 
 
