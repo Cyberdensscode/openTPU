@@ -16,6 +16,7 @@ from opentpu.host.board import BASE, BEAT, Board, BoardBackend, SimTransport, jo
 from opentpu.host.checks import (address_lines, channel_patterns, masked_program, partial_writes,
                                  pattern_test, run_demo, vops_program)
 from opentpu.host.opchecks import diag_image, op_checks
+from conftest import sim_board_config
 from opentpu.isasim import board_config
 
 
@@ -192,7 +193,7 @@ def test_two_slices_on_a_fake_card():
 
 
 # ------------------------------------------------------------------------------ board model
-CFG = board_config(DRAM_BYTES=1 << 22)
+CFG = sim_board_config(DRAM_BYTES=1 << 22)
 
 
 def test_program_on_board_model(have_verilator):
@@ -447,7 +448,7 @@ def test_tiny_qwen3_on_board_model(have_verilator, formats):
     mdl = transformers.Qwen3ForCausalLM(hc).float().eval()
     W = {k: v.float().numpy() for k, v in mdl.state_dict().items()}
     spec = dataclasses.replace(Spec(256, 2, 4, 2, 128, 512, 1000), formats=formats)
-    cfg = board_config(DRAM_BYTES=1 << 23)
+    cfg = sim_board_config(DRAM_BYTES=1 << 23)
     isa = Engine(spec, W, cap=256, cfg=cfg)
     tr = SimTransport(ch_bytes=cfg.DRAM_BYTES // 2, stall=20, seed=5)
     brd = Engine(spec, W, cap=256, cfg=cfg,
@@ -475,7 +476,7 @@ def test_tiny_qwen3_two_slices_on_board_model(have_verilator, nreg):
     mdl = transformers.Qwen3ForCausalLM(hc).float().eval()
     W = {k: v.float().numpy() for k, v in mdl.state_dict().items()}
     spec = Spec(256, 2, 4, 2, 128, 512, 1000)
-    cfg = board_config(DRAM_BYTES=1 << 23, S=2)
+    cfg = sim_board_config(DRAM_BYTES=1 << 23, S=2)
     isa = Engine(spec, W, cap=256, cfg=cfg)
     tr = SimTransport(ch_bytes=cfg.DRAM_BYTES // 2, stall=20, seed=5, target="bcu1525",
                       params={"NREG": nreg})
@@ -620,10 +621,10 @@ def test_tiny_qwen3_generate_on_board_model(have_verilator):
     mdl = transformers.Qwen3ForCausalLM(hc).float().eval()
     W = {k: v.float().numpy() for k, v in mdl.state_dict().items()}
     spec = Spec(256, 2, 4, 2, 128, 512, 1000)
-    need = spec.image(board_config(DRAM_BYTES=1 << 40), 512, rows=PREFILL_ROWS,
+    need = spec.image(sim_board_config(DRAM_BYTES=1 << 40), 512, rows=PREFILL_ROWS,
                       lookup=True).nbytes
     size = 1 << (need - 1).bit_length()
-    cfg = board_config(DRAM_BYTES=size)
+    cfg = sim_board_config(DRAM_BYTES=size)
     eng = Engine(spec, W, cap=512, cfg=cfg, resident=True)
     toks = [int(t) for t in np.random.default_rng(1).integers(0, 1000, 248)]
     t0 = int(np.argmax(eng.prefill(toks)))
@@ -650,7 +651,7 @@ def test_run_clock_is_there_while_the_host_serves_a_run():
     from opentpu import isa as I
     from opentpu.host.fake import FakeTransport
     t = FakeTransport(ch_bytes=1 << 21, run_s=0.01, cycles=1_000_000, core_khz=100_000)
-    be = BoardBackend(board_config(DRAM_BYTES=1 << 22), [np.zeros(4096, np.uint8)],
+    be = BoardBackend(sim_board_config(DRAM_BYTES=1 << 22), [np.zeros(4096, np.uint8)],
                       transport=t)
     seen = []
     be.host = lambda: (seen.append(be.run_clock()), 0)[1]

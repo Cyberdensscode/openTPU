@@ -16,10 +16,10 @@ from opentpu import isa as I
 from opentpu.hwtrace import (R_TRACE_ADDR, R_TRACE_COUNT, R_TRACE_CTRL, R_TRACE_DROP,
                              R_TRACE_HI, R_TRACE_LO, TRACE_BUSY, TRACE_CLEAR, TRACE_ENABLE,
                              TRACE_STOP_WHEN_FULL, records_to_trace, ring_order)
-from opentpu.isasim import board_config
 from opentpu.kernels import attention_decode, mlp
 from opentpu.runtime import compile_kernel
 
+from conftest import sim_board_config
 from test_kernels import attn_args, mlp_args
 
 R_REGMAP, R_CAPS, R_CORE_KHZ, R_BUILD_ID, R_TEMP, R_SNAP = 0x3C, 0x40, 0x44, 0x48, 0x4C, 0x50
@@ -28,7 +28,7 @@ COUNTERS = ["UPTIME", "RUNNING", "MXU_BUSY", "MXU_MAC", "VPU_BUSY", "QNT_BUSY", 
             "TMEM_DENY", "DRAM_RD", "DRAM_WR", "DRAM_WAIT", "INSTR", "MXU_STARVE"]
 TB_BUILD_ID, TB_TEMP = 0x0B0A4D00, 0xA1A        # tb_board.sv
 LINE = re.compile(r"^T\d+ [DSGEUHPQ] ")
-CFG = board_config(DRAM_BYTES=1 << 22)
+CFG = sim_board_config(DRAM_BYTES=1 << 22)
 
 
 def sim_lines(out: str) -> list[str]:
@@ -43,7 +43,7 @@ def run_traced(t: SimTransport, img, prog: list, trace_ctrl: int = TRACE_ENABLE,
     img = np.asarray(img, np.uint8)
     at = max(PROG_AT, -(-len(img) // 4096) * 4096)
     b.write(0, img)
-    b.load_program(at, np.asarray(I.assemble(prog), np.uint32))
+    b.load(at, prog)                        # (with its wait entries where the board takes them)
     t.reg_write(R_TRACE_CTRL, TRACE_CLEAR)
     t.reg_write(R_TRACE_CTRL, trace_ctrl)
     if snap:
@@ -233,7 +233,7 @@ def _deltas(t, prog, img):
     """Counter deltas over one run: snapshot, run, snapshot (one simulation)."""
     b = Board(t, check=False)
     b.write(0, img)
-    b.load_program(PROG_AT, np.asarray(I.assemble(prog), np.uint32))
+    b.load(PROG_AT, prog)
     t.reg_write(R_SNAP, 1)
     t.reg_write(R_CTRL, CTRL_CLEAR)
     t.reg_write(R_CTRL, CTRL_RUN)
@@ -311,7 +311,7 @@ def test_mxu_starve_counter(have_verilator):
 
 # ------------------------------------------------------------------------------ trace
 def _kernel(name):
-    cfg = board_config(DRAM_BYTES=1 << 23)
+    cfg = sim_board_config(DRAM_BYTES=1 << 23)
     if name == "mlp":
         a, _ = mlp_args(np.random.default_rng(0), M=1, H=512, Fd=1024)
         comp, imgs = compile_kernel(mlp, cfg, **a)

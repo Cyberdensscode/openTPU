@@ -91,6 +91,16 @@ def rel(a, b):
     return float(np.linalg.norm(np.asarray(a, np.float64) - b) / np.linalg.norm(b))
 
 
+def sim_board_config(**kw):
+    """isasim.board_config for the board model this session simulates: with the sequencer's
+    wait entries (SEQ_WC, CFG_UARCH bit24) where its uarch builds them (rtlsim.UARCH: the
+    board's under OTPU_UARCH=board, where the card's m4 takes them; none on the default
+    uarch's), as device_config takes them from the bitstream on the card. A keyword overrides."""
+    from opentpu.isasim import board_config
+    kw.setdefault("SEQ_WC", bool(rtlsim.UARCH.get("SEQ_WC")))
+    return board_config(**kw)
+
+
 def assert_same_state(ri, rr):
     """RTL and ISA simulator must agree bit for bit on every slice's DRAM and TMEM."""
     for s, (a, b) in enumerate(zip(ri.drams, rr.drams)):
