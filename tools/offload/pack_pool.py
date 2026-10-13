@@ -43,9 +43,10 @@ the pool's experts are this tree's (the split format's bytes, as pack writes the
 layer's MoE is one more layer of the pool's, its experts (mtp.layers.0.mlp.experts.E.*) after
 the model's (g = layers * E + e); --mtp-from DIR takes the mtp.* tensors from another
 checkpoint (MiniCPM-V 4.7 has none: its base Qwen3.5-35B-A3B's), named in the key. `extend SRC`
-makes one from the model's own pool SRC (its key checked) without packing it again: a copy of
-SRC's experts and marks, the MTP layer's experts not packed (the run packs each on its first
-use, or `pack ... --mtp` workers do). SRC is only read.
+makes one from the model's own pool SRC (its key checked) without packing it again: SRC's
+experts and marks (reflinked where the file system can: btrfs, XFS; --copy), the MTP layer's
+experts not packed (the run packs each on its first use, or `pack ... --mtp` workers do, or
+`recv --mtp` from a host with the whole checkpoint). SRC is only read.
 """
 from __future__ import annotations
 
@@ -53,6 +54,7 @@ import argparse
 import dataclasses
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -79,7 +81,8 @@ def weights(a):
 
 def extend(a, n: int, slot: int, key: dict) -> None:
     """POOL: an MTP image's pool from the model's own pool SRC (a.args[0]), checked by its key:
-    SRC's experts and marks copied, the MTP layer's experts after them not packed. Entries of
+    SRC's experts and marks (the file reflinked where the file system can, so no byte of it is
+    written twice on the disk: a.copy), the MTP layer's experts after them not packed. Entries of
     SRC past its experts (MiniCPM-V's staged vision pieces, at layers * E + i) are not copied:
     the key written has no "vision", and a staged run adds them again after the MTP layer."""
     from opentpu.host.offload import SPLIT
@@ -109,20 +112,28 @@ def extend(a, n: int, slot: int, key: dict) -> None:
         sys.exit(f"{pk}: {len(done)} marks, not {size // slot}")
     done = done[:n0]
     t0 = time.time()
-    with open(src, "rb") as f, open(a.pool, "wb") as g:     # SRC's experts only
-        left = n0 * slot
-        while left:
-            b = f.read(min(left, 64 << 20))
-            if not b:
-                sys.exit(f"{src}: short read")
-            g.write(b)
-            left -= len(b)
-        g.truncate(n * slot)                # (the MTP layer's experts: sparse until packed)
+    how = "reflinked"                       # (btrfs, XFS: SRC's extents shared, copy on write)
+    if a.copy == "full" or subprocess.run(["cp", "--reflink=always", src, a.pool],
+                                          capture_output=True).returncode:
+        how = "copied"
+        if a.copy == "reflink":
+            sys.exit(f"--copy reflink: {a.pool}'s file system does not reflink {src}")
+        with open(src, "rb") as f, open(a.pool, "wb") as g:     # SRC's experts only
+            left = n0 * slot
+            while left:
+                b = f.read(min(left, 64 << 20))
+                if not b:
+                    sys.exit(f"{src}: short read")
+                g.write(b)
+                left -= len(b)
+    with open(a.pool, "r+b") as g:          # (SRC's entries after its experts cut, then the
+        g.truncate(n0 * slot)               # MTP layer's experts: sparse until packed)
+        g.truncate(n * slot)
     np.concatenate([done, np.zeros(n - n0, np.uint8)]).tofile(a.pool + ".packed")
     open(a.pool + ".format", "w").write(SPLIT + "\n")
     open(a.pool + ".key", "w").write(json.dumps(key, indent=1) + "\n")
-    print(f"extend {a.pool}: {src}'s {int(done.astype(bool).sum())} of {n0} experts packed "
-          f"({time.time() - t0:.0f} s), {n - n0} more not packed (the MTP layer's); "
+    print(f"extend {a.pool}: {src}'s {int(done.astype(bool).sum())} of {n0} experts packed, "
+          f"{how} ({time.time() - t0:.0f} s), {n - n0} more not packed (the MTP layer's); "
           f"{n} x {slot} = {n * slot / 1e9:.2f} GB, {key['format']}")
 
 
@@ -189,6 +200,10 @@ def main():
                          "(extend: always)")
     ap.add_argument("--mtp-from", metavar="DIR",
                     help="the checkpoint of the MTP layer (mtp.*) when not MODEL's (--mtp)")
+    ap.add_argument("--copy", choices=("auto", "reflink", "full"), default="auto",
+                    help="extend: SRC's experts reflinked where the file system can (btrfs, "
+                         "XFS: no byte duplicated on the disk), else copied (auto); only "
+                         "reflinked; only copied")
     a = ap.parse_args()
     a.mtp = a.mtp or a.mode == "extend" or a.mtp_from is not None
     from opentpu.host.offload import SPLIT, to_split
