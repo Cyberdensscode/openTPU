@@ -39,10 +39,13 @@ IDLE_PARTS = ("v1", "ra", "halt", "v2")      # ExpertServer's idle parts (13.12)
 # per-kind choices (docs/mx_mxu.md 3.6, docs/offload.md 14.2): LFM2.5-8B-A1B nvfp4, experts
 # included, with an int8 head; Qwen3.5-35B-A3B nvfp4 layers (attention, DeltaNet, the shared
 # expert), fp4 experts and an int8 head; Gemma 4 26B-A4B int8 layers, nvfp4 experts (the user's
-# choice for off-distribution text, over the rule's fp4) and an fp4 head (11.5)
+# choice for off-distribution text, over the rule's fp4) and an fp4 head (11.5); MiniCPM-V 4.7
+# (Qwen3.5-35B-A3B's backbone) the 35B's with DeltaNet in layers 0-19 and the shared expert int8:
+# the most expert slots (35 a layer staged) within +4.00% dKL (+3.68%, docs/minicpmv.md 5.1)
 FORMATS = {"lfm2": ("nvfp4", "int8", None),
            "qwen35": ("fp4", "int8", "attn=nvfp4,delta=nvfp4,mlp=nvfp4"),
-           "gemma4": ("int8", "fp4", "experts=nvfp4")}
+           "gemma4": ("int8", "fp4", "experts=nvfp4"),
+           "minicpmv": ("fp4", "int8", "delta@0-19=int8,attn=nvfp4,delta=nvfp4,mlp=int8")}
 # each family's least new prompt rows a call for expert-major (docs/offload.md 13.16): below
 # them the layer-major prompt (pooled, a request a run) is as fast on the card or faster. A
 # short call has few mixer runs to hide its needs behind: they land mostly while its expert
@@ -52,7 +55,7 @@ FORMATS = {"lfm2": ("nvfp4", "int8", None),
 # 31 -0.36 s). Session emdef2's crossover, expert-major calls against layer-major: the 35B's
 # +0.27 s at 27 rows, -0.21 s at 45 (even at about 37); the 26B's at 21 rows over four pairs
 # (emdef2, emdef3) -0.086 s, its device time a gain in each
-EM_ROWS = {"qwen35": 44, "gemma4": 20}
+EM_ROWS = {"qwen35": 44, "gemma4": 20, "minicpmv": 44}     # (MiniCPM-V: the 35B's)
 
 
 class PoolError(ValueError):
@@ -67,7 +70,7 @@ def streams(spec) -> bool:
 
 def _family(spec) -> str:
     """A Spec's family: its module's name, or a subclass's first base's in FORMATS (MiniCPM-V's
-    Spec, minicpmv.py: qwen35's)."""
+    Spec, minicpmv.py, has its own)."""
     names = [c.__module__.rsplit(".", 1)[-1] for c in type(spec).__mro__]
     return next((n for n in names if n in FORMATS), names[0])
 

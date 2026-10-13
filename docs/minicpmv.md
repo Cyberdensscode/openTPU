@@ -210,9 +210,10 @@ and with several images.
   model alone.
 - `load_weights` and `LazyWeights` also skip `model.vision_tower.` and `model.merger.` (they skip
   `model.visual.` today). The vision side has its own loader (`minicpmv.load_vision`).
-- The formats are the qwen35 family's (`streamed.FORMATS`, which takes a Spec's family from its
-  first base in the table): fp4 experts, attention / DeltaNet / shared expert NVFP4, int8 head,
-  int8 embedding on the host. Section 5 has their dKL on this checkpoint.
+- The formats are MiniCPM-V's own (`streamed.FORMATS["minicpmv"]`; a Spec's family is its
+  module, else its first base in the table): fp4 experts, DeltaNet int8 in layers 0-19 and NVFP4
+  after them, attention NVFP4, the shared expert int8, int8 head, int8 embedding on the host.
+  Section 5.1 has the scan that chose them.
 - The pool is MX, built like `pool-q35-mx` (tools/offload/pack_pool.py) on hwe-bench:
   - `pool-mcpv35-mx.split.bin`, 17,532,190,720 bytes: 10,240 experts in 1.71 MB slots, with
     its .packed (all 10,240), .format and .key;
@@ -477,16 +478,39 @@ Results (hwe-bench, ISA simulator):
 - Greedy: the card's 16 tokens equal HF's through the end of the turn.
 - The vocabulary's partial head block gives the logits of the head padded with zero rows, bit
   for bit (tests/test_minicpmv.py).
-- Formats (tools/formats_scan.py ppl, 2000 tokens, dKL against int8):
+- Formats (tools/formats_scan.py ppl, 2000 tokens, dKL against int8 with its paired SE). Every
+  row but float and int8 is the 35B's mix (fp4 experts, attn / delta / mlp nvfp4, head int8)
+  with the named kinds or layer ranges int8. Slots: expert slots a layer on the card (4 GiB, a
+  4096-token cache, `streamed.fit_experts`), with the vision side staged / resident int8.
 
-| formats | ppl | dKL | resident MiB |
-|---|---|---|---|
-| float | 15.218 | -0.99% (SE 0.04) | - |
-| int8 | 15.276 | 0 | 1846 |
-| production: fp4 experts, attn / delta / mlp nvfp4, head int8 | 16.102 | +5.68% (SE 0.22) | 1255 |
+| formats | ppl | dKL | resident MiB | slots |
+|---|---|---|---|---|
+| float | 15.218 | -0.99% (SE 0.04) | - | - |
+| int8 | 15.276 | 0 | 1846 | - |
+| the 35B's mix | 16.102 | +5.68% (SE 0.22) | 1255 | 39 / 31 |
+| attn int8 | 16.087 | +5.14% (SE 0.23) | 1370 | 38 / 29 |
+| mlp (the shared expert) int8 | 16.037 | +5.41% (SE 0.22) | 1308 | 39 / 30 |
+| delta int8 (all 30 DeltaNet layers) | 15.851 | +3.26% (SE 0.13) | 1680 | 33 / 25 |
+| delta int8 in layers 0-9 | 16.215 | +4.79% (SE 0.17) | 1369 | 38 / 29 |
+| delta int8 in layers 10-19 | 16.037 | +4.99% (SE 0.19) | 1354 | 38 / 30 |
+| delta int8 in layers 20-29 | 16.023 | +5.23% (SE 0.23) | 1369 | 38 / 29 |
+| delta int8 in layers 30-39 | 15.957 | +5.26% (SE 0.21) | 1354 | 38 / 30 |
+| delta int8 in layers 0-19 | 16.069 | +4.19% (SE 0.16) | 1468 | 36 / 28 |
+| delta int8 in layers 0-29 | 16.027 | +3.67% (SE 0.13) | 1581 | 34 / 26 |
+| **delta int8 in layers 0-19, mlp int8** | 15.976 | +3.68% (SE 0.14) | 1520 | 35 / 27 |
 
-  qwen35-35b ships at +4.00% (SE 0.16) on its own text (docs/mx_mxu.md). The single-kind swaps
-  to int8 (the lead's GO, 2026-10-13) are in progress.
+  qwen35-35b ships at +4.00% (SE 0.16) on its own text (docs/mx_mxu.md). The rule (the lead's,
+  2026-10-13): the variant with the most slots whose dKL point estimate is at most +4.00%.
+  That is DeltaNet int8 in layers 0-19 with the shared expert int8, MiniCPM-V's default on the
+  card (`streamed.FORMATS["minicpmv"]`: fp4 experts, head int8, formats
+  `delta@0-19=int8,attn=nvfp4,delta=nvfp4,mlp=int8`). The experts stay fp4, so the pool is
+  unchanged. It costs 4 slots a layer against the 35B's mix: a layer's 4 x 1.637 MiB slots in
+  40 layers buy the 264 MiB of int8 weights.
+  - The DeltaNet layers carry most of the loss: all of them int8 takes 2.4 points off.
+  - The early ranges are worth more than the late ones (0-9 -0.89, 30-39 -0.42 points).
+  - On the card the layer ranges are a layer block layout per formats group
+    (tests/test_qwen35_moe.py test_formats_by_layer_range_stream_bit_exact: the layer-major
+    prefill, expert-major and not, equals token by token's bit for bit with this mix's ranges).
 
 ### 5.2 Vision
 
@@ -566,6 +590,5 @@ Sessions (the lead runs them; scripts prepared on this branch):
 6. M-RoPE rows written by the host's gather (4.3).
 7. The vision weights: int8 (the fp4 ViT MLPs fail on accuracy, 5.2); staged through the expert
    server's slots (4.2, 5.3), resident for the first card sessions.
-
-Open:
-- the language model's formats (5.1).
+8. The language model's formats: the 35B's mix with DeltaNet int8 in layers 0-19 and the shared
+   expert int8, +3.68% dKL at 35 slots a layer (5.1).

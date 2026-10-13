@@ -118,13 +118,16 @@ def _until_eos(tokens, eos):
 
 def test_streamed_defaults_are_the_cards_runs():
     """--wformat auto for a streamed MoE: each family's formats on the card (docs/offload.md
-    14.2: the MX formats' per-kind choices); the pool's default place is the checkpoint's
-    directory, named by the experts' format."""
-    from opentpu.llm import gemma4, lfm2, qwen35
+    14.2: the MX formats' per-kind choices; MiniCPM-V's its own, docs/minicpmv.md 5.1); the
+    pool's default place is the checkpoint's directory, named by the experts' format."""
+    from opentpu.llm import gemma4, lfm2, minicpmv, qwen35
     assert ST.defaults(object.__new__(qwen35.Spec)) == \
         ("fp4", "int8", "attn=nvfp4,delta=nvfp4,mlp=nvfp4")
     assert ST.defaults(object.__new__(lfm2.Spec)) == ("nvfp4", "int8", None)
     assert ST.defaults(object.__new__(gemma4.Spec)) == ("int8", "fp4", "experts=nvfp4")
+    assert ST.defaults(object.__new__(minicpmv.Spec)) == \
+        ("fp4", "int8", "delta@0-19=int8,attn=nvfp4,delta=nvfp4,mlp=int8")
+    assert ST.em_rows_of(object.__new__(minicpmv.Spec)) == ST.EM_ROWS["qwen35"]
     assert ST.default_pool("models/Qwen3.5-35B-A3B", "fp4") == \
         Path("models/Qwen3.5-35B-A3B/pool-mx1-fp4.bin")      # (beside the MXU before MX's
     assert ST.default_pool("models/LFM2.5-8B-A1B", "nvfp4") == \
