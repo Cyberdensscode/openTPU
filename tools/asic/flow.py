@@ -2,6 +2,7 @@
 through OpenROAD-flow-scripts, for PPA numbers.
 
     python3 tools/asic/flow.py prep POINT       # macros, the macro map, the ORFS design
+    python3 tools/asic/flow.py config POINT     # the ORFS design (config.mk, SDC) only, again
     python3 tools/asic/flow.py run POINT        # ORFS: native (ORFS_HOME), else Docker
     python3 tools/asic/flow.py report POINT     # area, timing, power -> report.json
     python3 tools/asic/flow.py all POINT        # the three
@@ -72,7 +73,8 @@ def yosys() -> str:
     return "yosys"
 
 # The design points: a target (its arch / uarch: otpu_asic_top's parameters; its core_mhz: the
-# clock the SDC asks for), the floorplan's utilisation, and a variant's source edits (rewrite:
+# clock the SDC asks for), the floorplan's utilisation and global placement's density margin
+# (addon: PLACE_DENSITY_LB_ADDON, 0.10 unless stated), and a variant's source edits (rewrite:
 # file -> [(old, new)], applied to copies in src/). lm3la6: otpu_fpipe's multiplier and adder one
 # and two stages deeper (LM 3, LA 6: the localparams of the VPU, the stream engine and the
 # quantizer), for the critical-path study.
@@ -81,7 +83,10 @@ _DEEP = {f: [("localparam int LM = 2, LA = 4;", "localparam int LM = 3, LA = 6;"
                    "vpu/otpu_quant.sv")}
 POINTS = {
     "small": dict(target="nangate45-small", util=35),
-    "card": dict(target="nangate45", util=35),
+    # the card: release r2's arch (90 macros, 5.87 mm2, and 4.19 mm2 of cells after synthesis)
+    # on a smaller die than the previous card point's 35% (30.6 mm2, most of it empty), with the
+    # lower placement density that cleared that run's congestion estimate (docs/asic.md)
+    "card": dict(target="nangate45", util=45, addon=0.02),
     "small-lm3la6": dict(target="nangate45-small", util=35, rewrite=_DEEP),
     "card-lm3la6": dict(target="nangate45", util=35, rewrite=_DEEP),
 }
@@ -257,7 +262,7 @@ export ADDITIONAL_LIBS = {libs}
 export CORE_UTILIZATION = {P['util']}
 export CORE_ASPECT_RATIO = 1
 export CORE_MARGIN = 5
-export PLACE_DENSITY_LB_ADDON = 0.10
+export PLACE_DENSITY_LB_ADDON = {P.get('addon', 0.10)}
 export MACRO_PLACE_HALO = 10 10
 # channels between macros at least the standard-cell grid's metal4 strap pitch (56 um), so the
 # rails in every channel reach a strap (pdngen: "Unable to repair all channels" at 44.8)
@@ -270,6 +275,17 @@ export LEC_CHECK = 0
 # largest 8 Kbit at the card's point); the large ones are macros
 export SYNTH_MEMORY_MAX_BITS = 16384
 """
+
+
+def config(point: str) -> None:
+    """config.mk and constraint.sdc again from prep's tiles (src/tiles.json), touching no
+    source: a floorplan or placement setting changed, the synthesis kept."""
+    o = out_dir(point)
+    ts = json.loads((o / "src" / "tiles.json").read_text())
+    macros = sorted({fakeram.Macro(x["kind"], x["words"], x["bits"]) for x in ts},
+                    key=lambda m: (m.kind, m.depth, m.width))
+    (o / "constraint.sdc").write_text(sdc(point))
+    (o / "config.mk").write_text(config_mk(point, macros))
 
 
 def prep(point: str) -> list[fakeram.Macro]:
@@ -404,7 +420,7 @@ def report(point: str) -> dict:
 
 
 def main(argv: list[str]) -> None:
-    if not argv or argv[0] not in ("prep", "run", "report", "all", "points"):
+    if not argv or argv[0] not in ("prep", "config", "run", "report", "all", "points"):
         print(__doc__)
         sys.exit(2)
     if argv[0] == "points":
@@ -417,6 +433,8 @@ def main(argv: list[str]) -> None:
     cpus = int(os.environ["ORFS_CPUS"]) if os.environ.get("ORFS_CPUS") else None
     if argv[0] in ("prep", "all"):
         prep(point)
+    if argv[0] == "config":
+        config(point)
     if argv[0] in ("run", "all"):
         rc = run(point, cpus, os.environ.get("ORFS_TARGET", "finish"))
         print(f"ORFS exit {rc}: {out_dir(point) / 'run.log'}")
