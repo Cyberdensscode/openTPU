@@ -78,12 +78,19 @@ host fp4 kernel.
 - **otpu-chat (section 14).** The chat runs LFM2.5-8B-A1B, Qwen3.5-35B-A3B and gemma-4-26B-A4B
   with moe_card's engine and settings (opentpu/host/streamed.py). Each model's pool is packed
   once beside its checkpoint and checked before the image is built.
+- **Lookahead expert scheduling (section 15).** OpenBMB's LES, asked for by name for MiniCPM-V
+  4.7 (Qwen3.5-35B-A3B's backbone). Its prefetch of the next layer's predicted experts models
+  at +1-3% here (+12% even for a perfect predictor), so it is closed. Its other half, the
+  card doing the work it has while the misses stream, is taken: the shared expert now runs
+  beside the request.
 
 The tools:
 
 - `tools/offload/survey.py`: the model survey, from the checkpoints' safetensors headers.
 - `router_trace.py`: the expert choices of a Hugging Face model on a text, on CPU.
 - `cachesim.py`: expert-cache hit rates on those traces, and path (a)'s event model.
+- `lesim.py`: the next layer's predictions against those traces, and the decode's timeline
+  with and without their prefetch (section 15).
 
 ## 1. The memory hierarchy
 
@@ -4355,7 +4362,8 @@ Expert-major against layer-major after the prompt (the A and B runs against L):
 | 26B | 3 | -1.083 s | +0.0070 | -6.35 |
 | 26B | 4 | -3.014 s | +0.0147 | -13.46 |
 
-Next steps (deferred to the release after r2; branch emc2, nothing built yet).
+Next steps (deferred to the release after r2; branch emc2). Step 1's server change is built on
+branch les (15.4); step 2 is not.
 
 1. The slots expert-major leaves for the decode.
 - The 35B's long expert-major prompt leaves worse slots for the decode: -0.035 hits, +18.9
@@ -4627,3 +4635,205 @@ head, LFM2-MoE, Gemma 4 MoE) on the ISA simulator with 2 slots a layer:
 test_qwen35_moe's `test_layer_major_prompts_as_prefill_chunks` covers the Engine's part: a
 layer-major prompt through prefill_chunks is one part with its runs' stats in one entry, and
 `prefill_layers(logits=False)` runs no head.
+
+## 15. Lookahead expert scheduling (LES)
+
+The user asked for OpenBMB's MiniCPM-V 4.7 (35B-A3B) to be served "with LES". Its language
+model is the Qwen3.5-35B-A3B architecture (qwen3_5_moe_text), which the card already serves as
+`qwen35-35b` with its experts streamed from the host (sections 10-14). So LES was measured on the
+35B and the 26B, and whatever it gives applies to MiniCPM-V unchanged.
+
+LES (llama.cpp-omni, docs/les/lookahead-expert-scheduling.md; no paper) is training-free and has
+three parts:
+1. cross-layer routing prediction, which prefetches the experts the next layer will likely want;
+2. once the router decides, the experts already resident compute first while the missing ones
+   load;
+3. routing stays exact: the prediction drives only the prefetch and the order.
+
+LES also uses layer-wise mixed precision, repacked contiguous expert storage and DSpark
+speculative decoding. It reports 2.97 -> 9.81 tok/s on an iPad M4 from the scheduling and load
+work alone. Fate (arXiv 2502.12224) predicts with the next layer's gate applied to this layer's
+gate input.
+
+What path (a) already had:
+- part 2 since phase 2, as hits first (section 5.2);
+- repacked contiguous storage, as the split pool (10.1);
+- a predictor of the layer's own experts one mixer ahead, as router hints (section 12: closed at
+  +0.85-1.5% on the card);
+- the next layer's experts in layer-major prefill (13.8-13.10).
+
+The open question was part 1 in decode: a prediction one layer ahead has a whole layer to
+land in, not just a mixer.
+
+### 15.1 Recall
+
+`tools/offload/lesim.py recall` uses the router traces (section 3: four texts of 2048 tokens,
+each warmed by the other three's profile) and the server's slots by decayed use: 43 a layer on
+the 35B, 16 on the 26B. Each predictor is a layer's router through its norm applied to an
+earlier state:
+- `pre`: the layer's input, one mixer ahead;
+- `prev_r`: the previous layer's router input, one layer ahead. This is Fate's, with the next
+  layer's norm gain;
+- `prev_in`: the previous layer's input, one layer and one mixer ahead. The card has it as early
+  as `prev_r`.
+
+Two baselines: `same` takes the previous layer's choice as this layer's ids, and `static`
+takes the profile's best of the layer. Two measures:
+- the share of the true top-8 that a predictor's 8 / 12 / 16 best name;
+- the share of the server's misses they name. This is what a prefetch needs: the slots already
+  hold the easy experts.
+
+| | 35B: true top-8 | 35B: misses | 26B: true top-8 | 26B: misses |
+|:--|:--|:--|:--|:--|
+| pre | 0.80 / 0.90 / 0.94 | 0.70 / 0.83 / 0.89 | 0.79 / 0.89 / 0.92 | 0.79 / 0.88 / 0.91 |
+| prev_r | 0.64 / 0.75 / 0.80 | 0.49 / 0.61 / 0.68 | 0.72 / 0.83 / 0.88 | 0.63 / 0.76 / 0.83 |
+| prev_in | 0.71 / 0.82 / 0.87 | 0.57 / 0.71 / 0.78 | 0.65 / 0.76 / 0.82 | 0.62 / 0.73 / 0.79 |
+| same | 0.03 | 0.03 | 0.06 | 0.06 |
+| static | 0.04 / 0.06 / 0.09 | 0.02 / 0.03 / 0.05 | 0.10 / 0.16 / 0.20 | 0.05 / 0.08 / 0.11 |
+
+The capped prefetch is cachesim's replay of 12.7: before each request, the first n of the
+predictor's first `top` ids not in a slot each take one (the victim of least decayed use outside
+the prediction, no use counted). The table gives misses a token, experts sent a token, the share
+of them a request used (precision), and MB a token sent early (used) and wasted. The 35B's base
+is 82.5 misses a token (141 MB), the 26B's 75.0 (286 MB).
+
+| model | predictor, top, n | misses | sent | precision | MB early / wasted |
+|:--|:--|--:|--:|--:|:--|
+| 35B | pre, 4, 1 | 65.3 (-20.9%) | 20.4 | 0.88 | 30.6 / 4.3 |
+| 35B | pre, 4, 2 | 58.6 (-29.0%) | 29.4 | 0.85 | 42.5 / 7.7 |
+| 35B | prev_in, 4, 1 | 68.0 (-17.7%) | 21.0 | 0.74 | 26.6 / 9.3 |
+| 35B | prev_in, 4, 2 | 62.8 (-23.9%) | 30.4 | 0.70 | 36.2 / 15.8 |
+| 35B | prev_r, 4, 1 | 69.7 (-15.6%) | 22.1 | 0.64 | 24.1 / 13.8 |
+| 35B | prev_r, 4, 2 | 65.3 (-20.9%) | 32.6 | 0.59 | 32.7 / 23.2 |
+| 35B | prev_r, 8, 8 | 49.0 (-40.6%) | 102.6 | 0.38 | 66.5 / 109.1 |
+| 26B | pre, 4, 1 | 56.1 (-25.2%) | 21.9 | 0.90 | 75.3 / 8.2 |
+| 26B | prev_r, 4, 1 | 60.4 (-19.5%) | 20.1 | 0.79 | 60.6 / 16.0 |
+| 26B | prev_r, 4, 2 | 54.2 (-27.7%) | 30.9 | 0.74 | 87.4 / 30.2 |
+| 26B | prev_in, 4, 2 | 53.8 (-28.2%) | 36.1 | 0.67 | 91.5 / 46.0 |
+| 26B | prev_r, 8, 8 | 37.6 (-49.9%) | 85.1 | 0.54 | 175.5 / 148.7 |
+
+- Cross-layer prediction works, as LES and Fate say: 0.64-0.72 of the next layer's top-8 from
+  this layer's state, and ten to twenty times the static profile.
+- Against the misses it is weaker. Only 0.49-0.63 of them are in the 8 best. The more ids it
+  sends, the lower its precision: 0.38-0.54 when every predicted id not in a slot goes.
+- On the 35B `prev_in` beats `prev_r` (0.74 against 0.64 at top 4, n 1). On the 26B it is
+  the other way round.
+
+### 15.2 The decode's timeline
+
+`tools/offload/lesim.py time` replays the same traces through the card's own model of a request.
+It uses design A' as the card ran it in session 16 (10.13, card_fit.py's fit), at r2's 41 slots
+a layer:
+- the host sees a request 45 us after its post;
+- the critical end comes 0.308 ms + 0.751 ms a miss later, after any part already on the link;
+- the next post comes at max(critical end + F, post + W0), where F = 1.705 ms and W0 = 2.47 ms
+  (the card's own time with no miss);
+- each prefetched expert that lands while the card computes adds CT x MB to the card's time:
+  13.8's 0.17 s a GB, or 0.29 ms for a 1.71 MB expert;
+- a token adds C0 = 29 ms for the head and sampling.
+
+The 26B uses session 16's F (2.956 ms), W0 (5.70 ms) and W(m), with its record scaled to the
+3.81 MB nvfp4 experts.
+
+A prefetch goes on the link after the request's demand, from the moment its prediction is
+known:
+- `prev_r` and `prev_in`: posted with this layer's request;
+- `pre`: at this layer's output;
+- the oracle: the next layer's true misses at this layer's request.
+
+The prefetch goes as whole experts of 0.88 ms each (an idle part, 13.12). "Gated" starts a part
+only if it lands before the next post is due. A landed expert is a hit. One still on its way is
+finished at once (its rest, no head). A queued one is a miss.
+
+The model leaves out two costs:
+- the predictor's own card time: the next router's 0.5 MB int8 MM and the top-k, about 50 us a
+  layer, or about -1%;
+- any host cost of a hint.
+
+Calibration:
+- On session 16's 102.85 misses a token the model gives about 190 ms a token, the card's
+  measured value (5.26 tok/s).
+- `pre`, top 4, n 1 models at +3.5% with no poll cost. Sessions 17 and 18 measured +0.85-1.5%
+  on the card with about 3% of hint polls (12.9).
+
+tok/s against no prefetch, the best setting of each (gated unless marked):
+
+| model (base) | oracle, n 1 / 2 / 4 | pre | prev_in | prev_r | oracle / pre / prev_in at CT = 0 |
+|:--|:--|:--|:--|:--|:--|
+| 35B (5.60 tok/s, 85.5 misses) | +6.2 / +10.4 / +11.9% (n 3 ungated +12.8%) | +5.0% (top 8, n 2) | +2.9% (top 4, n 2) | +1.4% (top 4, n 1-2) | +15.6 / +9.9 / +8.4% |
+| 26B (3.54 tok/s, 75.0 misses) | +4.8 / +7.6 / +8.3% | +4.5% (top 4, n 2, ungated) | +1.7% (top 2, n 2) | +2.5% (top 4, n 2) | |
+
+Sending more of a weak prediction loses: `prev_r` at top 8, n 4 ungated is -6.5% on the 35B,
+and `prev_in` -3.5%.
+
+### 15.3 Why LES's prefetch does not pay here
+
+LES and Fate measure on unified memory, with experts read from flash. There the prefetch's reads
+compete with nothing else, and a miss costs much more than any compute. Path (a) differs in three
+ways:
+1. **A prefetched byte is not free.** Every byte the link writes while the card computes costs
+   the card's DRAM 0.17 s a GB (13.8): 0.29 ms for each 1.71 MB expert. A miss it saves is
+   worth at most 0.751 ms of the link plus its request's head. So a prediction pays only well
+   above 0.4 precision, and only for experts the card would really have waited on.
+2. **The window is short.** The link carries this layer's own misses until the critical end.
+   The next request comes F = 1.7 ms after that, room for about two whole experts. A
+   one-layer-ahead prediction is known at the request, but the link is not free for it until
+   the window. Even a perfect predictor gains only +12% (35B) and +8% (26B).
+3. **The slots already hold the easy experts.** The predictions name 64-80% of a layer's
+   experts, but only 49-79% of its misses (the 8 best), and their precision on what they send
+   falls to 0.4-0.75 as they send more.
+
+So the LES prefetch is closed on the measurement above (not built). It is worth another look
+if any of these change, since each moves the balance; `lesim.py time --set K=V` re-runs it:
+- the write contention falls: CT = 0 lifts `pre` to +10% and `prev_in` to +8%. It is a
+  property of the controller's write and read turnarounds, which an RTL change could batch;
+- the link gets faster (PART and REC shorter);
+- the slot count changes (`--slots`);
+- MCOLS 8 changes the card's own time (F, W0).
+
+### 15.4 What we took: the card's own work first
+
+LES's part 2 was there, but not all of it. A Qwen3.5-MoE layer computed its shared expert after
+the last routed expert: after the last miss had landed. So in every layer whose request missed,
+the card's wait grew by the shared expert's time: 1.77 MB of nvfp4, about 0.136 ms. Gemma 4's
+dense MLP already ran beside the request (5.3).
+
+Now `moe_ffn` and `moe_ffn_rows` run the shared expert right after the post, before beside()'s
+work. Its output is still added last, after the routed rows' sum in the router's order: the same
+operations on the same operands, bit for bit.
+- The model gives 178.4 -> 174.0 ms a token on the 35B (+2.5%, F less 0.136 ms).
+- A layer-major prompt's runs gain the same way, per request with misses.
+- Only Qwen3.5-MoE's programs change. LFM2 and Gemma 4 have no shared expert.
+- On the ISA simulator, the tiny Qwen3.5-MoE gives the same logits as 217cf13a: decode with
+  misses, and a layer-major prefill of R = 2 with the decode after.
+
+The same branch (les) carries 13.18's slot-order fix, from moe-ab's design on emc2:
+- an expert-major need line counts as a request (one more of its layer's, and a use of each id);
+- at the layer switch, the finished layer's experts go to the pooled order's end by the last
+  line that named them.
+
+It changes no bytes and no program. em_slotsim bounds it at 177.0 -> 166.7 MB a token for the
+35B's decode after a long expert-major prompt.
+
+Card session les1 is the check: the production host against les on the production bitstream,
+both models, in ABBA order. It splits the two parts by turn:
+- the short turns' decode and prefill measure the shared expert alone;
+- the decode after the long expert-major turn adds the slot order: its hit rate and MB a token
+  move, and its time beyond the shared expert's.
+
+### 15.5 What we did not take, and the bigger levers
+
+Not taken:
+- the prefetch (15.3);
+- DSpark: speculative decoding needs a verify step of more than one row on the MoE. That is a
+  project of its own (below).
+
+Levers larger than LES's scheduling, from `lesim.py time` on the 35B. Not built; each needs its
+own decision:
+- **Experts in about 3.25 bits** instead of 4.35: 1.28 MB an expert, 54 slots a layer in the
+  same DRAM. Simulated 5.60 -> 6.63 tok/s (+18%). This is LES's "layer-wise mixed precision";
+  it is a numerics question (dKL at 2000 tokens or more).
+- **More slots**: +10 a layer gives +5.5%.
+- **An MTP verify of two rows a step**: the mixers' weights and the 29 ms head are read once
+  for about 1.7 tokens. Roughly +15-20% (estimate). Qwen3.5-35B-A3B has an MTP layer;
+  MiniCPM-V's draft (DSpark) is a separate checkpoint.
