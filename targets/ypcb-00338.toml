@@ -8,18 +8,18 @@ name = "ypcb-00338"
 kind = "fpga"
 platform_id = 1                 # the CFG_PLATFORM register
 description = "Inspur YPCB-00338: xc7k480t, 2 x DDR3-1066 (LiteDRAM), XDMA Gen2 x8"
-variant = "m8"                  # the default build's [variants.<name>] (below): ypcb-00338:m4 the other
+variant = "m4"                  # the default build's [variants.<name>] (below): ypcb-00338:m8 the other
 
 [arch]                          # opentpu.isasim.Config: what programs depend on
 S = 1
 D = 128
-MCOLS = 8                       # release r2: 8 MX columns (docs/mx_mxu.md 9; production 8b33206e: 4)
+MCOLS = 4                       # release r2 (m4): 4 MX columns, production 8b33206e's (m8: 8, r2.1)
 ACT_BLOCKS = 128
 ACT_ROWS = 16                   # the MX build's: MMs of up to 16 rows (replay); 0: MCOLS
-TMEM_WORDS = 131072             # release r2: 128K (128 RAMB36 at TMEM_IMPL 3). At MCOLS 8 and 64K
+TMEM_WORDS = 65536              # m4: 64K (64 RAMB36 at TMEM_IMPL 3). m8: 128K, at MCOLS 8 and 64K
 #                                 Qwen3.5-0.8B's MTP prompt runs held 5-7 rows and Gemma 4 E2B's 4-6
 #                                 (next-fit and best-fit alike); 128K runs 8: every row short of
-#                                 MCOLS is another pass of the weights (production 8b33206e: 64K)
+#                                 MCOLS is another pass of the weights
 IMEM_WORDS = 32768
 DRAM_BYTES = 4294967296         # per slice
 LANES = 8
@@ -32,7 +32,7 @@ SEQ_WC = true                   # the sequencer's wait entries (WAITC v2, docs/s
 [uarch]                         # timing only: RTL parameters the programs do not see
 MXU_IMPL = 2                    # systolic (docs/mxu_systolic.md)
 MXU_CL = 16
-MXU_E = 8                       # epilogue lanes: MCOLS, full rate (docs/mx_mxu.md 9: E = MCOLS at
+MXU_E = 4                       # epilogue lanes: MCOLS, full rate (docs/mx_mxu.md 9: E = MCOLS at
                                 # MCOLS 8; E 4 halves prefill q.K^T at d 128 and G 5-8 decode)
 VPU_CL = 2
 ULANES = 8
@@ -74,13 +74,13 @@ pcie_lanes = 8
 
 # Variants (opentpu/target.py: TARGET / OTPU_TARGET = ypcb-00338:<name>): arch and uarch values
 # over the ones above, each variant its own CFG_HASH. The [arch] and [uarch] above state the default
-# variant's.
-[variants.m8]                   # release r2: 8 MX columns at E 8, 128K TMEM words (CFG_HASH 46b96e6d)
+# variant's (m4: release r2's production candidate, 133.33 MHz; m8 does not close it yet: r2.1).
+[variants.m8]                   # release r2.1: 8 MX columns at E 8, 128K TMEM words (CFG_HASH 46b96e6d)
 MCOLS = 8
 MXU_E = 8
 TMEM_WORDS = 131072
 
-[variants.m4]                   # MX production 8b33206e's MXU (4 columns, E 4) with the rest of r2,
-MCOLS = 4                       # 64K TMEM words
+[variants.m4]                   # release r2: MX production 8b33206e's MXU (4 columns, E 4) with the
+MCOLS = 4                       # rest of r2, 64K TMEM words (CFG_HASH 4ffd1e17)
 MXU_E = 4
 TMEM_WORDS = 65536

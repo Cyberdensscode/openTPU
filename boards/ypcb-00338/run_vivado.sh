@@ -25,7 +25,7 @@
 #                                         # target's 16384 records: 32 RAMB36, docs/infra_hunt.md)
 #   COLL_GATHER=0 ./run_vivado.sh         # the collective unit without GATHER: BAR alone (CAPS2 bit0 = 0;
 #                                         # the host refuses GATHER programs; docs/infra_hunt.md 5)
-#   TMEM_WORDS=65536 ./run_vivado.sh      # a 64K-word TMEM (the target's: 131072, release r2; in CFG_HASH)
+#   TMEM_WORDS=131072 ./run_vivado.sh     # a 128K-word TMEM (the target's variant's; in CFG_HASH)
 #   VIVADO_DOCKER=image ./run_vivado.sh   # Docker (e.g. Apple Silicon with Rosetta), see docs/board.md
 #   VIVADO_AS_USER=1                      # Docker on Linux: run as the calling user (see run())
 #   STEP=impl ./run_vivado.sh             # rerun implementation only (keeps project and synthesis)
@@ -49,11 +49,11 @@ if tenv="$(PYTHONPATH="$root" python3 -m opentpu.target env "$target" 2>/dev/nul
 else
   echo "run_vivado: python3 -m opentpu.target env $target failed: built-in defaults, CFG_HASH 0" >&2
 fi
-mcols="${MCOLS:-${T_MCOLS:-8}}"     # MXU columns (the host reads them from the VERSION register)
+mcols="${MCOLS:-${T_MCOLS:-4}}"     # MXU columns (the host reads them from the VERSION register)
 vpu_cl="${VPU_CL:-${T_VPU_CL:-2}}"  # VPU lanes with the composite functions (timing only)
 lanes="${LANES:-${T_LANES:-8}}"     # VPU lanes / TMEM banks (likewise in VERSION)
 act_rows="${ACT_ROWS:-${T_ACT_ROWS:-$mcols}}"  # ACT RAM rows (> MCOLS: MM replay; the ACT_ROWS register)
-mxu_e="${MXU_E:-${T_MXU_E:-8}}"   # MXU epilogue lanes (timing only; 0: MCOLS / 2)
+mxu_e="${MXU_E:-${T_MXU_E:-4}}"   # MXU epilogue lanes (timing only; 0: MCOLS / 2)
 dstep="${DSTEP:-${T_DSTEP:-1}}"     # 0: no DSTEP datapath in the DMA (CAPS bit6 = 0)
 # otpu_seq WAITC (EXPERIMENTAL, docs/seq_vpu.md; CFG_UARCH bit24, in CFG_HASH when on): the
 # target's [arch] SEQ_WC, or SEQ_WC=1. The host writes each program's wait entries
@@ -71,8 +71,8 @@ mxu="$([[ "${T_MXU_IMPL:-2}" == 0 ]] && echo tree || echo systolic)"   # the MXU
 core_mhz="${CORE_MHZ:-$([[ "${FAST:-0}" == 1 ]] && echo 100 || echo "${T_CORE_MHZ:-133.33}")}"  # accelerator clock (FAST=1: 100)
 platform="${T_PLATFORM:-1}"
 # TMEM words (the CFG_TMEM register, in CFG_HASH; read by vivado/create_project.tcl): the target's
-# [arch] TMEM_WORDS (release r2: 131072), or TMEM_WORDS=65536 (r2's 64 RAMB36 TMEM)
-export TMEM_WORDS="${TMEM_WORDS:-${T_TMEM_WORDS:-131072}}"
+# [arch] TMEM_WORDS (its variant's: m4 65536, m8 131072), or TMEM_WORDS=
+export TMEM_WORDS="${TMEM_WORDS:-${T_TMEM_WORDS:-65536}}"
 # CFG_HASH: the arch hash of what this build is (the knobs applied to the target's arch)
 arch_hash="$(PYTHONPATH="$root" python3 -m opentpu.target hash "$target" MCOLS="$mcols" \
   LANES="$lanes" ACT_ROWS="$act_rows" TMEM_WORDS="$TMEM_WORDS" DSTEP="$dstep" SEQ_WC="$seq_wc" \

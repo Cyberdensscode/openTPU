@@ -50,8 +50,8 @@ if {![regexp {^[0-9]+$} $TRACE_DEPTH] || ($TRACE_DEPTH != 0 && ($TRACE_DEPTH & (
 set COLL_GATHER [expr {[info exists ::env(COLL_GATHER)] && $::env(COLL_GATHER) ne "" ? $::env(COLL_GATHER) : 1}]
 if {$COLL_GATHER ni {0 1}} { error "COLL_GATHER $COLL_GATHER: 0 or 1" }
 # TMEM_WORDS (environment, run_vivado.sh: the target's [arch] TMEM_WORDS, in its CFG_HASH): the
-# TMEM's words, a power of two (the CFG_TMEM register; release r2: 128K, 128 RAMB36 at TMEM_IMPL 3)
-set TMEM_WORDS [expr {[info exists ::env(TMEM_WORDS)] && $::env(TMEM_WORDS) ne "" ? $::env(TMEM_WORDS) : 131072}]
+# TMEM's words, a power of two (the CFG_TMEM register; the card's m4 64K, m8 128K: 128 RAMB36)
+set TMEM_WORDS [expr {[info exists ::env(TMEM_WORDS)] && $::env(TMEM_WORDS) ne "" ? $::env(TMEM_WORDS) : 65536}]
 if {![regexp {^[0-9]+$} $TMEM_WORDS] || $TMEM_WORDS < 1024 || ($TMEM_WORDS & ($TMEM_WORDS - 1))} {
   error "TMEM_WORDS $TMEM_WORDS: a power of two, 1024 or more"
 }

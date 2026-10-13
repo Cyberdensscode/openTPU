@@ -41,10 +41,10 @@ def test_every_target_loads():
 
 def test_board_config_is_the_card_by_default(no_env):
     """board_config() before targets: the same Config (its fields are in every cache key), but
-    for the MX build's ACT_ROWS 16 (0 before) and release r2's MCOLS 8 (4 before) and 128K TMEM
-    words (64K before)."""
-    legacy = Config(S=1, D=128, MCOLS=8, ACT_BLOCKS=128, LANES=8, ACT_ROWS=16,
-                    TMEM_WORDS=1 << 17, IMEM_WORDS=1 << 15, DRAM_BYTES=1 << 32, PAIR=False,
+    for the MX build's ACT_ROWS 16 (0 before; release r2's default variant m4: MCOLS 4, 64K TMEM
+    words, as before)."""
+    legacy = Config(S=1, D=128, MCOLS=4, ACT_BLOCKS=128, LANES=8, ACT_ROWS=16,
+                    TMEM_WORDS=1 << 16, IMEM_WORDS=1 << 15, DRAM_BYTES=1 << 32, PAIR=False,
                     DSTEP=False, STREAM=False)
     assert board_config() == legacy
     assert T.current().name == "ypcb-00338"
@@ -54,9 +54,9 @@ def test_board_config_is_the_card_by_default(no_env):
 
 
 def test_board_config_follows_otpu_target(no_env):
-    no_env.setenv("OTPU_TARGET", "ypcb-00338:m4")              # a variant (test_card_variants)
+    no_env.setenv("OTPU_TARGET", "ypcb-00338:m8")              # a variant (test_card_variants)
     c = board_config()
-    assert (c.MCOLS, c.ACT_ROWS, c.TMEM_WORDS) == (4, 16, 1 << 16)
+    assert (c.MCOLS, c.ACT_ROWS, c.TMEM_WORDS) == (8, 16, 1 << 17)
     no_env.setenv("OTPU_TARGET", "bcu1525")
     c = board_config()
     assert (c.S, c.D, c.MCOLS, c.DRAM_BYTES) == (2, 128, 4, 1 << 32)
@@ -81,11 +81,11 @@ def _hash_without_numerics(cfg) -> int:
 
 def test_arch_hash_is_stable_and_sensitive():
     card = T.config("ypcb-00338")
-    # in the bitstreams' CFG_HASH: keep them (release r2: MCOLS 8 with wait entries, 128K TMEM
-    # words; r2's dev build 83740e79 at 64K; MX production 8b33206e, MCOLS 4 at ACT_ROWS 16 and
-    # 64K, without; ff270e6e at ACT_ROWS 4)
-    assert f"{T.arch_hash(card):08x}" == "46b96e6d"
-    assert f"{T.arch_hash(dataclasses.replace(card, TMEM_WORDS=1 << 16)):08x}" == "19a2400e"
+    # in the bitstreams' CFG_HASH: keep them (release r2's m4: MCOLS 4 with wait entries, 64K TMEM
+    # words; its m8 at 128K (test_card_variants) and r2's dev build 83740e79, m8 at 64K; MX
+    # production 8b33206e, MCOLS 4 at ACT_ROWS 16 and 64K, without; ff270e6e at ACT_ROWS 4)
+    assert f"{T.arch_hash(card):08x}" == "4ffd1e17"
+    assert f"{T.arch_hash(dataclasses.replace(card, MCOLS=8)):08x}" == "19a2400e"
     mx = dataclasses.replace(card, MCOLS=4, SEQ_WC=False, TMEM_WORDS=1 << 16)
     assert f"{T.arch_hash(mx):08x}" == "89417856"
     four = dataclasses.replace(mx, ACT_ROWS=0)
@@ -103,12 +103,14 @@ def test_arch_hash_is_stable_and_sensitive():
 
 
 def test_card_variants(tmp_path):
-    """targets/ypcb-00338.toml's variants (TARGET / OTPU_TARGET ypcb-00338:<name>): m8, the
-    default (release r2: 8 MX columns at E 8, 128K TMEM words), and m4 (MX production 8b33206e's
-    MXU, 4 columns at E 4, 64K words, with the rest of r2), each its own CFG_HASH (pinned: the
-    bitstreams report them)."""
+    """targets/ypcb-00338.toml's variants (TARGET / OTPU_TARGET ypcb-00338:<name>): m4, the
+    default (release r2: MX production 8b33206e's MXU, 4 columns at E 4, 64K TMEM words, with the
+    rest of r2), and m8 (8 MX columns at E 8, 128K words: r2.1), each its own CFG_HASH (pinned:
+    the bitstreams report them)."""
     m8, m4 = T.load("ypcb-00338:m8"), T.load("ypcb-00338:m4")
-    assert T.load("ypcb-00338").variant == "m8" and T.config("ypcb-00338") == T.config(m8)
+    assert T.load("ypcb-00338").variant == "m4" and T.config("ypcb-00338") == T.config(m4)
+    c8 = T.config(m8)
+    assert (c8.MCOLS, c8.TMEM_WORDS, m8.uarch["MXU_E"]) == (8, 1 << 17, 8)
     c4 = T.config(m4)
     assert (c4.MCOLS, c4.ACT_ROWS, c4.TMEM_WORDS, c4.SEQ_WC, m4.uarch["MXU_E"]) == \
         (4, 16, 65536, True, 4)
@@ -124,15 +126,15 @@ def test_card_variants(tmp_path):
     # the file's [arch] / [uarch] state its default variant's values
     p = tmp_path / "ypcb-00338.toml"
     p.write_text((ROOT / "targets/ypcb-00338.toml").read_text().replace(
-        'variant = "m8"', 'variant = "m4"'))
-    with pytest.raises(T.TargetError, match="differ from the default variant 'm4'"):
+        'variant = "m4"', 'variant = "m8"'))
+    with pytest.raises(T.TargetError, match="differ from the default variant 'm8'"):
         T.load(str(p))
 
 
 def test_build_config_applies_the_flow_knobs():
     t = T.load("ypcb-00338")
-    assert T.build_config(t, MCOLS=8, LANES=8, ACT_ROWS=16, DSTEP=1) == T.config(t)
-    assert T.build_config(t, MCOLS=8, LANES=8, DSTEP=1) == T.config(t)       # the target's 16
+    assert T.build_config(t, MCOLS=4, LANES=8, ACT_ROWS=16, DSTEP=1) == T.config(t)
+    assert T.build_config(t, MCOLS=4, LANES=8, DSTEP=1) == T.config(t)       # the target's 16
     c = T.build_config(t, MCOLS=2, ACT_ROWS=2, DSTEP=0)
     assert (c.MCOLS, c.ACT_ROWS, c.DSTEP, c.STREAM, c.PAIR) == (2, 0, False, False, True)
     assert T.build_config(t, MCOLS=4, ACT_ROWS=8).ACT_ROWS == 8
@@ -168,7 +170,7 @@ def test_card_target_matches_the_rtl_defaults():
         == p["TRACE_DEPTH"]
     # release r2: MCOLS 8 at E 8, WAITC, the one pumped TMEM copy (r2pgRs, docs/tmem_nocopy.md)
     assert T.sim_uarch("ypcb-00338") == {"WIN": 16, "RPB": 128, "WPB": 1, "FIFO_DEPTH": 1024,
-                                         "MXU_E": 8, "SEQ_WC": 1, "TMEM_IMPL": 3, "TMEM_NSB": 2,
+                                         "MXU_E": 4, "SEQ_WC": 1, "TMEM_IMPL": 3, "TMEM_NSB": 2,
                                          "TMEM_RPL": 1, "TMEM_TDP": 1, "TMEM_GST": 1,
                                          "TMEM_PMP": 1}
 
@@ -178,10 +180,10 @@ def test_target_cli():
                                     capture_output=True, text=True, check=True).stdout
     env = dict(line.split("=", 1) for line in run("env", "ypcb-00338").split())
     assert (env["T_MCOLS"], env["T_ACT_ROWS"], env["T_PLATFORM"], env["T_ARCH_HASH"],
-            env["T_TMEM_WORDS"]) == ("8", "16", "1", "46b96e6d", "131072")  # release r2
-    env = dict(line.split("=", 1) for line in run("env", "ypcb-00338:m4").split())
+            env["T_TMEM_WORDS"]) == ("4", "16", "1", "4ffd1e17", "65536")   # release r2 (m4)
+    env = dict(line.split("=", 1) for line in run("env", "ypcb-00338:m8").split())
     assert (env["T_MCOLS"], env["T_MXU_E"], env["T_TMEM_WORDS"], env["T_ARCH_HASH"]) == \
-        ("4", "4", "65536", "4ffd1e17")                 # its variant m4 (run_vivado.sh TARGET)
+        ("8", "8", "131072", "46b96e6d")                # its variant m8 (run_vivado.sh TARGET)
     # r2's dev build 83740e79 (64K words); MX production 8b33206e's (MCOLS 4, no wait entries),
     # and its 4-row build's
     assert run("hash", "ypcb-00338", "MCOLS=8", "LANES=8", "ACT_ROWS=16", "TMEM_WORDS=65536",
@@ -227,7 +229,7 @@ def test_device_config_from_the_cfg_registers(no_env):
     """Map 4: the sizes come from the device; the hash must be the reported Config's."""
     t = FakeTransport(devname=None, regmap=4, pair=True, dstep=True, stream=True, seq_wc=True)
     info = Board(t).info()                      # (release r2's build: wait entries, CFG_UARCH 24)
-    assert info["cfg"]["platform"] == 1 and info["cfg"]["hash"] == 0x46b96e6d   # (128K words)
+    assert info["cfg"]["platform"] == 1 and info["cfg"]["hash"] == 0x4ffd1e17   # (r2's m4)
     assert info["act_rows"] == 16 and info["caps"]["act_rows"]
     cfg = device_config(info)
     assert cfg == T.config("ypcb-00338")
@@ -240,7 +242,7 @@ def test_device_config_from_the_cfg_registers(no_env):
     c2 = device_config(info)
     assert (c2.TMEM_WORDS, c2.IMEM_WORDS, c2.ACT_BLOCKS, c2.DRAM_BYTES) == \
         (1 << 15, 1 << 14, 64, 1 << 30)
-    with pytest.raises(ConfigMismatch, match="TMEM_WORDS=131072 and the device has 32768"):
+    with pytest.raises(ConfigMismatch, match="TMEM_WORDS=65536 and the device has 32768"):
         check_fits(cfg, info)
     check_fits(dataclasses.replace(c2, DRAM_BYTES=1 << 24), info)     # less DRAM: fine
     info["cfg"]["hash"] ^= 1
@@ -374,7 +376,7 @@ def test_config_summary_names_the_target(no_env):
     from opentpu.host.board import config_summary
     kw = dict(devname=None, ddr_mts=1066, pair=True, dstep=True, stream=True)
     old = config_summary(Board(FakeTransport(regmap=3, **kw)).info())
-    assert old == "D=128 MCOLS=8 LANES=8, register map 3, core 100 MHz, DDR3-1066, build 1234abcd"
+    assert old == "D=128 MCOLS=4 LANES=8, register map 3, core 100 MHz, DDR3-1066, build 1234abcd"
     new = config_summary(Board(FakeTransport(regmap=4, **kw)).info())
     assert "register map 4, ypcb-00338 (S=1, 2 channels x 2048 MiB)" in new and "DDR3-1066" in new
     assert T.by_platform(2).name == "bcu1525" and T.by_platform(999) is None

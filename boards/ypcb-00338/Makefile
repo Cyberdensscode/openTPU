@@ -25,7 +25,7 @@ DDR ?= 1066
 #   8b33206e), 1 banked (three copies, docs/tmem_pump.md; TMEM_RQ=1 with it: the banks' addresses
 #   from the requests by priority), 3 one copy (docs/tmem_nocopy.md; TMEM_X its knobs over the
 #   target's pick, vivado/tmem_knobs.tcl; pumped on core_clk2x: CORE_MHZ's divider even)
-# TMEM_WORDS: the TMEM's words (default the target's: 131072, release r2; 65536 r2's 64 RAMB36 TMEM)
+# TMEM_WORDS: the TMEM's words (default the target variant's: m4 65536, m8 131072)
 # BUILD_ID: the BUILD_ID register (8 hex digits; default: the git commit)
 # PCIE_GEN: 2 (Gen2 x8, xdma_aclk 250 MHz, the default) or 1 (Gen1 x8), from the environment
 ifeq ($(FAST),1)

@@ -33,11 +33,11 @@
 module otpu_fpga_top_ld #(
   // the defaults are the card's target, targets/ypcb-00338.toml (release r2: MCOLS 8, E 8, one
   // pumped TMEM copy, WAITC), which create_project.tcl passes as generics
-  parameter int MCOLS = 8,                  // MXU columns (activation rows per weight chunk)
+  parameter int MCOLS = 4,                  // MXU columns (activation rows per weight chunk; the target's m4)
   parameter int ACT_ROWS = 16,              // ACT RAM rows (> MCOLS: MM replay, one weight pass)
   parameter int VPU_CL = 2,                 // VPU lanes with the composite functions (exp2, ...)
   parameter int MXU_IMPL = 2,               // MXU dot product: 2 systolic (docs/mxu_systolic.md), the only one
-  parameter int MXU_E = 8,                  // MXU epilogue lanes: MCOLS (full rate; docs/mx_mxu.md section 9)
+  parameter int MXU_E = 4,                  // MXU epilogue lanes: MCOLS (full rate; docs/mx_mxu.md section 9)
   parameter int TMEM_IMPL = 3,              // TMEM: 0 a copy per read port (production 8b33206e),
                                             //   1 banked (three copies, docs/tmem_pump.md), 3 one copy
   parameter bit TMEM_RQ = 1'b0,             // TMEM_IMPL 1: request-priority bank addresses
@@ -50,8 +50,8 @@ module otpu_fpga_top_ld #(
   parameter int TMEM_PMP = 1,
   parameter int TMEM_PRK = 0,
   parameter int TMEM_SDM = -1,
-  parameter int TMEM_WORDS = 1 << 17,       // TMEM words (the target's [arch] TMEM_WORDS, the CFG_TMEM
-                                            //   register; release r2: 128K, 128 RAMB36 at TMEM_IMPL 3)
+  parameter int TMEM_WORDS = 1 << 16,       // TMEM words (the target's [arch] TMEM_WORDS, the CFG_TMEM
+                                            //   register; m4 64K, 64 RAMB36 at TMEM_IMPL 3; m8 128K)
   parameter int LANES = 8,                  // VPU lanes / TMEM banks (8 or 16)
   parameter int ULANES = 8,                 // TMEM lanes of the MXU and the quantizer
   parameter int CORE_KHZ = 100000,          // core_clk as the block design makes it (CORE_KHZ register)

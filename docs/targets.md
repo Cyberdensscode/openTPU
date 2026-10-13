@@ -10,7 +10,14 @@ is derived from that file by `opentpu/target.py`. The design rationale is in
 python3 -m opentpu.target list                  the targets
 python3 -m opentpu.target show bcu1525          one, resolved
 OTPU_TARGET=bcu1525 python3 ...                 simulators and tools use that target
+OTPU_TARGET=ypcb-00338:m8 python3 ...           a target's variant (below)
 ```
+
+A target file may hold variants, `[variants.<name>]` tables of `[arch]` and `[uarch]` values over
+the file's, selected as `NAME:VARIANT` (OTPU_TARGET; the board flow's `make bit TARGET=`); the
+file's `[target] variant` is the default, and its `[arch]` / `[uarch]` state that variant's values
+(`load` checks them). Each variant has its own CFG_HASH. The card's: m4 (release r2: 4 MX columns
+at E 4, 64K TMEM words) and m8 (8 at E 8, 128K words).
 
 ## The four layers of a target
 
