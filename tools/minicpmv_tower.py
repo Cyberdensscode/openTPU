@@ -221,9 +221,22 @@ def cosim(a) -> dict:
                 pf = parse(st["trace"], cfg, [prog], name)
                 pf.cycles = st["cycles"]
                 rl = pf.roofline()
+                cls = pf.by_class(0)
+                gaps = pf.mxu_gaps(0)
+                blame = sorted(gaps["blame"].items(), key=lambda x: -x[1])
                 prof[name] = {"busy": pf.unit_busy(0), "roofline": rl["per_slice"][0],
-                              "ports": {k: int(v) for k, v in pf.ports[0].items()}}
+                              "ports": {k: int(v) for k, v in pf.ports[0].items()},
+                              "classes": cls, "mxu_gaps": {
+                                  "prologue": gaps["prologue"], "epilogue": gaps["epilogue"],
+                                  "gaps": sum(b - a for a, b, _ in gaps["gaps"]),
+                                  "blame": [[k[0], k[1], v] for k, v in blame[:20]]}}
                 print(pf.summary(), f"\n  roofline {rl['per_slice'][0]}", flush=True)
+                for k, x in sorted(cls.items(), key=lambda x: -x[1]["busy"])[:12]:
+                    print(f"  {k:14s} x{x['count']:7d} busy {x['busy']:10d} work {x['work']:10d} "
+                          f"wait dep {x['wait_dep']:10d} unit {x['wait_unit']:10d}", flush=True)
+                print(f"  MXU gaps {prof[name]['mxu_gaps']['gaps']} cycles (prologue "
+                      f"{gaps['prologue']}, epilogue {gaps['epilogue']}); blame: "
+                      + ", ".join(f"{k[0]}@{k[1]} {v}" for k, v in blame[:8]), flush=True)
     count: dict = {}
     for name, _ in runs:
         count[name] = count.get(name, 0) + 1
