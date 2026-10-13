@@ -12,10 +12,10 @@
 // write enables, group-major. The read is registered (the MXU's first pipeline register) and
 // advances with the column's `ren` bit (otpu_mxu: the columns of the MM's rows); a read of a block written at the same edge returns the old bytes. Writes
 // land three cycles after they are presented: the quantizer's write is registered as it arrives
-// and again (LANES bytes, their index and row, the scale), so it crosses from the quantizer in
-// that narrow form in two hops and the lane placement (LANES -> D bytes) starts at a flip-flop
-// by the block RAMs, then registered again in place (bytes; the block address, column select
-// and group once per column and piece). The quantizer reports done two cycles after its last
+// and again (LANES bytes, their index and row, the scale; the second time once per piece of the
+// block RAMs), so it crosses from the quantizer in that narrow form in two hops and the lane
+// placement (LANES -> D bytes) starts at a flip-flop by the block RAMs, then registered again in
+// place (bytes; the block address, column select and group once per column and piece). The quantizer reports done two cycles after its last
 // write and the sequencer releases a dependent MM two cycles after that (otpu_quant), so a
 // consumed read (r_use, the MXU's pop) never names a block whose write is still in flight: the
 // simulation checks it.
@@ -107,9 +107,37 @@ module otpu_actram #(
     s_data_h <= s_data_i;
   end
 
-  // the write, as byte enables and bytes in place (registered; the block address, column select
-  // and group per column and piece in g_row), and the scale write (registered); per column:
-  // selected, and the group of the row it writes
+  // The bytes' second hop is a copy per piece (r2.1, kept: the same values as the _h registers):
+  // a piece's block RAMs sit level with its D/NP positions of the MXU's grid, so the copies of
+  // all pieces spread over the array's height, and each copy is placed by its own piece. One
+  // copy fanned out to every piece and stayed by the quantizer (r2.1's m8 163ab46d: w_data_h at
+  // SLICE_X146Y37 -> wd at SLICE_X77Y296, 6.5 ns of route at 0-1 levels, -0.001 ns)
+  (* keep *) logic [NP-1:0][LANES-1:0]      we_p;
+  (* keep *) logic [NP-1:0][7:0]            w_row_p, w_off_p;
+  (* keep *) logic [NP-1:0][DW+BW-1:0]      w_idx_p;
+  (* keep *) logic [NP-1:0][LANES-1:0][7:0] w_data_p;
+  (* keep *) logic [NP-1:0]                 w_dup_p;
+  always_ff @(posedge clk)
+    for (int p = 0; p < NP; p++) begin
+      we_p[p] <= we_i;
+      w_row_p[p] <= w_row_i;
+      w_off_p[p] <= w_off_i;
+      w_idx_p[p] <= w_idx_i;
+      w_data_p[p] <= w_data_i;
+      w_dup_p[p] <= w_dup_i;
+    end
+`ifndef SYNTHESIS
+  initial we_p = '0;
+  always @(posedge clk)
+    for (int p = 0; p < NP; p++)
+      if (we_p[p] != we_h || w_row_p[p] != w_row_h || w_off_p[p] != w_off_h ||
+          w_idx_p[p] != w_idx_h || w_data_p[p] != w_data_h || w_dup_p[p] != w_dup_h)
+        $fatal(1, "otpu_actram: piece %0d's copy of the write differs", p);
+`endif
+
+  // the write, as byte enables and bytes in place (registered, each piece's from its copy; the
+  // block address, column select and group per column and piece in g_row), and the scale write
+  // (registered); per column: selected, and the group of the row it writes
   logic [D-1:0]     wbe;
   logic [D*8-1:0]   wd;
   logic [MCOLS-1:0] ssel;
@@ -117,22 +145,31 @@ module otpu_actram #(
   logic [BW-1:0]    sb;
   logic [63:0]      sd;
   // the placement register's inputs: per column, selected and the group of the row it writes
+  // (wsel_n / wg_n: the checks'; each piece's from its copy: wsel_p / wg_p)
   logic [MCOLS-1:0] wsel_n, ssel_n;
   logic [GW-1:0]    wg_n [MCOLS], sg_n [MCOLS];
+  logic [NP-1:0][MCOLS-1:0] wsel_p;
+  logic [GW-1:0]    wg_p [NP][MCOLS];
   always_comb
     for (int j = 0; j < MCOLS; j++) begin
       wsel_n[j] = sel(j, w_row_h, w_dup_h, w_off_h) && (|we_h);
       ssel_n[j] = swe_h && sel(j, s_row_h, w_dup_h, w_off_h);
       wg_n[j] = sgrp(j, w_row_h, w_off_h);
       sg_n[j] = sgrp(j, s_row_h, w_off_h);
+      for (int p = 0; p < NP; p++) begin
+        wsel_p[p][j] = sel(j, w_row_p[p], w_dup_p[p], w_off_p[p]) && (|we_p[p]);
+        wg_p[p][j] = sgrp(j, w_row_p[p], w_off_p[p]);
+      end
     end
   always_ff @(posedge clk) begin
     wbe <= '0;
     wd <= '0;
-    for (int l = 0; l < LANES; l++) begin
-      wbe[w_idx_h[DW-1:0] + DW'(l)] <= we_h[l];
-      wd[8 * (w_idx_h[DW-1:0] + DW'(l)) +: 8] <= w_data_h[l];
-    end
+    for (int p = 0; p < NP; p++)
+      for (int l = 0; l < LANES; l++)
+        if (32'(w_idx_p[p][DW-1:0]) / PB == p) begin
+          wbe[w_idx_p[p][DW-1:0] + DW'(l)] <= we_p[p][l];
+          wd[8 * (w_idx_p[p][DW-1:0] + DW'(l)) +: 8] <= w_data_p[p][l];
+        end
     ssel <= ssel_n;
     for (int j = 0; j < MCOLS; j++) sg[j] <= sg_n[j];
     sb <= s_blk_h;
@@ -156,9 +193,9 @@ module otpu_actram #(
       (* keep *) logic [GW-1:0] wg;
       logic [PB*8-1:0] rd;
       always_ff @(posedge clk) begin
-        wb <= w_idx_h[DW +: BW];
-        wsel <= wsel_n[j];
-        wg <= wg_n[j];
+        wb <= w_idx_p[p][DW +: BW];
+        wsel <= wsel_p[p][j];
+        wg <= wg_p[p][j];
       end
       wire [GW+BW-1:0] wa = (GROUPS > 1) ? {wg, wb} : (GW+BW)'(wb);
       // the piece's bytes: a technology RAM with byte enables (rtl/tech)
