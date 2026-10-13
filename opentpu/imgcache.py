@@ -6,7 +6,8 @@ with every matrix in opentpu/qcache.py, 16 minutes with none).
 
 `build(image, W, layout)` is image.build(W) through the cache. The key is everything that
 decides the images' bytes: the checkpoint (W.model_dir: the names, sizes, modification times
-and safetensors headers of its config.json and weight files), the Image's class, the layout
+and safetensors headers of its config.json and weight files; and W.mtp_from's, the checkpoint
+an MTP image's drafter comes from when not the model's), the Image's class, the layout
 (the Engine's: Spec, Config, KV capacity, batch, prefill rows, attention block, the image
 keywords: formats, lookup tables, expert slots and the image's own choices), the OTPU_*
 environment (progcache.keyed_env: some layouts read it, e.g. OTPU_FORMATS), the source of every
@@ -124,6 +125,8 @@ def build(image, W, layout) -> list[np.ndarray]:
     t0 = time.perf_counter()
     d = cache_dir()
     ck = None if d is None else checkpoint(getattr(W, "model_dir", None))
+    if ck is not None and getattr(W, "mtp_from", None) is not None:    # (the MTP layer's)
+        ck = (ck, checkpoint(W.mtp_from))
     if ck is None:
         images = image.build(W)
         last = ("off", time.perf_counter() - t0)

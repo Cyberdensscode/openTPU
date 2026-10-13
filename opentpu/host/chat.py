@@ -1047,8 +1047,12 @@ def main(argv=None):
         "gemma4-26b): its experts stream from a pool file into slots in the card's DRAM "
         "(docs/offload.md 14); --wformat auto takes the formats it ran with on the card")
     moe.add_argument("--pool", help="the expert pool file (default: pool-mx1-<the experts' "
-                                    "format>.bin in the checkpoint's directory; "
-                                    "tools/offload/pack_pool.py packs it)")
+                                    "format>.bin in the checkpoint's directory, with --mtp "
+                                    "pool-mx1-<format>-mtp.bin; tools/offload/pack_pool.py "
+                                    "packs it, extend makes the -mtp one from it)")
+    moe.add_argument("--mtp-from", metavar="DIR",
+                     help="with --mtp: the MTP drafter's checkpoint when the model has none "
+                          "(MiniCPM-V 4.7: its base Qwen3.5-35B-A3B's, docs/offload.md 15.6)")
     moe.add_argument("--experts", type=int, default=0,
                      help="expert slots per MoE layer (default 0: as many as fit the DRAM)")
     moe.add_argument("--policy", choices=("lfu", "lru"), default="lfu",
@@ -1088,9 +1092,9 @@ def main(argv=None):
     wformat = FM.auto(spec, a.wformat)
     streams = ST.streams(spec)          # a MoE: its experts streamed (opentpu/host/streamed.py)
     if streams:
-        if a.backend not in ("isa", "board") or a.mtp or a.per_position:
+        if a.backend not in ("isa", "board") or a.per_position:
             raise SystemExit("otpu-chat: a streamed MoE runs on the ISA simulator or the card "
-                             "(--backend isa or board), resident, without --mtp")
+                             "(--backend isa or board), resident")
         formats = None
         if a.wformat == FM.AUTO:        # the formats it ran with on the card
             wformat, head, formats = ST.defaults(spec)
@@ -1110,8 +1114,8 @@ def main(argv=None):
         from opentpu.isasim import board_config
         cfg = sim_config(spec, a.cap, board_config(PAIR=True, DSTEP=True, STREAM=True),
                          lookup=not a.per_position, wformat=wformat, head_format=a.head_format)
-    if a.mtp and cfg is None:   # the simulators' default is the design's (two slices): the
-        from dataclasses import replace     # card's one-slice configuration instead
+    if a.mtp and cfg is None and not streams:   # the simulators' default is the design's
+        from dataclasses import replace     # (two slices): the card's one-slice configuration
 
         from opentpu.isasim import board_config
         from opentpu.llm.qwen3 import PREFILL_ROWS
@@ -1129,7 +1133,7 @@ def main(argv=None):
                             head_format=a.head_format, formats=formats,
                             embed_host=None if a.embed_table is None else a.embed_table == "host",
                             layer_major=a.layer_major, prog_cache=not a.no_prog_cache,
-                            snapshots=SNAPSHOTS)
+                            snapshots=SNAPSHOTS, mtp=a.mtp, mtp_from=a.mtp_from)
             ST.poll_idle(eng, a.poll_idle)
             print(f"experts: {ST.describe(eng, eng.pool_path)}", flush=True)
         elif a.mtp:

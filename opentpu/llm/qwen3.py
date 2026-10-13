@@ -249,18 +249,30 @@ class LazyWeights(dict):
     it is asked for and not kept: for a model whose fp32 weights would not fit host RAM (a
     MoE; its experts are packed one at a time, opentpu.llm.moe). release() gives the files'
     pages back once the image is built (a later read reopens its file). A tensor with a NaN or
-    an infinity is refused (finite)."""
+    an infinity is refused (finite). mtp: the multi-token prediction layers' tensors (mtp.*,
+    Qwen3.5's drafter) too, from `mtp_from` when given (another checkpoint's: MiniCPM-V 4.7
+    has none, its backbone's base Qwen3.5-35B-A3B's are transplanted, docs/offload.md 15.6)."""
 
-    def __init__(self, model_dir):
+    def __init__(self, model_dir, mtp: bool = False, mtp_from=None):
         super().__init__()
         from safetensors import safe_open
         self.model_dir = Path(model_dir)    # (moe.pool_key: the checkpoint's identity)
+        self.mtp_from = None if mtp_from is None else Path(mtp_from)
         self._at, self._h = {}, {}          # name -> (file, its name there); file -> handle
+        own = mtp and mtp_from is None
         for f in sorted(Path(model_dir).glob("*.safetensors")):
             h = self._h[str(f)] = safe_open(str(f), "pt")
             for k in h.keys():
-                if not k.startswith(VISION + ("mtp.",)):
+                if not k.startswith(VISION + (() if own else ("mtp.",))):
                     self._at[k.replace("model.language_model.", "model.", 1)] = (str(f), k)
+        for f in sorted(Path(mtp_from).glob("*.safetensors")) if mtp and mtp_from else ():
+            h = safe_open(str(f), "pt")
+            keys = [k for k in h.keys() if k.startswith("mtp.")]
+            if keys:
+                self._h[str(f)] = h
+                self._at.update((k, (str(f), k)) for k in keys)
+        if mtp and not any(k.startswith("mtp.") for k in self._at):
+            raise ValueError(f"{mtp_from or model_dir}: no mtp.* tensors (the MTP drafter)")
 
     def _open(self, k):
         from safetensors import safe_open
@@ -2243,7 +2255,8 @@ class Engine:
         if pool_file is not None and getattr(self.image, "offload", None) is not None:
             from .moe import open_pool, pool_key    # its read into the page cache runs during
             pool_file = open_pool(self.image.offload, pool_file, mapped=pool_map,  # the build
-                                  key=pool_key(self.image, getattr(W, "model_dir", None)),
+                                  key=pool_key(self.image, getattr(W, "model_dir", None),
+                                               getattr(W, "mtp_from", None)),
                                   extra=(getattr(self.image, "pool_extra", None) or (0,))[0])
         images = IC.build(self.image, W, self.layout)     # (opentpu/imgcache.py)
         # rollback's snapshots of the state the KV caches do not hold (snapshot.py)

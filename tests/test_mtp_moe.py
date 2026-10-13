@@ -277,3 +277,82 @@ def test_moe_mtp_layer_major_continues_from_slot_1(tiny_moe_mtp, monkeypatch):
     assert any(k[1:] == ("slot", 1) for k in dec.eng._layer_runs if len(k) == 3)
     fresh = MTPDecoder(_layered(spec, W, True)).generate_card(ctx, max_new=10, stop=[])
     assert st.tokens == fresh.tokens == _plain(spec, W, ctx, 10)
+
+
+def test_streamed_mtp_engine_from_a_checkpoint_and_an_extended_pool(tiny_moe_mtp, tmp_path,
+                                                                      monkeypatch):
+    """otpu-chat --mtp on a streamed MoE (streamed.engine(mtp=True)): the checkpoint's mtp.*
+    tensors (LazyWeights(mtp=True)) and the pool pack_pool.py extend makes from the model's own
+    (its experts and marks copied, the MTP layer's after them not packed: the run packs each it
+    asks for from the checkpoint). The loop's tokens equal plain greedy decode's from the
+    model's pool. MiniCPM-V 4.7's case: a checkpoint without mtp.* is refused, and takes them
+    from another (mtp_from), whose identity the pool's key holds: the pool extended for the
+    model's own MTP layer is refused, one extended with --mtp-from serves it."""
+    import json
+    import runpy
+    import sys
+    from pathlib import Path
+
+    from safetensors.numpy import save_file
+
+    from opentpu.host import streamed as ST
+    from opentpu.host.offload import to_split
+    from opentpu.llm.qwen3 import LazyWeights
+    from test_qwen35_moe import _tiny
+
+    W, spec = tiny_moe_mtp
+    hf = _tiny()[0].config
+    hf.tie_word_embeddings = False
+
+    def checkpoint(d, names):
+        d.mkdir()
+        hf.save_pretrained(d)
+        save_file({k: np.ascontiguousarray(W[k]) for k in names}, str(d / "model.safetensors"))
+        return d
+    m = checkpoint(tmp_path / "model", list(W))
+    m2 = checkpoint(tmp_path / "nomtp", [k for k in W if not k.startswith("mtp.")])
+    tool = str(Path(__file__).resolve().parents[1] / "tools" / "offload" / "pack_pool.py")
+
+    def run(*args):
+        monkeypatch.setattr(sys, "argv", ["pack_pool.py", *map(str, args)])
+        try:
+            runpy.run_path(tool, run_name="__main__")
+        finally:
+            monkeypatch.undo()
+
+    a, b, c = (tmp_path / f"{x}.bin" for x in "abc")
+    run(m, a, "init")
+    run(m, a, "pack", 0, 1)
+    run(m, b, "extend", a)
+    run(m2, c, "extend", a, "--mtp-from", m)
+    nE = spec.layers * spec.moe.E
+    pa, pb = (np.fromfile(str(p) + ".packed", np.uint8) for p in (a, b))
+    assert pa.tolist() == [1] * nE and pb.tolist() == [1] * nE + [0] * spec.moe.E
+    slot = a.stat().st_size // nE
+    assert b.read_bytes()[:nE * slot] == a.read_bytes()
+    kb, kc = (json.loads(Path(str(p) + ".key").read_text()) for p in (b, c))
+    assert kb["layout"]["layers"] == spec.layers + 1 and "mtp_from" not in kb
+    assert kc["mtp_from"] and {k: v for k, v in kc.items() if k not in ("mtp_from", "model")} \
+        == {k: v for k, v in kb.items() if k != "model"}
+
+    prompt = [int(t) for t in np.random.default_rng(4).integers(0, 1000, 9)]
+    N = 12
+    kw = dict(cap=512, experts=SLOTS, wformat="fp4", head_format="int8")     # (the pools')
+    want = ST.engine(m, CFG, pool=a, **kw).generate(prompt, max_new=N)
+    eng = ST.engine(m, CFG, pool=b, mtp=True, **kw)
+    assert eng.image.rows == 2 and eng.image.offload.layers == spec.layers + 1
+    dec = MTPDecoder(eng)
+    assert dec.generate_card(prompt, max_new=N, stop=[]).tokens == want
+    got = np.fromfile(str(b) + ".packed", np.uint8)[nE:]
+    assert got.any()                        # the MTP layer's experts it asked for, packed
+    Wm, img = LazyWeights(m, mtp=True), eng.image
+    pool = np.fromfile(b, np.uint8).reshape(-1, slot)
+    for e in np.nonzero(got)[0]:
+        assert np.array_equal(pool[nE + e], np.asarray(to_split(img.expert(Wm, nE + e)))
+                              .view(np.uint8)), e
+    with pytest.raises(ValueError, match="no mtp.. tensors"):
+        ST.engine(m2, CFG, pool=c, mtp=True, **kw)
+    with pytest.raises(ST.PoolError, match="mtp_from differ"):
+        ST.engine(m2, CFG, pool=b, mtp=True, mtp_from=m, **kw)
+    eng = ST.engine(m2, CFG, pool=c, mtp=True, mtp_from=m, **kw)
+    assert MTPDecoder(eng).generate_card(prompt, max_new=N, stop=[]).tokens == want

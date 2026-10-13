@@ -12,6 +12,8 @@ the whole checkpoint: in parallel workers on its host, or streamed into a pool o
     python3 tools/offload/pack_pool.py MODEL POOL info           # its format, layout, packed experts
     python3 tools/offload/pack_pool.py MODEL POOL sums IDS       # sha256 of the pool's records IDS
     python3 tools/offload/pack_pool.py MODEL - sums IDS          # ... of the experts packed now
+    python3 tools/offload/pack_pool.py MODEL POOL extend SRC     # an MTP image's pool: SRC's
+                                                                  # experts, the MTP layer's after
 
 The card's host keeps a checkpoint without the experts (strip_experts.py), so its pool must be
 whole before a run warms more slots than the experts it packed itself: session 5 filled the 35B's
@@ -36,6 +38,14 @@ its slot size says (int8, or 4-bit: fp4 and int4 have the same size).
 (a file of global ids, one a line, or a number N: N ids spread over the pool) as the pool holds
 them, or as this tree packs them from the whole checkpoint (`-`). The two lists are equal when
 the pool's experts are this tree's (the split format's bytes, as pack writes them).
+
+--mtp: the pool of an MTP image (Spec.mtp, Qwen3.5's drafter, docs/offload.md 15.6): its MTP
+layer's MoE is one more layer of the pool's, its experts (mtp.layers.0.mlp.experts.E.*) after
+the model's (g = layers * E + e); --mtp-from DIR takes the mtp.* tensors from another
+checkpoint (MiniCPM-V 4.7 has none: its base Qwen3.5-35B-A3B's), named in the key. `extend SRC`
+makes one from the model's own pool SRC (its key checked) without packing it again: a copy of
+SRC's experts and marks, the MTP layer's experts not packed (the run packs each on its first
+use, or `pack ... --mtp` workers do). SRC is only read.
 """
 from __future__ import annotations
 
@@ -49,12 +59,62 @@ import time
 import numpy as np
 
 
-def image(model: str, wformat: str):
+def image(model: str, wformat: str, mtp: bool = False):
     from opentpu.isasim import board_config
     from opentpu.llm import load_spec
     spec = load_spec(model)
+    if mtp:                                 # (the MTP layer's MoE: one more layer; 2 rows)
+        spec = dataclasses.replace(spec, mtp=True)
     cfg = dataclasses.replace(board_config(), DRAM_BYTES=1 << 40)   # the layout only
-    return spec.image(cfg, 1024, 1, 1, wformat, "int8", lookup=True, experts=spec.moe.k)
+    return spec.image(cfg, 1024, 1, 2 if mtp else 1, wformat, "int8", lookup=True,
+                      experts=spec.moe.k)
+
+
+def weights(a):
+    """The checkpoint's tensors as the pool's experts read them (an MTP pool's: with mtp.*)."""
+    from opentpu.llm.qwen3 import LazyWeights
+    return LazyWeights(a.model, mtp=True, mtp_from=a.mtp_from) if a.mtp else \
+        LazyWeights(a.model)
+
+
+def extend(a, n: int, slot: int, key: dict) -> None:
+    """POOL: an MTP image's pool from the model's own pool SRC (a.args[0]), checked by its key:
+    SRC's experts and marks copied, the MTP layer's experts after them not packed."""
+    import shutil
+    from opentpu.host.offload import SPLIT
+    from opentpu.llm import moe as MO
+    src = a.args[0]
+    base = image(a.model, a.wformat)
+    L0 = base.offload
+    n0 = L0.layers * L0.E
+    if os.path.exists(a.pool):
+        sys.exit(f"{a.pool} exists")
+    if L0.slot_bytes != slot or n0 >= n:
+        sys.exit(f"the MTP image's pool ({n} experts of {slot} bytes) does not extend the "
+                 f"model's ({n0} of {L0.slot_bytes})")
+    try:
+        MO.check_pool_key(src, MO.pool_key(base, a.model))
+    except ValueError as e:
+        sys.exit(str(e))
+    if os.path.getsize(src) != n0 * slot:
+        sys.exit(f"{src}: {os.path.getsize(src)} bytes, not {n0} experts of {slot}")
+    fmt = src + ".format"
+    if not (os.path.exists(fmt) and open(fmt).read().strip() == SPLIT):
+        sys.exit(f"{src} is not in the split format ({SPLIT}): repack it")
+    pk = src + ".packed"
+    done = np.fromfile(pk, np.uint8) if os.path.exists(pk) else np.ones(n0, np.uint8)
+    if len(done) != n0:
+        sys.exit(f"{pk}: {len(done)} marks, not {n0}")
+    t0 = time.time()
+    shutil.copyfile(src, a.pool)
+    with open(a.pool, "r+b") as f:
+        f.truncate(n * slot)                # (the MTP layer's experts: sparse until packed)
+    np.concatenate([done, np.zeros(n - n0, np.uint8)]).tofile(a.pool + ".packed")
+    open(a.pool + ".format", "w").write(SPLIT + "\n")
+    open(a.pool + ".key", "w").write(json.dumps(key, indent=1) + "\n")
+    print(f"extend {a.pool}: {src}'s {int(done.astype(bool).sum())} of {n0} experts packed "
+          f"({time.time() - t0:.0f} s), {n - n0} more not packed (the MTP layer's); "
+          f"{n} x {slot} = {n * slot / 1e9:.2f} GB, {key['format']}")
 
 
 def info(a, key: dict) -> None:
@@ -94,8 +154,7 @@ def sums(a, img, n: int, slot: int) -> None:
     ids = [i * n // int(arg) for i in range(int(arg))] if arg.isdigit() else \
         [int(x) for x in open(arg).read().split()]
     if a.pool == "-":
-        from opentpu.llm.qwen3 import LazyWeights
-        W = LazyWeights(a.model)
+        W = weights(a)
         get = lambda g: to_split(img.expert(W, g))                     # noqa: E731
     else:
         if os.path.getsize(a.pool) != n * slot:
@@ -112,20 +171,30 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("model")
     ap.add_argument("pool")
-    ap.add_argument("mode", choices=("init", "pack", "send", "recv", "stamp", "info", "sums"))
+    ap.add_argument("mode", choices=("init", "pack", "send", "recv", "stamp", "info", "sums",
+                                     "extend"))
     ap.add_argument("args", nargs="*")
     ap.add_argument("--wformat", default="fp4", help="the image's weight format (default fp4)")
+    ap.add_argument("--mtp", action="store_true",
+                    help="an MTP image's pool: its MTP layer's experts after the model's "
+                         "(extend: always)")
+    ap.add_argument("--mtp-from", metavar="DIR",
+                    help="the checkpoint of the MTP layer (mtp.*) when not MODEL's (--mtp)")
     a = ap.parse_args()
+    a.mtp = a.mtp or a.mode == "extend" or a.mtp_from is not None
     from opentpu.host.offload import SPLIT, to_split
     from opentpu.llm import moe as MO
 
-    img = image(a.model, a.wformat)
+    img = image(a.model, a.wformat, a.mtp)
     L = img.offload
     n, slot = L.layers * L.E, L.slot_bytes
     # the experts' key: a file of n experts (staged vision's entries past them, pool_key's
     # "vision", are appended by the first staged run's open_pool, which then adds "vision";
     # with it here, pool_entries would count them, and open_pool truncate the pool as new)
-    key = {k: v for k, v in MO.pool_key(img, a.model).items() if k != "vision"}
+    key = {k: v for k, v in MO.pool_key(img, a.model, a.mtp_from).items() if k != "vision"}
+    if a.mode == "extend":
+        extend(a, n, slot, key)
+        return
     if a.mode == "info":
         info(a, key)
         return
@@ -190,7 +259,6 @@ def main():
         print(f"recv: {k} experts", file=sys.stderr)
         return
 
-    from opentpu.llm.qwen3 import LazyWeights
     if a.mode == "send":
         ids = [int(x) for x in open(a.args[0]).read().split()]
         out, log = os.fdopen(sys.stdout.fileno(), "wb", buffering=0, closefd=False), sys.stderr
@@ -203,7 +271,7 @@ def main():
         ids = [g for g in range(i * n // k, (i + 1) * n // k) if not packed[g]]   # a rerun resumes
         fd, pk = os.open(a.pool, os.O_WRONLY), os.open(a.pool + ".packed", os.O_WRONLY)
         log = sys.stdout
-    W, t0 = LazyWeights(a.model), time.time()
+    W, t0 = weights(a), time.time()
     for c, g in enumerate(ids):
         b = to_split(img.expert(W, g))
         assert len(b) == slot

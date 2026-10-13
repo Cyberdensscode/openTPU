@@ -220,32 +220,40 @@ def checkpoint_id(model_dir) -> str | None:
     return hashlib.blake2b(f.read_bytes(), digest_size=16).hexdigest()
 
 
-def pool_key(image, model_dir=None) -> dict:
+def pool_key(image, model_dir=None, mtp_from=None) -> dict:
     """The key of `image`'s expert pool (`<pool>.key`, JSON): what decides its experts' bytes,
     the MXU's numerics (quant.MX_NUMERICS: key 2 and on; a key 1 pool holds the scale words of
     the MXU before MX, docs/mx_mxu.md), the quantizer's code (quant_source), the format, D, the
     layout (the pool's and the slot's: ExpertFormat's parts) and the checkpoint
-    (checkpoint_id); "numpy" and "model" are notes, not compared. An image with entries past
-    the experts (`pool_extra`: (their count, their key), MiniCPM-V's vision pieces staged
-    through the slots, docs/minicpmv.md 4.2) adds "vision": their key, which open_pool
-    compares on its own (key_diff does not: the experts' part of a pool is the same)."""
+    (checkpoint_id); "numpy" and "model" are notes, not compared. mtp_from: the checkpoint an
+    MTP image's MTP layer (its experts the pool's last layer) comes from when not the model's
+    (LazyWeights.mtp_from: MiniCPM-V 4.7's, docs/offload.md 15.6), its checkpoint_id as
+    "mtp_from". An image with entries past the experts (`pool_extra`: (their count, their key),
+    MiniCPM-V's vision pieces staged through the slots, docs/minicpmv.md 4.2) adds "vision":
+    their key, which open_pool compares on its own (key_diff does not: the experts' part of a
+    pool is the same)."""
     f, L = image.fmt, image.offload
-    return {"key": 2, "numerics": Q.MX_NUMERICS, "quant": quant_source(f.wformat),
-            "format": f.wformat, "D": f.D,
-            "layout": {"layers": L.layers, "E": L.E, "slot_bytes": L.slot_bytes, "H": f.H,
-                       "F": f.F0, "C": f.C, "wg": list(f.wg), "wu": list(f.wu),
-                       "wd": [list(x) for x in f.wd]},
-            "checkpoint": checkpoint_id(model_dir), "numpy": np.__version__,
-            "model": None if model_dir is None else Path(model_dir).name,
-            **({} if getattr(image, "pool_extra", None) is None else
-               {"vision": image.pool_extra[1]})}
+    key = {"key": 2, "numerics": Q.MX_NUMERICS, "quant": quant_source(f.wformat),
+           "format": f.wformat, "D": f.D,
+           "layout": {"layers": L.layers, "E": L.E, "slot_bytes": L.slot_bytes, "H": f.H,
+                      "F": f.F0, "C": f.C, "wg": list(f.wg), "wu": list(f.wu),
+                      "wd": [list(x) for x in f.wd]},
+           "checkpoint": checkpoint_id(model_dir), "numpy": np.__version__,
+           "model": None if model_dir is None else Path(model_dir).name}
+    if mtp_from is not None:
+        key["mtp_from"] = checkpoint_id(mtp_from)
+    if getattr(image, "pool_extra", None) is not None:
+        key["vision"] = image.pool_extra[1]
+    return key
 
 
 def key_diff(have: dict, want: dict) -> list:
     """The fields in which a pool's key `have` differs from `want` (the checkpoint only when
-    both know it)."""
+    both know it; the MTP layer's checkpoint, mtp_from, whenever either names one)."""
     out = [k for k in ("key", "numerics", "quant", "format", "D", "layout")
            if have.get(k) != want.get(k)]
+    if have.get("mtp_from") != want.get("mtp_from"):
+        out.append("mtp_from")
     if None not in (have.get("checkpoint"), want.get("checkpoint")) and \
             have["checkpoint"] != want["checkpoint"]:
         out.append("checkpoint")
