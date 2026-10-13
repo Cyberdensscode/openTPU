@@ -535,21 +535,35 @@ class VisionImage:
     """The vision tower's and projector's part of a MiniCPM-V image in one slice's DRAM
     (docs/minicpmv.md 4.2): the weights in MXU formats (the checkpoint's shapes, but the MLPs'
     widths padded to their chunks with zero rows and columns and the patch rows' 588 to 640;
-    each LayerNorm's bias folded into the next linear's; `fmt`: their formats, formats()),
-    each encoder layer a block of `lstride` bytes (a run-time layer index addresses any of
-    them; block `layers` is the window merger's attention); the work area of a crop of up to
+    each LayerNorm's bias folded into the next linear's; `fmt`: their formats, formats()), in
+    pieces of at most `max_piece` bytes (kernels/pieces.py: an expert slot's, so the host can
+    stage them into slots); the vectors (gains, biases) in a block a layer (block `layers` is
+    the window merger's attention), `lstride` bytes apart; the work area of a crop of up to
     `nmax` patches (the host's patch rows P and position-table rows E, the residual rows X and
     X2, the Q and O scratch, the KV scratch) and the projector's output rows `vis`
     (`out_rows`: the prompt's image rows). `b`: the image's allocator (qwen3._Bump), from its
-    next byte."""
+    next byte.
+
+    The pieces' addresses: `table` (the default) has the kernels read them from a table in
+    DRAM (`pieces()` order: each layer block's PL, then the window merger's, the projector's
+    and the patch embedding's), so the same programs run with the pieces resident (`resident`:
+    laid out after each layer's vectors, the table holding their addresses, written at build)
+    or staged into expert slots by the host (resident False: the pieces' bytes are the pool's
+    entries, the table written per image). table False: static addresses, the resident
+    pieces' (the reference the table runs are checked against, bit for bit)."""
 
     CHUNK = 256         # the MLPs' F chunk (a 4-bit W2's column slices: whole 2D)
     WCHUNK = 512        # the window merger's (17216 -> 17408)
+    WUNIT = 256         # its W1 rows a piece holds at least (a chunk then spans two pieces)
     PARTS = (768, 512, 256, 128)    # vit_merge's pieces: the widest that splits 4C (1152: 768,
     #                                 6 blocks: an even first block for a 4-bit W1)
+    MAX_PIECE = 1712128             # a piece's bytes by default: qwen35-35b's fp4 expert slot
+    LMATS = ("wq", "wk", "wv", "wo", "w1", "w2")
 
     def __init__(self, vs: VisionSpec, cfg, b, nmax: int = 2048, out_rows: int = 2048,
-                 fmt: str = "int8"):
+                 fmt: str = "int8", max_piece: int | None = None, resident: bool = True,
+                 table: bool = True):
+        from ..kernels import pieces as PC
         D = cfg.D
         self.vs, self.cfg = vs, cfg
         self.tables = {}                # the host's tables (build: "pos", the position table)
@@ -563,33 +577,73 @@ class VisionImage:
         self.KP = _up(3 * vs.patch ** 2, D)
         self.part = next(p for p in self.PARTS if (4 * C) % p == 0)
         self.nmax, self.out_rows = _up(nmax, D), out_rows     # V^T rows: whole D stretches
+        if not (resident or table):
+            raise ValueError("staged pieces are read from the table")
+        self.resident, self.use_table = resident, table
+        self.max_piece = mp = max_piece or self.MAX_PIECE
         HP = H * self.dp
 
-        def mat(bump, n, k, f):
-            return (bump.alloc(n * Q.row_bytes(k, f, D)), bump.alloc(n * Q.scale_bytes(k, f, D)),
-                    n, k, f)
+        def mat(n, k, f, unit, parts=False):
+            return PC.plan(n, k, f, D, unit, mp, parts)
+        dh = vs.head_dim
+        # the matrices in pieces of whole units: a head's rows (q, k, v), D rows (out, the
+        # embedding: a piece's output columns an MM), MLP chunks of rows (W1), column parts (W2)
+        self.lmats = dict(wq=mat(C, C, F_["attn"], dh), wk=mat(C, C, F_["attn"], dh),
+                          wv=mat(C, C, F_["attn"], dh), wo=mat(C, C, F_["attn"], D),
+                          w1=mat(self.F, C, F_["mlp"], self.CHUNK),
+                          w2=mat(C, self.F, F_["mlp"], self.CHUNK, parts=True))
+        self.mmats = {"wm": dict(w1=mat(self.FW, 4 * C, F_["wm"], self.WUNIT),
+                                 w2=mat(C, self.FW, F_["wm"], self.WCHUNK, parts=True)),
+                      "proj": dict(w1=mat(4 * C, 4 * C, F_["proj"], self.CHUNK),
+                                   w2=mat(vs.out, 4 * C, F_["proj"], self.CHUNK, parts=True))}
+        self.emat = mat(C, self.KP, F_["embed"], D)
+        # the table's order: per layer block its matrices' pieces (PL words), then the window
+        # merger's, the projector's, the embedding's
+        self.lfirst, a = {}, 0
+        for n in self.LMATS:
+            self.lfirst[n], a = a, a + len(self.lmats[n].groups)
+        self.PL = a
+        self.mfirst, a = {}, (vs.layers + 1) * self.PL
+        for m in ("wm", "proj"):
+            for n in ("w1", "w2"):
+                self.mfirst[m, n], a = a, a + len(self.mmats[m][n].groups)
+        self.efirst, self.npieces = a, a + len(self.emat.groups)
+        # a layer block: its vectors, then (resident) its pieces
         from .qwen3 import _Bump
-        lb = _Bump()                                    # a layer block's offsets
-        self.lofs = dict(ln1w=lb.alloc(4 * C), ln2w=lb.alloc(4 * C),
-                         wq=mat(lb, C, C, F_["attn"]), bq=lb.alloc(4 * C),
-                         wk=mat(lb, C, C, F_["attn"]), bk=lb.alloc(4 * C),
-                         wv=mat(lb, C, C, F_["attn"]), bv=lb.alloc(4 * C),
-                         wo=mat(lb, C, C, F_["attn"]), bo=lb.alloc(4 * C),
-                         w1=mat(lb, self.F, C, F_["mlp"]), b1=lb.alloc(4 * self.F),
-                         w2=mat(lb, C, self.F, F_["mlp"]), b2=lb.alloc(4 * C))
+        lb = _Bump()
+        self.lofs = dict(ln1w=lb.alloc(4 * C), ln2w=lb.alloc(4 * C), bq=lb.alloc(4 * C),
+                         bk=lb.alloc(4 * C), bv=lb.alloc(4 * C), bo=lb.alloc(4 * C),
+                         b1=lb.alloc(4 * self.F), b2=lb.alloc(4 * C))
+        self.lpiece = {}                # (matrix, piece) -> offset in the block (resident)
+        if resident:
+            lb.next = _up(lb.next, 4096)
+            for n in self.LMATS:
+                for i in range(len(self.lmats[n].groups)):
+                    self.lpiece[n, i] = lb.alloc(_up(self.lmats[n].piece_bytes(i), 128))
         self.lstride = _up(lb.next, 4096)
         self.layer0 = _up(b.next, 4096)
         b.next = self.layer0 + (vs.layers + 1) * self.lstride
         self.start = self.layer0
-        self.wm = dict(pre_w=b.alloc(16 * C), pre_b=b.alloc(16 * C),
-                       w1=mat(b, self.FW, 4 * C, F_["wm"]), b1=b.alloc(4 * self.FW),
-                       w2=mat(b, C, self.FW, F_["wm"]), b2=b.alloc(4 * C))
+        self.wm = dict(pre_w=b.alloc(16 * C), pre_b=b.alloc(16 * C), b1=b.alloc(4 * self.FW),
+                       b2=b.alloc(4 * C))
         self.post = (b.alloc(4 * C), b.alloc(4 * C))
-        self.proj = dict(pre_w=b.alloc(16 * C), pre_b=b.alloc(16 * C),
-                         w1=mat(b, 4 * C, 4 * C, F_["proj"]), b1=b.alloc(16 * C),
-                         w2=mat(b, vs.out, 4 * C, F_["proj"]), b2=b.alloc(4 * vs.out))
-        self.emb = dict(wp=mat(b, C, self.KP, F_["embed"]), bp=b.alloc(4 * C))
+        self.proj = dict(pre_w=b.alloc(16 * C), pre_b=b.alloc(16 * C), b1=b.alloc(16 * C),
+                         b2=b.alloc(4 * vs.out))
+        self.emb = dict(bp=b.alloc(4 * C))
+        self.table = b.alloc(4 * self.npieces)
+        self.mpiece = {}                # (merge, matrix, piece) / ("emb", piece) -> address
+        if resident:
+            b.next = _up(b.next, 4096)
+            for m in ("wm", "proj"):
+                for n in ("w1", "w2"):
+                    for i in range(len(self.mmats[m][n].groups)):
+                        self.mpiece[m, n, i] = b.alloc(_up(self.mmats[m][n].piece_bytes(i),
+                                                           128))
+            for i in range(len(self.emat.groups)):
+                self.mpiece["emb", i] = b.alloc(_up(self.emat.piece_bytes(i), 128))
         self.weights_end = b.next
+        # the RLD bound of a piece's address: the resident pieces' span (set_bound: the slots')
+        self.bound = (self.layer0, max(self.weights_end - 1, self.layer0))
         n = self.nmax
         self.work = dict(P=b.alloc(4 * n * self.KP), E=b.alloc(4 * n * C),
                          X=b.alloc(4 * n * C), X2=b.alloc(4 * n // 4 * C),
@@ -617,41 +671,94 @@ class VisionImage:
             out[k] = f
         return out
 
-    # ---- descriptors
-    def _w(self, base, m):
-        from ..compiler import QTensor
-        a, s, n, k, _ = m
-        return QTensor.weight(base + a, base + s, n, k, m[4], self.cfg.D)
+    def set_bound(self, lo: int, hi: int) -> None:
+        """Staged pieces: the addresses a piece may be at (the slot region's), RLD's bound."""
+        self.bound = (int(lo), int(hi))
 
+    # ---- the pieces
+    def pieces(self) -> list:
+        """Every piece in the table's order: (key, Layout, piece index), key ("l", layer,
+        matrix), ("m", "wm" / "proj", matrix) or ("emb",)."""
+        out = []
+        for li in range(self.vs.layers + 1):
+            for n in self.LMATS:
+                lay = self.lmats[n]
+                out += [(("l", li, n), lay, i) for i in range(len(lay.groups))]
+        for m in ("wm", "proj"):
+            for n in ("w1", "w2"):
+                lay = self.mmats[m][n]
+                out += [(("m", m, n), lay, i) for i in range(len(lay.groups))]
+        out += [(("emb",), self.emat, i) for i in range(len(self.emat.groups))]
+        return out
+
+    def resident_addresses(self) -> np.ndarray:
+        """The table of the resident pieces' addresses (uint32, pieces() order)."""
+        if not self.resident:
+            raise ValueError("the pieces are not resident")
+        out = []
+        for li in range(self.vs.layers + 1):
+            for n in self.LMATS:
+                out += [self.layer0 + li * self.lstride + self.lpiece[n, i]
+                        for i in range(len(self.lmats[n].groups))]
+        for m in ("wm", "proj"):
+            for n in ("w1", "w2"):
+                out += [self.mpiece[m, n, i] for i in range(len(self.mmats[m][n].groups))]
+        out += [self.mpiece["emb", i] for i in range(len(self.emat.groups))]
+        return np.array(out, np.uint32)
+
+    # ---- descriptors
     @staticmethod
     def _v(base, a, n):
         from ..compiler import Affine, Tensor
         return Tensor(Affine.of(base) + a, (n,), (1,))
+
+    def _table(self, first: int, n: int, li=None):
+        from ..compiler import Affine, Tensor
+        from ..kernels import pieces as PC
+        at = Affine(self.table + 4 * first)
+        if li is not None:
+            at = at + Affine.of(li) * (4 * self.PL)
+        return PC.Table(Tensor(at, (n,), (1,)), n, self.bound)
 
     def layer(self, li):
         """Encoder layer li's weights (li an int or a run-time value; vs.layers: the window
         merger's attention, whose block has the layers' layout)."""
         from types import SimpleNamespace
         from ..compiler import Affine
+        from ..kernels import pieces as PC
         base = Affine(self.layer0) + Affine.of(li) * self.lstride
         o, C = self.lofs, self.C
+        if self.use_table:
+            t = self._table(0, self.PL, li)
+            ws = {n: PC.PQ(self.lmats[n], table=t, first=self.lfirst[n]) for n in self.LMATS}
+        else:
+            ws = {n: PC.PQ(self.lmats[n], bases=[base + self.lpiece[n, i] for i in
+                                                 range(len(self.lmats[n].groups))])
+                  for n in self.LMATS}
         return SimpleNamespace(
             ln1w=self._v(base, o["ln1w"], C), ln2w=self._v(base, o["ln2w"], C),
-            wq=self._w(base, o["wq"]), bq=self._v(base, o["bq"], C),
-            wk=self._w(base, o["wk"]), bk=self._v(base, o["bk"], C),
-            wv=self._w(base, o["wv"]), bv=self._v(base, o["bv"], C),
-            wo=self._w(base, o["wo"]), bo=self._v(base, o["bo"], C),
-            w1=self._w(base, o["w1"]), b1=self._v(base, o["b1"], self.F),
-            w2=self._w(base, o["w2"]), b2=self._v(base, o["b2"], C))
+            bq=self._v(base, o["bq"], C), bk=self._v(base, o["bk"], C),
+            bv=self._v(base, o["bv"], C), bo=self._v(base, o["bo"], C),
+            b1=self._v(base, o["b1"], self.F), b2=self._v(base, o["b2"], C), **ws)
+
+    def _mat(self, m, n, lay):
+        from ..kernels import pieces as PC
+        if self.use_table:
+            first = self.efirst if m == "emb" else self.mfirst[m, n]
+            return PC.PQ(lay, table=self._table(first, len(lay.groups)), first=0)
+        return PC.PQ(lay, bases=[self.mpiece[(m, i) if m == "emb" else (m, n, i)]
+                                 for i in range(len(lay.groups))])
 
     def merge_weights(self, which: str):
         """The window merger's MLP ("wm") or the projector's ("proj") for vit_merge."""
         from types import SimpleNamespace
-        m, C = getattr(self, which), self.C
+        m, C, mm = getattr(self, which), self.C, self.mmats[which]
         return SimpleNamespace(pre_w=self._v(0, m["pre_w"], 4 * C),
                                pre_b=self._v(0, m["pre_b"], 4 * C),
-                               w1=self._w(0, m["w1"]), b1=self._v(0, m["b1"], m["w1"][2]),
-                               w2=self._w(0, m["w2"]), b2=self._v(0, m["b2"], m["w2"][2]))
+                               w1=self._mat(which, "w1", mm["w1"]),
+                               b1=self._v(0, m["b1"], mm["w1"].n),
+                               w2=self._mat(which, "w2", mm["w2"]),
+                               b2=self._v(0, m["b2"], mm["w2"].n))
 
     def descriptors(self):
         """The phases' `v`: the work area, the embedding's weights, the post norm."""
@@ -666,20 +773,17 @@ class VisionImage:
             Q=[t(w["Q"] + 4 * h * n * self.dp, (n, self.dp)) for h in range(self.heads)],
             O=t(w["O"], (n, C)), vis=t(w["vis"], (self.out_rows, self.vs.out)),
             kv=VitKV(self.kvh, n, self.dp, self.cfg.D, 1, 0, dv=self.dv),
-            emb=SimpleNamespace(wp=self._w(0, self.emb["wp"]), bp=self._v(0, self.emb["bp"], C)),
+            emb=SimpleNamespace(wp=self._mat("emb", None, self.emat),
+                                bp=self._v(0, self.emb["bp"], C)),
             post=(self._v(0, self.post[0], C), self._v(0, self.post[1], C)))
 
     # ---- contents
-    def build(self, W: dict, put) -> None:
-        """Write the weights (W: load_vision's tensors) with put(addr, array); keep the
-        position table for the host's rows (host_rows)."""
-        vs, C, D = self.vs, self.C, self.cfg.D
+    def _matrices(self, W: dict):
+        """The float matrices by piece key, padded as laid out, and the vectors (address,
+        values): the checkpoint's tensors (load_vision's), each LayerNorm's bias folded into
+        the next linear's bias (float64)."""
+        vs, C = self.vs, self.C
         f32 = np.float32
-
-        def put_m(base, m, a):
-            q, s = Q.quantize_mxu(np.asarray(a, f32), m[4], D)
-            put(base + m[0], q)
-            put(base + m[1], s)
 
         def pad(a, shape):
             a = np.asarray(a, f32)
@@ -687,46 +791,70 @@ class VisionImage:
             out[tuple(slice(0, n) for n in a.shape)] = a
             return out
 
-        def vec(addr, a):
-            put(addr, np.asarray(a, f32))
-
-        o = self.lofs
-
         def folded(p, ln):      # the linear's bias with the LayerNorm's before it folded in
             return W[p + ".bias"] + W[p + ".weight"].astype(np.float64) @ W[ln + ".bias"]
-
-        def attn(base, p):
+        mats, vecs = {}, []
+        o = self.lofs
+        for li in range(vs.layers + 1):
+            base = self.layer0 + li * self.lstride
+            merger = li == vs.layers
+            p = f"{TOWER}vit_merger." if merger else f"{TOWER}encoder.layers.{li}."
             for n in "qkv":
-                put_m(base, o["w" + n], W[p + f"self_attn.{n}_proj.weight"])
-                vec(base + o["b" + n], folded(p + f"self_attn.{n}_proj", p + "layer_norm1"))
-            put_m(base, o["wo"], W[p + "self_attn.out_proj.weight"])
-            vec(base + o["bo"], W[p + "self_attn.out_proj.bias"])
-            vec(base + o["ln1w"], W[p + "layer_norm1.weight"])
-
-        for i in range(vs.layers):
-            base = self.layer0 + i * self.lstride
-            p = f"{TOWER}encoder.layers.{i}."
-            attn(base, p)
-            vec(base + o["ln2w"], W[p + "layer_norm2.weight"])
-            put_m(base, o["w1"], pad(W[p + "mlp.fc1.weight"], (self.F, C)))
-            vec(base + o["b1"], pad(folded(p + "mlp.fc1", p + "layer_norm2"), (self.F,)))
-            put_m(base, o["w2"], pad(W[p + "mlp.fc2.weight"], (C, self.F)))
-            vec(base + o["b2"], W[p + "mlp.fc2.bias"])
-        attn(self.layer0 + vs.layers * self.lstride, TOWER + "vit_merger.")
-        for m, p, F in ((self.wm, TOWER + "vit_merger.", self.FW),
-                        (self.proj, MERGER + "mlp.0.", 4 * C)):
-            vec(m["pre_w"], W[p + "pre_norm.weight"])
-            vec(m["pre_b"], W[p + "pre_norm.bias"])
-            put_m(0, m["w1"], pad(W[p + "linear_1.weight"], (F, 4 * C)))
-            vec(m["b1"], pad(W[p + "linear_1.bias"], (F,)))
-            put_m(0, m["w2"], pad(W[p + "linear_2.weight"], (m["w2"][2], F)))
-            vec(m["b2"], W[p + "linear_2.bias"])
-        vec(self.post[0], W[TOWER + "post_layernorm.weight"])
-        vec(self.post[1], W[TOWER + "post_layernorm.bias"])
+                mats["l", li, "w" + n] = W[p + f"self_attn.{n}_proj.weight"]
+                vecs.append((base + o["b" + n],
+                             folded(p + f"self_attn.{n}_proj", p + "layer_norm1")))
+            mats["l", li, "wo"] = W[p + "self_attn.out_proj.weight"]
+            vecs += [(base + o["bo"], W[p + "self_attn.out_proj.bias"]),
+                     (base + o["ln1w"], W[p + "layer_norm1.weight"])]
+            if merger:                  # (no MLP: its block's W1 / W2 stay zero)
+                mats["l", li, "w1"] = np.zeros((self.F, C), f32)
+                mats["l", li, "w2"] = np.zeros((C, self.F), f32)
+                continue
+            vecs += [(base + o["ln2w"], W[p + "layer_norm2.weight"]),
+                     (base + o["b1"], pad(folded(p + "mlp.fc1", p + "layer_norm2"), (self.F,))),
+                     (base + o["b2"], W[p + "mlp.fc2.bias"])]
+            mats["l", li, "w1"] = pad(W[p + "mlp.fc1.weight"], (self.F, C))
+            mats["l", li, "w2"] = pad(W[p + "mlp.fc2.weight"], (C, self.F))
+        for m, p, F in (("wm", TOWER + "vit_merger.", self.FW), ("proj", MERGER + "mlp.0.", 4 * C)):
+            d = getattr(self, m)
+            vecs += [(d["pre_w"], W[p + "pre_norm.weight"]), (d["pre_b"], W[p + "pre_norm.bias"]),
+                     (d["b1"], pad(W[p + "linear_1.bias"], (F,))),
+                     (d["b2"], W[p + "linear_2.bias"])]
+            mats["m", m, "w1"] = pad(W[p + "linear_1.weight"], (F, 4 * C))
+            mats["m", m, "w2"] = pad(W[p + "linear_2.weight"], (self.mmats[m]["w2"].n, F))
+        vecs += [(self.post[0], W[TOWER + "post_layernorm.weight"]),
+                 (self.post[1], W[TOWER + "post_layernorm.bias"]),
+                 (self.emb["bp"], W[TOWER + "embeddings.patch_embedding.bias"])]
         wp = np.asarray(W[TOWER + "embeddings.patch_embedding.weight"], f32).reshape(C, -1)
-        put_m(0, self.emb["wp"], pad(wp, (C, self.KP)))
-        vec(self.emb["bp"], W[TOWER + "embeddings.patch_embedding.bias"])
-        self.tables["pos"] = np.asarray(W[TOWER + "embeddings.position_embedding.weight"], f32)
+        mats["emb", ] = pad(wp, (C, self.KP))
+        return mats, vecs
+
+    def piece_bytes(self, W: dict) -> list:
+        """Every piece's bytes in pieces() order (uint8, each its Layout's piece_bytes): the
+        pool's vision entries, or the resident pieces."""
+        from ..kernels import pieces as PC
+        mats, _ = self._matrices(W)
+        out, done = [], {}
+        for key, lay, i in self.pieces():
+            if key not in done:
+                q, s = Q.quantize_mxu(np.asarray(mats[key], np.float32), lay.fmt, self.cfg.D)
+                done = {key: PC.pack(lay, q, s)}
+            out.append(done[key][i])
+        return out
+
+    def build(self, W: dict, put) -> None:
+        """Write the vectors and (resident) the pieces and their table (W: load_vision's
+        tensors) with put(addr, array); keep the position table for the host's rows
+        (host_rows)."""
+        mats, vecs = self._matrices(W)
+        for addr, v in vecs:
+            put(addr, np.asarray(v, np.float32))
+        if self.resident:
+            for a, p in zip(self.resident_addresses(), self.piece_bytes(W)):
+                put(int(a), p)
+            put(self.table, self.resident_addresses())
+        self.tables["pos"] = np.asarray(W[TOWER + "embeddings.position_embedding.weight"],
+                                        np.float32)
 
     # ---- the runs
     def programs(self, N: int, block: int = 256, R: int | None = None,

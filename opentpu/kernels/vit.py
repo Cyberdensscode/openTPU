@@ -27,11 +27,16 @@ in the same order one level up (the projector's windows consecutive, its rows th
 
 The KV scratch is untiled (VitKV: V^T rows N tokens wide), so a row group's appends are at
 loop-dependent tokens.
+
+The weights may be pieced (kernels/pieces.py: PQ, at static addresses or at the ones a table
+in DRAM holds, the host's staging into expert slots): each phase binds its weights' tables at
+its start, and a row group's body gives its piece registers back at its end (row_groups).
 """
 from __future__ import annotations
 
 from .. import language as ol
 from ..compiler import Affine, CompileError, KVDesc, QTensor, Tensor, current
+from . import pieces as PC
 from .attention import _attend_heads
 from .lib import gelu_tanh
 
@@ -99,25 +104,41 @@ def row_groups(n: int, R: int, body) -> None:
     full, tail = divmod(n, R)
     if full == 1:
         body(0, R)
+        PC.flush()
     elif full > 1:
         for g in ol.range(full):
             body(g * R, R)
+            PC.flush()
     if tail:
         body(full * R, tail)
+        PC.flush()
 
 
-def mlp_bias(xs, w1: QTensor, b1: Tensor, w2: QTensor, chunk: int, act=gelu_tanh, acc=None):
+def _row_parts(w, r0: int, r1: int) -> list:
+    """[r0, r1) of w's rows as slices an MM can stream: one, or a pieced matrix's pieces."""
+    return w.row_split(r0, r1) if isinstance(w, PC.PQ) else [(r0, r1)]
+
+
+def mlp_bias(xs, w1: QTensor, b1: Tensor, w2: QTensor, chunk: int, act=gelu_tanh, acc=None,
+             rows: int | None = None):
     """W2 act(W1 x + b1) for x quantized in xs, F in chunks: chunk c's W1 rows stream while the
     VPU works on chunk c - 1, and its activations (quantized on their own) multiply W2's
     columns of the chunk, added into `acc` (a [R, out] tile: the residual) or a new tile.
-    b2 is the caller's."""
+    b2 is the caller's. A chunk whose W1 rows lie in several pieces (pieces.PQ) is one MM a
+    piece, each writing its columns of the chunk's tile (rows: xs's)."""
     F = w1.shape[0]
     if F % chunk:
         raise CompileError(f"MLP width {F} is not a multiple of its chunk {chunk}")
     starts = list(range(0, F, chunk))
 
     def up(c0):
-        return ol.dot(xs, w1[c0:c0 + chunk, :])
+        parts = _row_parts(w1, c0, c0 + chunk)
+        if len(parts) == 1:
+            return ol.dot(xs, w1[c0:c0 + chunk, :])
+        h = ol.empty([rows, chunk])
+        for a, b in parts:
+            ol.dot(xs, w1[a:b, :], out=h[:, a - c0:b - c0])
+        return h
 
     y = acc
     nxt = up(starts[0])
@@ -137,12 +158,14 @@ def mlp_bias(xs, w1: QTensor, b1: Tensor, w2: QTensor, chunk: int, act=gelu_tanh
 @ol.jit
 def vit_embed(v, N: int, R: int):
     """X[r] = P[r] Wp^T + bp + E[r] for the crop's N rows."""
-    bp = ol.load(v.emb.bp)
+    emb = PC.bind(v.emb)
+    bp = ol.load(emb.bp)
 
     def body(r0, n):
         ps = ol.quantize(ol.load(v.P[r0:r0 + n, :]), free=True)
         x = ol.load(v.E[r0:r0 + n, :])
-        ol.dot(ps, v.emb.wp, acc=x)
+        for a, c in _row_parts(emb.wp, 0, emb.wp.shape[0]):    # (a piece's output columns)
+            ol.dot(ps, emb.wp[a:c, :], acc=x[:, a:c])
         x.set(x + bp[None, :])
         ol.store(v.X[r0:r0 + n, :], x)
     row_groups(N, R, body)
@@ -156,6 +179,7 @@ def vit_qkv(v, lw, src, N: int, R: int, eps: float):
     columns stay 0 (two heads' sets, alternating): the MXU streams no padding rows, the cache
     and Q get D-wide rows. Each starts as its bias (a fill) and the MM accumulates into it."""
     H, dp, dh = v.heads, v.dp, v.dv
+    lw = PC.bind(lw)
     w = ol.load(lw.ln1w)
     bs = ol.load(lw.bq), ol.load(lw.bk), ol.load(lw.bv)
     ws = lw.wq, lw.wk, lw.wv
@@ -264,6 +288,7 @@ def vit_out_mlp(v, lw, dst, N: int, R: int, eps: float, chunk: int, mlp: bool = 
     """dst rows x (the residual, in place): x += O Wo^T + bo, then (mlp) x += W2 gelu(W1
     LayerNorm(x) + b1) + b2; post (w, b): the rows stored LayerNorm'd with it (the tower's
     post_layernorm after its last layer)."""
+    lw = PC.bind(lw)
     bo = ol.load(lw.bo)
     if mlp:
         w2 = ol.load(lw.ln2w)
@@ -274,11 +299,12 @@ def vit_out_mlp(v, lw, dst, N: int, R: int, eps: float, chunk: int, mlp: bool = 
     def body(r0, n):
         os = ol.quantize(ol.load(v.O[r0:r0 + n, :]), free=True)
         x = ol.load(dst[r0:r0 + n, :])
-        ol.dot(os, lw.wo, acc=x)
+        for a, c in _row_parts(lw.wo, 0, lw.wo.shape[0]):      # (a piece's output columns)
+            ol.dot(os, lw.wo[a:c, :], acc=x[:, a:c])
         x.set(x + bo[None, :])
         if mlp:
             zs = layernorm_q(x, w2, eps)
-            mlp_bias(zs, lw.w1, lw.b1, lw.w2, chunk, acc=x)
+            mlp_bias(zs, lw.w1, lw.b1, lw.w2, chunk, acc=x, rows=n)
             x.set(x + b2[None, :])
         if post is not None:
             layernorm_(x, pw[0], pw[1], eps)
@@ -301,6 +327,7 @@ def vit_merge(v, mw, src, dst, N4: int, R: int, eps: float, chunk: int, mean: bo
     if K % part:
         raise CompileError(f"merge pieces of {part} do not split 4C = {K}")
     pieces = list(range(0, K, part))
+    mw = PC.bind(mw)
     b2 = ol.load(mw.b2)
 
     def piece(w0, n, c):
@@ -335,7 +362,7 @@ def vit_merge(v, mw, src, dst, N4: int, R: int, eps: float, chunk: int, mean: bo
             ol.quantize_into(st, t, c)
         if mean:
             y.set(y * 0.25)
-        mlp_bias(st, mw.w1, mw.b1, mw.w2, chunk, act=act, acc=y)
+        mlp_bias(st, mw.w1, mw.b1, mw.w2, chunk, act=act, acc=y, rows=n)
         y.set(y + b2[None, :])
         ol.store(dst[w0:w0 + n, :], y)
 

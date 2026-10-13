@@ -287,6 +287,53 @@ def test_the_tower_on_the_card_is_the_reference(tiny_tower, size):
     assert np.abs(got - ref).max() < 0.05 * np.abs(ref).max()
 
 
+@pytest.mark.parametrize("fmt", ["int8", "attn=fp4,mlp=fp4,wm=fp4,proj=fp4"])
+def test_the_piece_table_is_the_static_layout(fmt):
+    """The pieced weights' table (kernels/pieces.py): the tower's rows with every piece address
+    read from the table, the pieces resident, and with the pieces staged at scattered
+    slot-like addresses (shuffled, as an expert server's victims fall), are the rows of the
+    same pieces at static addresses, bit for bit: only the address source changes. Pieces of
+    at most 300 KB (160 KB at fp4): the window merger's 512-row W1 chunks span two pieces (one
+    MM a piece, each writing its columns), several W2 column parts share a piece."""
+    from opentpu.isasim import board_config
+    from opentpu.kernels.lib import gelu_tanh
+    from opentpu.llm import minicpmv as MV
+    from opentpu.llm.qwen3 import IsaBackend, _Bump
+    vs = MV.VisionSpec(hidden=256, heads=4, ffn=300, layers=3, side=5, insert=1, out=256)
+    rng = np.random.default_rng(8)
+    W = _tiny_vision_weights(vs, rng)
+    cfg = board_config(DRAM_BYTES=1 << 27)
+    size = (8, 12)
+    P = rng.uniform(-1, 1, (96, 3 * vs.patch ** 2)).astype(np.float32)
+    outs = []
+    for mode in ("static", "table", "staged"):
+        vi = MV.VisionImage(vs, cfg, _Bump(), nmax=256, out_rows=64, fmt=fmt,
+                            max_piece=300_000 if fmt == "int8" else 160_000,
+                            resident=mode != "staged",
+                            table=mode != "static")
+        img = np.zeros(cfg.DRAM_BYTES, np.uint8)
+
+        def put(addr, a):
+            v = np.ascontiguousarray(a).view(np.uint8).reshape(-1)
+            img[addr:addr + v.size] = v
+        vi.build(W, put)
+        if mode == "staged":
+            pcs = vi.piece_bytes(W)
+            pitch = -(-max(len(p) for p in pcs) // 4096) * 4096
+            base = -(-vi.end // 4096) * 4096
+            at = base + rng.permutation(len(pcs)) * pitch
+            for a, p in zip(at, pcs):
+                put(int(a), p)
+            put(vi.table, at.astype(np.uint32))
+            vi.set_bound(base, base + (len(pcs) - 1) * pitch)
+        outs.append(vi.encode(IsaBackend(cfg, [img]), P, size, proj_gelu=gelu_tanh))
+    wm = vi.mmats["wm"]
+    assert len(wm["w1"].groups) > vi.FW // vi.WCHUNK
+    assert any(b - a > 1 for a, b in wm["w2"].groups + vi.lmats["w2"].groups)
+    for got in outs[1:]:
+        assert np.array_equal(got.view(np.uint32), outs[0].view(np.uint32))
+
+
 def test_the_card_order_puts_each_window_in_consecutive_rows():
     """card_order: each 4 x 4 block of the grid row-major, its 2 x 2 windows row-major, their
     4 patches row-major. Windows are consecutive rows (windows()' rows, in their order), and
