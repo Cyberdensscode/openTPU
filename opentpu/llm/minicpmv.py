@@ -1080,11 +1080,21 @@ class Image(QW.Image):
             if max(v.piece_sizes()) > L.slot_bytes:
                 raise ValueError(f"vision pieces of up to {max(v.piece_sizes())} bytes, slots "
                                  f"of {L.slot_bytes}")
-            free = sum(max(0, n - L.k) for _, n in L.slots)     # (ExpertServer.place's room)
-            if len(v.used()) > free:
-                raise ValueError(f"staged vision: {len(v.used())} pieces, {free} expert slots "
-                                 f"past k = {L.k} a layer (more slots, or vision_staged False)")
             v.set_bound(*L.slot_bounds)
+
+    def check_room(self) -> None:
+        """Staged vision's pieces against the expert slots past k a layer (ExpertServer.place's
+        room): a ValueError when they do not fit. An engine's image is checked (streamed.engine
+        after it opens, Vision); not every image: streamed.probe's has k slots a layer, the
+        layout alone (session mcpv3's first run, 2026-10-13: the check in __init__ refused the
+        probe, 438 pieces against 0 slots, before the engine's 36 a layer)."""
+        v, L = self.vision, self.offload
+        if v is None or v.resident:
+            return
+        free = sum(max(0, n - L.k) for _, n in L.slots)
+        if len(v.used()) > free:
+            raise ValueError(f"staged vision: {len(v.used())} pieces, {free} expert slots past "
+                             f"k = {L.k} a layer (more slots, or vision_staged False)")
 
     def before_slots(self, b) -> None:
         sp = self.spec
@@ -1207,6 +1217,7 @@ class Vision:
         img = eng.image
         if getattr(img, "vision", None) is None:
             raise ValueError("the engine's image has no vision side (minicpmv.Spec.vision)")
+        img.check_room()
         self.eng, self.img, self.vs = eng, img, eng.spec.vision
         self.table = img.rope_table()
         self.cache = {}                     # VisionImage's programs by patch count

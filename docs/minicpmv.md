@@ -771,6 +771,23 @@ Sessions (the lead runs them; scripts on this branch):
    - **Decode against qwen35-35b** (~5.3 tok/s at 41 slots). MiniCPM-V's formats (5.1, 7)
      read 265 MiB more int8 weights every token (1,520 against 1,255 MiB), ~28 ms a token at
      decode's ~9.8 GB/s. They also have fewer slots.
+3. **mcpv3** (`tools/offload/sessions/mcpv3.sh`): this tree's defaults (staged vision, the
+   tower's wait entries computed ahead, waits._MemoPass, the odd-stride residual), the sliced
+   reference's first run, and what the pool's disk costs.
+   - **First run (2026-10-13, ~19:25 opentpu): FAILED in 3 minutes, on the host only.**
+     - Every run died opening the engine: "staged vision: 438 pieces, 0 expert slots past
+       k = 8".
+     - 3779dc22 checked staged vision's room in every minicpmv.Image's constructor (the
+       pieces against the expert slots past k).
+     - streamed.engine first builds a probe image, the layout alone, at k slots a layer.
+       mcpv2's staged runs came before that check.
+   - **The fix:** the room is Image.check_room, run on an engine's image (streamed.engine once
+     it opens, and Vision).
+   - **Tests:**
+     - test_streamed_engine_opens_staged_vision_past_its_probe runs the tiny model through
+       streamed.engine.
+     - test_the_real_staged_layout_has_room_at_the_cards_slots builds the real layout on the
+       card's 4 GiB: the probe at 8 slots a layer, the engine's 36.
 
 ## 7. Decisions
 

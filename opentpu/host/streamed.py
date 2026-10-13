@@ -240,6 +240,8 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
                  resident=True, experts=experts, pool_file=pool, backend=backend,
                  release_weights=release_weights, pool_map=pool_map, **ekw, **kw)
     eng.pool_path = pool
+    if hasattr(eng.image, "check_room"):        # (MiniCPM-V's staged vision: at the engine's
+        eng.image.check_room()                  # slots, not the probe's k a layer)
     if em_pass:                                 # (the expert runs' passes: 13.18)
         eng.em_pass = em_pass
     if eng.expert_major and em_rows:            # (a short call layer-major: 13.16)

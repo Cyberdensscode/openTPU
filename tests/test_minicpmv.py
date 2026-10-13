@@ -395,7 +395,7 @@ def test_staged_vision_is_the_resident_towers(tiny, pool, tmp_path):
     b = Engine(spec, W, **(dict(kw, pool_file=tmp_path / "pool.bin") if pool else kw))
     with pytest.raises(ValueError, match="staged vision: .* pieces"):   # (2 k slots a layer)
         spec.image(device_config(spec, 256, rows=1, lookup=True, S=1, experts=2 * K), 256, 1, 1,
-                   experts=2 * K)
+                   experts=2 * K).check_room()
     va, vb = a.image.vision, b.image.vision
     assert va.resident and not vb.resident and vb.max_piece <= b.image.offload.slot_bytes
     assert b.image.pool_extra[0] == vb.npieces and a.image.pool_extra is None
@@ -424,6 +424,75 @@ def test_staged_vision_is_the_resident_towers(tiny, pool, tmp_path):
         ga, gb = a.step(t), b.step(t)
         assert np.array_equal(ga.view(np.uint32), gb.view(np.uint32))
         t = int(np.argmax(ga))
+
+
+def test_streamed_engine_opens_staged_vision_past_its_probe(tiny):
+    """streamed.engine's own path with staged vision (the default): its probe image (the
+    layout alone, k slots a layer: no room past k for the pieces) builds, fit_experts sizes the
+    engine's slots, the engine's image has the room (Image.check_room) and a Vision opens on
+    it; an engine of k slots a layer is refused when it opens. Session mcpv3's first run
+    (2026-10-13) died at the probe: the room was checked in every image's constructor."""
+    from opentpu.host import streamed as ST
+    from opentpu.isasim import board_config
+    from opentpu.llm import minicpmv as MV
+    m, d = tiny
+    spec = load_spec(d)
+    assert spec.vision_staged
+    W = dict(load_weights(d).items())
+    W.update(_tiny_vision_weights(spec.vision, np.random.default_rng(7)))
+    cfg = board_config(DRAM_BYTES=1 << 26)
+    kw = dict(wformat="int8", head_format=None)  # (int8 slots: the tiny tower's units fit)
+    pr = ST.probe(spec, cfg, 256, lookup=True, **kw)
+    assert not pr.vision.resident and {n for _, n in pr.offload.slots} == {K}
+    with pytest.raises(ValueError, match="staged vision: .* pieces, 0 expert slots past k"):
+        pr.check_room()
+    eng = ST.engine(d, cfg, "isa", 256, None, W=W, vision_warm=False, **kw)
+    assert not eng.image.vision.resident and min(n for _, n in eng.image.offload.slots) > K
+    MV.Vision(eng)
+    with pytest.raises(ValueError, match="staged vision: .* pieces"):
+        ST.engine(d, cfg, "isa", 256, None, experts=K, W=W, vision_warm=False, **kw)
+
+
+def test_the_real_staged_layout_has_room_at_the_cards_slots(tmp_path):
+    """MiniCPM-V 4.7's own layout (its config: Qwen3.5-35B-A3B's language model, SigLIP2's
+    tower; the family's formats, chat's 2,048-token cache) on the card's 4 GiB, as
+    streamed.engine opens it: the probe image builds at k slots a layer, the slots that fit
+    (fit_experts: 36 a layer, mcpv2's) give the engine's image the room for every staged piece,
+    and at k slots a layer they do not fit. Layouts only, no weights."""
+    from opentpu.host import streamed as ST
+    from opentpu.isasim import board_config
+    tc = transformers.Qwen3_5MoeTextConfig(
+        hidden_size=2048, num_hidden_layers=40, num_attention_heads=16, num_key_value_heads=2,
+        head_dim=256, vocab_size=248144, full_attention_interval=4, attn_output_gate=True,
+        linear_num_key_heads=16, linear_num_value_heads=32, linear_key_head_dim=128,
+        linear_value_head_dim=128, linear_conv_kernel_dim=4, tie_word_embeddings=False,
+        max_position_embeddings=262144, rms_norm_eps=1e-6, num_experts=256,
+        num_experts_per_tok=8, moe_intermediate_size=512, shared_expert_intermediate_size=512,
+        rope_parameters={"rope_type": "default", "rope_theta": 1e7, "partial_rotary_factor": 0.25,
+                         "mrope_interleaved": True, "mrope_section": [11, 11, 10]}).to_dict()
+    tc["model_type"] = "qwen3_5_moe_text"
+    (tmp_path / "config.json").write_text(json.dumps({
+        "architectures": ["MiniCPMV4_7ForConditionalGeneration"], "model_type": "minicpmv4_7",
+        "tie_word_embeddings": False, "text_config": tc, "insert_layer_id": 6,
+        "downsample_mode": "16x", "mrope_mode": "canvas",
+        "vision_config": {"hidden_size": 1152, "intermediate_size": 4304,
+                          "num_hidden_layers": 27, "num_attention_heads": 16, "image_size": 980,
+                          "patch_size": 14, "model_type": "minicpmv4_7_vision"},
+        "image_token_id": 248056, "image_start_id": 248078, "image_end_id": 248079,
+        "slice_start_id": 248088, "slice_end_id": 248089, "newline_id": 198}))
+    spec = load_spec(tmp_path)
+    assert spec.vision_staged and spec.moe.k == 8 and spec.vision.layers == 27
+    wformat, head, formats = ST.defaults(spec)
+    spec = replace(spec, formats=formats)
+    cfg = board_config(DRAM_BYTES=1 << 32, MCOLS=4, ACT_ROWS=16, PAIR=True, DSTEP=True,
+                       STREAM=True)
+    kw = dict(wformat=wformat, head_format=head, lookup=True)
+    pr = ST.probe(spec, cfg, 2048, **kw)
+    n = ST.fit_experts(spec, cfg, 2048, pr)
+    assert n == 36
+    with pytest.raises(ValueError, match="staged vision: .* pieces, 0 expert slots past k"):
+        pr.check_room()
+    spec.image(cfg, 2048, 1, 1, experts=n, **kw).check_room()
 
 
 def test_a_pool_takes_the_vision_entries_past_its_experts(tmp_path):
