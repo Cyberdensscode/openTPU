@@ -168,6 +168,18 @@ def assert_waits_exact(progs, cfg) -> int:
     return n
 
 
+def assert_drains_keep_up(progs, cfg, allow=None) -> int:
+    """No MM of the programs drains slower than its array (compiler.slow_drains: its output
+    rows at a stride that puts a replay group's results in too few TMEM banks), but those
+    allow(ins) accepts; returns the MMs checked."""
+    from opentpu import isa as I
+    from opentpu.compiler import slow_drains
+    slow = sorted({c for p in progs for pc, c in slow_drains(p, cfg)
+                   if allow is None or not allow(p[pc])})
+    assert not slow, f"MMs that drain slower than their array: {slow[:8]}"
+    return sum(ins.op == I.MM for p in progs for ins in p)
+
+
 GUARD = 1 << 16       # bytes: more than an attention block's tokens of any KV region
 
 

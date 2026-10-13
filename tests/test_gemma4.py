@@ -562,8 +562,10 @@ def test_waits_memo_is_exact_on_its_programs(tiny, wf, host, monkeypatch):
     """The waits pass's memoized entries (opentpu/waits.py _MemoPass) are the exact pass's on
     every program Gemma 4 E2B's parts run (sliding and global layers, the KV-shared ones, the
     per-layer inputs on the card or the host's slot): the prompt runs' (docs/prefill.md), the
-    step and resident decode programs, the decode loop's (GEN, RLD)."""
-    from conftest import assert_waits_exact, waits_programs
+    step and resident decode programs, the decode loop's (GEN, RLD). Their MMs drain at their
+    array's rate (compiler.slow_drains), but the prompt runs' queries at this tiny hidden."""
+    from conftest import assert_drains_keep_up, assert_waits_exact, waits_programs
+    from opentpu import isa as I
     _, W, spec = tiny
     monkeypatch.setenv("OTPU_PLE_HOST", host)
     toks = [int(t) for t in np.random.default_rng(5).integers(0, 1000, 40)]
@@ -574,6 +576,12 @@ def test_waits_memo_is_exact_on_its_programs(tiny, wf, host, monkeypatch):
     e.step(toks[30])
     e.generate_card(toks[31], 6, stop_ids=[])
     assert len(progs) >= 3 and assert_waits_exact(progs, e.cfg) > 1000
+    # the prompt runs' queries (tiled.py: a dense [T, w d] tile, read back as rows of heads,
+    # no ACC) are the one layout the drain cannot spread: 4 steps a replay group, more than
+    # this tiny hidden's 2 blocks, fewer than E2B's 12 (1,536)
+    q = lambda ins: not ins.flags & I.F_ACC and ins.w[5] & 0xFFFF == ins.w[3] & 0xFFFF and \
+        (ins.w[3] & 0xFFFF) % spec.head_dim == 0
+    assert assert_drains_keep_up(progs, e.cfg, allow=q) > 0
 
 
 @pytest.mark.parametrize("split", [None, True], ids=["one", "split"])

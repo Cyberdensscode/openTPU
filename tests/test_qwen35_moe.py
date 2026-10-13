@@ -1148,8 +1148,9 @@ def test_waits_memo_is_exact_on_its_programs(tiny, wformat, b, monkeypatch):
     every program the streamed Qwen3.5-MoE runs from 6 slots a layer: expert-major's layer runs
     (DeltaNet and attention) and expert runs, the embedding rows from the host's table, the
     step and resident decode programs, the decode loop's (GEN, RLD; the expert requests' WAITW);
-    b: build B's PAIR, DSTEP and STREAM."""
-    from conftest import assert_waits_exact, waits_programs
+    b: build B's PAIR, DSTEP and STREAM. Their MMs drain at their array's rate
+    (compiler.slow_drains)."""
+    from conftest import assert_drains_keep_up, assert_waits_exact, waits_programs
     from opentpu.llm import qwen35 as Q35
     monkeypatch.setattr(Q35, "PREFILL_CHUNK", 24)
     spec, W = _untied(tiny)
@@ -1164,3 +1165,4 @@ def test_waits_memo_is_exact_on_its_programs(tiny, wformat, b, monkeypatch):
     e.generate_card(toks[31], 6, stop_ids=[])
     assert any(k[0] == "x" for k in e._layer_runs)
     assert len(progs) >= 4 and assert_waits_exact(progs, e.cfg) > 1000
+    assert assert_drains_keep_up(progs, e.cfg) > 0

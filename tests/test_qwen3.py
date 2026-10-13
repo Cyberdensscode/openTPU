@@ -288,8 +288,9 @@ def test_tiny_reset_reuses_cache(tiny):
 def test_waits_memo_is_exact_on_its_programs(tiny, wformat):
     """The waits pass's memoized entries (opentpu/waits.py _MemoPass) are the exact pass's on
     every program a dense model runs, int8 and fp4: the chunked prefill's and the prompt runs'
-    (docs/prefill.md), the step and resident decode programs, the decode loop's (GEN, RLD)."""
-    from conftest import assert_waits_exact, waits_programs
+    (docs/prefill.md), the step and resident decode programs, the decode loop's (GEN, RLD).
+    Their MMs drain at their array's rate (compiler.slow_drains)."""
+    from conftest import assert_drains_keep_up, assert_waits_exact, waits_programs
     _, W, spec = tiny
     toks = [int(t) for t in np.random.default_rng(3).integers(0, 1000, 40)]
     n = 0
@@ -301,6 +302,7 @@ def test_waits_memo_is_exact_on_its_programs(tiny, wformat):
         e.generate_card(toks[31], 6, stop_ids=[])
         assert len(progs) >= 3
         n += assert_waits_exact(progs, e.cfg)
+        assert assert_drains_keep_up(progs, e.cfg) > 0
     assert n > 1000
 
 

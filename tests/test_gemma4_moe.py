@@ -530,8 +530,9 @@ def test_waits_memo_is_exact_on_its_programs(moe, wf, em, monkeypatch):
     """The waits pass's memoized entries (opentpu/waits.py _MemoPass) are the exact pass's on
     every program Gemma 4 26B-A4B's parts run streamed from 6 slots a layer: the layer runs
     (layer-major, sliding and global layers), expert-major's expert runs (em), the step and
-    resident decode programs, the decode loop's (GEN, RLD)."""
-    from conftest import assert_waits_exact, waits_programs
+    resident decode programs, the decode loop's (GEN, RLD). Their MMs drain at their array's
+    rate (compiler.slow_drains)."""
+    from conftest import assert_drains_keep_up, assert_waits_exact, waits_programs
     monkeypatch.setattr(G, "PREFILL_CHUNK", 24)
     toks = [int(t) for t in np.random.default_rng(13).integers(0, 1000, 40)]
     e = _moe_engine(moe, wformat=wf, experts=6, layer_major=2, expert_major=em, resident=True)
@@ -541,6 +542,7 @@ def test_waits_memo_is_exact_on_its_programs(moe, wf, em, monkeypatch):
     e.generate_card(toks[31], 6, stop_ids=[])
     assert e._layer_runs and any(k[0] == "x" for k in e._layer_runs) == em
     assert len(progs) >= 4 and assert_waits_exact(progs, e.cfg) > 1000
+    assert assert_drains_keep_up(progs, e.cfg) > 0
 
 
 def test_moe_layer_major_prefill_on_a_live_card(moe):

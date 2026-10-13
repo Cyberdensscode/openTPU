@@ -28,6 +28,30 @@ def test_hardware_loop_lowering_uses_address_registers():
     assert np.array_equal(r.outputs["out"], xs.reshape(4, 8).sum(0))
 
 
+def test_an_accumulator_at_its_dram_stride_drains_slower_than_its_array():
+    """compiler.slow_drains: an MM of 4 rows (a replay group at MCOLS 4) and one block adding
+    into a tile loaded from DRAM (row stride 256, a multiple of the TMEM banks: the 4 results
+    of a streamed row in one bank, one a cycle) drains slower than its array, 1 cycle a column;
+    into an ol.zeros tile (an odd row stride) it does not."""
+    from opentpu.compiler import slow_drains
+
+    @ol.jit
+    def k(x, a, w, out, loaded: bool):
+        y = ol.load(x) if loaded else ol.zeros([4, 256])
+        ol.dot(ol.load(a), w, acc=y)
+        ol.store(out, y)
+
+    cfg = Config(MCOLS=4)
+    rng = np.random.default_rng(0)
+    xs, a_ = rng.standard_normal((4, 256), np.float32), rng.standard_normal((4, 32), np.float32)
+    w = rng.standard_normal((256, 32), np.float32)
+    for loaded in (True, False):
+        comp, _ = compile_kernel(k, cfg, x=Input(xs), a=Input(a_), w=Weight(w),
+                                 out=Output((4, 256)), loaded=loaded)
+        slow = slow_drains(comp.programs[0], cfg)
+        assert [c for _, c in slow] == (["mm 4x32 . 256x32^T"] if loaded else [])
+
+
 def test_nested_loops_affine_addresses():
     @ol.jit
     def k(x, out):

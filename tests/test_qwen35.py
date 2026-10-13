@@ -205,6 +205,28 @@ def test_embedding_format_by_table_size(tiny, tmp_path):
         assert Spec.from_hf(tmp_path).embed == embed, hidden
 
 
+@pytest.mark.parametrize("wformat", ["int8", "fp4"])
+def test_its_programs_drain_at_the_arrays_rate(tiny, wformat):
+    """Every MM the dense Qwen3.5 runs (DeltaNet and attention layers: the chunked prefill,
+    the prompt runs, the step and resident decode programs, the decode loop) drains at its
+    array's rate (compiler.slow_drains): where the array takes fewer cycles a column than its
+    rows, their results are in distinct TMEM banks."""
+    from conftest import assert_drains_keep_up, waits_programs
+    _, W, spec = tiny
+    toks = [int(t) for t in np.random.default_rng(3).integers(0, 1000, 40)]
+    cfg = board_config(DRAM_BYTES=1 << 25, PAIR=True)
+    n = 0
+    for kw in ({}, {"prompt_runs": True}):
+        e = Engine(spec, W, cap=256, cfg=cfg, resident=True, wformat=wformat, **kw)
+        progs = waits_programs(e)
+        e.prefill(toks[:30])
+        e.step(toks[30])
+        e.generate_card(toks[31], 6, stop_ids=[])
+        assert len(progs) >= 3
+        n += assert_drains_keep_up(progs, e.cfg)
+    assert n > 100
+
+
 @pytest.mark.parametrize("head", ["int8", "fp4"])
 def test_tiny_int8_embedding(tiny, head):
     """Spec.embed "int8": the token's int8 embedding row is gathered on the device from the
