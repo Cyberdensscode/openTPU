@@ -199,3 +199,121 @@ def test_canvas_positions_match_hf(hf_tiny):
         pos, delta = MV.rope_index(ids, sizes, vs)
         assert np.array_equal(pos, hp[:, 0].numpy()), (ids, pos, hp[:, 0])
         assert delta == int(hd[0, 0])
+
+
+# =============================================================================== vision on the card
+def _tiny_vision_weights(vs, rng):
+    """Random weights of a tiny vision tower, window merger and projector (load_vision's
+    names)."""
+    from opentpu.llm import minicpmv as MV
+    C, F, W = vs.hidden, vs.ffn, {}
+
+    def lin(n, o, i):
+        W[n + ".weight"] = (rng.standard_normal((o, i)) / np.sqrt(i)).astype(np.float32)
+        W[n + ".bias"] = (0.1 * rng.standard_normal(o)).astype(np.float32)
+
+    def ln(n, k):
+        W[n + ".weight"] = (1 + 0.1 * rng.standard_normal(k)).astype(np.float32)
+        W[n + ".bias"] = (0.1 * rng.standard_normal(k)).astype(np.float32)
+
+    def attn(p):
+        for n in ("q_proj", "k_proj", "v_proj", "out_proj"):
+            lin(p + "self_attn." + n, C, C)
+        ln(p + "layer_norm1", C)
+    for i in range(vs.layers):
+        p = f"{MV.TOWER}encoder.layers.{i}."
+        attn(p)
+        ln(p + "layer_norm2", C)
+        lin(p + "mlp.fc1", F, C)
+        lin(p + "mlp.fc2", C, F)
+    p = MV.TOWER + "vit_merger."
+    attn(p)
+    ln(p + "pre_norm", 4 * C)
+    lin(p + "linear_1", 4 * F, 4 * C)
+    lin(p + "linear_2", C, 4 * F)
+    ln(MV.TOWER + "post_layernorm", C)
+    p = MV.MERGER + "mlp.0."
+    ln(p + "pre_norm", 4 * C)
+    lin(p + "linear_1", 4 * C, 4 * C)
+    lin(p + "linear_2", vs.out, 4 * C)
+    k = vs.patch
+    W[MV.TOWER + "embeddings.patch_embedding.weight"] = \
+        (rng.standard_normal((C, 3, k, k)) / 24).astype(np.float32)
+    W[MV.TOWER + "embeddings.patch_embedding.bias"] = (0.1 * rng.standard_normal(C)).astype(
+        np.float32)
+    W[MV.TOWER + "embeddings.position_embedding.weight"] = \
+        (0.5 * rng.standard_normal((vs.side ** 2, C))).astype(np.float32)
+    return W
+
+
+@pytest.fixture(scope="module")
+def tiny_tower():
+    """A tiny tower (C 256, 4 heads of 64: padded to D on the card, an MLP of 300: padded to
+    its chunks; 3 layers, the window merger after layer 1) on the ISA simulator."""
+    from opentpu.isasim import board_config
+    from opentpu.llm import minicpmv as MV
+    from opentpu.llm.qwen3 import IsaBackend, _Bump
+    vs = MV.VisionSpec(hidden=256, heads=4, ffn=300, layers=3, side=5, insert=1, out=256)
+    W = _tiny_vision_weights(vs, np.random.default_rng(0))
+    cfg = board_config(DRAM_BYTES=1 << 26)
+    vi = MV.VisionImage(vs, cfg, _Bump(), nmax=256, out_rows=64)
+    img = np.zeros(cfg.DRAM_BYTES, np.uint8)
+
+    def put(addr, a):
+        v = np.ascontiguousarray(a).view(np.uint8).reshape(-1)
+        img[addr:addr + v.size] = v
+    vi.build(W, put)
+    return vs, W, vi, IsaBackend(cfg, [img])
+
+
+@pytest.mark.parametrize("size", [(4, 4), (8, 12), (16, 12), (12, 20)])
+def test_the_tower_on_the_card_is_the_reference(tiny_tower, size):
+    """A crop of h x w patches through the card's tower, window merger and projector
+    (VisionImage.encode: its programs on the ISA simulator, int8 weights and operands) gives
+    vision_reference's rows (fp32) to within int8's error: every row's cosine >= 0.999. Sizes
+    of one window block (4 x 4), of less and more than one D-token stretch of the window
+    attention (96, 192, 240 patches)."""
+    from opentpu.kernels.lib import gelu_tanh
+    from opentpu.llm import minicpmv as MV
+    vs, W, vi, be = tiny_tower
+    h, w = size
+    P = np.random.default_rng(h * 100 + w).uniform(-1, 1, (h * w, 3 * vs.patch ** 2)).astype(
+        np.float32)
+    got = vi.encode(be, P, size, proj_gelu=gelu_tanh)
+    ref = MV.vision_reference(vs, W, P, size, gelu=MV._gelu_tanh)
+    assert got.shape == ref.shape == (h * w // 16, vs.out)
+    cos = (got * ref).sum(-1) / np.linalg.norm(got, axis=-1) / np.linalg.norm(ref, axis=-1)
+    assert cos.min() >= 0.999, cos.min()
+    assert np.abs(got - ref).max() < 0.05 * np.abs(ref).max()
+
+
+def test_the_card_order_puts_each_window_in_consecutive_rows():
+    """card_order: each 4 x 4 block of the grid row-major, its 2 x 2 windows row-major, their
+    4 patches row-major. Windows are consecutive rows (windows()' rows, in their order), and
+    so are the blocks (the projector's output rows: the h/4 x w/4 grid row-major)."""
+    from opentpu.llm import minicpmv as MV
+    for h, w in ((4, 4), (8, 12), (12, 8), (16, 20)):
+        o = MV.card_order(h, w)
+        assert sorted(o) == list(range(h * w))
+        assert {tuple(r) for r in o.reshape(-1, 4)} == {tuple(r) for r in MV.windows(h, w)}
+        blocks = o.reshape(-1, 16)
+        assert np.array_equal(np.sort(blocks, 1), np.sort(MV.windows(h, w, 4), 1))
+        for b in blocks:            # a block's windows row-major: (0, 0), (0, 1), (1, 0), (1, 1)
+            r, c = b // w, b % w
+            assert list(zip(r[::4] // 2 % 2, c[::4] // 2 % 2)) == [(0, 0), (0, 1), (1, 0), (1, 1)]
+
+
+def test_the_real_towers_programs_fit_the_card():
+    """MiniCPM-V 4.7's tower (C 1152, 16 heads of 72, 27 layers) compiles for the card's
+    configuration (TMEM, ACT RAM) at crops of 1024, 1056 and 2048 patches, each program within
+    IMEM."""
+    from opentpu.isasim import board_config
+    from opentpu.llm import minicpmv as MV
+    from opentpu.llm.qwen3 import _Bump
+    cfg = board_config()
+    vi = MV.VisionImage(MV.VisionSpec(), cfg, _Bump(), nmax=2048, out_rows=2048)
+    for N in (1024, 1056, 2048):
+        progs, runs = vi.programs(N)
+        assert len(runs) == 1 + 3 * 7 + 4 + 3 * 20 + 1
+        for name, (p, _) in progs.items():
+            assert len(p) <= cfg.IMEM_WORDS // 8, (N, name, len(p))

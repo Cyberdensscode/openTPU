@@ -67,11 +67,11 @@ class LazyExperts(nn.Module):
             e = int(expert_idx)
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             current_state = hidden_states[token_idx]
-            gate, up = nn.functional.linear(current_state, self.weight("gate_up_proj", e)).chunk(2, dim=-1)
-            current_hidden_states = self.act_fn(gate) * up
-            current_hidden_states = nn.functional.linear(current_hidden_states, self.weight("down_proj", e))
-            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+            gate, up = nn.functional.linear(current_state,
+                                            self.weight("gate_up_proj", e)).chunk(2, dim=-1)
+            h = nn.functional.linear(self.act_fn(gate) * up, self.weight("down_proj", e))
+            h = h * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, h.to(final_hidden_states.dtype))
         return final_hidden_states
 
 
@@ -257,7 +257,8 @@ def procheck(a) -> None:
             hf_rows = pv.reshape(3, p, -1, p).transpose(2, 0, 1, 3).reshape(-1, 3 * p * p)
             ours = np.concatenate(im.patches)
             pos, delta = MV.rope_index(ids, im.sizes, vs)
-            hp, hd = m.model.get_rope_index(x["input_ids"], mm_token_type_ids=x["mm_token_type_ids"],
+            hp, hd = m.model.get_rope_index(x["input_ids"],
+                                            mm_token_type_ids=x["mm_token_type_ids"],
                                             target_sizes=x["target_sizes"])
             ok = dict(ids=list(x["input_ids"][0]) == ids,
                       sizes=[tuple(s) for s in x["target_sizes"].tolist()] == list(im.sizes),

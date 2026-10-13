@@ -22,6 +22,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .. import quant as Q
+
 TOWER, MERGER = "model.vision_tower.", "model.merger."
 
 
@@ -425,6 +427,15 @@ def windows(h: int, w: int, k: int = 2) -> np.ndarray:
     return i.reshape(-1, k * k)
 
 
+def card_order(h: int, w: int) -> np.ndarray:
+    """[h w]: the raster indices of an h x w crop's patches in the card's window order (h, w
+    multiples of 4): each 4 x 4 block row-major, within it its 2 x 2 windows row-major, within
+    those their 4 patches (opentpu/kernels/vit.py: both merges' windows are then consecutive
+    rows; the projector's output rows come out row-major over the blocks, HF's order)."""
+    i = np.arange(h * w).reshape(h // 4, 2, 2, w // 4, 2, 2)
+    return i.transpose(0, 3, 1, 4, 2, 5).reshape(-1)
+
+
 def _layer(x, W, i, vs, groups):
     p = f"{TOWER}encoder.layers.{i}."
     x = x + _attention(_ln(x, W[p + "layer_norm1.weight"], W[p + "layer_norm1.bias"], vs.eps),
@@ -471,3 +482,277 @@ def vision_reference(vs: VisionSpec, W: dict, P: np.ndarray, size, capture=None,
     out = _lin(gelu(_lin(y, W, p + "linear_1")), W, p + "linear_2")
     cap["out"] = out
     return out
+
+
+# =============================================================================== on the card
+def _up(n: int, q: int) -> int:
+    return -(-n // q) * q
+
+
+class VisionImage:
+    """The vision tower's and projector's part of a MiniCPM-V image in one slice's DRAM
+    (docs/minicpmv.md 4.2): the weights in MXU formats (the checkpoint's shapes, but the MLPs'
+    widths padded to their chunks with zero rows and columns and the patch rows' 588 to 640;
+    each LayerNorm's bias folded into the next linear's), each encoder layer a block of
+    `lstride` bytes (a run-time layer index
+    addresses any of them; block `layers` is the window merger's attention); the work area of
+    a crop of up to `nmax` patches (the host's patch rows P and position-table rows E, the
+    residual rows X and X2, the Q and O scratch, the KV scratch) and the projector's output
+    rows `vis` (`out_rows`: the prompt's image rows). `b`: the image's allocator
+    (qwen3._Bump), from its next byte."""
+
+    CHUNK = 256         # the MLPs' F chunk (a 4-bit W2's column slices: whole 2D)
+    WCHUNK = 512        # the window merger's (17216 -> 17408)
+    PARTS = (768, 512, 256, 128)    # vit_merge's pieces: the widest that splits 4C (1152: 768,
+    #                                 6 blocks: an even first block for a 4-bit W1)
+
+    def __init__(self, vs: VisionSpec, cfg, b, nmax: int = 2048, out_rows: int = 2048,
+                 fmt: str = "int8"):
+        D = cfg.D
+        self.vs, self.cfg, self.fmt = vs, cfg, fmt
+        C, H = vs.hidden, vs.heads
+        self.C, self.heads, self.dv = C, H, vs.head_dim
+        self.dp = _up(vs.head_dim, D)
+        self.F = _up(vs.ffn, self.CHUNK)
+        self.FW = _up(4 * vs.ffn, self.WCHUNK)
+        self.KP = _up(3 * vs.patch ** 2, D)
+        self.part = next(p for p in self.PARTS if (4 * C) % p == 0)
+        self.nmax, self.out_rows = _up(nmax, D), out_rows     # V^T rows: whole D stretches
+        HP = H * self.dp
+
+        def mat(bump, n, k):
+            return (bump.alloc(n * Q.row_bytes(k, fmt, D)),
+                    bump.alloc(n * Q.scale_bytes(k, fmt, D)), n, k)
+        from .qwen3 import _Bump
+        lb = _Bump()                                    # a layer block's offsets
+        self.lofs = dict(ln1w=lb.alloc(4 * C), ln2w=lb.alloc(4 * C),
+                         wq=mat(lb, C, C), bq=lb.alloc(4 * C),
+                         wk=mat(lb, C, C), bk=lb.alloc(4 * C), wv=mat(lb, C, C),
+                         bv=lb.alloc(4 * C), wo=mat(lb, C, C), bo=lb.alloc(4 * C),
+                         w1=mat(lb, self.F, C), b1=lb.alloc(4 * self.F),
+                         w2=mat(lb, C, self.F), b2=lb.alloc(4 * C))
+        self.lstride = _up(lb.next, 4096)
+        self.layer0 = _up(b.next, 4096)
+        b.next = self.layer0 + (vs.layers + 1) * self.lstride
+        self.start = self.layer0
+        self.wm = dict(pre_w=b.alloc(16 * C), pre_b=b.alloc(16 * C),
+                       w1=mat(b, self.FW, 4 * C), b1=b.alloc(4 * self.FW),
+                       w2=mat(b, C, self.FW), b2=b.alloc(4 * C))
+        self.post = (b.alloc(4 * C), b.alloc(4 * C))
+        self.proj = dict(pre_w=b.alloc(16 * C), pre_b=b.alloc(16 * C),
+                         w1=mat(b, 4 * C, 4 * C), b1=b.alloc(16 * C),
+                         w2=mat(b, vs.out, 4 * C), b2=b.alloc(4 * vs.out))
+        self.emb = dict(wp=mat(b, C, self.KP), bp=b.alloc(4 * C))
+        self.weights_end = b.next
+        n = self.nmax
+        self.work = dict(P=b.alloc(4 * n * self.KP), E=b.alloc(4 * n * C),
+                         X=b.alloc(4 * n * C), X2=b.alloc(4 * n // 4 * C),
+                         Q=b.alloc(4 * n * HP), O=b.alloc(4 * n * C),
+                         vis=b.alloc(4 * out_rows * vs.out))
+        self.kvh = {h: {"k": b.alloc(n * self.dp), "ks": b.alloc(4 * n),
+                        "vt": b.alloc(self.dp * n), "vs": b.alloc(4 * n)} for h in range(H)}
+        self.end = b.next
+
+    # ---- descriptors
+    def _w(self, base, m):
+        from ..compiler import QTensor
+        a, s, n, k = m
+        return QTensor.weight(base + a, base + s, n, k, self.fmt, self.cfg.D)
+
+    @staticmethod
+    def _v(base, a, n):
+        from ..compiler import Affine, Tensor
+        return Tensor(Affine.of(base) + a, (n,), (1,))
+
+    def layer(self, li):
+        """Encoder layer li's weights (li an int or a run-time value; vs.layers: the window
+        merger's attention, whose block has the layers' layout)."""
+        from types import SimpleNamespace
+        from ..compiler import Affine
+        base = Affine(self.layer0) + Affine.of(li) * self.lstride
+        o, C = self.lofs, self.C
+        return SimpleNamespace(
+            ln1w=self._v(base, o["ln1w"], C), ln2w=self._v(base, o["ln2w"], C),
+            wq=self._w(base, o["wq"]), bq=self._v(base, o["bq"], C),
+            wk=self._w(base, o["wk"]), bk=self._v(base, o["bk"], C),
+            wv=self._w(base, o["wv"]), bv=self._v(base, o["bv"], C),
+            wo=self._w(base, o["wo"]), bo=self._v(base, o["bo"], C),
+            w1=self._w(base, o["w1"]), b1=self._v(base, o["b1"], self.F),
+            w2=self._w(base, o["w2"]), b2=self._v(base, o["b2"], C))
+
+    def merge_weights(self, which: str):
+        """The window merger's MLP ("wm") or the projector's ("proj") for vit_merge."""
+        from types import SimpleNamespace
+        m, C = getattr(self, which), self.C
+        return SimpleNamespace(pre_w=self._v(0, m["pre_w"], 4 * C),
+                               pre_b=self._v(0, m["pre_b"], 4 * C),
+                               w1=self._w(0, m["w1"]), b1=self._v(0, m["b1"], m["w1"][2]),
+                               w2=self._w(0, m["w2"]), b2=self._v(0, m["b2"], m["w2"][2]))
+
+    def descriptors(self):
+        """The phases' `v`: the work area, the embedding's weights, the post norm."""
+        from types import SimpleNamespace
+        from ..kernels.vit import VitKV
+        from .qwen3 import _tdesc as t
+        w, n, C = self.work, self.nmax, self.C
+        return SimpleNamespace(
+            C=C, heads=self.heads, dp=self.dp, dv=self.dv,
+            P=t(w["P"], (n, self.KP)), E=t(w["E"], (n, C)), X=t(w["X"], (n, C)),
+            X2=t(w["X2"], (n // 4, C)),
+            Q=[t(w["Q"] + 4 * h * n * self.dp, (n, self.dp)) for h in range(self.heads)],
+            O=t(w["O"], (n, C)), vis=t(w["vis"], (self.out_rows, self.vs.out)),
+            kv=VitKV(self.kvh, n, self.dp, self.cfg.D, 1, 0, dv=self.dv),
+            emb=SimpleNamespace(wp=self._w(0, self.emb["wp"]), bp=self._v(0, self.emb["bp"], C)),
+            post=(self._v(0, self.post[0], C), self._v(0, self.post[1], C)))
+
+    # ---- contents
+    def build(self, W: dict, put) -> None:
+        """Write the weights (W: load_vision's tensors) with put(addr, array); keep the
+        position table for the host's rows (host_rows)."""
+        vs, C, D = self.vs, self.C, self.cfg.D
+        f32 = np.float32
+
+        def put_m(base, m, a):
+            q, s = Q.quantize_mxu(np.asarray(a, f32), self.fmt, D)
+            put(base + m[0], q)
+            put(base + m[1], s)
+
+        def pad(a, shape):
+            a = np.asarray(a, f32)
+            out = np.zeros(shape, f32)
+            out[tuple(slice(0, n) for n in a.shape)] = a
+            return out
+
+        def vec(addr, a):
+            put(addr, np.asarray(a, f32))
+
+        o = self.lofs
+
+        def folded(p, ln):      # the linear's bias with the LayerNorm's before it folded in
+            return W[p + ".bias"] + W[p + ".weight"].astype(np.float64) @ W[ln + ".bias"]
+
+        def attn(base, p):
+            for n in "qkv":
+                put_m(base, o["w" + n], W[p + f"self_attn.{n}_proj.weight"])
+                vec(base + o["b" + n], folded(p + f"self_attn.{n}_proj", p + "layer_norm1"))
+            put_m(base, o["wo"], W[p + "self_attn.out_proj.weight"])
+            vec(base + o["bo"], W[p + "self_attn.out_proj.bias"])
+            vec(base + o["ln1w"], W[p + "layer_norm1.weight"])
+
+        for i in range(vs.layers):
+            base = self.layer0 + i * self.lstride
+            p = f"{TOWER}encoder.layers.{i}."
+            attn(base, p)
+            vec(base + o["ln2w"], W[p + "layer_norm2.weight"])
+            put_m(base, o["w1"], pad(W[p + "mlp.fc1.weight"], (self.F, C)))
+            vec(base + o["b1"], pad(folded(p + "mlp.fc1", p + "layer_norm2"), (self.F,)))
+            put_m(base, o["w2"], pad(W[p + "mlp.fc2.weight"], (C, self.F)))
+            vec(base + o["b2"], W[p + "mlp.fc2.bias"])
+        attn(self.layer0 + vs.layers * self.lstride, TOWER + "vit_merger.")
+        for m, p, F in ((self.wm, TOWER + "vit_merger.", self.FW),
+                        (self.proj, MERGER + "mlp.0.", 4 * C)):
+            vec(m["pre_w"], W[p + "pre_norm.weight"])
+            vec(m["pre_b"], W[p + "pre_norm.bias"])
+            put_m(0, m["w1"], pad(W[p + "linear_1.weight"], (F, 4 * C)))
+            vec(m["b1"], pad(W[p + "linear_1.bias"], (F,)))
+            put_m(0, m["w2"], pad(W[p + "linear_2.weight"], (m["w2"][2], F)))
+            vec(m["b2"], W[p + "linear_2.bias"])
+        vec(self.post[0], W[TOWER + "post_layernorm.weight"])
+        vec(self.post[1], W[TOWER + "post_layernorm.bias"])
+        wp = np.asarray(W[TOWER + "embeddings.patch_embedding.weight"], f32).reshape(C, -1)
+        put_m(0, self.emb["wp"], pad(wp, (C, self.KP)))
+        vec(self.emb["bp"], W[TOWER + "embeddings.patch_embedding.bias"])
+        self.pos_table = np.asarray(W[TOWER + "embeddings.position_embedding.weight"], f32)
+
+    # ---- the runs
+    def programs(self, N: int, block: int = 256, R: int | None = None,
+                 proj_gelu=None) -> tuple:
+        """One crop of N patches (h x w, both multiples of 4, its rows in card_order): ({phase:
+        (program, run_args)}, the runs in order [(phase, run argument values)]): a program per
+        phase and patch count (not grid: the order makes the merges' windows consecutive), the
+        encoder layers' at a run-time layer index ("layer"), the projector's at a run-time
+        output row ("vis_row")."""
+        from ..compiler import Affine, RunVar, Tensor
+        from ..kernels import vit as VK
+        from ..kernels.lib import gelu_tanh
+        vs, cfg = self.vs, self.cfg
+        R = R or min(16, cfg.act_rows)
+        RM = max(1, R // 2)          # the merges' windows a group: their [R, chunk] MLP tiles
+        G = min(16, cfg.act_rows) // 4 * 4  # the window attention's rows an MM (G / 4 windows)
+        N2 = N // 4
+        if N > self.nmax:
+            raise ValueError(f"a crop of {N} patches: the image's work area holds {self.nmax}")
+        if N % 16:
+            raise ValueError(f"a crop of {N} patches: h and w multiples of 4 (two merges)")
+        eps, sc = vs.eps, 1.0 / math.log(2.0) / math.sqrt(vs.head_dim)
+        v = self.descriptors()
+        lw = self.layer(RunVar("layer", bound=vs.layers))
+        mlw = self.layer(vs.layers)
+
+        def tr(kernel, **kw):
+            b = kernel.trace(cfg, 0, {"v": v, **kw})
+            return b.finish(), list(b.run_args)
+        row = RunVar("vis_row", bound=self.out_rows)
+        vis = Tensor(Affine.of(v.vis.base) + row * (4 * vs.out), v.vis.shape, v.vis.strides)
+        P = {"embed": tr(VK.vit_embed, N=N, R=R),
+             "qkv": tr(VK.vit_qkv, lw=lw, src=v.X, N=N, R=R, eps=eps),
+             "attend": tr(VK.vit_attend, N=N, scale=sc, block=block),
+             "out": tr(VK.vit_out_mlp, lw=lw, dst=v.X, N=N, R=R, eps=eps, chunk=self.CHUNK),
+             "mqkv": tr(VK.vit_qkv, lw=mlw, src=v.X, N=N, R=R, eps=eps),
+             "wattend": tr(VK.vit_window_attend, N=N, G=G, scale=sc),
+             "mout": tr(VK.vit_out_mlp, lw=mlw, dst=v.X, N=N, R=R, eps=eps, chunk=self.CHUNK,
+                        mlp=False),
+             "wmerge": tr(VK.vit_merge, mw=self.merge_weights("wm"), src=v.X, dst=v.X2,
+                          N4=N2, R=RM, eps=eps, chunk=self.WCHUNK, mean=True, part=self.part),
+             "qkv2": tr(VK.vit_qkv, lw=lw, src=v.X2, N=N2, R=R, eps=eps),
+             "attend2": tr(VK.vit_attend, N=N2, scale=sc, block=block),
+             "out2": tr(VK.vit_out_mlp, lw=lw, dst=v.X2, N=N2, R=R, eps=eps, chunk=self.CHUNK),
+             "last": tr(VK.vit_out_mlp, lw=lw, dst=v.X2, N=N2, R=R, eps=eps, chunk=self.CHUNK,
+                        post=v.post),
+             "proj": tr(VK.vit_merge, mw=self.merge_weights("proj"), src=v.X2, dst=vis,
+                        N4=N2 // 4, R=RM, eps=eps, chunk=self.CHUNK, mean=False,
+                        part=self.part, act=proj_gelu or gelu_tanh)}
+        runs = [("embed", {})]
+        for i in range(vs.insert + 1):
+            runs += [("qkv", {"layer": i}), ("attend", {}), ("out", {"layer": i})]
+        runs += [("mqkv", {}), ("wattend", {}), ("mout", {}), ("wmerge", {})]
+        for i in range(vs.insert + 1, vs.layers):
+            runs += [("qkv2", {"layer": i}), ("attend2", {}),
+                     ("last" if i == vs.layers - 1 else "out2", {"layer": i})]
+        runs.append(("proj", {"vis_row": 0}))
+        return P, runs
+
+    def host_rows(self, P: np.ndarray, size) -> tuple:
+        """The host's rows of a crop (P raster order): its patch rows padded to KP columns, and
+        its position rows (the position table's rows at its NaViT ids: a table lookup, no
+        arithmetic), both in card_order."""
+        h, w = size
+        o = card_order(h, w)
+        p = np.zeros((h * w, self.KP), np.float32)
+        p[:, :P.shape[1]] = P[o]
+        return p, self.pos_table[position_ids(h, w, self.vs.side)[o]]
+
+    def encode(self, backend, P: np.ndarray, size, vis_row: int = 0, proj_gelu=None,
+               cache: dict | None = None, s: int = 0) -> np.ndarray:
+        """One crop through the tower and projector on `backend` (a qwen3 backend: write, run,
+        read); its rows go to vis[vis_row:]; returns them ([h w / 16, out] fp32)."""
+        from ..compiler import arg_words
+        h, w = size
+        key = (h * w, proj_gelu)
+        progs = None if cache is None else cache.get(key)
+        if progs is None:
+            progs = self.programs(h * w, proj_gelu=proj_gelu)
+            if cache is not None:
+                cache[key] = progs
+        P_, runs = progs
+        p, e = self.host_rows(P, size)
+        backend.write(s, self.work["P"], p)
+        backend.write(s, self.work["E"], e)
+        for name, vals in runs:
+            prog, ra = P_[name]
+            if "vis_row" in vals:
+                vals = {"vis_row": vis_row}
+            backend.run([prog], args=arg_words(ra, vals))
+        n = h * w // 16
+        return backend.read(s, self.work["vis"] + 4 * vis_row * self.vs.out,
+                            4 * n * self.vs.out).view(np.float32).reshape(n, self.vs.out)
