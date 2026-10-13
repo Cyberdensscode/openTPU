@@ -29,7 +29,9 @@
 #   the MTP pool (QM: its disk the lead's choice; opentpu's /data is a 7200 rpm disk): on opentpu at nice / ionice idle, pack_pool.py $O/Qwen3.5-35B-A3B $QM extend
 #   $O/pool-q35-mx.split.bin (card2's verified pool, only read; sha256 before and after), then recv the MTP layer's 256
 #   experts (pack_pool.py ... send --mtp on hwe-bench, ~438 MB relayed through the Mac, sha256 on both sides);
-#   info --mtp: 10496 of 10496 packed, the same key
+#   info --mtp: 10496 of 10496 packed, the same key; B's checkpoint (MDB): card2's Qwen3.5-35B-A3B files linked, beside
+#   them mtp.safetensors (the MTP head but its experts, 0.1 GiB: strip_experts.py BASE DIR --mtp --only mtp. --out
+#   mtp.safetensors on hwe-bench, relayed; card2's checkpoint has no mtp.* and is not changed)
 # Run (no pipe; QM the MTP pool's path): QM=... setsid nohup ~/.local/bin/otpu-lock --wait 600 -- bash
 #   ~/otpu-build/les/mtp1/host/tools/offload/sessions/mtp1.sh > ~/otpu-build/les/mtp1.launch.log 2>&1 < /dev/null &
 set -u
@@ -51,6 +53,7 @@ ORDER=${ORDER:-A1 B1 B2 A2 A3 B3 B4 A4}       # (after the warm-ups WA, WB)
 MAXNEW=${MAXNEW:-32}
 S_MS=${S_MS:--4.09}                             # (les1: S, the 35B's decode B - A, ms a token)
 MD=Qwen3.5-35B-A3B
+MDB=${MDB:-$LS/$MD-mtp}                         # (B's checkpoint: card2's files linked, and mtp.safetensors)
 QA=${QA:-pool-q35-mx.split.bin}                 # (in O)
 QM=${QM:?the MTP pool (the lead chooses its disk: beside QA on /home, or on /data and kept warm)}
 DROPOTHER=$HOME/openTPU/models:$O:$HOME/otpu-build/offload/g26it:$(dirname $QM)
@@ -68,7 +71,8 @@ grep -q 'mtp_from' $TB/opentpu/host/streamed.py && grep -q '"--mtp"' $TB/tools/q
 grep -q 'mtp_from' $TA/opentpu/host/streamed.py && { echo "STOP: TA already has les-mtp's engine"; exit 2; }
 [ -f $O/$QA ] && [ -f $QM ] && [ -f $RF/chatmoe-$name.json ] && [ -f $RL/chatmoe5-$name.json ] \
   || { echo "STOP: $O/$QA, $QM, $RF/chatmoe-$name.json or $RL/chatmoe5-$name.json missing"; exit 2; }
-(cd $TB && PYTHONPATH=$TB python tools/offload/pack_pool.py $O/$MD $QM info --mtp) 2>&1 | tail -3 > $R/qm-info.txt
+[ -f $MDB/mtp.safetensors ] && [ -f $MDB/config.json ] || { echo "STOP: $MDB is not B's checkpoint"; exit 2; }
+(cd $TB && PYTHONPATH=$TB python tools/offload/pack_pool.py $MDB $QM info --mtp) 2>&1 | tail -3 > $R/qm-info.txt
 cat $R/qm-info.txt
 grep -q "10496 of 10496 experts packed" $R/qm-info.txt && grep -q "the same key" $R/qm-info.txt \
   || { echo "STOP: the MTP pool is not whole or not this image's"; exit 2; }
@@ -88,9 +92,10 @@ print("  cfg: production's (qual/cfg.pkl)" if not d else f"  cfg DIFFERS from pr
 sys.exit(1 if d else 0)
 PY
 warm() {   # checkpoint, pool: every other big file out of the page cache, the pool read into it
-  python - $O/$1 $2 $DROPOTHER <<'PY'
+  python - $1 $2 $DROPOTHER <<'PY'
 import os, sys                      # every other file of 100 MB or more out of the page cache
 keep = {os.path.realpath(sys.argv[1]), os.path.realpath(sys.argv[2])}  # (card_moe.sh's DROPOTHER)
+keep |= {os.path.realpath(os.path.join(sys.argv[1], f)) for f in os.listdir(sys.argv[1])}  # (B's links)
 ours = tuple(os.path.realpath(os.path.expanduser(d)) + os.sep for d in ("~/openTPU", "~/otpu-build", "/data/otpu"))
 gb = n = 0
 seen = set()
@@ -123,11 +128,11 @@ res() {    # the percentage of a file in the page cache (util-linux fincore)
 }
 # 2. WA, WB, then ORDER; A from TA (plain, production's pool), B from TB (--mtp, the MTP pool)
 for x in WA WB $ORDER; do
-  case $x in WA|A*) tr=$TA; pool=$O/$QA; extra="";; *) tr=$TB; pool=$QM; extra="--mtp";; esac
+  case $x in WA|A*) tr=$TA; md=$O/$MD; pool=$O/$QA; extra="";; *) tr=$TB; md=$MDB; pool=$QM; extra="--mtp";; esac
   echo "=== q$x $(date +%T) ($name, $(basename $(dirname $tr))/$(basename $tr) $(cut -c1-8 $tr/COMMIT) $extra)"
-  warm $MD $pool || { echo "STOP: $pool not wholly in the page cache (both arms' pools must be warm)"; fail=1; break; }
+  warm $md $pool || { echo "STOP: $pool not wholly in the page cache (both arms' pools must be warm)"; fail=1; break; }
   busy
-  (cd $tr && PYTHONPATH=$tr timeout 1800 python $tr/tools/qual/chatmoe.py $O/$MD --pool $pool --backend board \
+  (cd $tr && PYTHONPATH=$tr timeout 1800 python $tr/tools/qual/chatmoe.py $md --pool $pool --backend board \
      --cfg $R/cfg-dev.pkl --turn "$T1" --turn "$T2" --turn "$T3" --turn "$T4" --turn "$T5" --max-new $MAXNEW \
      $extra --out $R/q$x.json > $R/q$x.log 2>&1)
   rc=$?; echo "  exit $rc $(date +%T); after it $(res $pool)% of its pool in the page cache"
