@@ -690,26 +690,29 @@ def test_tiled_expert_major_layer_run_on_rtl(gmoe, monkeypatch, have_verilator, 
                                              li, form):
     """A tiled expert-major layer run on the RTL with the board's memory path (DRAM and TMEM as
     the ISA simulator's), from chunk row 3 (its records as a prompt left them), every need
-    served: the tiny Gemma 4 MoE's sliding layer, 4 rows on the card's ACT RAM (4 rows), and a
-    global one's 8 on ACT_ROWS 16 (and in QACT ranges: form), at position 300 after a
-    300-token prompt; the tiny Qwen3.5-MoE's attention layer (4 rows, ACT_ROWS 4) and the
-    DeltaNet layer after it (its MoE's end; 8 rows on 16, DSTEP, PAIR), at position 200 after
-    200 tokens."""
+    served: the tiny Gemma 4 MoE's sliding layer, 4 rows on an MCOLS 4 card's ACT RAM (4 rows),
+    and a global one's 8 on ACT_ROWS 16 (and in QACT ranges: form), at position 300 after a
+    300-token prompt; the tiny Qwen3.5-MoE's attention layer (4 rows, ACT_ROWS 4, MCOLS 4) and
+    the DeltaNet layer after it (its MoE's end; 8 rows on 16, DSTEP, PAIR), at position 200 after
+    200 tokens. The ACT RAM's rows are a multiple of MCOLS: 4 rows is the MCOLS 4 card's (the
+    target's MCOLS 8 has 16)."""
     from opentpu import rtlsim
     from opentpu.compiler import arg_words
     from opentpu.llm.qwen3 import RunPos
     monkeypatch.setenv("OTPU_TILE", "1")
     if form is not None:
         monkeypatch.setattr(tiled, "layer_variants", lambda img, fam, T: [form])
+    mc = min(act, board_config().MCOLS)
     if fam == "gemma4":
         _, W, spec = gmoe
-        cfg, p, cap = board_config(DRAM_BYTES=1 << 26, ACT_ROWS=act), 300, 1024
+        cfg, p, cap = board_config(DRAM_BYTES=1 << 26, ACT_ROWS=act, MCOLS=mc), 300, 1024
         eng = Engine(spec, W, cap=cap, cfg=cfg, rows=1, wformat="fp4", experts=6,
                      layer_major=T, expert_major=True)
     else:
         import test_qwen35_moe as TQM
         spec, W = TQM._untied(TQM._tiny())
-        cfg = board_config(DRAM_BYTES=1 << 26, ACT_ROWS=act, PAIR=True, DSTEP=True, STREAM=True)
+        cfg = board_config(DRAM_BYTES=1 << 26, ACT_ROWS=act, MCOLS=mc, PAIR=True, DSTEP=True,
+                           STREAM=True)
         p, cap = 200, 256
         eng = Engine(spec, W, cap=cap, cfg=cfg, rows=1, resident=True, experts=6,
                      wformat="fp4", layer_major=T, expert_major=True)
