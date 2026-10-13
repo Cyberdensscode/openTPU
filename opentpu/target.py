@@ -47,7 +47,10 @@ FAMILIES = ("generic", "xilinx7", "xilinxus", "asic")
 UARCH_KEYS = ("MXU_IMPL", "MXU_CL", "VPU_CL", "ULANES", "TMEM_IMPL", "RPB", "WPB", "WIN",
               "FIFO_DEPTH", "TRACE_DEPTH", "PQ_WIN", "CHASH")
 # and the optional ones (absent: the RTL's default): MXU_E, the MXU's epilogue lanes (0: MCOLS / 2;
-# above MCOLS: MCOLS)
+# above MCOLS: MCOLS); with TMEM_IMPL 3 the one copy's knobs (otpu_slice TMEM_<K>,
+# docs/tmem_nocopy.md; vivado/tmem_knobs.tcl's TMEM_X)
+TMEM3_KEYS = ("TMEM_NSB", "TMEM_SBP", "TMEM_SBH", "TMEM_RPL", "TMEM_TDP", "TMEM_GST", "TMEM_PMP",
+              "TMEM_PRK", "TMEM_SDM")
 PLATFORM_KEYS = ("board", "core_mhz", "mem", "channels_per_slice", "channel_bytes", "beat_bytes",
                  "host")
 # The slice's TMEM read ports (otpu_slice NRP) and the most lanes a simulation may set
@@ -225,6 +228,8 @@ def sim_uarch(t: Target | str | None = None) -> dict:
          "FIFO_DEPTH": u["FIFO_DEPTH"]}
     if u["TMEM_IMPL"]:
         d["TMEM_IMPL"] = u["TMEM_IMPL"]
+    if u["TMEM_IMPL"] == 3:                     # the one copy's knobs the target states
+        d.update({k: int(u[k]) for k in TMEM3_KEYS if k in u})
     if u.get("MXU_E"):
         d["MXU_E"] = u["MXU_E"]
     if t.arch["SEQ_WC"]:
@@ -239,7 +244,8 @@ def rtl_params(t: Target | str | None = None) -> dict:
     t = t if isinstance(t, Target) else load(t)
     a, u, p = t.arch, t.uarch, t.platform
     cfg = config(t)
-    return {
+    tm3 = {k: int(u[k]) for k in TMEM3_KEYS if k in u} if u["TMEM_IMPL"] == 3 else {}
+    return tm3 | {
         "S": a["S"], "D": a["D"], "MCOLS": a["MCOLS"], "ACT_ROWS": t.act_rows,
         "ACT_BLOCKS": a["ACT_BLOCKS"], "TMEM_WORDS": a["TMEM_WORDS"],
         "IMEM_WORDS": a["IMEM_WORDS"], "LANES": a["LANES"], "DSTEP": int(a["DSTEP"]),

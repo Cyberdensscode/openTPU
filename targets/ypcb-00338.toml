@@ -12,7 +12,7 @@ description = "Inspur YPCB-00338: xc7k480t, 2 x DDR3-1066 (LiteDRAM), XDMA Gen2 
 [arch]                          # opentpu.isasim.Config: what programs depend on
 S = 1
 D = 128
-MCOLS = 4
+MCOLS = 8                       # release r2: 8 MX columns (docs/mx_mxu.md 9; production 8b33206e: 4)
 ACT_BLOCKS = 128
 ACT_ROWS = 16                   # the MX build's: MMs of up to 16 rows (replay); 0: MCOLS
 TMEM_WORDS = 65536
@@ -22,17 +22,25 @@ LANES = 8
 PAIR = true
 DSTEP = true
 STREAM = true
-SEQ_WC = false                  # the sequencer's wait entries (WAITC, EXPERIMENTAL: docs/seq_vpu.md):
+SEQ_WC = true                   # the sequencer's wait entries (WAITC v2, docs/seq_vpu.md; release r2):
 #                                 the host loads them with every program; needs WIN <= 16
 
 [uarch]                         # timing only: RTL parameters the programs do not see
 MXU_IMPL = 2                    # systolic (docs/mxu_systolic.md)
 MXU_CL = 16
-MXU_E = 4                       # epilogue lanes: MCOLS, full rate (E 2 slowed Phi-4-mini and
-                                # SmolLM3's decode attention below production's: mx_mxu.md 9)
+MXU_E = 8                       # epilogue lanes: MCOLS, full rate (docs/mx_mxu.md 9: E = MCOLS at
+                                # MCOLS 8; E 4 halves prefill q.K^T at d 128 and G 5-8 decode)
 VPU_CL = 2
 ULANES = 8
-TMEM_IMPL = 0                   # 0: one copy per read port (block RAM); 1: banked 1R1W macros
+TMEM_IMPL = 3                   # 0: one copy per read port (block RAM); 1: banked 1R1W macros;
+                                # 3: one copy (docs/tmem_nocopy.md), the pick r2pgRs below:
+TMEM_NSB = 2                    #   2 RAMs a bank (64 RAMB36 at 64K words, against 384),
+TMEM_RPL = true                 #   lost reads replayed under the board's arbiter,
+TMEM_TDP = true                 #   true dual-port RAMs,
+TMEM_GST = true                 #   QUANT 3 and COLL the DMA's guests,
+TMEM_PMP = 1                    #   pumped at 2x on core_clk2x (CLK2X: core_clk's divider even);
+                                #   SBP 3, SBH 0, PRK 0 and SDM -1 (sides s) the RTL's defaults
+                                #   (vivado/tmem_knobs.tcl builds the same pick)
 RPB = 0                         # TMEM reads per bank per cycle; 0: every read lane (replicated)
 WPB = 1
 WIN = 16

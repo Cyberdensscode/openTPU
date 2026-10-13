@@ -547,6 +547,14 @@ class SimTransport:
              "MEM_NATIVE": 2 if native == "ld" else 1}
         if rtlsim.UARCH.get("SEQ_WC"):              # (EXPERIMENTAL: WAITC, CFG_UARCH bit24)
             p["SEQ_WC"] = 1
+        # the TMEM as the target builds it (TMEM_IMPL 3: the one copy and its knobs, pumped on
+        # tb_board's clk_f with PMP 1); OTPU_TMEM_* (rtlsim.UARCH) override
+        from opentpu.target import sim_uarch
+        tm = {k: v for k, v in sim_uarch(self.target).items() if k.startswith("TMEM_")}
+        tm.update({k: v for k, v in rtlsim.UARCH.items()
+                   if k.startswith("TMEM_") and k not in ("TMEM_RQ", "TMEM_NCP")})
+        if tm.get("TMEM_IMPL") == 3:
+            p.update(tm)
         p.update(self.params)
         # the configuration registers (register map 4) as the target's build of this
         # configuration reports them (run_vivado.sh: opentpu.target build_config / arch_hash)

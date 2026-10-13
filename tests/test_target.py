@@ -95,8 +95,8 @@ def test_arch_hash_is_stable_and_sensitive():
 
 def test_build_config_applies_the_flow_knobs():
     t = T.load("ypcb-00338")
-    assert T.build_config(t, MCOLS=4, LANES=8, ACT_ROWS=16, DSTEP=1) == T.config(t)
-    assert T.build_config(t, MCOLS=4, LANES=8, DSTEP=1) == T.config(t)       # the target's 16
+    assert T.build_config(t, MCOLS=8, LANES=8, ACT_ROWS=16, DSTEP=1) == T.config(t)
+    assert T.build_config(t, MCOLS=8, LANES=8, DSTEP=1) == T.config(t)       # the target's 16
     c = T.build_config(t, MCOLS=2, ACT_ROWS=2, DSTEP=0)
     assert (c.MCOLS, c.ACT_ROWS, c.DSTEP, c.STREAM, c.PAIR) == (2, 0, False, False, True)
     assert T.build_config(t, MCOLS=4, ACT_ROWS=8).ACT_ROWS == 8
@@ -125,12 +125,15 @@ def test_card_target_matches_the_rtl_defaults():
     assert p["RPB"] == 8 * p["LANES"]                       # otpu_board: RPB = 8 * LANES
     top = _sv_defaults(ROOT / "rtl/boards/ypcb-00338/otpu_fpga_top_ld.sv")
     for k in ("MCOLS", "ACT_ROWS", "VPU_CL", "MXU_IMPL", "MXU_E", "LANES", "ULANES", "DDR_MTS",
-              "PLATFORM", "TRACE_DEPTH", "SEQ_WC"):
-        assert p[k] == top[k], k
+              "PLATFORM", "TRACE_DEPTH", "SEQ_WC", "TMEM_IMPL") + T.TMEM3_KEYS:
+        assert p.get(k, top[k]) == top[k], k
     assert _sv_defaults(ROOT / "rtl/boards/ypcb-00338/otpu_native_sys.sv")["TRACE_DEPTH"] \
         == p["TRACE_DEPTH"]
+    # release r2: MCOLS 8 at E 8, WAITC, the one pumped TMEM copy (r2pgRs, docs/tmem_nocopy.md)
     assert T.sim_uarch("ypcb-00338") == {"WIN": 16, "RPB": 128, "WPB": 1, "FIFO_DEPTH": 1024,
-                                         "MXU_E": 4}
+                                         "MXU_E": 8, "SEQ_WC": 1, "TMEM_IMPL": 3, "TMEM_NSB": 2,
+                                         "TMEM_RPL": 1, "TMEM_TDP": 1, "TMEM_GST": 1,
+                                         "TMEM_PMP": 1}
 
 
 def test_target_cli():
@@ -138,11 +141,12 @@ def test_target_cli():
                                     capture_output=True, text=True, check=True).stdout
     env = dict(line.split("=", 1) for line in run("env", "ypcb-00338").split())
     assert (env["T_MCOLS"], env["T_ACT_ROWS"], env["T_PLATFORM"], env["T_ARCH_HASH"]) == \
-        ("4", "16", "1", "89417856")
-    assert run("hash", "ypcb-00338", "MCOLS=4", "LANES=8", "ACT_ROWS=16", "DSTEP=1").strip() \
-        == "89417856"
-    assert run("hash", "ypcb-00338", "MCOLS=4", "LANES=8", "ACT_ROWS=4", "DSTEP=1").strip() \
-        == "ff270e6e"
+        ("8", "16", "1", "19a2400e")                    # release r2 (MCOLS 8, SEQ_WC)
+    # MX production 8b33206e's (MCOLS 4, no wait entries), and its 4-row build's
+    assert run("hash", "ypcb-00338", "MCOLS=4", "LANES=8", "ACT_ROWS=16", "DSTEP=1",
+               "SEQ_WC=0").strip() == "89417856"
+    assert run("hash", "ypcb-00338", "MCOLS=4", "LANES=8", "ACT_ROWS=4", "DSTEP=1",
+               "SEQ_WC=0").strip() == "ff270e6e"
     assert "bcu1525" in run("list")
 
 

@@ -34,19 +34,22 @@ device: use a paid license or AMD's 30-day evaluation license (see "License" bel
 ```sh
 cd boards/ypcb-00338
 make lint          # offline: Tcl syntax, XDC vs top ports, Verilator lint of the top
-make bit           # = MCOLS=4 ./run_vivado.sh 1066 -> build/vivado/otpu.bit, otpu.mcs, reports/.
-                   # The LiteDRAM core (WL7DDRPHY, DDR3-1066, the speed it is generated for; host
-                   # calibration; per channel behind otpu_mem_ch, which also takes XDMA's
-                   # traffic; docs/litedram.md section 9), 4 MXU columns and the systolic MXU
-                   # (docs/mxu_systolic.md; the host reads MCOLS and LANES from the bitstream's
-                   # VERSION register)
+make bit           # = MCOLS=8 ./run_vivado.sh 1066 -> build/vivado/otpu.bit, otpu.mcs, reports/.
+                   # The target's build (targets/ypcb-00338.toml, release r2): the LiteDRAM core
+                   # (WL7DDRPHY, DDR3-1066, the speed it is generated for; host calibration; per
+                   # channel behind otpu_mem_ch, which also takes XDMA's traffic; docs/litedram.md
+                   # section 9), 8 MX columns at E 8 (docs/mx_mxu.md 9; the host reads MCOLS and
+                   # LANES from the bitstream's VERSION register), WAITC (SEQ_WC, docs/seq_vpu.md)
+                   # and one TMEM copy pumped on core_clk2x (TMEM_IMPL 3, docs/tmem_nocopy.md)
 make bit FAST=1    # the same as a development build at 100 MHz (below)
+make bit MCOLS=4 MXU_E=4 TMEM_IMPL=0 SEQ_WC=0   # MX production 8b33206e's configuration
 make bit MCOLS=2   # 2 MXU columns
 make bit CORE_MHZ=80   # accelerator clock fallback when 100 MHz does not close (800/D MHz, D in 1/8 steps)
 make bit VPU_CL=4  # 4 VPU lanes with exp2/recip/rsqrt (2 by default): ~75% -> ~89% of the
                    # roofline on long-context attention; timing only, programs unchanged
-make bit MXU_E=2   # 2 MXU epilogue lanes (the target's: 4, full rate at MCOLS 4; timing only:
-                   # E 2 made Phi-4-mini / SmolLM3 decode slower than the previous numerics', docs/mx_mxu.md 9)
+make bit MXU_E=4   # 4 MXU epilogue lanes (the target's: 8, full rate at MCOLS 8; timing only:
+                   # E 4 halves prefill q.K^T at d 128 and G 5-8 decode; at MCOLS 4, E 2 made
+                   # Phi-4-mini / SmolLM3 decode slower than the previous numerics', docs/mx_mxu.md 9)
 make bit TMEM_IMPL=3  # one TMEM copy instead of six (docs/tmem_nocopy.md): 2 RAMs a bank pumped
                    # at 2x on the block design's core_clk2x (CLK2X: the MMCM's second output,
                    # O1 = O0 / 2), so core_clk's divider must be even: 133.33 (6) or 100 MHz (8),

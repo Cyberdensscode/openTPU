@@ -47,9 +47,30 @@ module tb_board;
   parameter logic [11:0] TEMP = 12'hA1A;  // the XADC code of 45 C
   parameter int NREG       = 0;            // bit j: channel j through two otpu_native_reg (an SLR
                                            // crossing's register slices, otpu_bcu_sys SLL)
+  // the TMEM (otpu_board; docs/tmem_nocopy.md): 0 a copy per read port, 3 one copy and its knobs
+  // (the card's target: opentpu/host/board.py passes them; PMP 1 on clk_f, below)
+  parameter int TMEM_IMPL  = 0;
+  parameter int TMEM_NSB   = 8;
+  parameter int TMEM_SBP   = 3;
+  parameter int TMEM_SBH   = 0;
+  parameter bit TMEM_RPL   = 1'b0;
+  parameter bit TMEM_TDP   = 1'b0;
+  parameter bit TMEM_GST   = 1'b0;
+  parameter int TMEM_PMP   = 0;
+  parameter int TMEM_PRK   = 0;
+  parameter int TMEM_SDM   = -1;
 
-  logic clk = 1'b0, rst = 1'b1, dump = 1'b0;
-  always #5 clk = ~clk;
+  logic clk = 1'b0, clk_f = 1'b0, rst = 1'b1, dump = 1'b0;
+  // TMEM_PMP 1: clk_f (2 x clk) rises with each edge of clk, in clk's own process (as tb_top);
+  // clk's edges stay where they are (the memory models' clocks are absolute)
+  if (TMEM_PMP == 1) begin : g_clkf
+    initial forever begin
+      #2 clk_f = 1'b0;
+      #3 begin clk = ~clk; clk_f = 1'b1; end
+    end
+  end else begin : g_clk
+    always #5 clk = ~clk;
+  end
 
   // AXI-Lite
   logic [11:0] awaddr, araddr;
@@ -82,8 +103,11 @@ module tb_board;
                .IMEM_WORDS(IMEM_WORDS), .LANES(LANES), .VPU_CL(VPU_CL), .MXU_IMPL(MXU_IMPL), .MXU_E(MXU_E), .ULANES(ULANES), .WIN(WIN), .CORE_KHZ(CORE_KHZ),
                .BUILD_ID(BUILD_ID), .DDR_MTS(DDR_MTS), .TRACE_DEPTH(TRACE_DEPTH), .TRACE_QD(TRACE_QD),
                .PQ_WIN(PQ_WIN), .DSTEP(DSTEP), .HOSTCAL(HOSTCAL), .SEQ_WC(SEQ_WC), .PLATFORM(PLATFORM),
-               .ARCH_HASH(ARCH_HASH), .COLL_GATHER(COLL_GATHER)) dut (
-    .clk, .clk_f(1'b0), .rst, .ctl_mrst(1'b0), .calib, .ded, .temp(TEMP), .led,
+               .ARCH_HASH(ARCH_HASH), .COLL_GATHER(COLL_GATHER), .TMEM_IMPL(TMEM_IMPL),
+               .TMEM_NSB(TMEM_NSB), .TMEM_SBP(TMEM_SBP), .TMEM_SBH(TMEM_SBH), .TMEM_RPL(TMEM_RPL),
+               .TMEM_TDP(TMEM_TDP), .TMEM_GST(TMEM_GST), .TMEM_PMP(TMEM_PMP), .TMEM_PRK(TMEM_PRK),
+               .TMEM_SDM(TMEM_SDM)) dut (
+    .clk, .clk_f, .rst, .ctl_mrst(1'b0), .calib, .ded, .temp(TEMP), .led,
     .i2c_lo, .i2c_pin(~({1'b0, i2c_lo} | i2c_hold)),
     .s_ctl_awaddr(awaddr), .s_ctl_awvalid(awvalid), .s_ctl_awready(awready),
     .s_ctl_wdata(wdata), .s_ctl_wstrb(4'hF), .s_ctl_wvalid(wvalid), .s_ctl_wready(wready),

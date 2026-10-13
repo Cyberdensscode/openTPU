@@ -31,21 +31,23 @@
 // flight at its reset and drops the response, so neither answers the reset master.
 // DDR3 port names are the LiteDRAM core's (ddram0_*, ddram1_*), so its XDC places them.
 module otpu_fpga_top_ld #(
-  parameter int MCOLS = 4,                  // MXU columns (activation rows per weight chunk)
+  // the defaults are the card's target, targets/ypcb-00338.toml (release r2: MCOLS 8, E 8, one
+  // pumped TMEM copy, WAITC), which create_project.tcl passes as generics
+  parameter int MCOLS = 8,                  // MXU columns (activation rows per weight chunk)
   parameter int ACT_ROWS = 16,              // ACT RAM rows (> MCOLS: MM replay, one weight pass)
   parameter int VPU_CL = 2,                 // VPU lanes with the composite functions (exp2, ...)
   parameter int MXU_IMPL = 2,               // MXU dot product: 2 systolic (docs/mxu_systolic.md), the only one
-  parameter int MXU_E = 4,                  // MXU epilogue lanes: MCOLS (full rate; docs/mx_mxu.md section 9)
-  parameter int TMEM_IMPL = 0,              // TMEM: 0 a copy per read port (production), 1 banked
-                                            //   (three copies, docs/tmem_pump.md), 3 one copy
+  parameter int MXU_E = 8,                  // MXU epilogue lanes: MCOLS (full rate; docs/mx_mxu.md section 9)
+  parameter int TMEM_IMPL = 3,              // TMEM: 0 a copy per read port (production 8b33206e),
+                                            //   1 banked (three copies, docs/tmem_pump.md), 3 one copy
   parameter bit TMEM_RQ = 1'b0,             // TMEM_IMPL 1: request-priority bank addresses
-  parameter int TMEM_NSB = 8,               // TMEM_IMPL 3, the one copy (docs/tmem_nocopy.md;
+  parameter int TMEM_NSB = 2,               // TMEM_IMPL 3, the one copy (docs/tmem_nocopy.md;
   parameter int TMEM_SBP = 3,               //   create_project.tcl TMEM_X, otpu_slice): RAMs a bank,
   parameter int TMEM_SBH = 0,               //   the sub-bank's address bit, its hash, replays, true
-  parameter bit TMEM_RPL = 1'b0,            //   dual-port RAMs, QUANT 3 and COLL the DMA's guests,
-  parameter bit TMEM_TDP = 1'b0,            //   the RAMs pumped at 2x (1: on core_clk2x, below),
-  parameter bit TMEM_GST = 1'b0,            //   the read ports' ranks and RAM sides
-  parameter int TMEM_PMP = 0,
+  parameter bit TMEM_RPL = 1'b1,            //   dual-port RAMs, QUANT 3 and COLL the DMA's guests,
+  parameter bit TMEM_TDP = 1'b1,            //   the RAMs pumped at 2x (1: on core_clk2x, below),
+  parameter bit TMEM_GST = 1'b1,            //   the read ports' ranks and RAM sides
+  parameter int TMEM_PMP = 1,
   parameter int TMEM_PRK = 0,
   parameter int TMEM_SDM = -1,
   parameter int LANES = 8,                  // VPU lanes / TMEM banks (8 or 16)
@@ -57,7 +59,7 @@ module otpu_fpga_top_ld #(
   parameter int PCIE_GEN = 1,               // 1: Gen1 x8, xdma_aclk 125 MHz; 2: Gen2 x8, 250 MHz,
                                             // slices to the bridges (otpu_native_sys XREG),
                                             // the LiteDRAM CSRs on core_clk (bd_native.tcl)
-  parameter bit SEQ_WC     = 1'b0,    // EXPERIMENTAL: otpu_seq's wait entries (WAITC, docs/seq_vpu.md; CFG_UARCH bit24)
+  parameter bit SEQ_WC     = 1'b1,    // otpu_seq's wait entries (WAITC v2, docs/seq_vpu.md; CFG_UARCH bit24)
   parameter int PLATFORM = 1,               // targets/ypcb-00338.toml (CFG_PLATFORM)
   parameter logic [31:0] ARCH_HASH = 32'h0, // its arch_hash (CFG_HASH; create_project.tcl)
   parameter int TRACE_DEPTH = 16384,        // trace records (a power of two; 0: no trace buffer,
