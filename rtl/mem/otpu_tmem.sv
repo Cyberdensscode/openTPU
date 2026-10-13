@@ -301,7 +301,8 @@ module otpu_tmem #(
   // RPL (replay): the units read as if no RAM were shared (the slice's grant ignores the RAMs) and
   // a read that lost is read again the next cycle: the port's banks and rows are registered with
   // the read, and the next cycle they ask again (frz) ranked before every request but TOPP's (the
-  // DMA's, which has no hold); their words reach the port's lanes the cycle after (the lanes
+  // DMA's, which has no hold), and among the replays the oldest first (age, a forward-progress
+  // guarantee); their words reach the port's lanes the cycle after (the lanes
   // fresh again, without the bypass: the replay returns what the first read would have, the
   // writes landed since are the ones that were before it). `lost` tells the slice to hold the
   // port's unit for the cycle the replay takes (its lanes' words of the lost read are not the
@@ -329,7 +330,9 @@ module otpu_tmem #(
   // own: SH_HOST's asker asks for the first guest that reads, and the guests take its data (one
   // data select for the three). With RPL the host is TOPP, which never loses.
   // an asker's rank (0 first): without RPL PRANK's; with it TOPP's request, the replays in PRANK
-  // order, then the other requests in PRANK order. rlive: the port's reads may be replayed
+  // order (on a side with three or more replay askers the oldest first: age, below; PRANK's for
+  // those begun in one cycle), then the other requests in PRANK order. rlive: the port's reads
+  // may be replayed
   function automatic int rnk(input int p, input bit rp);
     if (!RPL) return int'(PRANK[p]);
     if (rp) return 1 + int'(PRANK[p]);
@@ -423,8 +426,39 @@ module otpu_tmem #(
         assign arw[i][b] = ram_row(aa[i][b]);
       end
     end
+    // The replays' age (RPL, a forward-progress guarantee): of two replays the older ranks first
+    // (begun in one cycle, in PRANK order). A replay then loses only to TOPP's ask and to replays
+    // older than it, and the oldest wins as soon as TOPP leaves its RAMs. A fixed order let two
+    // ports that took turns replaying hold off a third: each lost a read to the third's pending
+    // replay (which took that RAM, losing another) and its replay then beat the third's. With two
+    // replay askers on a side that needs TOPP every other cycle, so the age is kept only on a side
+    // of three or more (the pick's port B: the MXU, VPU B, QUANT 2; GST's guests have no asker).
+    function automatic bit asker_rl(input int p);   // a replayable port with an asker of its own
+      return rlive(p) && !(GST && SH_MASK[p]);
+    endfunction
+    function automatic bit aged(input int i, input int o);
+      int n;
+      n = 0;
+      for (int p = 0; p < NRP; p++) if (asker_rl(p) && sd_of(p) == sd_of(i)) n++;
+      return i != o && asker_rl(i) && asker_rl(o) && sd_of(i) == sd_of(o) && n >= 3;
+    endfunction
+    // age[i][o] (o < i): o's replay began before i's (meaningful while both replay). A replay
+    // begins the cycle after its port's read loses (lost, rpv low): o's beginning makes it the
+    // younger, unless i's begins with it
+    logic [NRP-1:0][NRP-1:0] age;
+    always_ff @(posedge clk)
+      for (int i = 0; i < NRP; i++)
+        for (int o = 0; o < i; o++)
+          if (aged(i, o)) begin
+            if (lost[o] && !rpv[o])
+              age[i][o] <= (lost[i] && !rpv[i]) ? rnk(o, 1'b1) < rnk(i, 1'b1) : 1'b0;
+            else if (lost[i] && !rpv[i]) age[i][o] <= 1'b1;
+          end
+`ifndef SYNTHESIS
+    initial age = '0;
+`endif
     // bf[i][o]: asker o ranks before asker i this cycle (on i's side; the replays' registers pick
-    // the case of four constant ones)
+    // the case of four: three constant ones, and with both replaying their age where it is kept)
     logic [NRP-1:0][NRP-1:0] bf;
     for (genvar i = 0; i < NRP; i++) begin : g_bf
       for (genvar o = 0; o < NRP; o++) begin : g_o
@@ -435,7 +469,8 @@ module otpu_tmem #(
           localparam bit B01 = rnk(o, 1'b0) < rnk(i, 1'b1);
           localparam bit B10 = rnk(o, 1'b1) < rnk(i, 1'b0);
           localparam bit B11 = rnk(o, 1'b1) < rnk(i, 1'b1);
-          assign bf[i][o] = rp[o] ? (rp[i] ? B11 : B10) : (rp[i] ? B01 : B00);
+          wire ol = !aged(i, o) ? B11 : (o < i) ? age[i][o] : !age[o][i];
+          assign bf[i][o] = rp[o] ? (rp[i] ? ol : B10) : (rp[i] ? B01 : B00);
         end
       end
     end
@@ -545,6 +580,19 @@ module otpu_tmem #(
             if (rpe[p][b] && pw_v[b][0] && pw_a[b][0] == rpa[p][b])
               $fatal(1, "TMEM%0d: port %0d's word %0d awaiting a replay was written at %0t", SID, p,
                      int'(rpa[p][b]) * LANES + b, $time);
+    // forward progress: a replay that loses RPLW cycles in a row stops the simulation (a livelock:
+    // what holds a replay off, TOPP's asks and older replays, lasts that long only when it waits on
+    // the replaying unit itself)
+    localparam int RPLW = 1 << 22;
+    int rpn [NRP];
+    initial for (int p = 0; p < NRP; p++) rpn[p] = 0;
+    always @(posedge clk)
+      for (int p = 0; p < NRP; p++) begin
+        rpn[p] <= (RPL && rpv[p] && lost[p]) ? rpn[p] + 1 : 0;
+        if (rpn[p] >= RPLW)
+          $fatal(1, "TMEM%0d: port %0d's replay lost %0d cycles in a row at %0t", SID, p, rpn[p],
+                 $time);
+      end
 `endif
     assign frz = RPL ? rpv : '0;
     always_comb

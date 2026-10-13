@@ -680,13 +680,21 @@ module otpu_slice
   // successive cycles: those not blocked read ahead of the grant (tm_pre: their lanes hold the
   // words), drop out of the requests (tm_sv), and the unit is granted when the rest can read.
   // (TMEM_RPL: the requests of a group held for a replay, and the VPU's while its registered
-  // enable is low, ask no RAM)
+  // enable is low, ask no RAM.) TMEM_RPL with guests: the collective asks only when the guests'
+  // rule lets it read (coll_blk, from the requests). While QUANT holds for a replay its QUANT 3
+  // request asks nothing but is still up, and coll_blk keeps the collective from reading; had the
+  // collective asked, the DMA's asker, first in rank, would ask for its words every cycle, and a
+  // replay on that RAM side (the one holding QUANT among them) would lose to it for good. Every
+  // ask of the DMA's asker is then a read that happens, unless the read waits on something no
+  // replay holds up (the DRAM's write room for a QST, another slice's grant of the collective,
+  // the DMA's write banks), and a replay waits only on it and on older replays (otpu_tmem)
   always_comb begin
     logic [NRP-1:0] off;
     off = '0;
     if (TMEM_IMPL == 3 && TMEM_RPL)
       for (int g = 0; g < NG; g++)
         if ((g == G_VPU) ? !v_ren : rpl_frz[g]) off = off | grp_rports(g);
+    if (TMEM_IMPL == 3 && TMEM_RPL && coll_blk) off[P_COLL] = 1'b1;
     for (int p = 0; p < NRP; p++)
       rq_t[p] = ((TMEM_IMPL == 3 && !TMEM_RPL && tm_sv[p]) || off[p]) ? '0 : rq_en[p];
   end

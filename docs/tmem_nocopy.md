@@ -239,8 +239,9 @@ is settled after the fact.
   then holds, so its request does not ask): one asker a port. The DMA's request ranks first (it
   cannot hold: its data arrive from DRAM), then the replays, then the other requests (the
   groups' order: COLL, VPU A, VPU B, MXU, QUANT, QUANT 2, QUANT 3). A replay ranks before every
-  request but the DMA's, so it wins the next cycle unless the DMA or an earlier replay takes the
-  same RAM for another word.
+  request but the DMA's, so it wins the next cycle unless the DMA or an older replay takes the
+  same RAM for another word. Among replays the oldest ranks first; those that began in one cycle
+  keep the groups' order (section 5.3).
 - **A lost read.** An asker loses when an asker before it takes one of its RAMs for another word.
   Its port's banks, rows and lanes are registered with the read (`rpe`, `rpa`, `rpl`); the next
   cycle they ask again (`frz`), and the cycle after the replay wins its words reach the port's
@@ -261,7 +262,9 @@ is settled after the fact.
   before them, ask nothing (today's rule: the slice's `q3_blk` / `coll_blk`), so they need no
   asker of their own: the DMA's asker asks for the first reading guest, and the guests take the
   DMA's data. Six askers instead of eight, one data select for three ports, and the same cycles
-  as today's TMEM for those two ports. The DMA ranks first, so a guest's read is never lost.
+  as today's TMEM for those two ports. The DMA ranks first, so a guest's read is never lost. A
+  guest asks only when that rule lets it read: while QUANT holds for a replay, QUANT 3's request
+  asks nothing but still keeps COLL from reading, so COLL does not ask either (section 5.3).
 - **Pumped** (`TMEM_PMP`, 30cbe6e0). Each RAM is P3's pumped bank (`otpu_pump_bank` on a 2x
   clock, `docs/tmem_pump.md`): both RAM ports read at the core edge (port B side B, port A side
   A), and the write lands at the fast edge between. A write takes no read port, so there are no
@@ -319,6 +322,78 @@ scoreboard or with WAITC (section 6.4).
   write's port-A conflict dropped, the host ignoring its guest's request, the core-clock model
   without its bypass: each fails within 12 cycles.
 - The co-simulations of section 6 are checked against the ISA simulator.
+
+### 5.3 Forward progress
+
+A replay must win in the end. Two things can keep it losing: an asker ranked before it on its
+RAM side that asks every cycle for a read that never happens, and younger replays that keep
+coming back.
+
+**The hang of release r2 (2026-10-13).** Under the r2 target (`OTPU_UARCH=board`),
+`test_fuzz_mm_replay[2-8-1]` and `[2-6-3]` ran to 50M cycles without halting. TMEMSTAT showed
+QUANT 2's replay losing every cycle, and VPU B's too in [2-8-1]. The cause was the guests:
+
+1. QUANT holds while QUANT 2 replays. Its requests then ask nothing (the slice's `off` mask), but
+   QUANT 3's request stays up.
+2. The slice's guest rule (`coll_blk`, from the requests) keeps the collective from reading while
+   QUANT 3 requests, so a pending collective read (`coll_ren`) is never granted.
+3. `otpu_tmem`'s guest chain works from the asks. QUANT 3 asks nothing, so the DMA's asker, first in
+   rank, asks for the collective's words, every cycle.
+4. Those words sat in a RAM the replays needed, on port B: the DMA's side is also QUANT 2's and
+   VPU B's. The replays lost to it every cycle, so QUANT never resumed and QUANT 3's request
+   stayed up. A deadlock.
+
+A debug print at the hang: [2-8-1], cycle 2,288, QUANT 2 (word 660) and VPU B (word 2,748)
+replaying; the collective's words 4,568-4,575 in the same RAMs of banks 0-3; `coll_blk` 1, the
+collective never granted. WAITC only moves the schedule: without it [2-6-3] still hangs and [2-8-1]
+does not. The simulators' default TMEM (`TMEM_IMPL 0`) has no replays, so only the board's uarch
+showed it.
+
+**The fix: a guest asks only when it may read.** The slice keeps the collective's request out of the
+asks while `coll_blk` holds. QUANT 3 already asks only when the DMA does not, which is `q3_blk`. So
+every ask of the DMA's asker is a read that happens, unless that read waits on something no replay
+holds up:
+- the DRAM's write room for a QST (`sw_rdy`);
+- another slice's grant of the collective;
+- the DMA's write banks.
+
+**The age order: a guarantee among the replays.** The replays had a fixed order (PRANK). Two ports
+taking turns could then hold off a third. A replay that loses elsewhere still takes the RAMs it
+asks first, so with QUANT 2's replay pending:
+1. Cycle t: VPU B's replay beats QUANT 2's in one bank, and the MXU's read loses to QUANT 2's
+   replay in another.
+2. Cycle t+1: the MXU's replay beats QUANT 2's, and VPU B's next read loses to QUANT 2's replay.
+3. Cycle t+2 is cycle t again.
+
+Such a run ends only when one of the two units finishes its instruction; nothing bounds it. Now,
+of two replays the older ranks first: a register per pair of replay ports on one RAM side, set as
+a replay begins, and replays that begin in one cycle keep PRANK's order. With two replay askers on a
+side, the fixed order cannot starve one without the DMA's asker every other cycle, so the age is kept
+only on a side with three or more: the pick's port B (the MXU, VPU B and QUANT 2; the guests have no
+asker). A replay then loses only to two things:
+- the DMA's asker;
+- older replays.
+
+The oldest replay wins as soon as the DMA's asker leaves its RAMs. In the unpumped ASIC form a write
+on port A also takes its RAM. None of these waits on the replaying unit. The simulation stops when
+a replay loses 4M cycles in a row (`otpu_tmem`, the `RPLW` check).
+
+**Measured** (hwe-bench, the r2 target through `OTPU_UARCH=board`; omarchy, Vivado 2026.1):
+
+| | release-2 (5107b74f) | the guest fix alone | the fix (guests + age) |
+|---|---|---|---|
+| test_rtl's fuzzers' generators, 296 programs (seeds 0-39 of five mm shapes, 0-63 one slice, 0-31 two) | 34 hang | | none hangs, all bit-exact |
+| the same at more seeds, 856 programs (0-119, 0-191, 0-63) | | | all bit-exact (one run failed before its simulation started; bit-exact on a rerun) |
+| the mm fuzzers, 160 programs | | all bit-exact | |
+| `test_fuzz_mm_replay[2-8-1]`, `[2-6-3]` | hang (50M cycles) | | 2,637 and 3,537 cycles, bit-exact |
+| the age order alone (no guest fix), those two | | | still hang: the 4M-cycle check stops them |
+| the 17 co-simulations of `all.txt` (the r2 target, real 2x clock), cycles | | | geomean +0.00% (12 identical, -0.03% to +0.05%); every checked run bit-exact |
+| ... extra TMEM reads (replays / reads) | 1.39-6.94% | | 1.39-6.94% (each within 2.5% of release-2's count) |
+| `k7-r2pgRs` out of context, LUTs | 13,271 | 13,314 | 13,551 |
+| WNS / WHS at 7.5 / 3.75 ns | +0.232 / +0.071 | +0.071 / +0.068 | +0.281 / +0.056 |
+
+The worst path of all three is the write stage into a RAM at the fast edge (0 or 1 level), as
+section 6.3's; it moves with placement. The age costs about 240 LUTs, the guest fix about 40.
 
 ## 6. Measurements
 

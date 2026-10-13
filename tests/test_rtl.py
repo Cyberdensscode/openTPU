@@ -289,6 +289,30 @@ def test_fuzz_mm_replay(have_verilator, mcols, rows, seed):
     assert np.array_equal(tmems[0], m.slices[0].tmem)
 
 
+# the single pumped TMEM copy as release r2 builds it (targets/ypcb-00338.toml: r2pgRs)
+R2_TMEM = {"TMEM_IMPL": 3, "TMEM_NSB": 2, "TMEM_SBP": 3, "TMEM_RPL": 1, "TMEM_TDP": 1,
+           "TMEM_GST": 1, "TMEM_PMP": 1}
+
+
+@pytest.mark.parametrize("mcols,rows,seed", [(2, 8, 1), (2, 6, 3)])
+def test_one_copy_replays_make_progress(have_verilator, mcols, rows, seed):
+    """The single pumped TMEM copy (TMEM_IMPL 3 with replays and guests, on the board's uarch)
+    on the two fuzz_mm_replay programs it never finished (docs/tmem_nocopy.md 5.3): a collective
+    read waited behind QUANT 3's request while QUANT held for a replay, the DMA's asker asked for
+    the collective's words every cycle, and the replay, on that RAM side, lost to it for good
+    (QUANT 2's; VPU B's too in [2-8-1]). The results are the ISA's, and they come within a
+    million cycles (about 3,000 with the fix)."""
+    rng = np.random.default_rng(3000 + seed)
+    cfg = Config(S=1, MCOLS=mcols, ACT_ROWS=rows)
+    prog = _random_program(rng, cfg, n_ops=60)
+    imgs = _images(rng, 1)
+    m = Machine(cfg, [prog], [i.copy() for i in imgs]).run()
+    drams, tmems, _ = rtlsim.run(cfg, [prog], [i.copy() for i in imgs],
+                                 uarch={**rtlsim.BOARD_UARCH, **R2_TMEM}, max_cycles=1_000_000)
+    assert np.array_equal(drams[0], m.slices[0].dram)
+    assert np.array_equal(tmems[0], m.slices[0].tmem)
+
+
 @pytest.mark.parametrize("mcols,rows", [(4, 8), (8, 16)])
 @pytest.mark.parametrize("M,wf,pair", [(1, I.W8, False), (3, I.W8, False), (1, I.W4F, True),
                                        (2, I.WNV, True), (4, I.W4I, False), (6, I.W4F, False),
