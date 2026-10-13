@@ -4,7 +4,7 @@
 # in the middle, between the lower and the upper half of the chains). The ACT RAM's memory
 # of column j (otpu_actram g_row[j]) goes in the block RAM column beside it, each block RAM at the
 # height of the positions it feeds. The weight RAMs (otpu_mxu g_fd, u_fs0, u_fs1) go in the block
-# RAM column beside column 0.
+# RAM column beside column 0, each level with the positions its outputs reach.
 #
 # Why. Left to the placer, r2's MCOLS 8 dev build (f55949f9) spread each array column's 16-DSP
 # cascade chains over 5-7 DSP columns across the whole die. Each column's weight hop (2 x 8 bits
@@ -31,6 +31,16 @@
 #   at level 5 (101-103%, X27-58 Y200-238: u_mxu, u_mem, u_seq, u_ch1) against 163ab46d's one,
 #   the weight feed's endpoints under +0.2 ns went from 88 to 455, and core_clk from -0.003 to
 #   -0.156 ns. top places exactly as before mid existed (the scale RAMs above the array too).
+# - The weight RAMs: OTPU_MXU_WRAM=loads (the default) puts a RAM whose outputs reach the weight
+#   skews (g_wsk[i], through wsel: an 8-bit format's position range and a 4-bit one, D/2 apart for
+#   the high half) level with the middle of the rows of the positions it reaches (the farthest
+#   one's distance halved; their centroid sits nearer the 4-bit range, twice as many positions, and
+#   on 163ab46d's opt checkpoint left the farthest at 85 DSP rows, linear 75); the RAMs that reach none
+#   (u_fs0, u_fs1: the scale entries) take their places of the linear spread. linear: all spread
+#   over the array's height in name order, as r2 and r2.1's 163ab46d / 4f8be3d2 did, which put
+#   g_fd[1]'s mem_reg_5 at RAMB36_X0Y30 (level with position ~50) for skews at positions 58..62
+#   and 117..125: the weight feed's endpoints were 2-3 levels with 5.0-5.7 ns of route (163ab46d
+#   88 under +0.2 ns, worst +0.009; 4f8be3d2 455, worst -0.156, its worst endpoint).
 # It stops the run (error) when a name pattern matches no cells, when the PEs are not MCOLS x D,
 # or when a cascade chain is not in position order. The LOCs it sets are also written to
 # otpu_mxu_place.xdc in the implementation run's directory (or to OTPU_MXU_PLACE_XDC).
@@ -115,6 +125,18 @@ proc ::otpu_mxu_place::chain_order {cs} {
 proc ::otpu_mxu_place::prow {i} {
   variable split_at; variable n_ce
   return [expr {$i >= $split_at ? $i + $n_ce : $i}]
+}
+
+# the positions i whose weight skews (g_wsk[i]; wd[i] where the skew is 0 stages) a block RAM's
+# outputs reach, through the decode (wsel) to their first registers
+proc ::otpu_mxu_place::wsk_pos {c} {
+  set pins [get_pins -quiet -of_objects [get_cells $c] -filter {DIRECTION == OUT && REF_PIN_NAME =~ DO*}]
+  if {![llength $pins]} { return {} }
+  set ps {}
+  foreach e [all_fanout -quiet -flat -endpoints_only -from $pins] {
+    if {[regexp {/g_wsk\[(\d+)\]\.} $e -> i] || [regexp {/u_mxu/wd_reg\[(\d+)\]} $e -> i]} { lappend ps $i }
+  }
+  return [lsort -integer -unique $ps]
 }
 
 proc ::otpu_mxu_place::loc {cell site} {
@@ -260,15 +282,51 @@ proc ::otpu_mxu_place::run {} {
       incr k; incr nact
     }
   }
-  # ---- the weight RAMs, spread level with the PEs beside column 0
+  # ---- the weight RAMs beside column 0: by their loads (each level with the middle of the rows
+  # of the positions it reaches, which halves the farthest one's distance; those first, in row
+  # order), the others at their places of the linear spread; or all linear
   set wr [lsort -dictionary [cells RAMB [format {^%s/(g_fd\[\d+\]\.|u_fs0/|u_fs1/)} [q $pre]] \
                                "the MXU's weight RAMs (otpu_mxu g_fd, u_fs0, u_fs1)"]]
   set n [llength $wr]
+  set wm [expr {[info exists ::env(OTPU_MXU_WRAM)] ? $::env(OTPU_MXU_WRAM) : "loads"}]
+  if {$wm ni {loads linear}} { error "otpu_mxu_place: OTPU_MXU_WRAM '$wm': loads or linear" }
+  set byl {}; set lin {}; set far 0; set farl 0; set wnotes {}
   set k 0
   foreach c $wr {
-    ram $c $wcol [expr {int(($base + [prow [expr {($k + 0.5) * $d / $n}]]) / 2)}] $nb
+    set rl [expr {int(($base + [prow [expr {($k + 0.5) * $d / $n}]]) / 2)}]
     incr k
+    set ps [expr {$wm eq "loads" ? [wsk_pos $c] : {}}]
+    if {![llength $ps]} { lappend lin [list $rl $c]; continue }
+    set lo [expr {$base + [prow [lindex $ps 0]]}]
+    set hi [expr {$base + [prow [lindex $ps end]]}]
+    lappend byl [list [expr {($lo + $hi) / 4}] $c $ps $rl]
   }
+  foreach e [lsort -integer -index 0 $byl] {
+    lassign $e r c ps rl
+    ram $c $wcol $r $nb
+    # the farthest position it reaches, in DSP rows from its block RAM row (and from the linear one)
+    regexp {Y(\d+)$} [get_property LOC [get_cells $c]] -> got
+    if {[string match RAMB18* [get_property REF_NAME [get_cells $c]]]} { set got [expr {$got / 2}] }
+    set f1 0; set f2 0
+    foreach i $ps {
+      set dr [expr {$base + [prow $i]}]
+      set f1 [expr {max($f1, abs($dr - 2 * $got))}]
+      set f2 [expr {max($f2, abs($dr - 2 * $rl))}]
+    }
+    set far [expr {max($far, $f1)}]; set farl [expr {max($farl, $f2)}]
+    # its positions as ranges, for the record
+    set rg {}; set a [lindex $ps 0]; set z $a
+    foreach i [lrange $ps 1 end] {
+      if {$i == $z + 1} { set z $i; continue }
+      lappend rg [expr {$a == $z ? $a : "$a-$z"}]; set a $i; set z $i
+    }
+    lappend rg [expr {$a == $z ? $a : "$a-$z"}]
+    lappend wnotes "# weight RAM $c: positions [join $rg ,] -> block RAM row $got (linear $rl),\
+                    the farthest $f1 DSP rows away (linear $f2)"
+  }
+  foreach e $lin { ram [lindex $e 1] $wcol [lindex $e 0] $nb }
+  set wdesc [expr {$wm eq "loads" ? "[llength $byl] by their loads, the farthest position $far DSP rows\
+                                     away (linear: $farl), [llength $lin] linear" : "linear"}]
   # ---- the record: in an implementation run's directory, or OTPU_MXU_PLACE_XDC; not where
   # build.tcl opens the synthesized design for its reports (the build's working directory)
   set rec ""
@@ -282,13 +340,14 @@ proc ::otpu_mxu_place::run {} {
     puts $f "# otpu_mxu_place.tcl on $part: MCOLS $mc, D $d ($heads cascade chains), rows $base..[expr {$base + $h - 1}],\
              column ends ($cem) at rows [expr {$base + $split}]..[expr {$base + $split + $nce - 1}];\
              DSP columns $dcols, ACT block RAM columns $bcols, weight RAMs column $wcol"
+    foreach l $wnotes { puts $f $l }
     puts $f [join $lines \n]
     close $f
   }
   puts "otpu_mxu_place: MCOLS $mc x D $d PEs ($heads chains) and [llength $ce(0)] column-end DSPs a column on\
         DSP48_X{$dcols} rows $base..[expr {$base + $h - 1}], the column ends ($cem) from row [expr {$base + $split}];\
         $nact ACT RAMs on RAMB36_X{$bcols};\
-        $n weight RAMs on RAMB36_X$wcol ([llength $lines] LOCs[expr {$rec ne "" ? ", $rec" : ""}])"
+        $n weight RAMs on RAMB36_X$wcol ($wdesc) ([llength $lines] LOCs[expr {$rec ne "" ? ", $rec" : ""}])"
 }
 
 ::otpu_mxu_place::run

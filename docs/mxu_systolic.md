@@ -237,8 +237,17 @@ the netlist's PE names and takes the part's column table:
 - The ACT RAM's memory of column j (`otpu_actram g_row[j]`: 4 pieces of 4 RAMB36, piece p = bytes
   32p..32p+31, and its scale RAM) goes in the block RAM column beside it, RAMB36_X1..X8 (tile X 17
   26 37 46 57 66 77 86). Each block RAM sits level with the 8 positions its bytes feed.
-- The weight RAMs (`g_fd`, `u_fs0`, `u_fs1`) go in RAMB36_X0 (tile X 6), beside column 0, spread
-  over the array's height.
+- The weight RAMs (`g_fd`, `u_fs0`, `u_fs1`) go in RAMB36_X0 (tile X 6), beside column 0. Through
+  `wsel` a `g_fd` RAM's bits reach two position ranges, an 8-bit format's and a 4-bit one's (the
+  high half's D/2 lower): `g_fd[1]`'s `mem_reg_5` reaches positions 58-62 and 117-125. Each goes
+  level with the middle of the rows of the positions its outputs reach (`OTPU_MXU_WRAM=loads`,
+  the default since r2.1: `all_fanout` from its outputs to the `g_wsk` skews), `u_fs0` / `u_fs1`
+  (the scale entries, no position) at their places of the linear spread. On 163ab46d's opt
+  checkpoint that leaves the farthest position 35 DSP rows from its RAM (65 for `g_fd[1]`'s
+  `mem_reg_6`, which reaches positions 0-6, 63-67 and 126-127) where the linear spread in name order
+  (`OTPU_MXU_WRAM=linear`, release r2 and r2.1's 163ab46d) left 75: in 163ab46d the weight feed's
+  endpoints (2-3 levels, 5.0-5.7 ns of route) were 88 under +0.2 ns (worst +0.009), in 4f8be3d2
+  (column ends in the middle) 455 (-0.156 ns, its worst).
 - DSP X0 and X9..X11 (640 sites) stay free for the VPU, QUANT and the epilogue lanes.
 
 It stops (an error, and `build.tcl` fails the build if its summary line is missing from the run's
