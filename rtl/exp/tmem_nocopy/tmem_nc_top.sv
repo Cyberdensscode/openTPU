@@ -174,6 +174,8 @@ module tmem_nc_top #(
       off = '0;
       for (int g = 0; g < NG; g++)
         if ((g == G_VPU) ? !v_en : frzg[g]) off = off | grp_rports(g);
+      // GST: the collective asks only when the guests' rule lets it read (otpu_slice coll_blk)
+      if (GST && (|rq_en[P_COLL]) && ((|rq_en[P_DMA]) || (|rq_en[P_Q3]))) off[P_COLL] = 1'b1;
       for (int p = 0; p < NRP; p++) rq_t[p] = off[p] ? '0 : rq_en[p];
     end
     always_ff @(posedge ck) v_en <= v_room && !(tm_lost[P_VA] || tm_lost[P_VB]);
