@@ -1038,14 +1038,15 @@ class Spec(QW.Spec):
     `vision` (VisionSpec) in the model's image before the expert slots (Image): the tower's
     weights in `vision_fmt` (VisionImage.formats), a crop's work area of `vision_patches`
     patches, `vision_rows` rows of image tokens (the projector's output rows a prompt's
-    images take, docs/minicpmv.md 4.3). `vision_staged`: the tower's weights are the expert
-    pool's entries past the experts, placed in expert slots for an image's runs (the expert
-    server's place) instead of resident (docs/minicpmv.md 4.2)."""
+    images take, docs/minicpmv.md 4.3). `vision_staged` (a MoE's; the default since session
+    mcpv2, docs/minicpmv.md 6: decode +8.4%, an image +0.3-0.9 s): the tower's weights are the
+    expert pool's entries past the experts, placed in expert slots for an image's runs (the
+    expert server's place) instead of resident (docs/minicpmv.md 4.2)."""
     vision: VisionSpec | None = VisionSpec()   # None: the language model alone
     vision_fmt: str = "int8"
     vision_patches: int = 2048
     vision_rows: int = 2048
-    vision_staged: bool = False
+    vision_staged: bool = True
 
     @staticmethod
     def from_hf(model_dir) -> "Spec":
@@ -1079,18 +1080,23 @@ class Image(QW.Image):
             if max(v.piece_sizes()) > L.slot_bytes:
                 raise ValueError(f"vision pieces of up to {max(v.piece_sizes())} bytes, slots "
                                  f"of {L.slot_bytes}")
+            free = sum(max(0, n - L.k) for _, n in L.slots)     # (ExpertServer.place's room)
+            if len(v.used()) > free:
+                raise ValueError(f"staged vision: {len(v.used())} pieces, {free} expert slots "
+                                 f"past k = {L.k} a layer (more slots, or vision_staged False)")
             v.set_bound(*L.slot_bounds)
 
     def before_slots(self, b) -> None:
         sp = self.spec
         mp = None                       # staged: pieces of at most an expert slot's bytes
-        if sp.vision is not None and sp.vision_staged and sp.moe is not None:
+        staged = sp.vision is not None and sp.vision_staged and sp.moe is not None
+        if staged:
             from . import moe as MO
             mp = min(VisionImage.MAX_PIECE,
                      MO.ExpertFormat(sp.hidden, sp.moe.ffn, self.cfg.D, self.wformat).nbytes)
         self.vision = None if sp.vision is None else \
             VisionImage(sp.vision, self.cfg, b, nmax=sp.vision_patches, out_rows=sp.vision_rows,
-                        fmt=sp.vision_fmt, resident=not sp.vision_staged, max_piece=mp)
+                        fmt=sp.vision_fmt, resident=not staged, max_piece=mp)
         if self.vision is not None:     # (an attribute of the image's own: the image cache keeps
             self.vis_tables = self.vision.tables    # its entries, opentpu/imgcache.py)
 

@@ -348,13 +348,16 @@ def test_staged_vision_is_the_resident_towers(tiny, pool, tmp_path):
     from opentpu.llm import minicpmv as MV
     m, d = tiny
     spec = replace(load_spec(d), vision_patches=128, vision_rows=64)
+    assert spec.vision_staged                   # (the default)
     W = dict(load_weights(d).items())
     W.update(_tiny_vision_weights(spec.vision, np.random.default_rng(7)))
     cfg = device_config(spec, 256, rows=1, lookup=True, S=1, experts=E)
     kw = dict(cap=256, cfg=cfg, rows=1, resident=True, experts=E, layer_major=2)
-    a = Engine(spec, W, **kw)
-    b = Engine(replace(spec, vision_staged=True), W,
-               **(dict(kw, pool_file=tmp_path / "pool.bin") if pool else kw))
+    a = Engine(replace(spec, vision_staged=False), W, **kw)
+    b = Engine(spec, W, **(dict(kw, pool_file=tmp_path / "pool.bin") if pool else kw))
+    with pytest.raises(ValueError, match="staged vision: .* pieces"):   # (2 k slots a layer)
+        spec.image(device_config(spec, 256, rows=1, lookup=True, S=1, experts=2 * K), 256, 1, 1,
+                   experts=2 * K)
     va, vb = a.image.vision, b.image.vision
     assert va.resident and not vb.resident and vb.max_piece <= b.image.offload.slot_bytes
     assert b.image.pool_extra[0] == vb.npieces and a.image.pool_extra is None
@@ -550,7 +553,8 @@ def test_image_rows_are_layer_zeros_input(tiny, em, monkeypatch):
     from opentpu.llm import qwen35 as Q35
     monkeypatch.setattr(Q35, "PREFILL_CHUNK", 24)
     m, d = tiny
-    spec = replace(load_spec(d), vision_patches=128, vision_rows=64)
+    spec = replace(load_spec(d), vision_patches=128, vision_rows=64,
+                   vision_staged=False)         # (2 k slots a layer: too few to stage)
     rng = np.random.default_rng(3)
     W = dict(load_weights(d).items())
     W.update(_tiny_vision_weights(spec.vision, rng))
@@ -610,7 +614,8 @@ def test_an_image_cache_hit_keeps_the_position_table(tiny, tmp_path, monkeypatch
     ck = tmp_path / "ck"
     ck.mkdir()
     (ck / "config.json").write_text((d / "config.json").read_text())
-    spec = replace(load_spec(ck), vision_patches=128, vision_rows=64)
+    spec = replace(load_spec(ck), vision_patches=128, vision_rows=64,
+                   vision_staged=False)         # (2 k slots a layer: too few to stage)
     vw = _tiny_vision_weights(spec.vision, np.random.default_rng(4))
     sd = safetensors.load_file(str(d / "model.safetensors"))
     sd.update({k: torch.from_numpy(v) for k, v in vw.items()})
@@ -637,7 +642,8 @@ def test_the_card_rope_rows_are_hfs_mrope(tiny):
     from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as HM
     from opentpu.llm import minicpmv as MV
     m, d = tiny
-    spec = replace(load_spec(d), vision_patches=128, vision_rows=64)
+    spec = replace(load_spec(d), vision_patches=128, vision_rows=64,
+                   vision_staged=False)         # (2 k slots a layer: too few to stage)
     vs = spec.vision
     W = dict(load_weights(d).items())
     W.update(_tiny_vision_weights(vs, np.random.default_rng(6)))
@@ -696,7 +702,8 @@ def test_serve_keys_contexts_by_their_images(tiny):
     sp = load_spec(d)
     vs = replace(sp.vision, image_token=1000, image_start=1001, image_end=1002,
                  slice_start=1003, slice_end=1004)
-    spec = replace(sp, vision=vs, vision_patches=128, vision_rows=64)
+    spec = replace(sp, vision=vs, vision_patches=128, vision_rows=64,
+                   vision_staged=False)         # (2 k slots a layer: too few to stage)
     rng = np.random.default_rng(7)
     W = dict(load_weights(d).items())
     W.update(_tiny_vision_weights(vs, rng))

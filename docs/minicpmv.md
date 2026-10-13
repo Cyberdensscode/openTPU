@@ -346,10 +346,10 @@ not the card).
   fp4, pieces small enough to split every kind).
 
 **Residence** (`Spec.vision_staged`).
-- **Resident**, the default (v1): the pieces after each layer's vectors. 621 MiB of the image,
-  543 of them weights.
-- **Staged**: the pieces are the expert pool's entries past the experts (entry L x E + i is
-  piece i; L the pool's layers, 41 with an MTP layer).
+- **Resident**: the pieces after each layer's vectors. 621 MiB of the image, 543 of them
+  weights.
+- **Staged** (the default since session mcpv2, 6): the pieces are the expert pool's entries
+  past the experts (entry L x E + i is piece i; L the pool's layers, 41 with an MTP layer).
   - For an image's runs the expert server places them in expert slots (`ExpertServer.place`):
     free slots first, then the experts of least decayed use across the layers, each layer
     keeping k. The victims' directory entries are cleared before the pieces are written.
@@ -484,29 +484,42 @@ Results (hwe-bench, ISA simulator):
   with the named kinds or layer ranges int8. Slots: expert slots a layer on the card (4 GiB, a
   4096-token cache, `streamed.fit_experts`), with the vision side staged / resident int8.
 
-| formats | ppl | dKL | resident MiB | slots |
-|---|---|---|---|---|
-| float | 15.218 | -0.99% (SE 0.04) | - | - |
-| int8 | 15.276 | 0 | 1846 | - |
-| the 35B's mix | 16.102 | +5.68% (SE 0.22) | 1255 | 39 / 31 |
-| attn int8 | 16.087 | +5.14% (SE 0.23) | 1370 | 38 / 29 |
-| mlp (the shared expert) int8 | 16.037 | +5.41% (SE 0.22) | 1308 | 39 / 30 |
-| delta int8 (all 30 DeltaNet layers) | 15.851 | +3.26% (SE 0.13) | 1680 | 33 / 25 |
-| delta int8 in layers 0-9 | 16.215 | +4.79% (SE 0.17) | 1369 | 38 / 29 |
-| delta int8 in layers 10-19 | 16.037 | +4.99% (SE 0.19) | 1354 | 38 / 30 |
-| delta int8 in layers 20-29 | 16.023 | +5.23% (SE 0.23) | 1369 | 38 / 29 |
-| delta int8 in layers 30-39 | 15.957 | +5.26% (SE 0.21) | 1354 | 38 / 30 |
-| delta int8 in layers 0-19 | 16.069 | +4.19% (SE 0.16) | 1468 | 36 / 28 |
-| delta int8 in layers 0-29 | 16.027 | +3.67% (SE 0.13) | 1581 | 34 / 26 |
-| **delta int8 in layers 0-19, mlp int8** | 15.976 | +3.68% (SE 0.14) | 1520 | 35 / 27 |
+| formats | ppl | dKL | resident MiB | slots | + ms a token: bytes + slots | net |
+|---|---|---|---|---|---|---|
+| float | 15.218 | -0.99% (SE 0.04) | - | - | - | - |
+| int8 | 15.276 | 0 | 1846 | - | - | - |
+| the 35B's mix | 16.102 | +5.68% (SE 0.22) | 1255 | 39 / 31 | 0 | 0 |
+| attn int8 | 16.087 | +5.14% (SE 0.23) | 1370 | 38 / 29 | 12.3 + 0.7 (+6.9%) | -1.5 |
+| mlp (the shared expert) int8 | 16.037 | +5.41% (SE 0.22) | 1308 | 39 / 30 | 5.7 + 0 (+3.0%) | -0.3 |
+| delta int8 (all 30 DeltaNet layers) | 15.851 | +3.26% (SE 0.13) | 1680 | 33 / 25 | 45.5 + 4.4 (+26.4%) | -2.2 |
+| delta int8 in layers 0-9 | 16.215 | +4.79% (SE 0.17) | 1369 | 38 / 29 | 12.2 + 0.7 (+6.8%) | +2.1 |
+| delta int8 in layers 10-19 | 16.037 | +4.99% (SE 0.19) | 1354 | 38 / 30 | 10.6 + 0.7 (+6.0%) | +0.9 |
+| delta int8 in layers 20-29 | 16.023 | +5.23% (SE 0.23) | 1369 | 38 / 29 | 12.2 + 0.7 (+6.8%) | -2.3 |
+| delta int8 in layers 30-39 | 15.957 | +5.26% (SE 0.21) | 1354 | 38 / 30 | 10.6 + 0.7 (+6.0%) | -1.8 |
+| delta int8 in layers 0-19 | 16.069 | +4.19% (SE 0.16) | 1468 | 36 / 28 | 22.8 + 2.1 (+13.2%) | +1.7 |
+| delta int8 in layers 0-29 | 16.027 | +3.67% (SE 0.13) | 1581 | 34 / 26 | 34.9 + 3.6 (+20.3%) | -0.2 |
+| **delta int8 in layers 0-19, mlp int8** | 15.976 | +3.68% (SE 0.14) | 1520 | 35 / 27 | 28.4 + 2.8 (+16.5%) | **+3.5** |
 
-  qwen35-35b ships at +4.00% (SE 0.16) on its own text (docs/mx_mxu.md). The rule (the lead's,
-  2026-10-13): the variant with the most slots whose dKL point estimate is at most +4.00%.
-  That is DeltaNet int8 in layers 0-19 with the shared expert int8, MiniCPM-V's default on the
-  card (`streamed.FORMATS["minicpmv"]`: fp4 experts, head int8, formats
-  `delta@0-19=int8,attn=nvfp4,delta=nvfp4,mlp=int8`). The experts stay fp4, so the pool is
-  unchanged. It costs 4 slots a layer against the 35B's mix: a layer's 4 x 1.637 MiB slots in
-  40 layers buy the 264 MiB of int8 weights.
+  The decode time a token is against the 35B's mix, with the vision side staged:
+  - bytes: the resident weights every token reads, at decode's ~9.8 GB/s;
+  - slots: the slot count's misses, interpolated from 5.3's cachesim points (~0.7 ms a slot a
+    layer).
+
+  Percentages are of the 35B's ~189 ms a token on the card. "net" is the formats rule's balance
+  (1 point of dKL is worth 10% of speed): the dKL points gained against the 35B's mix x 10,
+  less the decode time's percent.
+
+  qwen35-35b ships at +4.00% (SE 0.16) on its own text (docs/mx_mxu.md). The first rule (the
+  lead's, 2026-10-13: the most slots with a dKL point estimate at most +4.00%) picked DeltaNet
+  int8 in layers 0-19 with the shared expert int8. Decode time confirms it (the lead, 2026-10-13):
+  it is also the best net (+3.5) and meets the quality bar.
+  - It is MiniCPM-V's default on the card (`streamed.FORMATS["minicpmv"]`: fp4 experts, head
+    int8, formats `delta@0-19=int8,attn=nvfp4,delta=nvfp4,mlp=int8`).
+  - The experts stay fp4, so the pool is unchanged.
+  - It reads 265 MiB more int8 weights every token than the 35B's mix and has 4 fewer slots a
+    layer (a layer's 4 x 1.637 MiB slots in 40 layers).
+  - From now on, format variants are ranked by dKL against the whole decode time (the bytes a
+    token reads plus the slot count's misses from cachesim), not by slots alone.
   - The DeltaNet layers carry most of the loss: all of them int8 takes 2.4 points off.
   - The early ranges are worth more than the late ones (0-9 -0.89, 30-39 -0.42 points).
   - On the card the layer ranges are a layer block layout per formats group
@@ -560,8 +573,9 @@ Results (hwe-bench, ISA simulator):
   - The card's int8 tower costs ~5e-3 nats a reply token. That is ~3x the floor of tanh alone,
     half the language model's int8 dKL (9.9e-3) and a ninth of its card formats' (4.7e-2 from
     float, 5.1). Every variant's top token disagrees with HF's at most once per reply.
-  - Two-pass int8 would not pay for its cost. The recommendation is to keep the tower int8;
-    the decision is the lead's.
+  - Decided (the lead, 2026-10-13): the tower stays int8, with no fix. The variants cannot be
+    told apart at 3 images; the card's 5.3e-3 is half the language model's own int8 dKL; the
+    top token differs from HF's at most once a reply.
 - **The 0.776 row** is one row of 203: cats.jpg's second crop (40 x 28), output row 68, its
   bottom edge (refract.png's worst is 0.957; the next worst of cats.jpg 0.978). Stage by stage
   on the ISA simulator against the fp32 reference (scratch vit_stages2.py, the row's 16 patches
@@ -612,8 +626,9 @@ The model reads about 15% above the card in absolute tok/s, so the differences a
 - Data moved per 10-crop image: staged 0.6 GB plus at most 0.6 GB of refills; streamed 5.4 GB.
 
 The choice (the lead's, 2026-10-13): staged through the expert server (4.2). Decode keeps every
-slot between images, and it moves the fewest bytes. Resident int8 stays the default for the
-first card sessions.
+slot between images, and it moves the fewest bytes. The card measured it in session mcpv2 (6):
+decode +8.4% (36 slots a layer against 27), an image +0.3-0.9 s. It has been the default since
+then; resident is `--vision-resident`.
 
 ## 6. Card plan
 
@@ -674,7 +689,15 @@ Sessions (the lead runs them; scripts on this branch):
    - **The first crop of a patch count.** It takes ~23 s more on the card host (doc.png's
      first 32 x 32: 28.9 s). BoardBackend.start computes each new program's WAITC wait
      entries (waits.entries) the first time it is started: attend 14.1 s, wmerge 2.5 s, qkv
-     1.4 s, the rest 4.7 s. On the Mac the same is 16.9 s, attend's 12.4 s for 214,534 visits.
+     1.4 s, the rest 4.7 s. On the Mac it is 6-17 s, depending on load; attend's 214,534 visits
+     dominate it.
+     - The analysis is linear in the instructions a run executes: it walks every iteration
+       of each loop of known count (attend at 1,024 patches: 214,534 visits). Each visit
+       checks ~68 footprints of the units' histories (75% of the time).
+     - Since then (decision 9) `opentpu/host/vision_warm.py` computes them ahead. After the
+       engine's load, a spawned process at nice 19 builds the image's layout and computes
+       every count's programs' entries into the program cache's disk, most frequent first.
+       Each count is done once per tree: a marker lists its entries' keys.
      - The entries are kept in the program cache's disk, keyed by the tree's sources, so this
        comes once per host tree and patch count.
      - It is mcpv1's thumb's vision_s, 30.3 s: 5.8 device + ~24. serve's first image TTFT,
@@ -709,7 +732,12 @@ Sessions (the lead runs them; scripts on this branch):
 4. The card host's storage: `/data/otpu/minicpmv/`.
 5. `--max-slices`: default 9, in otpu-chat and as otpu-serve's request field and option.
 6. M-RoPE rows written by the host's gather (4.3).
-7. The vision weights: int8 (the fp4 ViT MLPs fail on accuracy, 5.2); staged through the expert
-   server's slots (4.2, 5.3), resident for the first card sessions.
+7. The vision weights: int8, without a fix for the 0.776 row (the reply's dKL, 5.2; the fp4
+   ViT MLPs fail on accuracy). They are staged through the expert server's slots (4.2, 5.3), the
+   default since session mcpv2 (6).
 8. The language model's formats: the 35B's mix with DeltaNet int8 in layers 0-19 and the shared
-   expert int8, +3.68% dKL at 35 slots a layer (5.1).
+   expert int8, +3.68% dKL at 35 slots a layer. It is also the best by dKL against decode time
+   (+31 ms a token, 5.1), the rule for format variants from now on.
+9. A new crop size's tower programs: their wait entries are computed ahead at the engine's load
+   (opentpu/host/vision_warm.py, 6). Next, with a keyed change, the tower's programs take N as
+   a run argument: one program set for every crop size.
