@@ -418,7 +418,7 @@ def run(a, t, dev: str, sim: bool) -> tuple[list[Row], list[str]]:
             v = t.reg_read_many([R.R_ID, R.R_VERSION, R.R_REGMAP, R.R_CAPS, R.R_CORE_KHZ,
                                  R.R_BUILD_ID, R.R_STATUS, 0xFFC] + ([R.R_CAPS2] if c2 else []))
             bad = []
-            if i["MCOLS"] not in (2, 4) or i["LANES"] not in (8, 16):
+            if i["MCOLS"] not in (2, 4, 8) or i["LANES"] not in (8, 16):   # (8: release r2)
                 bad.append(f"VERSION {v[1]:#x}")
             if i["regmap"] >= 2:
                 if v[2] not in (2, 3, 4, 5):

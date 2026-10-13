@@ -220,21 +220,24 @@ def test_r_max_holds_every_run_a_prompt_asks_for(monkeypatch):
 
 @pytest.mark.parametrize("fp4", [True, False], ids=["fp4", "int8"])
 def test_odd_rows_take_one_less_where_pair_makes_it_cheaper(fp4):
-    """qwen3.prefer_rows: with PAIR a 4-bit MM of at most MCOLS / 2 rows streams two blocks a
-    cycle, so 3 rows (MCOLS 4) take a 4-row run's MXU time and 2 cost less per row (the 4B:
-    -13.8% a row in the RTL co-sim); an int8 MM streams once per MCOLS rows, so 3 rows cost
-    less per row than 2. Even sizes stay."""
+    """qwen3.prefer_rows: with PAIR a 4-bit MM of at most MCOLS / 2 rows (h) streams two blocks
+    a cycle, so h + 1 rows (3 at MCOLS 4, 5 at MCOLS 8) take a whole pass's MXU time and h cost
+    less per row (the 4B at MCOLS 4: -13.8% a row in the RTL co-sim); an int8 MM streams once
+    per MCOLS rows, so h + 1 rows cost less per row than h. Even sizes stay."""
     from opentpu.llm.qwen3 import PREFER_MARGIN, mxu_time, prefer_rows
     _, W, spec = _tiny_model(16, 16, init=0.2)
     a = Engine(spec, W, cap=512, cfg=CFG, resident=True, **(FP4 if fp4 else {}))
     img = a.image
+    h = CFG.MCOLS // 2
+    assert h >= 2                           # (h + 1 odd)
 
     def rows(r):
         return img.compile_rows([(0, j) for j in range(r)], [], a.block,
                                 tokens=list(range(1, r + 1)))
-    t2, t3 = (mxu_time(rows(r)) / r for r in (2, 3))
-    assert (t2 <= (1 - PREFER_MARGIN) * t3) == fp4
-    assert prefer_rows(img, 3, rows) == (2 if fp4 else 3) and prefer_rows(img, 4, rows) == 4
+    th, t1 = (mxu_time(rows(r)) / r for r in (h, h + 1))
+    assert (th <= (1 - PREFER_MARGIN) * t1) == fp4
+    assert prefer_rows(img, h + 1, rows) == (h if fp4 else h + 1)
+    assert prefer_rows(img, 2 * h, rows) == 2 * h
 
 def _static_mtp(dec, R_max):
     """MTPDecoder.prefill as compile-time runs of the prompt runs' split: the rows (hidden,
