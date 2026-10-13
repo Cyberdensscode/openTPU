@@ -18,7 +18,8 @@
 #   overrides: OTPU_MXU_DSP_COLS="1 2 ...", OTPU_MXU_BRAM_COLS="1 2 ...", OTPU_MXU_WRAM_COL=0.
 # - The first PE row, OTPU_MXU_BASE (DSP site row). Default: the array and its column ends
 #   centred in the DSP column.
-# - OTPU_MXU_PLACE=0 skips the whole file.
+# - On at MCOLS 8 and up, off below (the placer's), from the netlist's MCOLS; OTPU_MXU_PLACE=1
+#   places at any MCOLS, OTPU_MXU_PLACE=0 skips the whole file.
 # It stops the run (error) when a name pattern matches no cells, when the PEs are not MCOLS x D,
 # or when a cascade chain is not in position order. The LOCs it sets are also written to
 # otpu_mxu_place.xdc in the implementation run's directory (or to OTPU_MXU_PLACE_XDC).
@@ -133,7 +134,8 @@ proc ::otpu_mxu_place::ram {cell x r nrow} {
 proc ::otpu_mxu_place::run {} {
   variable table; variable lines; variable used; variable all
   set lines {}; array unset used; array unset all
-  if {[info exists ::env(OTPU_MXU_PLACE)] && $::env(OTPU_MXU_PLACE) eq "0"} {
+  set on [expr {[info exists ::env(OTPU_MXU_PLACE)] ? $::env(OTPU_MXU_PLACE) : ""}]
+  if {$on eq "0"} {
     puts "otpu_mxu_place: off (OTPU_MXU_PLACE=0)"
     return
   }
@@ -149,6 +151,14 @@ proc ::otpu_mxu_place::run {} {
     set mc [expr {max($mc, $j + 1)}]; set d [expr {max($d, $i + 1)}]
   }
   if {[array size PE] != $mc * $d} { error "otpu_mxu_place: [array size PE] PE DSPs, not MCOLS $mc x D $d" }
+  # the default: the grid at MCOLS 8 and up, the placer's below. MCOLS 8 does not route without it
+  # (f55949f9); at MCOLS 4 it costs (d352e53d at 133.33 MHz, r2m4 with it against r2m4ng without:
+  # core_clk WNS -0.536 / -0.281 ns, TNS -236.1 / -33.9 ns, crg sys +0.019 / +0.098, 57.5K / 54.2K
+  # slices; docs/mxu_systolic.md)
+  if {$on eq "" && $mc < 8} {
+    puts "otpu_mxu_place: off (MCOLS $mc, below 8: the placer's; OTPU_MXU_PLACE=1 places it)"
+    return
+  }
   # the chains: PE i's cascade input is PE i-1's, or none (a chain's first)
   set heads 0
   for {set j 0} {$j < $mc} {incr j} {

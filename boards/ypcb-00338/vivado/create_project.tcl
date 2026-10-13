@@ -129,7 +129,7 @@ set_property generic "SEQ_WC=1'b$SEQ_WC MCOLS=$MCOLS ACT_ROWS=$ACT_ROWS VPU_CL=$
 # netlist, each otpu_mem_ch's crossings (scoped to the module) and the top's (otpu_top_native.tcl);
 # with CLK2X the paths between core_clk and core_clk2x (otpu_clk2x.tcl); the MXU's systolic array
 # as a grid of LOCs, each column on its DSP column beside its ACT RAM memory, generated from the
-# netlist at any MCOLS (otpu_mxu_place.tcl; OTPU_MXU_PLACE=0 leaves it to the placer)
+# netlist at MCOLS 8 and up (otpu_mxu_place.tcl; below, the placer's: OTPU_MXU_PLACE=1 / 0 overrides)
 set cons $root/boards/ypcb-00338/constraints
 add_files -fileset constrs_1 -norecurse [list $cons/otpu_top_ld.xdc \
   $root/boards/ypcb-00338/litedram/otpu_litedram.xdc]

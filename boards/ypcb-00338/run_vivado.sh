@@ -29,6 +29,11 @@
 #                                         # the GATHER unit's read select and write-bank mask fed the MXU's
 #                                         # TMEM grant (r2m4: -0.261 ns, 12% of core_clk's TNS;
 #                                         # docs/infra_hunt.md 5)
+#   OTPU_MXU_PLACE=1 ./run_vivado.sh      # the MXU's systolic array LOCed as a grid at any MCOLS; the
+#                                         # default places it at MCOLS 8 and up (m8 does not route without
+#                                         # it) and leaves it to the placer below (r2m4 against r2m4ng:
+#                                         # core_clk WNS -0.536 / -0.281 ns; constraints/otpu_mxu_place.tcl,
+#                                         # docs/mxu_systolic.md); OTPU_MXU_PLACE=0 never places it
 #   TMEM_WORDS=131072 ./run_vivado.sh     # a 128K-word TMEM (the target's variant's; in CFG_HASH)
 #   VIVADO_DOCKER=image ./run_vivado.sh   # Docker (e.g. Apple Silicon with Rosetta), see docs/board.md
 #   VIVADO_AS_USER=1                      # Docker on Linux: run as the calling user (see run())

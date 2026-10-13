@@ -66,7 +66,7 @@ if {[get_property PROGRESS [get_runs impl_1]] != "100%"} { error "implementation
 set fh [open $out/otpu.runs/impl_1/runme.log]; set ilog [read $fh]; close $fh
 if {![regexp {otpu_mxu_place: (MCOLS \d+ x D \d+|off)} $ilog]} {
   error "otpu_mxu_place.tcl did not place the MXU (no summary line in impl_1/runme.log; its error is\
-         a critical warning there; OTPU_MXU_PLACE=0 builds without it)"
+         a critical warning there; OTPU_MXU_PLACE=0 builds without it; below MCOLS 8 it says off)"
 }
 open_run impl_1
 

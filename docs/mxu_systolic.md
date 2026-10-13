@@ -219,8 +219,9 @@ whole die, so position i of column j sat nowhere near position i of column j+1: 
 pin boxes were ~220 tiles, the design's longest.
 
 `boards/ypcb-00338/constraints/otpu_mxu_place.tcl` (read by `create_project.tcl` for every build,
-late, on the implemented netlist) LOCs the array as a grid. It reads MCOLS and D from the
-netlist's PE names and takes the part's column table:
+late, on the implemented netlist) LOCs the array as a grid at MCOLS 8 and up; below MCOLS 8 it
+leaves the array to the placer (MCOLS 4 is better without it, below). It reads MCOLS and D from
+the netlist's PE names and takes the part's column table:
 - Array column j goes on one DSP column, positions 0..D-1 in order up it (the chains stay whole,
   position i is level in every column), with its column end (`otpu_mxce`, a 9-DSP cascade) above.
   At MCOLS 8 that is DSP48_X1..X8 (tile X 14 29 34 49 54 69 74 89), rows 10..146 of 160.
@@ -235,7 +236,8 @@ It stops (an error, and `build.tcl` fails the build if its summary line is missi
 log) when a name pattern matches no cells, the PEs are not MCOLS x D, or a chain is not in
 position order. The LOCs it set are in the run's `otpu_mxu_place.xdc`. The environment overrides
 the table: `OTPU_MXU_DSP_COLS`, `OTPU_MXU_BRAM_COLS`, `OTPU_MXU_WRAM_COL`, `OTPU_MXU_BASE`.
-`OTPU_MXU_PLACE=0` leaves the array to the placer. DSP cascades cross clock-region rows on the
+`OTPU_MXU_PLACE=1` places the array at any MCOLS, `OTPU_MXU_PLACE=0` at none (the summary line
+then says off, as it does below MCOLS 8). DSP cascades cross clock-region rows on the
 xc7k480t (25 of the free placement's 64 chains did, and every region boundary's PCOUT reaches the
 next PCIN through one pip), so the columns need no gaps.
 
@@ -260,6 +262,20 @@ the class `build.tcl`'s `userclk1_reroute.tcl` routes again. The router's final 
 only Long-line level 5 windows (tile X 64-95, Y 240-271: XDMA's DMA 17% + 11%, u_mxu 16%). The SRL
 skews and the hop registers came next to their DSPs on their own, so there are no pblocks.
 No logic or cycles change.
+
+At MCOLS 4 the grid is the worse placement, so it is off there by default. The same tree
+(`d352e53d`, release r2's m4 at 133.33 MHz, the production strategy) built with it (r2m4) and
+without it (r2m4ng):
+
+| | the grid (r2m4) | the placer's (r2m4ng) |
+|---|---|---|
+| core_clk WNS / TNS | -0.536 / -236.1 ns | -0.281 / -33.9 ns |
+| core_clk -> core_clk2x WNS / TNS | -0.390 / -146.2 ns | -0.175 / -9.8 ns |
+| core_clk2x -> core_clk WNS | -0.187 ns | +0.026 ns |
+| all clocks' TNS | -382.6 ns | -43.7 ns |
+| the memory core's sys clock (crg) WNS | +0.019 ns | +0.098 ns |
+| slices / LUT | 57,519 (77.05%) / 172,736 | 54,176 (72.57%) / 169,571 |
+| the router's worst congestion | South level 5, 110% | North and East level 5, 105% / 104% |
 
 ## Plan and status
 
