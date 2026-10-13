@@ -539,7 +539,7 @@ class SimTransport:
         # VPU_CL and ULANES as the bitstream builds them (make bit: VPU_CL 2, ULANES 8)
         p = {"S": self.slices, "WORDS": 2 * len(self.ch[0]) // 4, "MCOLS": cfg.MCOLS,
              "LANES": cfg.LANES,
-             "ACT_ROWS": cfg.act_rows,
+             "ACT_ROWS": cfg.act_rows, "TMEM_WORDS": cfg.TMEM_WORDS,      # (release r2: 128K)
              "VPU_CL": rtlsim.UARCH.get("VPU_CL", 2), "ULANES": rtlsim.UARCH.get("ULANES", 8),
              "MXU_IMPL": rtlsim.UARCH.get("MXU_IMPL", 2),
              # the MXU's epilogue lanes as the target builds them (OTPU_MXU_E overrides)
@@ -564,7 +564,7 @@ class SimTransport:
         p.setdefault("PLATFORM", t.platform_id)
         p.setdefault("ARCH_HASH", "32'h%08x" % arch_hash(build_config(
             t, MCOLS=p["MCOLS"], LANES=p["LANES"], ACT_ROWS=p["ACT_ROWS"],
-            DSTEP=p.get("DSTEP", 1), SEQ_WC=p.get("SEQ_WC", 0))))
+            TMEM_WORDS=p["TMEM_WORDS"], DSTEP=p.get("DSTEP", 1), SEQ_WC=p.get("SEQ_WC", 0))))
         exe = rtlsim.build("tb_board", srcs, p)
         with simtmp.tempdir("otpu_board_") as d:
             for c in range(len(self.ch)):
