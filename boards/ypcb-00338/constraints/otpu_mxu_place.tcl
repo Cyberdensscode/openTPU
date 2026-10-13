@@ -1,6 +1,7 @@
 # The MXU's systolic array placed as a grid (docs/mxu_systolic.md, "Placement on the YPCB").
 # Array column j goes in one DSP column, its positions in order up the column, so position i sits
-# at the same height in every column; its column end (otpu_mxce) goes above. The ACT RAM's memory
+# at the same height in every column; its column end (otpu_mxce) goes in the middle, between the
+# lower and the upper half of the chains (OTPU_MXU_CE=top: above them). The ACT RAM's memory
 # of column j (otpu_actram g_row[j]) goes in the block RAM column beside it, each block RAM at the
 # height of the positions it feeds. The weight RAMs (otpu_mxu g_fd, u_fs0, u_fs1) go in the block
 # RAM column beside column 0.
@@ -20,6 +21,12 @@
 #   centred in the DSP column.
 # - On at MCOLS 8 and up, off below (the placer's), from the netlist's MCOLS; OTPU_MXU_PLACE=1
 #   places at any MCOLS, OTPU_MXU_PLACE=0 skips the whole file.
+# - The column ends: OTPU_MXU_CE=mid (the default) puts a column's end between its chains
+#   0..n/2-1 and n/2..n-1, top above the array. Each chain end feeds its own DSP of the column
+#   end (otpu_mxce g_m[g]) from the chain's last DSP's P register through fabric: above the array
+#   the lowest chain's end crossed 113 DSP rows, at 0 levels with 5.3-5.8 ns of route (r2.1's m8
+#   163ab46d: g_ask[0].g_p[15] at DSP48_X1Y25 -> g_col_end[0] g_m[0] at Y138, -0.005 ns before
+#   userclk1's reroute; 76 such endpoints under +0.2 ns); in the middle it is 65 at most.
 # It stops the run (error) when a name pattern matches no cells, when the PEs are not MCOLS x D,
 # or when a cascade chain is not in position order. The LOCs it sets are also written to
 # otpu_mxu_place.xdc in the implementation run's directory (or to OTPU_MXU_PLACE_XDC).
@@ -97,6 +104,13 @@ proc ::otpu_mxu_place::chain_order {cs} {
   }
   if {[llength $out] != [llength $cs]} { error "otpu_mxu_place: a cascade loop among [llength $cs] DSPs" }
   return $out
+}
+
+# a position's (or a fractional position's) DSP row above the base: the positions from the split
+# up sit above the column ends
+proc ::otpu_mxu_place::prow {i} {
+  variable split_at; variable n_ce
+  return [expr {$i >= $split_at ? $i + $n_ce : $i}]
 }
 
 proc ::otpu_mxu_place::loc {cell site} {
@@ -191,15 +205,24 @@ proc ::otpu_mxu_place::run {} {
     set ce($j) [chain_order [cells DSP48 [format {^%s/g_col_end\[%d\]\.u_ce/} [q $pre] $j] \
                                "column $j's end (otpu_mxu g_col_end\[$j\].u_ce)"]]
   }
-  set h [expr {$d + [llength $ce(0)]}]
+  set nce [llength $ce(0)]
+  set h [expr {$d + $nce}]
   set base [expr {2 * (($nd - $h) / 4)}]
   if {[info exists ::env(OTPU_MXU_BASE)]} { set base $::env(OTPU_MXU_BASE) }
   if {$base < 0 || $base + $h > $nd} { error "otpu_mxu_place: rows $base..[expr {$base + $h - 1}] outside the $nd DSP rows" }
+  # the column ends' first row above the base: after the lower half of the chains (mid), or after
+  # all of them (top); a position's row skips them (prow)
+  set cem [expr {[info exists ::env(OTPU_MXU_CE)] ? $::env(OTPU_MXU_CE) : "mid"}]
+  if {$cem ni {mid top}} { error "otpu_mxu_place: OTPU_MXU_CE '$cem': mid or top" }
+  set nch [expr {$heads / $mc}]
+  variable split_at [expr {$cem eq "top" ? $d : ($nch / 2) * ($d / $nch)}]
+  variable n_ce $nce
+  set split $split_at
   # ---- PEs and column ends
   for {set j 0} {$j < $mc} {incr j} {
     set x [lindex $dcols $j]
-    for {set i 0} {$i < $d} {incr i} { loc $PE($j,$i) DSP48_X${x}Y[expr {$base + $i}] }
-    set k $d
+    for {set i 0} {$i < $d} {incr i} { loc $PE($j,$i) DSP48_X${x}Y[expr {$base + [prow $i]}] }
+    set k $split
     foreach c $ce($j) { loc $c DSP48_X${x}Y[expr {$base + $k}]; incr k }
   }
   # ---- the ACT RAM: column j's memory beside it, piece p (bytes p*D/NP ..) level with its PEs
@@ -221,7 +244,7 @@ proc ::otpu_mxu_place::run {} {
       set k 0
       foreach c $rs {
         # the DSP row in the middle of the positions this RAM's bytes feed, as a block RAM row
-        set dr [expr {$base + $p * $pb + ($k + 0.5) * $pb / $nr}]
+        set dr [expr {$base + [prow [expr {$p * $pb + ($k + 0.5) * $pb / $nr}]]}]
         ram $c $x [expr {int($dr / 2)}] $nb
         incr k; incr nact
       }
@@ -229,7 +252,7 @@ proc ::otpu_mxu_place::run {} {
     set k 0
     foreach c [lsort -dictionary [cells RAMB [format {^%s/g_row\[%d\]\.u_asc/} [q $act] $j] \
                                     "column $j's ACT scale RAM (otpu_actram g_row\[$j\].u_asc)"]] {
-      ram $c $x [expr {($base + $d) / 2 + $k}] $nb
+      ram $c $x [expr {($base + $split + $nce / 2) / 2 + $k}] $nb
       incr k; incr nact
     }
   }
@@ -239,7 +262,7 @@ proc ::otpu_mxu_place::run {} {
   set n [llength $wr]
   set k 0
   foreach c $wr {
-    ram $c $wcol [expr {int(($base + ($k + 0.5) * $d / $n) / 2)}] $nb
+    ram $c $wcol [expr {int(($base + [prow [expr {($k + 0.5) * $d / $n}]]) / 2)}] $nb
     incr k
   }
   # ---- the record: in an implementation run's directory, or OTPU_MXU_PLACE_XDC; not where
@@ -252,13 +275,15 @@ proc ::otpu_mxu_place::run {} {
   }
   if {$rec ne ""} {
     set f [open $rec w]
-    puts $f "# otpu_mxu_place.tcl on $part: MCOLS $mc, D $d ($heads cascade chains), PE rows $base..[expr {$base + $d - 1}],\
-             column ends above; DSP columns $dcols, ACT block RAM columns $bcols, weight RAMs column $wcol"
+    puts $f "# otpu_mxu_place.tcl on $part: MCOLS $mc, D $d ($heads cascade chains), rows $base..[expr {$base + $h - 1}],\
+             column ends ($cem) at rows [expr {$base + $split}]..[expr {$base + $split + $nce - 1}];\
+             DSP columns $dcols, ACT block RAM columns $bcols, weight RAMs column $wcol"
     puts $f [join $lines \n]
     close $f
   }
   puts "otpu_mxu_place: MCOLS $mc x D $d PEs ($heads chains) and [llength $ce(0)] column-end DSPs a column on\
-        DSP48_X{$dcols} rows $base..[expr {$base + $h - 1}]; $nact ACT RAMs on RAMB36_X{$bcols};\
+        DSP48_X{$dcols} rows $base..[expr {$base + $h - 1}], the column ends ($cem) from row [expr {$base + $split}];\
+        $nact ACT RAMs on RAMB36_X{$bcols};\
         $n weight RAMs on RAMB36_X$wcol ([llength $lines] LOCs[expr {$rec ne "" ? ", $rec" : ""}])"
 }
 
