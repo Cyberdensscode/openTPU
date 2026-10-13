@@ -19,7 +19,8 @@
 # on a global buffer (the top: DDR4 channel C1's, SLR1, which also feeds that channel's core).
 # xdma_aclk: 250 MHz.
 #
-# Variables (set before sourcing): CORE_MHZ (default 100, the development builds' clock). Environment:
+# Variables (set before sourcing): CORE_MHZ (default 100, the development builds' clock), CLK2X (below,
+# as bd_native.tcl's). Environment:
 # PCIE_LANES, 16 (Gen3 x16, 512-bit AXI, the default) or 8 (Gen3 x8, 256 bits).
 # Checked (vivado/ip_check.tcl) on a Kintex UltraScale+ part until a VU9P license exists: the
 # xcvu9p settings that differ (the GT quad) are applied only on the VU9P.
@@ -40,6 +41,17 @@ set CORE_DIV [expr {round(double($VCO) / $CORE_MHZ * 8) / 8.0}]
 set CORE_MHZ_ACT [format %.3f [expr {double($VCO) / $CORE_DIV}]]
 set CORE_HZ [expr {int(floor($VCO * 1.0e6 / $CORE_DIV))}]
 puts "core_clk: $CORE_MHZ_ACT MHz (MMCM divide $CORE_DIV)"
+# CLK2X (set before sourcing, default 0; create_project.tcl: 1 with the TMEM's pumped RAMs,
+# TMEM_PMP 1): core_clk2x, the MMCM's second output at twice core_clk from the same VCO, both
+# dividers integers and no phase shift, so its edges rise with core_clk's (core_clk's divider must
+# then be even). With CLK2X 0 the port is core_clk itself: the wrapper keeps one form, and the RTL
+# leaves it unused (otpu_fpga_top_*: clk_f). constraints/otpu_clk2x.tcl times the paths between them.
+if {![info exists CLK2X]} { set CLK2X 0 }
+if {$CLK2X && ($CORE_DIV != floor($CORE_DIV) || int($CORE_DIV) % 2)} {
+  error "bd.tcl: CLK2X needs an even MMCM divide for core_clk, not $CORE_DIV ($CORE_MHZ_ACT MHz; 100: 12, 150: 8)"
+}
+set CLK2X_HZ [expr {$CLK2X ? int(floor($VCO * 1.0e6 / ($CORE_DIV / 2))) : $CORE_HZ}]
+if {$CLK2X} { puts "core_clk2x: [expr {$CLK2X_HZ / 1.0e6}] MHz (MMCM divide [expr {int($CORE_DIV) / 2}])" }
 set PCIE_LANES [expr {[info exists ::env(PCIE_LANES)] && $::env(PCIE_LANES) ne "" ? $::env(PCIE_LANES) : 16}]
 if {$PCIE_LANES ni {8 16}} { error "bd.tcl: PCIE_LANES $PCIE_LANES (8 or 16)" }
 set AXI_BITS [expr {$PCIE_LANES == 16 ? 512 : 256}]
@@ -55,6 +67,7 @@ set_property CONFIG.FREQ_HZ 100000000 $pcie_refclk
 create_bd_port -dir I -type rst pcie_perstn
 set_property CONFIG.POLARITY ACTIVE_LOW [get_bd_ports pcie_perstn]
 create_bd_port -dir O -type clk core_clk
+create_bd_port -dir O -type clk core_clk2x
 create_bd_port -dir O -type rst core_rstn
 create_bd_port -dir O -type clk xdma_aclk
 create_bd_port -dir O -type rst xdma_aresetn
@@ -71,6 +84,7 @@ foreach p $lites {
 set_property CONFIG.ASSOCIATED_BUSIF [join $lites :] [get_bd_ports core_clk]
 set_property CONFIG.ASSOCIATED_RESET {core_rstn} [get_bd_ports core_clk]
 set_property CONFIG.FREQ_HZ $CORE_HZ [get_bd_ports core_clk]
+set_property CONFIG.FREQ_HZ $CLK2X_HZ [get_bd_ports core_clk2x]
 
 # ------------------------------------------------------------------ clocks and resets
 set clk [create_bd_cell -type ip -vlnv [ip_vlnv clk_wiz] clk_wiz_0]
@@ -82,6 +96,20 @@ set_property -dict [list \
 ] $clk
 connect_bd_net [get_bd_ports clk300_in] [get_bd_pins clk_wiz_0/clk_in1]
 connect_bd_net [get_bd_pins clk_wiz_0/core_clk] [get_bd_ports core_clk]
+# CLK2X: the second output, as bd_native.tcl's (VCO 1200 MHz)
+if {$CLK2X} {
+  set_property -dict [list CONFIG.NUM_OUT_CLKS {2} CONFIG.CLKOUT2_USED {true} \
+    CONFIG.CLKOUT2_REQUESTED_OUT_FREQ [format %.3f [expr {$CLK2X_HZ / 1.0e6}]] \
+    CONFIG.CLKOUT2_REQUESTED_PHASE {0.000} CONFIG.CLK_OUT2_PORT {core_clk2x}] $clk
+  set_property -dict [list CONFIG.OVERRIDE_MMCM {true} CONFIG.MMCM_DIVCLK_DIVIDE {1} \
+    CONFIG.MMCM_CLKFBOUT_MULT_F [format %.3f [expr {$VCO / 300.0}]] \
+    CONFIG.MMCM_CLKOUT0_DIVIDE_F $CORE_DIV CONFIG.MMCM_CLKOUT1_DIVIDE [expr {int($CORE_DIV) / 2}]] $clk
+  connect_bd_net [get_bd_pins clk_wiz_0/core_clk2x] [get_bd_ports core_clk2x]
+  set f2 [get_property CONFIG.FREQ_HZ [get_bd_pins clk_wiz_0/core_clk2x]]
+  if {$f2 != $CLK2X_HZ} { error "bd.tcl: the clock wizard makes core_clk2x at $f2 Hz, not $CLK2X_HZ" }
+} else {
+  connect_bd_net [get_bd_pins clk_wiz_0/core_clk] [get_bd_ports core_clk2x]
+}
 # the wizard's own M / D / O unless they miss CORE_HZ: then VCO / CORE_DIV, as bd_native.tcl
 if {[get_property CONFIG.FREQ_HZ [get_bd_pins clk_wiz_0/core_clk]] != $CORE_HZ} {
   set_property -dict [list CONFIG.OVERRIDE_MMCM {true} CONFIG.MMCM_DIVCLK_DIVIDE {1} \

@@ -1,0 +1,7 @@
+# EXPERIMENTAL (docs/tmem_nocopy.md): the screening subset of all.txt (one per kind, short)
+p_q3 --model qwen3 --wformat fp4 --head-format int8 --pos 544 --layers 2 --rows 4 --logits none --check
+p_q35 --model qwen35 --wformat fp4 --head-format int8 --pos 544 --layers 4 --rows 4 --logits none --check
+p8_q3 --model qwen3 --wformat fp4 --head-format int8 --pos 544 --layers 2 --rows 8 --logits none --mcols 8 --check
+b4_q3 --model qwen3 --wformat fp4 --head-format int8 --pos 544 --layers 2 --batch 4 --check
+l_q35m moe: layer models/Qwen3.5-35B-A3B --R 2 --prefix 1:4
+d_lf --model lfm2 --wformat fp4 --head-format int8 --pos 544 --layers 0 --check

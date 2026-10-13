@@ -3,7 +3,7 @@
 # the block design (bd.tcl: XDMA Gen3, the core clock, the SYSMON) and the board top
 # (rtl/boards/bcu1525/otpu_fpga_top_bcu.sv: S slices, two DDR4 channels each).
 #   vivado -mode batch -source create_project.tcl -tclargs OUT_DIR MCOLS CORE_MHZ BUILD_ID VPU_CL \
-#     LANES ACT_ROWS DSTEP S PLATFORM ARCH_HASH DDR_MTS
+#     LANES ACT_ROWS DSTEP S PLATFORM ARCH_HASH DDR_MTS [TMEM_IMPL] [TMEM_X]
 # (run_vivado.sh takes them from the target, targets/bcu1525.toml; the RTL list below is
 # opentpu.target sources("bcu1525"): tests/test_target.py)
 # Environment: PCIE_LANES (bd.tcl), OTPU_FAST (development strategies), OTPU_IP_CACHE, OTPU_PART
@@ -28,6 +28,11 @@ set PLATFORM [expr {[llength $argv] > 9 ? [lindex $argv 9] : 2}]
 set ARCH_HASH [expr {[llength $argv] > 10 ? [lindex $argv 10] : 0}]
 if {![regexp {^[0-9a-fA-F]{1,8}$} $ARCH_HASH]} { set ARCH_HASH 0 }
 set DDR_MTS [expr {[llength $argv] > 11 ? [lindex $argv 11] : 1600}]
+# TMEM_IMPL, TMEM_X: the TMEM (the YPCB's vivado/tmem_knobs.tcl: 3 one copy, its knobs; CLK2X)
+set TMEM_IMPL [expr {[llength $argv] > 12 ? [lindex $argv 12] : 0}]
+set TMEM_X [expr {[llength $argv] > 13 ? [lindex $argv 13] : ""}]
+source $root/boards/ypcb-00338/vivado/tmem_knobs.tcl
+if {$TMEM_IMPL} { set TMEM_GEN " TMEM_IMPL=$TMEM_IMPL$TMEM_GEN" }   ;# 0: the generics as before
 set VU9P xcvu9p-fsgd2104-2L-e
 set PART [expr {[info exists ::env(OTPU_PART)] && $::env(OTPU_PART) ne "" ? $::env(OTPU_PART) : $VU9P}]
 if {$BUILD_ID eq ""} {
@@ -74,13 +79,13 @@ foreach f [glob $ld/otpu_ld4_*.init] {
 set_property verilog_define {SYNTHESIS} [get_filesets sources_1]
 
 # ---- block design
-source $here/bd.tcl
+source $here/bd.tcl   ;# CLK2X (tmem_knobs.tcl): core_clk2x
 make_wrapper -files [get_files otpu_bd.bd] -top
 add_files -norecurse [glob $out/otpu.gen/sources_1/bd/otpu_bd/hdl/otpu_bd_wrapper.v]
 set_property top otpu_fpga_top_bcu [current_fileset]
 # otpu_seq WAITC (run_vivado.sh: the target's [arch] SEQ_WC, or SEQ_WC=1; CFG_UARCH bit24)
 set SEQ_WC [expr {[info exists ::env(OTPU_SEQ_WC_GEN)] && $::env(OTPU_SEQ_WC_GEN) eq "1" ? 1 : 0}]
-set_property generic "SEQ_WC=1'b$SEQ_WC S=$S MCOLS=$MCOLS ACT_ROWS=$ACT_ROWS VPU_CL=$VPU_CL LANES=$LANES CORE_KHZ=$CORE_KHZ BUILD_ID=32'h$BUILD_ID DDR_MTS=$DDR_MTS DSTEP=1'b$DSTEP PCIE_LANES=$PCIE_LANES PLATFORM=$PLATFORM ARCH_HASH=32'h$ARCH_HASH" [current_fileset]
+set_property generic "SEQ_WC=1'b$SEQ_WC S=$S MCOLS=$MCOLS ACT_ROWS=$ACT_ROWS VPU_CL=$VPU_CL LANES=$LANES CORE_KHZ=$CORE_KHZ BUILD_ID=32'h$BUILD_ID DDR_MTS=$DDR_MTS DSTEP=1'b$DSTEP PCIE_LANES=$PCIE_LANES PLATFORM=$PLATFORM ARCH_HASH=32'h$ARCH_HASH$TMEM_GEN" [current_fileset]
 
 # ---- constraints: the pins (scripts/gen_pins.py), the top's clocks and crossings; each DDR4
 # core's own (LiteX's false paths, by names inside the core: scoped to otpu_ld4)
@@ -113,6 +118,8 @@ if {[info exists ::env(TMEM_URAM)] && $::env(TMEM_URAM) eq "1"} {
 # floorplan (bcu1525_top.tcl, bcu1525_floorplan.tcl: UNVERIFIED, docs/bcu1525.md section 10)
 set memch $root/boards/ypcb-00338/constraints/otpu_mem_ch.tcl
 set late [list $memch $cons/bcu1525_top.tcl $cons/bcu1525_floorplan.tcl]
+# with CLK2X the paths between core_clk and core_clk2x (the YPCB's otpu_clk2x.tcl, shared)
+if {$CLK2X} { lappend late $root/boards/ypcb-00338/constraints/otpu_clk2x.tcl }
 add_files -fileset constrs_1 -norecurse $late
 set_property SCOPED_TO_REF otpu_mem_ch [get_files $memch]
 set_property PROCESSING_ORDER LATE [get_files $late]

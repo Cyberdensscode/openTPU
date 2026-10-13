@@ -91,7 +91,9 @@ module otpu_asic_top
                .FIFO_DEPTH(FIFO_DEPTH), .LANES(LANES), .WIN(WIN), .RPB(RPB), .WPB(WPB),
                .MXU_IMPL(MXU_IMPL), .MXU_CL(MXU_CL), .VPU_CL(VPU_CL), .ULANES(ULANES),
                .HAS_DSTEP(HAS_DSTEP), .TMEM_IMPL(TMEM_IMPL)) u_slice (
-    .clk, .sys_rst, .rst, .rinit(rinit_a), .ld_start, .ld_addr, .ld_n, .ld_busy,
+    // clk_f: an ASIC does not pump its SRAM (TMEM_PMP 0: the one copy's two-port macros run at
+    // the core clock, docs/tmem_nocopy.md), so there is no 2x clock
+    .clk, .clk_f(1'b0), .sys_rst, .rst, .rinit(rinit_a), .ld_start, .ld_addr, .ld_n, .ld_busy,
     .a_rdy, .b_rdy, .sw_rdy, .wr_idle, .rd_idle,
     .a_req, .a_we, .a_addr, .a_wdata, .a_be, .a_rvalid, .a_rdata,
     .sw_req, .sw_addr, .sw_wdata, .sw_be,

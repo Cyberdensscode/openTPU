@@ -30,9 +30,21 @@ module otpu_top
   parameter int ULANES     = LANES,   // TMEM lanes of the MXU and the quantizer
   parameter int AXI        = 0,       // memory path: see the top
   parameter int TMEM_IMPL  = 0,       // TMEM: 0 a copy per read port, 1 banked (otpu_slice)
+  parameter bit TMEM_RQ    = 1'b0,    // TMEM_IMPL 1: request-priority bank addresses (otpu_slice)
+  parameter int TMEM_NCP   = 3,       // TMEM_IMPL 1: copies (otpu_slice)
+  parameter int TMEM_NSB   = 8,       // TMEM_IMPL 3: sub-banks per bank (otpu_slice)
+  parameter int TMEM_SBP   = 3,       // TMEM_IMPL 3: the sub-bank field's word-address bit
+  parameter int TMEM_SBH   = 0,       // TMEM_IMPL 3: the sub-bank hashed (otpu_slice)
+  parameter bit TMEM_RPL   = 1'b0,    // TMEM_IMPL 3: lost reads replayed (otpu_slice)
+  parameter bit TMEM_TDP   = 1'b0,    // TMEM_IMPL 3: true dual-port RAMs (otpu_slice)
+  parameter bit TMEM_GST   = 1'b0,    // TMEM_IMPL 3: QUANT 3 and COLL the DMA's guests (otpu_slice)
+  parameter int TMEM_PMP   = 0,       // TMEM_TDP: 2 the pumped RAMs' model (otpu_slice)
+  parameter int TMEM_PRK   = 0,       // TMEM_IMPL 3: the read ports' ranks (otpu_slice)
+  parameter int TMEM_SDM   = -1,      // TMEM_TDP: the read ports' RAM sides (otpu_slice)
   parameter bit SEQ_WC     = 1'b0     // EXPERIMENTAL: otpu_seq's wait counts (otpu_slice)
 ) (
   input  logic          clk,
+  input  logic          clk_f,         // TMEM_PMP 1: 2 x clk, rising with it (otpu_slice)
   input  logic          sys_rst,
   input  logic          rst,
   input  logic [31:0]   rinit [8],     // the run's arguments (R8..R15 at the start)
@@ -121,9 +133,12 @@ module otpu_top
                  .TMEM_WORDS(TMEM_WORDS), .IMEM_WORDS(IMEM_WORDS),
                  .FIFO_DEPTH(FIFO_DEPTH), .LANES(LANES), .WIN(WIN), .RPB(RPB),
                  .WPB(WPB), .MXU_IMPL(MXU_IMPL), .MXU_CL(MXU_CL), .MXU_E(MXU_E), .QUANT_XD(QUANT_XD), .VPU_CL(VPU_CL), .ULANES(ULANES),
-                 .TMEM_IMPL(TMEM_IMPL), .SEQ_WC(SEQ_WC))
+                 .TMEM_IMPL(TMEM_IMPL), .TMEM_RQ(TMEM_RQ), .TMEM_NCP(TMEM_NCP),
+                 .TMEM_NSB(TMEM_NSB), .TMEM_SBP(TMEM_SBP), .TMEM_SBH(TMEM_SBH),
+                 .TMEM_RPL(TMEM_RPL), .TMEM_TDP(TMEM_TDP), .TMEM_GST(TMEM_GST),
+                 .TMEM_PMP(TMEM_PMP), .TMEM_PRK(TMEM_PRK), .TMEM_SDM(TMEM_SDM), .SEQ_WC(SEQ_WC))
     u_slice (
-      .clk, .sys_rst, .rst, .rinit, .ld_start, .ld_addr, .ld_n, .ld_busy(ldb[s]),
+      .clk, .clk_f, .sys_rst, .rst, .rinit, .ld_start, .ld_addr, .ld_n, .ld_busy(ldb[s]),
       .a_rdy, .b_rdy, .sw_rdy, .wr_idle, .rd_idle,
       .a_req, .a_we, .a_addr, .a_wdata, .a_be, .a_rvalid, .a_rdata,
       .sw_req, .sw_addr, .sw_wdata, .sw_be,

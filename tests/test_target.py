@@ -273,7 +273,7 @@ def test_rtl_file_lists_agree():
     """Every flow's RTL list is opentpu.target.sources(): the board Makefile's lint and
     create_project.tcl (the board's top last, the Makefile linting it separately), the
     simulators' (rtlsim.RTL_SOURCES: the generic cells, plus the simulation-only DRAM model,
-    native adapter and top) and tools/synth's."""
+    native adapter, top and single-copy TMEM grant model) and tools/synth's."""
     from opentpu import rtlsim
     card = [f"rtl/{f}" for f in T.sources("ypcb-00338")]
     tcl = _tcl_rtl(ROOT / "boards/ypcb-00338/vivado/create_project.tcl")
@@ -281,7 +281,8 @@ def test_rtl_file_lists_agree():
     make = _make_rtl(ROOT / "boards/ypcb-00338/Makefile")
     assert make == [f for f in card if not f.endswith("otpu_fpga_top_ld.sv")]
     sim = [f for f in rtlsim.RTL_SOURCES
-           if f not in ("mem/otpu_dram.sv", "mem/otpu_native_dram.sv", "top/otpu_top.sv")]
+           if f not in ("mem/otpu_dram.sv", "mem/otpu_native_dram.sv", "top/otpu_top.sv",
+                        "exp/tmem_nocopy/otpu_tmem_model.sv")]
     assert sim == T.sources("nangate45", "generic")
     for f in T.CORE + T.SHELL + sum(T.TECH.values(), []) + sum(T.BOARDS.values(), []):
         assert (ROOT / "rtl" / f).exists(), f

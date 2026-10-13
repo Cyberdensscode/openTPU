@@ -47,6 +47,10 @@ make bit VPU_CL=4  # 4 VPU lanes with exp2/recip/rsqrt (2 by default): ~75% -> ~
                    # roofline on long-context attention; timing only, programs unchanged
 make bit MXU_E=2   # 2 MXU epilogue lanes (the target's: 4, full rate at MCOLS 4; timing only:
                    # E 2 made Phi-4-mini / SmolLM3 decode slower than the previous numerics', docs/mx_mxu.md 9)
+make bit TMEM_IMPL=3  # one TMEM copy instead of six (docs/tmem_nocopy.md): 2 RAMs a bank pumped
+                   # at 2x on the block design's core_clk2x (CLK2X: the MMCM's second output,
+                   # O1 = O0 / 2), so core_clk's divider must be even: 133.33 (6) or 100 MHz (8),
+                   # never 120.755 (6.625: the build stops); TMEM_X=NSB=1,... its knobs
 make bit LANES=16  # 16 VPU lanes / TMEM banks (the MXU and quantizer stay on 8): Qwen3.5 -4%
                    # cycles at 80% bw, -13% at 100% (simulated). Does not route on the xc7k480t
                    # (measured, MCOLS=4 VPU_CL=2 with the r3-route area cuts: 212K LUT placed,
@@ -686,6 +690,7 @@ so the 8250 driver probes the card: a udev rule sets `driver_override=xdma` (now
 | ui_clk0/1 | 100 MHz (133 / 162.5 / 167 / 200 at 1066 / 1300 / 1333 / 1600) | MIG | MIG AXI side, 512 bit |
 | DDR3 CK | 400 MHz (533 / 650 / 667 / 800) | MIG PLL | memory |
 | axi_aclk | 250 MHz (125 at Gen1) | XDMA | PCIe AXI side, 128 bit (Gen2 x8; PCIE_GEN=1: Gen1 x8) |
+| core_clk2x | 2 x core_clk (266.67 MHz at 133.33) | the block design's MMCM, O1 = O0 / 2 (bd_native.tcl CLK2X 1: `make bit TMEM_IMPL=3`) | the TMEM's pumped RAMs (clk_f; constraints/otpu_clk2x.tcl). Needs an even core_clk divider: 133.33 or 100 MHz, not 120.755 |
 
 Decode is DRAM-bound: every token streams all weights once. The accelerator consumes one
 128-byte chunk per core cycle at its peak; each DDR3 channel (x64) delivers 8 bytes per CK edge.

@@ -19,6 +19,9 @@ DDR ?= 1066
 # ACT_ROWS: ACT RAM rows, the most rows of one MM (default the target's: 16, the MX build's; the
 #   MXU replays each streamed weight chunk per MCOLS rows; MCOLS: no replay)
 # MXU_E: the MXU's epilogue lanes (timing only; default the target's: 4, MCOLS: full rate)
+# TMEM_IMPL: the TMEM, 0 a copy per read port (default) or 1 banked (three copies; timing only,
+#   docs/tmem_pump.md); TMEM_RQ=1 with it: the banks' addresses from the requests by priority;
+#   3 one copy (docs/tmem_nocopy.md; TMEM_X its knobs, vivado/tmem_knobs.tcl)
 # BUILD_ID: the BUILD_ID register (8 hex digits; default: the git commit)
 # PCIE_GEN: 2 (Gen2 x8, xdma_aclk 250 MHz, the default) or 1 (Gen1 x8), from the environment
 ifeq ($(FAST),1)
@@ -55,7 +58,7 @@ lint:
 lint-ld: lint
 
 bit:
-	MCOLS=$(MCOLS) $(if $(ACT_ROWS),ACT_ROWS=$(ACT_ROWS)) $(if $(MXU_E),MXU_E=$(MXU_E)) VPU_CL=$(VPU_CL) LANES=$(LANES) CORE_MHZ=$(CORE_MHZ) $(if $(BUILD_ID),BUILD_ID=$(BUILD_ID)) ./run_vivado.sh $(DDR)
+	MCOLS=$(MCOLS) $(if $(ACT_ROWS),ACT_ROWS=$(ACT_ROWS)) $(if $(MXU_E),MXU_E=$(MXU_E)) VPU_CL=$(VPU_CL) LANES=$(LANES) CORE_MHZ=$(CORE_MHZ) $(if $(TMEM_IMPL),TMEM_IMPL=$(TMEM_IMPL)) $(if $(TMEM_RQ),TMEM_RQ=$(TMEM_RQ)) $(if $(TMEM_X),TMEM_X=$(TMEM_X)) $(if $(BUILD_ID),BUILD_ID=$(BUILD_ID)) ./run_vivado.sh $(DDR)
 
 impl:
 	STEP=impl ./run_vivado.sh $(DDR)

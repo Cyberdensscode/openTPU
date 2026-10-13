@@ -1,0 +1,133 @@
+# EXPERIMENTAL (docs/tmem_nocopy.md): the TMEM candidates of run_cosim.sh, "NAME K=V ...".
+# OTPU_TMEM_IMPL=2 is otpu_slice's simulation model (otpu_tmem_model: the data in a copy per port,
+# the grants of the candidate); its plusargs (comma-separated): tm_nsb sub-banks per bank,
+# tm_sbp the sub-bank field's lowest address bit, tm_sbh a hash, tm_rps reads per RAM and cycle,
+# tm_rq request-priority addresses, tm_cpy each port's copy (MXU DMA Q VA VB Q3 Q2 COLL; 9 no
+# RAM read), tm_nbuf / tm_bufm lines kept per port. tm_sdly / tm_ddly / tm_sidle: the start and
+# completion delays of a longer read path (otpu_slice, any TMEM).
+#
+# references: the card's TMEM (six copies; TRACE writes its accesses), and the model with a
+# copy per port (no read conflicts, the model's arbiter path)
+i0 TRACE=1
+x8 OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_cpy=01234567,+tm_nsb=1
+# one copy of 8 banks (word address mod 8), one read per bank and cycle
+c1 OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=1
+# ... two reads per bank (a true dual-port RAM's second port, or the copy pumped at 2x); with the
+# row factor (QUANT 3) in a register
+c1r2 OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=1,+tm_rps=2
+c1r2q OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=1,+tm_rps=2,+tm_cpy=00000900
+# one copy, each bank 8 or 16 RAMs (sub-banks) with their own addresses: interleaved by 8-word
+# groups (sbp 3), as 8K-word regions (sbp 13), or hashed
+s8i OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3
+s16i OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3
+s8r OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=13
+s8h OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_sbh=1
+# ... with request-priority addresses (no grant on the RAM address path)
+s8iq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_rq=1
+s16iq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3,+tm_rq=1
+# ... with two reads per RAM
+s8i2 OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_rps=2
+# ... with two lines kept per port (a read of a kept line needs no RAM read)
+s8ib OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_nbuf=2
+s16ib OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3,+tm_nbuf=2
+s8rb OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=13,+tm_nbuf=2
+c1b OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=1,+tm_nbuf=2
+# ... with request-priority addresses and two lines per port
+s8iqb OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_rq=1,+tm_nbuf=2
+s16iqb OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3,+tm_rq=1,+tm_nbuf=2
+# ... the quantizer's row factor in a register, lines only for the small operands (VPU B, QUANT 2
+# and 3: bufm 0x70)
+s8iF OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_cpy=00000900,+tm_nbuf=2,+tm_bufm=70
+s16iF OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3,+tm_cpy=00000900,+tm_nbuf=2,+tm_bufm=70
+# a longer read path on the card's TMEM: the 2-cycle read (completions a cycle late); stream
+# buffers (starts and completions 2 cycles late; sidle: a busy unit's next start is fetched ahead)
+L1 OTPU_SIM_PLUSARGS=+tm_ddly=1
+L2 OTPU_SIM_PLUSARGS=+tm_sdly=2,+tm_ddly=2
+L2i OTPU_SIM_PLUSARGS=+tm_sdly=2,+tm_sidle=1,+tm_ddly=2
+# ... hashed: every address field above XORed into the sub-bank
+s8h2 OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_sbh=2
+s16h2 OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3,+tm_sbh=2
+# ... a unit's operands placed in different sub-banks (VPU B +32 words, QUANT 2 +24, QUANT 3 +40:
+# the most a placement pass could do for one instruction's own reads)
+s8ip OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_pskew=00004530
+s8ipq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_pskew=00004530,+tm_rq=1
+s16ipq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3,+tm_pskew=00004530,+tm_rq=1
+# ... two ports reading one word take two reads (no address compare across ports)
+s8in OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_share=0
+s8ipqn OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_pskew=00004530,+tm_rq=1,+tm_share=0
+# the RTL: otpu_tmem IMPL 3 (one copy, NSB RAMs a bank, request-priority addresses, a unit's
+# colliding ports read over successive cycles)
+r8i OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=8 OTPU_TMEM_SBP=3
+r16i OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=16 OTPU_TMEM_SBP=3
+# ... true dual-port RAMs (two accesses each, a write takes one): no second clock
+s8t OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_rps=2,+tm_tdp=1
+s16t OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3,+tm_rps=2,+tm_tdp=1
+s8tq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_rps=2,+tm_tdp=1,+tm_rq=1
+c1t OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=1,+tm_rps=2,+tm_tdp=1
+# ... true dual-port, hashed; with request-priority addresses
+s8h2t OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_sbh=2,+tm_rps=2,+tm_tdp=1
+s8h2tq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_sbh=2,+tm_rps=2,+tm_tdp=1,+tm_rq=1
+s16h2tq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3,+tm_sbh=2,+tm_rps=2,+tm_tdp=1,+tm_rq=1
+s16h2q OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3,+tm_sbh=2,+tm_rq=1
+# ... a scalar operand read once: a line of the last word kept at QUANT 3, VPU B and COLL (their
+# reads repeat one address; bufm 0xb0), with a write to it dropping it
+s8iqB OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_rq=1,+tm_nbuf=1,+tm_bufm=b0
+s16h2qB OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3,+tm_sbh=2,+tm_rq=1,+tm_nbuf=1,+tm_bufm=b0
+s8tqB OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_rps=2,+tm_tdp=1,+tm_rq=1,+tm_nbuf=1,+tm_bufm=b0
+s8h2tqB OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_sbh=2,+tm_rps=2,+tm_tdp=1,+tm_rq=1,+tm_nbuf=1,+tm_bufm=b0
+s16h2tqB OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3,+tm_sbh=2,+tm_rps=2,+tm_tdp=1,+tm_rq=1,+tm_nbuf=1,+tm_bufm=b0
+# two copies, a unit's ports split over them (copy 0: MXU, QUANT, VPU A; copy 1: DMA, VPU B,
+# QUANT 3, QUANT 2, COLL): only other units' reads can collide
+d8iq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_rq=1,+tm_cpy=01001111
+d1q OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=1,+tm_rq=1,+tm_cpy=01001111
+# the RTL with replays (otpu_tmem IMPL 3 RPL, otpu_slice TMEM_RPL): the board's arbiter (no RAM in
+# the grant), a lost read read again the next cycle while its unit holds
+r8iR OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=8 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1
+r8hR OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=8 OTPU_TMEM_SBP=3 OTPU_TMEM_SBH=2 OTPU_TMEM_RPL=1
+r16hR OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=16 OTPU_TMEM_SBP=3 OTPU_TMEM_SBH=2 OTPU_TMEM_RPL=1
+r16h OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=16 OTPU_TMEM_SBP=3 OTPU_TMEM_SBH=2
+# ... fewer readers (A4): the MXU's accumulation kept in the MXU (92% of its reads are its own
+# results) and the row factor in a register: the MXU and QUANT 3 ports read no RAM
+s8iqA OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_rq=1,+tm_cpy=90000900
+s16h2qA OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=16,+tm_sbp=3,+tm_sbh=2,+tm_rq=1,+tm_cpy=90000900
+# ... one true dual-port copy, its two ports split over the units' ports (port B: DMA, MXU, QUANT,
+# VPU A; port A: VPU B, QUANT 3, QUANT 2, COLL and the writes): a unit's ports never share a RAM port
+s8xq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_rq=1,+tm_cpy=00001111,+tm_tdp=1,+tm_wcpy=1
+s8hxq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=8,+tm_sbp=3,+tm_sbh=2,+tm_rq=1,+tm_cpy=00001111,+tm_tdp=1,+tm_wcpy=1
+# ... the replays on one true dual-port copy (otpu_tmem TDP, otpu_slice TMEM_TDP): the MXU, the DMA,
+# QUANT and VPU A on the RAMs' port B, VPU B, QUANT 3, QUANT 2 and COLL on port A with the writes
+# (s8xq in RTL); r8iRb: r8iR on the RTL with one asker a port (must equal r8iR cycle for cycle)
+r8xR OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=8 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1 OTPU_TMEM_TDP=1
+r8xhR OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=8 OTPU_TMEM_SBP=3 OTPU_TMEM_SBH=2 OTPU_TMEM_RPL=1 OTPU_TMEM_TDP=1
+r8iRb OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=8 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1
+# ... fewer RAMs a bank (smaller data selects: 4:1, 2:1), true dual-port split, model and RTL
+s4xq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=4,+tm_sbp=3,+tm_rq=1,+tm_cpy=00001111,+tm_tdp=1,+tm_wcpy=1
+s4hxq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=4,+tm_sbp=3,+tm_sbh=2,+tm_rq=1,+tm_cpy=00001111,+tm_tdp=1,+tm_wcpy=1
+s2xq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=2,+tm_sbp=3,+tm_rq=1,+tm_cpy=00001111,+tm_tdp=1,+tm_wcpy=1
+c1xq OTPU_TMEM_IMPL=2 OTPU_SIM_PLUSARGS=+tm_nsb=1,+tm_rq=1,+tm_cpy=00001111,+tm_tdp=1,+tm_wcpy=1
+r4xR OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=4 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1 OTPU_TMEM_TDP=1
+r2xR OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=2 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1 OTPU_TMEM_TDP=1
+# ... with QUANT 3 and COLL the DMA's guests (TMEM_GST: today's guest rule, one data select for the three)
+r8xgR OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=8 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1 OTPU_TMEM_TDP=1 OTPU_TMEM_GST=1
+r4xgR OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=4 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1 OTPU_TMEM_TDP=1 OTPU_TMEM_GST=1
+r2xgR OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=2 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1 OTPU_TMEM_TDP=1 OTPU_TMEM_GST=1
+# ... one copy pumped at 2x (otpu_tmem PMP: both RAM ports read, the write between; P3's banks, one
+# copy), its model at the core clock (PMP 2: the same cycles), guests, 1 / 2 / 4 RAMs a bank
+r1pgR OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=1 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1 OTPU_TMEM_TDP=1 OTPU_TMEM_GST=1 OTPU_TMEM_PMP=2
+r2pgR OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=2 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1 OTPU_TMEM_TDP=1 OTPU_TMEM_GST=1 OTPU_TMEM_PMP=2
+r4pgR OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=4 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1 OTPU_TMEM_TDP=1 OTPU_TMEM_GST=1 OTPU_TMEM_PMP=2
+# ... the same with the read ports' RAM sides from the screen (tools/tmem_trace.py; side A: QUANT and
+# VPU A, side B: the MXU, the DMA and its guests, VPU B, QUANT 2: OTPU_TMEM_SDM=12), and the MXU
+# ranked first after the DMA (OTPU_TMEM_PRK: DMA MXU COLL VPU-A VPU-B QUANT QUANT-2 QUANT-3)
+r1pgRs OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=1 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1 OTPU_TMEM_TDP=1 OTPU_TMEM_GST=1 OTPU_TMEM_PMP=2 OTPU_TMEM_SDM=12
+r2pgRs OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=2 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1 OTPU_TMEM_TDP=1 OTPU_TMEM_GST=1 OTPU_TMEM_PMP=2 OTPU_TMEM_SDM=12
+r1pgRsm OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=1 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1 OTPU_TMEM_TDP=1 OTPU_TMEM_GST=1 OTPU_TMEM_PMP=2 OTPU_TMEM_SDM=12 OTPU_TMEM_PRK=6014785
+r2pgRsm OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=2 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1 OTPU_TMEM_TDP=1 OTPU_TMEM_GST=1 OTPU_TMEM_PMP=2 OTPU_TMEM_SDM=12 OTPU_TMEM_PRK=6014785
+r1pgRm OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=1 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1 OTPU_TMEM_TDP=1 OTPU_TMEM_GST=1 OTPU_TMEM_PMP=2 OTPU_TMEM_PRK=6014785
+r2pgRm OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=2 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1 OTPU_TMEM_TDP=1 OTPU_TMEM_GST=1 OTPU_TMEM_PMP=2 OTPU_TMEM_PRK=6014785
+# the pick (r2pgRs) with its RAMs pumped on a real 2x clock (tb_top's clk_f, TMEM_PMP 1) and the
+# default RAM sides (Q and VA on port A, as SDM 12): its cycles and results are r2pgRs's
+r2pgRs1 OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=2 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1 OTPU_TMEM_TDP=1 OTPU_TMEM_GST=1 OTPU_TMEM_PMP=1
+# the ASIC form at 2 RAMs a bank with the pumped TMEM's sides (QUANT and VPU A on port A; r2xgR: the
+# writes' port A light, the old sides): two-port RAMs at the core clock, a write taking port A
+r2xgRs OTPU_TMEM_IMPL=3 OTPU_TMEM_NSB=2 OTPU_TMEM_SBP=3 OTPU_TMEM_RPL=1 OTPU_TMEM_TDP=1 OTPU_TMEM_GST=1 OTPU_TMEM_SDM=12

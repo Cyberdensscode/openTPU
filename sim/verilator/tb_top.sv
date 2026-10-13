@@ -29,8 +29,19 @@ module tb_top;
   parameter int FIFO_DEPTH = 128;
   parameter int TMEM_IMPL  = 0;       // TMEM: 0 a copy per read port, 1 banked (otpu_slice)
   parameter bit SEQ_WC     = 1'b0;    // EXPERIMENTAL: otpu_seq's wait counts (docs/seq_vpu.md)
+  parameter bit TMEM_RQ    = 1'b0;    // TMEM_IMPL 1: request-priority bank addresses
+  parameter int TMEM_NCP   = 3;       // TMEM_IMPL 1: copies
+  parameter int TMEM_NSB   = 8;       // TMEM_IMPL 3: sub-banks per bank
+  parameter int TMEM_SBP   = 3;       // TMEM_IMPL 3: the sub-bank field's word-address bit
+  parameter int TMEM_SBH   = 0;       // TMEM_IMPL 3: the sub-bank hashed
+  parameter bit TMEM_RPL   = 1'b0;    // TMEM_IMPL 3: lost reads replayed
+  parameter bit TMEM_TDP   = 1'b0;    // TMEM_IMPL 3: true dual-port RAMs
+  parameter bit TMEM_GST   = 1'b0;    // TMEM_IMPL 3: QUANT 3 and COLL the DMA's guests
+  parameter int TMEM_PMP   = 0;       // TMEM_TDP: 2 the pumped RAMs' model
+  parameter int TMEM_PRK   = 0;       // TMEM_IMPL 3: the read ports' ranks (otpu_slice)
+  parameter int TMEM_SDM   = -1;      // TMEM_TDP: the read ports' RAM sides (otpu_slice)
 
-  logic clk = 1'b0, sys_rst = 1'b1, rst = 1'b1, dump = 1'b0;
+  logic clk = 1'b0, clk_f = 1'b0, sys_rst = 1'b1, rst = 1'b1, dump = 1'b0;
   logic ld_start = 1'b0, ld_busy;
   logic [31:0] ld_addr = '0, ld_n = '0;
   logic [31:0] rinit [8] = '{default: '0};    // +arg0=N .. +arg7=N: R8..R15 at the start
@@ -41,11 +52,23 @@ module tb_top;
   otpu_top #(.S(S), .D(D), .MCOLS(MCOLS), .ACT_BLOCKS(ACT_BLOCKS), .ACT_ROWS(ACT_ROWS), .TMEM_WORDS(TMEM_WORDS),
              .IMEM_WORDS(IMEM_WORDS), .DRAM_WORDS(DRAM_WORDS), .DRAM_LAT(DRAM_LAT),
              .LANES(LANES), .WIN(WIN), .RPB(RPB), .WPB(WPB), .MXU_IMPL(MXU_IMPL), .MXU_CL(MXU_CL), .MXU_E(MXU_E), .QUANT_XD(QUANT_XD), .VPU_CL(VPU_CL), .ULANES(ULANES), .AXI(AXI), .FIFO_DEPTH(FIFO_DEPTH),
-             .TMEM_IMPL(TMEM_IMPL), .SEQ_WC(SEQ_WC)) dut (
-    .clk, .sys_rst, .rst, .rinit, .ld_start, .ld_addr, .ld_n, .ld_busy, .all_halted, .any_error, .icount,
-    .dump);
+             .TMEM_IMPL(TMEM_IMPL), .TMEM_RQ(TMEM_RQ), .TMEM_NCP(TMEM_NCP),
+             .TMEM_NSB(TMEM_NSB), .TMEM_SBP(TMEM_SBP), .TMEM_SBH(TMEM_SBH),
+             .TMEM_RPL(TMEM_RPL), .TMEM_TDP(TMEM_TDP), .TMEM_GST(TMEM_GST),
+             .TMEM_PMP(TMEM_PMP), .TMEM_PRK(TMEM_PRK), .TMEM_SDM(TMEM_SDM), .SEQ_WC(SEQ_WC)) dut (
+    .clk, .clk_f, .sys_rst, .rst, .rinit, .ld_start, .ld_addr, .ld_n, .ld_busy, .all_halted, .any_error,
+    .icount, .dump);
 
-  always #5 clk = ~clk;
+  // TMEM_PMP 1: clk_f (2 x clk) rises with each edge of clk, in clk's own process (no race between
+  // the two domains); clk's edges stay where they are (the memory models' clocks are absolute)
+  if (TMEM_PMP == 1) begin : g_clkf
+    initial forever begin
+      #2 clk_f = 1'b0;
+      #3 begin clk = ~clk; clk_f = 1'b1; end
+    end
+  end else begin : g_clk
+    always #5 clk = ~clk;
+  end
 
   initial begin
     void'($value$plusargs("max_cycles=%d", max_cycles));

@@ -90,6 +90,9 @@ module otpu_vpu
                                                // the head write is taken)
   output logic                    ren,        // the lanes take the read data (WBUF: the
                                                // registered enable; else the grant)
+  input  logic                    rhold,      // WBUF: a read of this cycle lost its TMEM RAM
+                                               // (otpu_tmem RPL): hold the next cycle while it
+                                               // is read again
   output logic [LANES-1:0]        ta_en,
   output logic [LANES-1:0][31:0]  ta_addr,
   input  logic [LANES-1:0][31:0]  ta_data,
@@ -1212,9 +1215,9 @@ module otpu_vpu
         wn <= wn_nx;
         if (SE) begin
           en_q <= ss_act_d ? ss_pe : (pop ? (wn_p1 < 2) : (wn_p0 < 2)) && red_thr;  // a stream: its pe (as sen)
-          en_r <= en_q;
+          en_r <= en_q && !rhold;
         end else begin
-          en_r <= (pop ? (wn_p1 < 2) : (wn_p0 < 2)) && red_thr;
+          en_r <= (pop ? (wn_p1 < 2) : (wn_p0 < 2)) && red_thr && !rhold;
         end
         done <= pop && hd.dn;
         dpend <= pdn && !en;

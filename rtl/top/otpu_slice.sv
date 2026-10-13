@@ -48,10 +48,35 @@ module otpu_slice
   parameter int PQ_WIN     = 64,      // cycles per P/Q counter window (+bucket= in simulation)
   parameter bit HAS_DSTEP  = 1'b1,    // streams (DSTEP, STREAM): SE's tail in the VPU
   parameter int TMEM_IMPL  = 0,       // TMEM: 0 a copy per read port (FPGA block RAM), 1 banked
-                                      //   (three copies of 1R1W RAMs: an ASIC; otpu_tmem)
+                                      //   (three copies of 1R1W RAMs: an ASIC; otpu_tmem); 2
+                                      //   (simulation only) the read arbitration of a candidate
+                                      //   with one or two copies (otpu_tmem_model,
+                                      //   docs/tmem_nocopy.md)
+  parameter bit TMEM_RQ    = 1'b0,    // TMEM_IMPL 1: the banks' addresses from the requests by
+                                      //   priority, and the arbiter grants by them (gnt_q)
+  parameter int TMEM_NCP   = 3,       // TMEM_IMPL 1: copies (3; 2, 4, 5, 7: the read slots of
+                                      //   pumped copies, docs/tmem_pump.md)
+  parameter int TMEM_NSB   = 8,       // TMEM_IMPL 3 (EXPERIMENTAL): one copy, each bank TMEM_NSB
+  parameter int TMEM_SBP   = 3,       //   RAMs, the sub-bank at word-address bit TMEM_SBP
+                                      //   (docs/tmem_nocopy.md)
+  parameter int TMEM_SBH   = 0,       // TMEM_IMPL 3: the sub-bank hashed (otpu_tmem SBH)
+  parameter bit TMEM_RPL   = 1'b0,    // TMEM_IMPL 3: lost reads replayed (otpu_tmem RPL), the
+                                      //   board's arbiter (ARB_MASK) with the replays' holds
+  parameter bit TMEM_TDP   = 1'b0,    // TMEM_IMPL 3: true dual-port RAMs (otpu_tmem TDP), a
+                                      //   unit's ports on different RAM ports (TM_SIDE)
+  parameter bit TMEM_GST   = 1'b0,    // TMEM_IMPL 3: QUANT 3 and COLL the DMA's guests, as
+                                      //   TMEM_IMPL 0's (otpu_tmem GST: one data select)
+  parameter int TMEM_PMP   = 0,       // TMEM_TDP: 1 the RAMs pumped at 2x on clk_f (otpu_tmem
+                                      //   PMP: a write takes no read port), 2 their model at the
+                                      //   core clock (simulation)
+  parameter int TMEM_PRK   = 0,       // TMEM_IMPL 3: the read ports' ranks (3 bits a port, port p
+                                      //   at bit 3p; 0: PRANK3, below)
+  parameter int TMEM_SDM   = -1,      // TMEM_TDP: the read ports' RAM sides (bit p: port p on
+                                      //   port A; -1: TM_SIDED, below)
   parameter bit SEQ_WC     = 1'b0     // EXPERIMENTAL: otpu_seq's wait counts (WAITC, docs/seq_vpu.md)
 ) (
   input  logic          clk,
+  input  logic          clk_f,      // TMEM_PMP 1: 2 x clk, rising with it (the MMCM's); else unused
   input  logic          sys_rst,
   input  logic          rst,
   input  logic [31:0]   rinit [8],  // the run's arguments: R8..R15 at the start (otpu_seq)
@@ -117,26 +142,75 @@ module otpu_slice
   // the board build (TMEM replicated per read port, RPB >= NRP * LANES: reads never conflict;
   // WPB = 1): the arbiter only masks write banks (see the arbiter), and the VPU's grant only
   // takes its buffered writes (otpu_vpu WBUF)
-  localparam bit ARB_MASK = (TMEM_IMPL == 0) && (RPB >= NRP * LANES) && (WPB == 1);
+  localparam bit ARB_MASK = (TMEM_IMPL == 0 || (TMEM_IMPL == 3 && TMEM_RPL)) &&
+                            (RPB >= NRP * LANES) && (WPB == 1);
   // TMEM_IMPL 1 (banked TMEM): three copies, each bank one read per cycle; the ports of one
   // group on different copies (the quantizer's three, the VPU's two), so a group alone always
   // fits: copy 0 MXU, QUANT, VPU A; copy 1 VPU B, QUANT 2; copy 2 DMA, QUANT 3, COLL. The arbiter
   // counts one read per port and bank (its lanes there read one word) per copy (gnt_k).
-  localparam int NCP = 3;
-  localparam logic [NRP-1:0][1:0] CPY = {2'd2, 2'd1, 2'd2, 2'd1, 2'd0, 2'd0, 2'd2, 2'd0};
-  //                                    COLL  Q2    Q3    VB    VA    Q     DMA   MXU
+  // TMEM_NCP 4 (two pumped copies' four read slots): MXU and VPU A, VPU B and QUANT 3, DMA and
+  // QUANT 2, QUANT and COLL
+  // TMEM_NCP 2 (one pumped copy's two read slots, P1): MXU, VPU A, QUANT 2 and COLL share one,
+  // DMA, VPU B and QUANT the other; QUANT 3 (the row factor, one word) has a third of its own, a
+  // model of the row factor kept in a register by the quantizer (two slots cannot hold the
+  // quantizer's three reads)
+  // TMEM_NCP 5 / 7 (one copy pumped at 3x / 4x: 2K - 1 read slots, their count only, at today's
+  // read latency): 5: MXU; DMA, QUANT 3 and COLL; QUANT; VPU A; VPU B and QUANT 2. 7: a slot per
+  // port, COLL on the DMA's
+  localparam int NCP = (TMEM_NCP == 2) ? 3 : TMEM_NCP;
+  localparam logic [NRP-1:0][2:0] CPY =
+    (TMEM_NCP == 2) ? {3'd0, 3'd0, 3'd2, 3'd1, 3'd0, 3'd1, 3'd1, 3'd0} :
+    (TMEM_NCP == 4) ? {3'd3, 3'd2, 3'd1, 3'd1, 3'd0, 3'd3, 3'd2, 3'd0} :
+    (TMEM_NCP == 5) ? {3'd1, 3'd4, 3'd1, 3'd4, 3'd3, 3'd2, 3'd1, 3'd0} :
+    (TMEM_NCP == 7) ? {3'd1, 3'd6, 3'd5, 3'd4, 3'd3, 3'd2, 3'd1, 3'd0} :
+                      {3'd2, 3'd1, 3'd2, 3'd1, 3'd0, 3'd0, 3'd2, 3'd0};
+  //                    COLL  Q2    Q3    VB    VA    Q     DMA   MXU
+  // TMEM_RQ: each read port's rank in the arbiter's priority order (its group's: DMA, COLL, VPU,
+  // MXU, QUANT), for the copies' request-priority bank addresses (otpu_tmem RQ)
+  localparam logic [NRP-1:0][2:0] PRANK = {3'd1, 3'd4, 3'd4, 3'd2, 3'd2, 3'd4, 3'd0, 3'd3};
+  //                                       COLL  Q2    Q3    VB    VA    Q     DMA   MXU
+  initial if (TMEM_IMPL == 1 && !(TMEM_NCP inside {2, 3, 4, 5, 7}))
+    $fatal(1, "otpu_slice: TMEM_NCP %0d (2, 3, 4, 5 or 7)", TMEM_NCP);
   initial if (TMEM_IMPL == 1 && (RPB != 1 || WPB != 1))
     $fatal(1, "otpu_slice: TMEM_IMPL 1 needs RPB = 1 and WPB = 1 (RPB %0d WPB %0d)", RPB, WPB);
+`ifdef SYNTHESIS
+  initial if (TMEM_IMPL == 2) $fatal(1, "otpu_slice: TMEM_IMPL 2 is a simulation model");
+`endif
+  initial if (TMEM_IMPL == 2 && WPB != 1)
+    $fatal(1, "otpu_slice: TMEM_IMPL 2 needs WPB = 1 (WPB %0d)", WPB);
   localparam int W_DMA = 0, W_MXU = 1, W_COLL = 2, W_VPU = 3, NWP = 4;
   // The VPU ahead of the MXU drain: the VPU writes all its lanes' banks at once, so an MXU drain
   // write in any one bank cost it the whole cycle, and decode's softmax (EXP2SUB, which the next
   // PV MM waits for) ran at about half its rate; the drain holds a cycle instead
   // (docs/litedram.md section 11, "The core's own gaps": Qwen3 4-bit -3.0% cycles per token).
   localparam int G_DMA = 0, G_COLL = 1, G_VPU = 2, G_MXU = 3, G_Q = 4, NG = 5;
+  // TMEM_IMPL 3: every read port its own rank (the groups' order, DMA COLL VPU MXU QUANT; within
+  // a group in port order) and its group
+  localparam logic [NRP-1:0][2:0] PRANK3D = {3'd1, 3'd6, 3'd7, 3'd3, 3'd2, 3'd5, 3'd0, 3'd4};
+  //                                        COLL  Q2    Q3    VB    VA    Q     DMA   MXU
+  localparam logic [NRP-1:0][2:0] PRANK3 = (TMEM_PRK != 0) ? (3 * NRP)'(TMEM_PRK) : PRANK3D;
+  localparam logic [NRP-1:0][2:0] RGRP = {3'(G_COLL), 3'(G_Q), 3'(G_Q), 3'(G_VPU), 3'(G_VPU),
+                                          3'(G_Q), 3'(G_DMA), 3'(G_MXU)};
+  // TMEM_TDP: the RAM port each read port asks on (1: port A). The VPU's and the quantizer's
+  // operands never share a RAM port. Pumped (TMEM_PMP), where the write takes neither: QUANT and
+  // VPU A on port A, the MXU, the DMA (with its guests), VPU B and QUANT 2 on port B (the fewest
+  // replays of every split, docs/tmem_nocopy.md 6.4). Not pumped, where the writes take port A
+  // first: VPU B, QUANT 3, QUANT 2 and COLL on port A, the busy readers on port B
+  localparam logic [NRP-1:0] TM_SIDED = (TMEM_PMP != 0) ? ((NRP'(1) << P_Q) | (NRP'(1) << P_VA)) :
+                                        ((NRP'(1) << P_VB) | (NRP'(1) << P_Q3) | (NRP'(1) << P_Q2) |
+                                         (NRP'(1) << P_COLL));
+  localparam logic [NRP-1:0] TM_SIDE = (TMEM_SDM >= 0) ? NRP'(TMEM_SDM) : TM_SIDED;
+  initial if (TMEM_IMPL == 3 && (WPB != 1 || ARB_MASK != TMEM_RPL))
+    $fatal(1, "otpu_slice: TMEM_IMPL 3 needs WPB = 1 (WPB %0d), and RPB >= %0d with TMEM_RPL",
+           WPB, NRP * LANES);
 
   // ---- sequencer
   cmd_t ucmd [NUNITS];
   logic [NUNITS-1:0] ustart, urdy, udone;
+  // the sequencer's side of the units' handshake: the same, except in simulation with +tm_sdly
+  // or +tm_ddly (docs/tmem_nocopy.md: the cycles a TMEM with a longer read path adds)
+  cmd_t ucmd_s [NUNITS];
+  logic [NUNITS-1:0] ustart_s, urdy_s, udone_s;
   logic urel;
   logic im_we;
   logic [31:0] im_row;
@@ -151,10 +225,65 @@ module otpu_slice
   logic [31:0] sq_icount, sq_cha, sq_chn, rl_val;
   otpu_seq #(.IMEM_WORDS(IMEM_WORDS), .TMEM_WORDS(TMEM_WORDS), .SID(SID), .S(S), .D(D),
              .WIN(WIN), .STREAMS(HAS_SS), .WAITC(SEQ_WC)) u_seq (
-    .clk, .rst(srst), .ucmd, .ustart, .urel, .urdy, .udone, .halted(sq_halted), .error(sq_err),
+    .clk, .rst(srst), .ucmd(ucmd_s), .ustart(ustart_s), .urel, .urdy(urdy_s), .udone(udone_s),
+    .halted(sq_halted), .error(sq_err),
     .icount(sq_icount), .ev(sq_ev), .rinit, .rl_v, .rl_val, .ch_req(sq_ch), .ch_addr(sq_cha),
     .ch_n(sq_chn), .im_we, .im_row, .im_data(b_rdata),
     .sc_we, .sc_row, .sc_data);
+
+  // The units' handshake. In simulation, +tm_sdly=N starts every DMA, QUANT, VPU and collective
+  // instruction N cycles after the sequencer issues it (+tm_sidle=1: only when its unit has
+  // nothing in flight, as if a busy unit's next reads were fetched ahead), and +tm_ddly=N
+  // reports every completion N cycles late (its writes land later): the latency a TMEM with
+  // stream buffers or a registered read path adds (docs/tmem_nocopy.md). The MXU starts as
+  // issued (its stream and release, urel, are in order with its start). 0: wires.
+`ifdef SYNTHESIS
+  assign ustart = ustart_s;
+  assign urdy_s = urdy;
+  assign udone_s = udone;
+  for (genvar u = 0; u < NUNITS; u++) begin : g_hs
+    assign ucmd[u] = ucmd_s[u];
+  end
+`else
+  int hs_sd, hs_dd, hs_idle;
+  initial begin
+    hs_sd = 0; hs_dd = 0; hs_idle = 0;
+    void'($value$plusargs("tm_sdly=%d", hs_sd));
+    void'($value$plusargs("tm_ddly=%d", hs_dd));
+    void'($value$plusargs("tm_sidle=%d", hs_idle));
+    if (hs_dd > 15) $fatal(1, "otpu_slice: +tm_ddly %0d (0..15)", hs_dd);
+  end
+  logic [NUNITS-1:0] hs_pend, hs_fire, hs_dly;
+  int                hs_cnt [NUNITS], hs_busy [NUNITS];
+  cmd_t              hs_cmd [NUNITS];
+  logic [NUNITS-1:0] hs_dq [16];
+  always_comb
+    for (int u = 0; u < NUNITS; u++) begin
+      hs_dly[u] = hs_sd > 0 && u != U_MXU && (hs_idle == 0 || hs_busy[u] == 0);
+      hs_fire[u] = hs_pend[u] && hs_cnt[u] == 1;
+      ustart[u] = hs_fire[u] || (ustart_s[u] && !hs_dly[u]);
+      ucmd[u] = hs_fire[u] ? hs_cmd[u] : ucmd_s[u];
+      urdy_s[u] = urdy[u] && !hs_pend[u];
+      udone_s[u] = (hs_dd == 0) ? udone[u] : hs_dq[hs_dd - 1][u];
+    end
+  always_ff @(posedge clk) begin
+    if (srst) begin
+      hs_pend <= '0;
+      for (int u = 0; u < NUNITS; u++) begin hs_cnt[u] <= 0; hs_busy[u] <= 0; end
+    end else
+      for (int u = 0; u < NUNITS; u++) begin
+        if (ustart_s[u] && hs_dly[u]) begin
+          hs_pend[u] <= 1'b1; hs_cnt[u] <= hs_sd; hs_cmd[u] <= ucmd_s[u];
+        end else if (hs_pend[u]) begin
+          hs_cnt[u] <= hs_cnt[u] - 1;
+          if (hs_cnt[u] == 1) hs_pend[u] <= 1'b0;
+        end
+        hs_busy[u] <= hs_busy[u] + int'(ustart[u]) - int'(udone[u]);
+      end
+    hs_dq[0] <= srst ? '0 : udone;
+    for (int i = 1; i < 16; i++) hs_dq[i] <= srst ? '0 : hs_dq[i - 1];
+  end
+`endif
 
   // ---- HALT CHAIN: reload IMEM from the chained program's address, the units held in reset.
   // A WAITW timeout (dma_err) stops the slice until rst: to_err holds the sequencer and the
@@ -235,6 +364,9 @@ module otpu_slice
 
   // ---- TMEM
   logic [NRP-1:0][LANES-1:0]       rq_en, r_en;
+  logic [NRP-1:0]                  tm_bx, tm_bs, tm_sv, tm_pre;   // TMEM_IMPL 3 (below)
+  logic [NRP-1:0]                  tm_lost, tm_frz;               // TMEM_IMPL 3, TMEM_RPL
+  logic [NRP-1:0][LANES-1:0]       rq_t;
   logic [NRP-1:0][LANES-1:0][31:0] r_addr, r_data;
   logic [NWP-1:0][LANES-1:0]       wq_en, w_en;
   logic [NWP-1:0][LANES-1:0][31:0] w_addr, w_data;
@@ -242,12 +374,19 @@ module otpu_slice
   // the MXU's ports keep the crossbar (its drain writes scattered rows); the others are rotators.
   // The quantizer's row-factor port (one word) and the collective's read port, rarely busy,
   // share the DMA's copy (ST reads): 6 copies of the memory instead of 8.
+  // (TMEM_IMPL 2, simulation: IMPL 0 with a copy per read port, so any grant reads the right
+  // words; otpu_tmem_model decides the grants)
   otpu_tmem #(.WORDS(TMEM_WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .WPB(WPB),
               .GEN_R(NRP'(1) << P_MXU), .GEN_W(NWP'(1) << W_MXU),
-              .SH_HOST(P_DMA), .SH_MASK((NRP'(1) << P_Q3) | (NRP'(1) << P_COLL)),
-              .SID(SID), .IMPL(TMEM_IMPL), .NCP(NCP), .CPY(CPY)) u_tmem (
-    .clk, .r_en, .r_req(rq_en), .r_addr, .r_data, .w_en, .w_req(wq_en), .w_gnt, .w_addr,
-    .w_data, .dump);
+              .SH_HOST(P_DMA),
+              .SH_MASK((TMEM_IMPL == 2) ? '0 : (NRP'(1) << P_Q3) | (NRP'(1) << P_COLL)),
+              .SID(SID), .IMPL((TMEM_IMPL == 2) ? 0 : TMEM_IMPL), .NCP(NCP), .CPY(CPY), .RQ(TMEM_RQ),
+              .PRANK((TMEM_IMPL == 3) ? PRANK3 : PRANK), .NSB(TMEM_NSB), .SBP(TMEM_SBP),
+              .GRP(RGRP), .SBH(TMEM_SBH), .RPL(TMEM_RPL), .RPLM(~(NRP'(1) << P_COLL)),
+              .TOPP(P_DMA), .TDP(TMEM_TDP), .SIDE(TM_SIDE), .GST(TMEM_GST),
+              .PMP(TMEM_PMP)) u_tmem (
+    .clk, .clk_f, .r_en, .r_req(rq_t), .r_addr, .r_data, .w_en, .w_req(wq_en), .w_gnt, .w_addr,
+    .w_data, .blk_x(tm_bx), .blk_s(tm_bs), .lost(tm_lost), .frz(tm_frz), .dump);
   assign coll_rdata = r_data[P_COLL];
   // the units' TMEM requests
   logic [LANES-1:0]        dma_ren, dma_wen, va_ren, vb_ren, v_wen;
@@ -365,7 +504,7 @@ module otpu_slice
 
   otpu_vpu #(.LANES(LANES), .CL(VPU_CL), .SID(SID), .WBUF(ARB_MASK), .HAS_SE(HAS_SS)) u_vpu (
     .clk, .rst(rst_vpu), .start(ustart[U_VPU]), .cmd(ucmd[U_VPU]), .rdy(r_vpu), .done(d_vpu),
-    .gnt(gnt[G_VPU]), .ren(v_ren),
+    .gnt(gnt[G_VPU]), .ren(v_ren), .rhold(tm_lost[P_VA] || tm_lost[P_VB]),
     .ta_en(va_ren), .ta_addr(va_raddr), .ta_data(r_data[P_VA]),
     .tb_en(vb_ren), .tb_addr(vb_raddr), .tb_data(r_data[P_VB]),
     .tw_en(v_wen), .tw_addr(v_waddr), .tw_data(v_wdata), .pf_u(v_u), .pf_frz(v_frz),
@@ -486,11 +625,20 @@ module otpu_slice
   // the guests on the DMA's TMEM copy read only when no port before them there asks (from the
   // requests: the copy's block RAM address does not wait for the grants)
   // (TMEM_IMPL 1: no guests, the banked arbiter counts every copy's banks)
-  wire q3_blk = (TMEM_IMPL == 0) && (|rq_en[P_Q3]) && (|rq_en[P_DMA]);
-  wire coll_blk = (TMEM_IMPL == 0) && (|rq_en[P_COLL]) && ((|rq_en[P_DMA]) || (|rq_en[P_Q3]));
+  localparam bit GUESTS = TMEM_IMPL == 0 || (TMEM_IMPL == 3 && TMEM_GST);
+  wire q3_blk = GUESTS && (|rq_en[P_Q3]) && (|rq_en[P_DMA]);
+  wire coll_blk = GUESTS && (|rq_en[P_COLL]) && ((|rq_en[P_DMA]) || (|rq_en[P_Q3]));
+  // TMEM_RPL: a group whose port replays a lost read is held (tm_frz, a register); the
+  // collective, which is not replayed, reads only where its request does not lose (tm_bx)
+  logic [NG-1:0] rpl_hold, rpl_frz;
+  always_comb
+    for (int g = 0; g < NG; g++) begin
+      rpl_frz[g] = TMEM_RPL && g != G_VPU && g != G_COLL && (tm_frz & grp_rports(g)) != '0;
+      rpl_hold[g] = rpl_frz[g] || (TMEM_RPL && g == G_COLL && tm_bx[P_COLL] && |rq_en[P_COLL]);
+    end
   always_comb begin
     for (int g = 0; g < NG; g++) begin
-      aok[g] = 1'b1;
+      aok[g] = !rpl_hold[g];
       for (int h = 0; h < g; h++) if (aok[h] && acf[g][h]) aok[g] = 1'b0;
       if (g == G_Q && q_awant && !sw_rdy) aok[g] = 1'b0;   // QST write the DRAM cannot take
       if ((g == G_Q && q3_blk) || (g == G_COLL && coll_blk)) aok[g] = 1'b0;
@@ -500,11 +648,13 @@ module otpu_slice
     cgl_m = aok[G_COLL];
   end
 
-  logic [NG-1:0] gnt_k;
-  logic          cgl_k;
+  logic [NG-1:0] gnt_k, gnt_q, gnt_x, gnt_s;
+  logic          cgl_k, cgl_q, cgl_x, cgl_s;
   always_comb begin
-    gnt = ARB_MASK ? gnt_m : (TMEM_IMPL == 1) ? gnt_k : gnt_c;
-    coll_gnt_local = ARB_MASK ? cgl_m : (TMEM_IMPL == 1) ? cgl_k : cgl_c;
+    gnt = ARB_MASK ? gnt_m : (TMEM_IMPL == 1) ? (TMEM_RQ ? gnt_q : gnt_k) :
+          (TMEM_IMPL == 2) ? gnt_x : (TMEM_IMPL == 3) ? gnt_s : gnt_c;
+    coll_gnt_local = ARB_MASK ? cgl_m : (TMEM_IMPL == 1) ? (TMEM_RQ ? cgl_q : cgl_k) :
+                     (TMEM_IMPL == 2) ? cgl_x : (TMEM_IMPL == 3) ? cgl_s : cgl_c;
     for (int p = 0; p < NRP; p++) r_en[p] = rq_en[p];
     for (int p = 0; p < NWP; p++) w_en[p] = wq_en[p];
     w_gnt = '1;
@@ -516,7 +666,62 @@ module otpu_slice
     if (!v_ren)       begin r_en[P_VA] = '0; r_en[P_VB] = '0; end
     if (!gnt[G_VPU])  w_en[W_VPU] = '0;
     if (!gnt[G_COLL]) begin r_en[P_COLL] = '0; w_en[W_COLL] = '0; end
+    if (TMEM_IMPL == 3 && !TMEM_RPL)  // a split group's ports: read once, ahead of the grant
+      for (int p = 0; p < NRP; p++) begin
+        if (tm_sv[p]) r_en[p] = '0;
+        if (tm_pre[p]) r_en[p] = rq_en[p];
+      end
   end
+
+  // TMEM_IMPL 3 (EXPERIMENTAL, docs/tmem_nocopy.md): one copy of sub-banked RAMs (otpu_tmem IMPL
+  // 3). A group is granted when no port of another group blocks one of its reads (tm_bx, from
+  // the requests: the RAMs' addresses do not wait for the grants), its write banks are free (acf,
+  // as gnt_q) and its own ports do not collide (tm_bs). When they do, its ports read over
+  // successive cycles: those not blocked read ahead of the grant (tm_pre: their lanes hold the
+  // words), drop out of the requests (tm_sv), and the unit is granted when the rest can read.
+  // (TMEM_RPL: the requests of a group held for a replay, and the VPU's while its registered
+  // enable is low, ask no RAM)
+  always_comb begin
+    logic [NRP-1:0] off;
+    off = '0;
+    if (TMEM_IMPL == 3 && TMEM_RPL)
+      for (int g = 0; g < NG; g++)
+        if ((g == G_VPU) ? !v_ren : rpl_frz[g]) off = off | grp_rports(g);
+    for (int p = 0; p < NRP; p++)
+      rq_t[p] = ((TMEM_IMPL == 3 && !TMEM_RPL && tm_sv[p]) || off[p]) ? '0 : rq_en[p];
+  end
+  logic [NG-1:0] gs3;
+  always_comb begin
+    gnt_s = gs3;
+    gnt_s[G_COLL] = coll_gnt;      // every slice must grant the collective
+  end
+  always_comb begin
+    logic [NG-1:0]  gs;
+    logic [NRP-1:0] rp, ask;
+    logic           rd_ok, self;
+    tm_pre = '0;
+    for (int p = 0; p < NRP; p++) ask[p] = |rq_t[p];
+    for (int g = 0; g < NG; g++) begin
+      rp = grp_rports(g);
+      rd_ok = (tm_bx & rp & ask) == '0;
+      self = (tm_bs & rp & ask) != '0;
+      gs[g] = rd_ok && !self;
+      for (int h = 0; h < g; h++) if (gs[h] && acf[g][h]) gs[g] = 1'b0;
+      if (g == G_Q && q_awant && !sw_rdy) gs[g] = 1'b0;    // QST write the DRAM cannot take
+      if (rd_ok && self) tm_pre = tm_pre | (rp & ask & ~tm_bs);
+    end
+    gs3 = gs;
+    cgl_s = gs[G_COLL];
+  end
+  always_ff @(posedge clk)
+    if (srst || TMEM_IMPL != 3 || TMEM_RPL) tm_sv <= '0;
+    else
+      for (int g = 0; g < NG; g++) begin
+        logic [NRP-1:0] rp;
+        rp = grp_rports(g);
+        for (int p = 0; p < NRP; p++)
+          if (rp[p]) tm_sv[p] <= gnt[g] ? 1'b0 : (tm_sv[p] | tm_pre[p]);
+      end
 
   always_comb begin
     int rc [LANES];
@@ -556,6 +761,28 @@ module otpu_slice
     end
   end
 
+  // TMEM_IMPL 2 (simulation): a candidate's read arbitration (otpu_tmem_model, plusargs)
+`ifndef SYNTHESIS
+  if (TMEM_IMPL == 2) begin : g_model
+    otpu_tmem_model #(.LANES(LANES), .NRP(NRP), .NWP(NWP), .NG(NG),
+                      //      COLL    Q2      Q3      VB      VA      Q       DMA     MXU
+                      .RGRP({3'(G_COLL), 3'(G_Q), 3'(G_Q), 3'(G_VPU), 3'(G_VPU), 3'(G_Q),
+                             3'(G_DMA), 3'(G_MXU)}),
+                      //      VPU       COLL       MXU       DMA
+                      .WGRP({3'(G_VPU), 3'(G_COLL), 3'(G_MXU), 3'(G_DMA)}),
+                      .GCOLL(G_COLL), .SID(SID)) u_model (
+      .clk, .rst(srst), .run(!srst && !halted), .rq_en, .r_addr, .wq_en, .w_addr,
+      .r_take(r_en), .w_take(w_en), .blk(NG'(q_awant && !sw_rdy) << G_Q), .coll_gnt,
+      .gnt(gnt_x), .cgl(cgl_x));
+  end else begin : g_nomodel
+    assign gnt_x = '0;
+    assign cgl_x = 1'b0;
+  end
+`else
+  assign gnt_x = '0;
+  assign cgl_x = 1'b0;
+`endif
+
   // The banked TMEM's arbiter (TMEM_IMPL 1): as gnt_c, but each copy's bank takes one read per
   // cycle, and a port's lanes in one bank count once (they read one word there)
   always_comb begin
@@ -590,6 +817,40 @@ module otpu_slice
       end
       if (ok) begin rk |= uk; wk |= vk; end
     end
+  end
+
+  // The banked TMEM with request-priority addresses (TMEM_IMPL 1, TMEM_RQ): a group's reads are
+  // blocked where a group before it asks for the same copy and bank, granted or not (each copy's
+  // bank address is the first asking port's: otpu_tmem RQ), so the RAMs' addresses come from the
+  // requests alone and the grants reach no RAM pin. Its write banks are admitted as gnt_m's, a
+  // chain of single bits over the pairwise conflicts (acf).
+  logic [NG-1:0][NCP-1:0][LANES-1:0] qk;
+  logic [NG-1:0]                     qblk;
+  always_comb begin
+    logic [NRP-1:0] rp;
+    for (int g = 0; g < NG; g++) begin
+      rp = grp_rports(g);
+      qk[g] = '0;
+      for (int p = 0; p < NRP; p++)
+        if (rp[p])
+          for (int l = 0; l < LANES; l++)
+            if (rq_en[p][l]) qk[g][CPY[p]][r_addr[p][l][BW-1:0]] = 1'b1;
+    end
+    for (int g = 0; g < NG; g++) begin
+      qblk[g] = 1'b0;
+      for (int h = 0; h < g; h++) if ((qk[g] & qk[h]) != '0) qblk[g] = 1'b1;
+    end
+  end
+  always_comb begin
+    logic [NG-1:0] ok;
+    for (int g = 0; g < NG; g++) begin
+      ok[g] = !qblk[g];
+      for (int h = 0; h < g; h++) if (ok[h] && acf[g][h]) ok[g] = 1'b0;
+      if (g == G_Q && q_awant && !sw_rdy) ok[g] = 1'b0;    // QST write the DRAM cannot take
+    end
+    gnt_q = ok;
+    gnt_q[G_COLL] = coll_gnt;      // every slice must grant the collective
+    cgl_q = ok[G_COLL];
   end
 
   // ---- DRAM ports
@@ -640,6 +901,137 @@ module otpu_slice
   wire lose_q   = !gnt[G_Q] && ((|rq_en[P_Q]) || (|rq_en[P_Q2]) || q3_en);
   wire lose_vpu = !gnt[G_VPU] && ((|rq_en[P_VA]) || (|rq_en[P_VB]) || (|wq_en[W_VPU]));
   wire lose_col = !gnt[G_COLL] && ((|rq_en[P_COLL]) || (|wq_en[W_COLL]));
+
+`ifndef SYNTHESIS
+  // TMEM read demand (docs/tmem_pump.md; simulation only, a TMEMSTAT line at the end): each cycle
+  // out of reset and before the halt, how many read streams ask (MXU; the DMA's copy: DMA,
+  // QUANT 3, COLL; QUANT; VPU A; VPU B; QUANT 2: 0..6), the most read ports asking for one bank
+  // (0..8), the same with a write asking for that bank (0..9), the cycles the MXU, QUANT, the
+  // VPU and the collective lost to the arbitration, and each read port's reads (rd: cycles it
+  // reads) and lost reads (rpl: TMEM_RPL's replays, tm_lost)
+  longint ts_cyc, ts_lose [4], ts_n [7], ts_d [NRP + 1], ts_dw [NRP + 2], ts_rd [NRP], ts_rpl [NRP];
+  initial begin
+    ts_cyc = 0;
+    for (int i = 0; i < NRP; i++) begin ts_rd[i] = 0; ts_rpl[i] = 0; end
+    for (int i = 0; i < 4; i++) ts_lose[i] = 0;
+    for (int i = 0; i < 7; i++) ts_n[i] = 0;
+    for (int i = 0; i <= NRP; i++) ts_d[i] = 0;
+    for (int i = 0; i <= NRP + 1; i++) ts_dw[i] = 0;
+  end
+  always @(posedge clk)
+    if (!srst && !halted) begin
+      int n, dm, dwm, c;
+      logic [LANES-1:0] wb;
+      logic hit;
+      n = int'(|rq_en[P_MXU]) + int'((|rq_en[P_DMA]) || (|rq_en[P_Q3]) || (|rq_en[P_COLL])) +
+          int'(|rq_en[P_Q]) + int'(|rq_en[P_VA]) + int'(|rq_en[P_VB]) + int'(|rq_en[P_Q2]);
+      wb = '0;
+      for (int p = 0; p < NWP; p++)
+        for (int l = 0; l < LANES; l++) if (wq_en[p][l]) wb[w_addr[p][l][BW-1:0]] = 1'b1;
+      dm = 0; dwm = 0;
+      for (int b = 0; b < LANES; b++) begin
+        c = 0;
+        for (int p = 0; p < NRP; p++) begin
+          hit = 1'b0;
+          for (int l = 0; l < LANES; l++)
+            if (rq_en[p][l] && r_addr[p][l][BW-1:0] == BW'(b)) hit = 1'b1;
+          c += int'(hit);
+        end
+        if (c > dm) dm = c;
+        if (c + int'(wb[b]) > dwm) dwm = c + int'(wb[b]);
+      end
+      ts_cyc++; ts_n[n]++; ts_d[dm]++; ts_dw[dwm]++;
+      for (int p = 0; p < NRP; p++) begin
+        if (|r_en[p]) ts_rd[p]++;
+        if (tm_lost[p]) ts_rpl[p]++;
+      end
+      if (lose_mxu) ts_lose[0]++;
+      if (lose_q)   ts_lose[1]++;
+      if (lose_vpu) ts_lose[2]++;
+      if (lose_col) ts_lose[3]++;
+    end
+  final begin
+    string s;
+    s = $sformatf("TMEMSTAT sid=%0d cyc=%0d lose=%0d,%0d,%0d,%0d n=", SID, ts_cyc, ts_lose[0],
+                  ts_lose[1], ts_lose[2], ts_lose[3]);
+    for (int i = 0; i < 7; i++) s = {s, $sformatf("%s%0d", (i > 0) ? "," : "", ts_n[i])};
+    s = {s, " d="};
+    for (int i = 0; i <= NRP; i++) s = {s, $sformatf("%s%0d", (i > 0) ? "," : "", ts_d[i])};
+    s = {s, " dw="};
+    for (int i = 0; i <= NRP + 1; i++) s = {s, $sformatf("%s%0d", (i > 0) ? "," : "", ts_dw[i])};
+    s = {s, " rd="};
+    for (int i = 0; i < NRP; i++) s = {s, $sformatf("%s%0d", (i > 0) ? "," : "", ts_rd[i])};
+    s = {s, " rpl="};
+    for (int i = 0; i < NRP; i++) s = {s, $sformatf("%s%0d", (i > 0) ? "," : "", ts_rpl[i])};
+    $display("%s", s);
+  end
+
+  // The TMEM's accesses, cycle by cycle (docs/tmem_nocopy.md; +tmtrace=<file>, appended; S > 1:
+  // <file>.<sid>): records of three little-endian 32-bit words {cycle, info, value}, from reset
+  // to the halt. info[3:0] the kind, [7:4] the port or unit, [15:8] the lanes:
+  //   0 a read that happened (r_en), value lane 0's address (lane l reads value + l)
+  //   1 a write that happened (w_en), the same
+  //   2 / 3 a read / write lane of the MXU's ports (scattered lanes): one record per lane,
+  //     value its address
+  //   4 an instruction starts on unit [7:4]: [15:8] flags, [23:16] VOP func (w6[23:16]),
+  //     [31:24] opcode; value the sequencer's instruction count
+  //   5 an instruction completes on unit [7:4]
+  //   6 a unit asked for TMEM and was not granted: [15:8] a mask by group (DMA, COLL, VPU, MXU,
+  //     QUANT)
+  //   15 a simulation starts (cycle 0)
+  int     tt_fd;
+  longint tt_cyc;
+  initial begin
+    string fn;
+    tt_fd = 0;
+    tt_cyc = 0;
+    if ($value$plusargs("tmtrace=%s", fn)) begin
+      if (S > 1) fn = $sformatf("%s.%0d", fn, SID);
+      tt_fd = $fopen(fn, "ab");
+      if (tt_fd == 0) $fatal(1, "otpu_slice: cannot open %s", fn);
+      $fwrite(tt_fd, "%u%u%u", 32'd0, 32'd15, 32'd0);
+    end
+  end
+  /* verilator lint_off BLKSEQ */
+  always @(posedge clk) begin
+    tt_cyc <= tt_cyc + 1;
+    if (tt_fd != 0 && !srst && !halted) begin
+      logic [31:0] cy;
+      logic [NG-1:0] lg;
+      cy = 32'(tt_cyc);
+      for (int p = 0; p < NRP; p++)
+        if (|r_en[p]) begin
+          if (p == P_MXU) begin
+            for (int l = 0; l < LANES; l++)
+              if (r_en[p][l]) $fwrite(tt_fd, "%u%u%u", cy, {16'd0, 8'(1 << l), 4'(p), 4'd2}, r_addr[p][l]);
+          end else
+            $fwrite(tt_fd, "%u%u%u", cy, {16'd0, 8'(r_en[p]), 4'(p), 4'd0}, r_addr[p][0]);
+        end
+      for (int p = 0; p < NWP; p++)
+        if (|w_en[p]) begin
+          if (p == W_MXU) begin
+            for (int l = 0; l < LANES; l++)
+              if (w_en[p][l]) $fwrite(tt_fd, "%u%u%u", cy, {16'd0, 8'(1 << l), 4'(p), 4'd3}, w_addr[p][l]);
+          end else
+            $fwrite(tt_fd, "%u%u%u", cy, {16'd0, 8'(w_en[p]), 4'(p), 4'd1}, w_addr[p][0]);
+        end
+      for (int u = 0; u < NUNITS; u++) begin
+        if (ustart[u])
+          $fwrite(tt_fd, "%u%u%u", cy, {ucmd[u].op, ucmd[u].w6[23:16], ucmd[u].flags, 4'(u), 4'd4},
+                  sq_icount);
+        if (udone[u]) $fwrite(tt_fd, "%u%u%u", cy, {24'd0, 4'(u), 4'd5}, 32'd0);
+      end
+      lg = '0;
+      if (lose_mxu) lg[G_MXU] = 1'b1;
+      if (lose_q)   lg[G_Q] = 1'b1;
+      if (lose_vpu) lg[G_VPU] = 1'b1;
+      if (lose_col) lg[G_COLL] = 1'b1;
+      if (lg != '0) $fwrite(tt_fd, "%u%u%u", cy, {16'd0, 8'(lg), 4'd0, 4'd6}, 32'd0);
+    end
+  end
+  /* verilator lint_on BLKSEQ */
+  final if (tt_fd != 0) $fclose(tt_fd);
+`endif
 
   logic [31:0] win;                  // cycles per window
 `ifdef SYNTHESIS

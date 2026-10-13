@@ -26,7 +26,8 @@ RTL_SOURCES = [
     "vpu/otpu_vtree.sv", "dma/otpu_dma.sv", "mxu/otpu_mxu.sv", "tech/generic/otpu_tech_dsp.sv",
     "tech/generic/otpu_tech_ram.sv",
     "vpu/otpu_quant.sv", "vpu/otpu_se_comp.sv", "vpu/otpu_se_tail.sv", "vpu/otpu_vpu.sv",
-    "top/otpu_coll.sv", "top/otpu_slice.sv", "top/otpu_top.sv",
+    "top/otpu_coll.sv", "exp/tmem_nocopy/otpu_tmem_model.sv", "top/otpu_slice.sv",
+    "top/otpu_top.sv",
 ]
 
 
@@ -190,6 +191,28 @@ if os.environ.get("OTPU_SEQ_WC"):
     UARCH["SEQ_WC"] = BOARD_UARCH["SEQ_WC"] = int(os.environ["OTPU_SEQ_WC"])
     if UARCH["SEQ_WC"]:
         UARCH["WIN"] = min(UARCH.get("WIN", 32), 16)
+# The banked TMEM's request-priority addresses (otpu_slice TMEM_RQ; timing only), with a
+# TMEM_IMPL 1 target (OTPU_TARGET=nangate45): OTPU_TMEM_RQ=1 (docs/tmem_pump.md)
+if os.environ.get("OTPU_TMEM_RQ"):
+    UARCH["TMEM_RQ"] = BOARD_UARCH["TMEM_RQ"] = int(os.environ["OTPU_TMEM_RQ"])
+# ... and OTPU_TMEM_NCP=2, 4, 5, 7: the read slots of pumped copies (otpu_slice TMEM_NCP)
+if os.environ.get("OTPU_TMEM_NCP"):
+    UARCH["TMEM_NCP"] = int(os.environ["OTPU_TMEM_NCP"])
+# ... and OTPU_TMEM_IMPL=2: a candidate TMEM's read arbitration in simulation (otpu_tmem_model,
+# set by +tm_* plusargs: OTPU_SIM_PLUSARGS; docs/tmem_nocopy.md)
+if os.environ.get("OTPU_TMEM_IMPL"):
+    UARCH["TMEM_IMPL"] = BOARD_UARCH["TMEM_IMPL"] = int(os.environ["OTPU_TMEM_IMPL"])
+# ... OTPU_TMEM_IMPL=3: one copy of sub-banked RAMs (otpu_tmem IMPL 3), OTPU_TMEM_NSB RAMs a bank
+# with the sub-bank at word-address bit OTPU_TMEM_SBP, hashed by OTPU_TMEM_SBH (1, 2); with
+# OTPU_TMEM_RPL=1 lost reads are replayed under the board's arbiter (otpu_slice TMEM_RPL); with
+# OTPU_TMEM_TDP=1 the RAMs are true dual-port, a unit's ports on different RAM ports; with
+# OTPU_TMEM_GST=1 QUANT 3 and COLL are the DMA's guests (one data select for the three); with
+# OTPU_TMEM_PMP=2 (TDP) the RAMs are pumped at 2x (their model: a write takes no read port)
+# OTPU_TMEM_PRK / OTPU_TMEM_SDM (int, 0x... allowed): the read ports' ranks and RAM sides
+# (otpu_slice TMEM_PRK / TMEM_SDM)
+for _k in ("NSB", "SBP", "SBH", "RPL", "TDP", "GST", "PMP", "PRK", "SDM"):
+    if os.environ.get("OTPU_TMEM_" + _k):
+        UARCH["TMEM_" + _k] = int(os.environ["OTPU_TMEM_" + _k], 0)
 # TMEM lanes of the MXU and the quantizer when fewer than LANES (timing only): OTPU_ULANES=8
 if os.environ.get("OTPU_ULANES"):
     UARCH["ULANES"] = int(os.environ["OTPU_ULANES"])
@@ -359,8 +382,9 @@ def _run(cfg, programs: list, images: list, dram_lat: int = 8, max_cycles: int =
             f"{r:x} {ad // 4:x} {v & 0xFFFFFFFF:x}\n" for r, ad, v in pk))
     args = [str(exe), f"+dir={tmp}", f"+max_cycles={max_cycles}"] + (["+trace"] if trace else [])
     args += list(plusargs or [])
-    # e.g. OTPU_SIM_PLUSARGS=+hz_rh=1,+hz_log=/path (docs/seq_vpu.md; commas or spaces); %n is
-    # this process's simulation count (0, 1, ...), so each run of a tool gets its own files
+    # e.g. OTPU_SIM_PLUSARGS=+hz_rh=1,+hz_log=/path (docs/seq_vpu.md) or +tm_nsb=8,+tm_sbp=3
+    # (docs/tmem_nocopy.md; commas or spaces); %n is this process's simulation count (0, 1,
+    # ...), so each run of a tool gets its own files
     global _SIM_RUNS
     args += [x.replace("%n", str(_SIM_RUNS))
              for x in _re.split(r"[\s,]+", os.environ.get("OTPU_SIM_PLUSARGS", "")) if x]
@@ -382,6 +406,9 @@ def _run(cfg, programs: list, images: list, dram_lat: int = 8, max_cycles: int =
     r = run_sim(args, timeout=3600)
     out = r.stdout + r.stderr
     import re
+    if os.environ.get("OTPU_TMEMSTAT_LOG"):   # the TMEM's read demand (docs/tmem_pump.md)
+        with open(os.environ["OTPU_TMEMSTAT_LOG"], "a") as f:
+            f.writelines(m + "\n" for m in re.findall(r"(?:TMEMSTAT|TMMODEL) .*", out))
     m = re.search(r"RESULT cycles=(\d+) halted=(\d+) error=(\d+)", out)
     if not m:
         raise RuntimeError(f"RTL simulation failed:\n{out[-3000:]}")

@@ -23,6 +23,17 @@ module otpu_bcu_sys #(
   parameter int WIN        = 16,
   parameter int RPB        = 8 * LANES,
   parameter int WPB        = 1,
+  parameter int TMEM_IMPL  = 0,           // TMEM: 0 a copy per read port, 3 one copy (otpu_board)
+  parameter bit TMEM_RQ    = 1'b0,
+  parameter int TMEM_NSB   = 8,             // TMEM_IMPL 3 (one copy, docs/tmem_nocopy.md; otpu_board):
+  parameter int TMEM_SBP   = 3,             //   RAMs a bank, the sub-bank's address bit, its hash,
+  parameter int TMEM_SBH   = 0,             //   replays, true dual-port RAMs, QUANT 3 and COLL the
+  parameter bit TMEM_RPL   = 1'b0,          //   DMA's guests, the RAMs pumped at 2x on clk_f (1),
+  parameter bit TMEM_TDP   = 1'b0,          //   the read ports' ranks and RAM sides
+  parameter bit TMEM_GST   = 1'b0,
+  parameter int TMEM_PMP   = 0,
+  parameter int TMEM_PRK   = 0,
+  parameter int TMEM_SDM   = -1,
   parameter int MXU_IMPL   = 2,
   parameter int MXU_CL     = 16,
   parameter int VPU_CL     = 2,
@@ -45,6 +56,7 @@ module otpu_bcu_sys #(
 ) (
   // core clock and reset (synchronous, high), XDMA's clock and reset
   input  logic                    clk,
+  input  logic                    clk_f,        // TMEM_PMP 1: 2 x clk, rising with it (otpu_board)
   input  logic                    rst,
   input  logic                    ctl_mrst,     // the control master's reset, in clk (otpu_board)
   input  logic                    xclk,
@@ -187,8 +199,11 @@ module otpu_bcu_sys #(
                .MXU_CL(MXU_CL), .VPU_CL(VPU_CL), .ULANES(ULANES), .CORE_KHZ(CORE_KHZ),
                .BUILD_ID(BUILD_ID), .DDR_MTS(DDR_MTS), .TRACE_DEPTH(TRACE_DEPTH),
                .PQ_WIN(PQ_WIN), .HAS_I2C(1'b0), .CHASH(CHASH), .DSTEP(DSTEP),
-               .HOSTCAL(1'b0), .SEQ_WC(SEQ_WC), .PLATFORM(PLATFORM), .ARCH_HASH(ARCH_HASH)) u_board (
-    .clk, .rst, .ctl_mrst, .calib, .ded, .temp, .led, .i2c_lo, .i2c_pin,
+               .HOSTCAL(1'b0), .SEQ_WC(SEQ_WC), .PLATFORM(PLATFORM), .ARCH_HASH(ARCH_HASH),
+               .TMEM_IMPL(TMEM_IMPL), .TMEM_RQ(TMEM_RQ),
+               .TMEM_NSB(TMEM_NSB), .TMEM_SBP(TMEM_SBP), .TMEM_SBH(TMEM_SBH), .TMEM_RPL(TMEM_RPL), .TMEM_TDP(TMEM_TDP),
+               .TMEM_GST(TMEM_GST), .TMEM_PMP(TMEM_PMP), .TMEM_PRK(TMEM_PRK), .TMEM_SDM(TMEM_SDM)) u_board (
+    .clk, .clk_f, .rst, .ctl_mrst, .calib, .ded, .temp, .led, .i2c_lo, .i2c_pin,
     .s_ctl_awaddr, .s_ctl_awvalid, .s_ctl_awready, .s_ctl_wdata, .s_ctl_wstrb, .s_ctl_wvalid,
     .s_ctl_wready, .s_ctl_bresp, .s_ctl_bvalid, .s_ctl_bready, .s_ctl_araddr, .s_ctl_arvalid,
     .s_ctl_arready, .s_ctl_rdata, .s_ctl_rresp, .s_ctl_rvalid, .s_ctl_rready,

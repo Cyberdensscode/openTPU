@@ -12,7 +12,9 @@
 // Clocks: the 50 MHz oscillator, on one global buffer, feeds the block design's MMCM (core_clk)
 // and the LiteDRAM core's (its sys_clk, 133.33 MHz, the channels' controller side; each
 // channel's DDR3 clocks from a write clock MMCM cascaded from sys, placed by otpu_top_ld.xdc);
-// xdma_aclk (125 MHz; 250 at PCIE_GEN 2) is XDMA's. otpu_mem_ch crosses between the three; the
+// xdma_aclk (125 MHz; 250 at PCIE_GEN 2) is XDMA's. The block design's MMCM also makes core_clk2x,
+// twice core_clk and rising with it, for the TMEM's pumped RAMs (TMEM_PMP 1: the slices' clk_f;
+// bd_native.tcl CLK2X, constraints/otpu_clk2x.tcl). otpu_mem_ch crosses between the three; the
 // LiteDRAM core crosses its CSR port into sys_clk itself, from xdma_aclk (from core_clk at
 // PCIE_GEN 2, where the block design's SmartConnect puts M_AXI_MEMCAL on core_clk).
 // constraints/otpu_top_native.tcl and otpu_mem_ch.tcl constrain the crossings (no asynchronous
@@ -34,6 +36,18 @@ module otpu_fpga_top_ld #(
   parameter int VPU_CL = 2,                 // VPU lanes with the composite functions (exp2, ...)
   parameter int MXU_IMPL = 2,               // MXU dot product: 2 systolic (docs/mxu_systolic.md), the only one
   parameter int MXU_E = 4,                  // MXU epilogue lanes: MCOLS (full rate; docs/mx_mxu.md section 9)
+  parameter int TMEM_IMPL = 0,              // TMEM: 0 a copy per read port (production), 1 banked
+                                            //   (three copies, docs/tmem_pump.md), 3 one copy
+  parameter bit TMEM_RQ = 1'b0,             // TMEM_IMPL 1: request-priority bank addresses
+  parameter int TMEM_NSB = 8,               // TMEM_IMPL 3, the one copy (docs/tmem_nocopy.md;
+  parameter int TMEM_SBP = 3,               //   create_project.tcl TMEM_X, otpu_slice): RAMs a bank,
+  parameter int TMEM_SBH = 0,               //   the sub-bank's address bit, its hash, replays, true
+  parameter bit TMEM_RPL = 1'b0,            //   dual-port RAMs, QUANT 3 and COLL the DMA's guests,
+  parameter bit TMEM_TDP = 1'b0,            //   the RAMs pumped at 2x (1: on core_clk2x, below),
+  parameter bit TMEM_GST = 1'b0,            //   the read ports' ranks and RAM sides
+  parameter int TMEM_PMP = 0,
+  parameter int TMEM_PRK = 0,
+  parameter int TMEM_SDM = -1,
   parameter int LANES = 8,                  // VPU lanes / TMEM banks (8 or 16)
   parameter int ULANES = 8,                 // TMEM lanes of the MXU and the quantizer
   parameter int CORE_KHZ = 100000,          // core_clk as the block design makes it (CORE_KHZ register)
@@ -100,7 +114,7 @@ module otpu_fpga_top_ld #(
   output logic        ddram1_odt
 );
   logic        clk50_ib, clk50;
-  logic        core_clk, core_rstn, xdma_aclk, xdma_aresetn, pcie_link_up;
+  logic        core_clk, core_clk2x, core_rstn, xdma_aclk, xdma_aresetn, pcie_link_up;
   logic        ld_sys_clk, ld_sys_rst;
   logic [1:0]  calib, ded;
   logic [11:0] device_temp;                  // XADC die-temperature code (core_clk)
@@ -135,7 +149,7 @@ module otpu_fpga_top_ld #(
     .sys_clk_50(clk50),
     .pcie_refclk_clk_p, .pcie_refclk_clk_n, .pcie_perstn,
     .pcie_mgt_rxp, .pcie_mgt_rxn, .pcie_mgt_txp, .pcie_mgt_txn,
-    .pcie_link_up, .core_clk, .core_rstn, .xdma_aclk, .xdma_aresetn, .device_temp,
+    .pcie_link_up, .core_clk, .core_clk2x, .core_rstn, .xdma_aclk, .xdma_aresetn, .device_temp,
     .M_AXI_CTL_awaddr(ctl_awaddr), .M_AXI_CTL_awvalid(ctl_awvalid),
     .M_AXI_CTL_awready(ctl_awready), .M_AXI_CTL_wdata(ctl_wdata), .M_AXI_CTL_wstrb(ctl_wstrb),
     .M_AXI_CTL_wvalid(ctl_wvalid), .M_AXI_CTL_wready(ctl_wready),
@@ -260,14 +274,20 @@ module otpu_fpga_top_ld #(
   IOBUF u_iob_sda1 (.IO(smb_sda),  .I(1'b0), .T(!i2c_lo[3]), .O(i2c_lvl[3]));
 
   // ---- the accelerator and XDMA on the channels
+  // the TMEM's RAMs pumped at 2x (TMEM_PMP 1) on core_clk2x (the block design's CLK2X: an MMCM
+  // output at twice core_clk, rising with it); otherwise nothing runs at 2x and clk_f is unused
+  wire clk_f = TMEM_PMP == 1 ? core_clk2x : 1'b0;
   logic [2:0] board_led;
   otpu_native_sys #(.MCOLS(MCOLS), .ACT_ROWS(ACT_ROWS), .VPU_CL(VPU_CL), .MXU_IMPL(MXU_IMPL),
                     .MXU_E(MXU_E), .LANES(LANES),
+                    .TMEM_IMPL(TMEM_IMPL), .TMEM_RQ(TMEM_RQ),
+                    .TMEM_NSB(TMEM_NSB), .TMEM_SBP(TMEM_SBP), .TMEM_SBH(TMEM_SBH), .TMEM_RPL(TMEM_RPL), .TMEM_TDP(TMEM_TDP),
+                    .TMEM_GST(TMEM_GST), .TMEM_PMP(TMEM_PMP), .TMEM_PRK(TMEM_PRK), .TMEM_SDM(TMEM_SDM),
                     .ULANES(ULANES), .CORE_KHZ(CORE_KHZ), .BUILD_ID(BUILD_ID), .DDR_MTS(DDR_MTS),
                     .DSTEP(DSTEP), .HOSTCAL(1'b1), .XREG(PCIE_GEN == 2),
                     .SEQ_WC(SEQ_WC), .PLATFORM(PLATFORM), .ARCH_HASH(ARCH_HASH),
                     .TRACE_DEPTH(TRACE_DEPTH), .COLL_GATHER(COLL_GATHER)) u_sys (
-    .clk(core_clk), .rst(core_rst), .ctl_mrst(lrs2), .xclk(xdma_aclk), .xrst,
+    .clk(core_clk), .clk_f, .rst(core_rst), .ctl_mrst(lrs2), .xclk(xdma_aclk), .xrst,
     .calib, .ded, .temp(device_temp), .led(board_led), .i2c_lo, .i2c_pin({lm73_alert_n, i2c_lvl}),
     .s_ctl_awaddr(ctl_awaddr[11:0]), .s_ctl_awvalid(ctl_awvalid), .s_ctl_awready(ctl_awready),
     .s_ctl_wdata(ctl_wdata), .s_ctl_wstrb(ctl_wstrb), .s_ctl_wvalid(ctl_wvalid),
