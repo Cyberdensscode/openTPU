@@ -502,31 +502,20 @@ def test_the_real_towers_programs_fit_the_card():
 
 
 def test_the_towers_mms_drain_at_the_arrays_rate():
-    """An MM whose array takes fewer cycles an output column (KB x ceil(M / MCOLS) replay
-    groups) than its M rows writes (or adds) them at a row stride that puts them in
-    min(M, LANES) distinct TMEM banks: the drain's lanes take them together. In one bank they
-    go one a cycle, M cycles a column. W_down's ACC into the residual (vit_out_mlp: KB 2, 8
-    cycles a column for 16 rows) is loaded into an odd-stride tile; at its DRAM stride (C =
-    1152, a multiple of the banks) W_down's MMs ran at 40% of their pops (docs/minicpmv.md 6).
-    vit_embed's (KB 5: 20 cycles a column) keeps the dense stride and its one LD."""
-    from opentpu import isa as I
+    """Every MM of the real tower's programs drains at its array's rate (compiler.slow_drains:
+    where the array takes fewer cycles a column than its rows, their results are in distinct
+    TMEM banks). W_down's ACC into the residual (vit_out_mlp: KB 2, 8 cycles a column for 16
+    rows) needs the odd-stride tile it is loaded into: at its DRAM stride (C = 1152, a multiple
+    of the banks) W_down's MMs ran at 40% of their pops (docs/minicpmv.md 6). vit_embed's (KB 5)
+    keeps the dense stride and its one LD."""
+    from conftest import assert_drains_keep_up
     from opentpu.isasim import board_config
     from opentpu.llm import minicpmv as MV
     from opentpu.llm.qwen3 import _Bump
     cfg = board_config()
     vi = MV.VisionImage(MV.VisionSpec(), cfg, _Bump(), nmax=256, out_rows=16)
     P, _ = vi.programs(256)
-    n = 0
-    for name, (p, _) in P.items():
-        for ins in p:
-            if ins.op == I.MM:
-                ors, M = ins.w[5] & 0xFFFF, (ins.w[5] >> 16) & 0xFF
-                KB = (ins.w[3] >> 16) & 0xFF
-                if KB * -(-M // cfg.MCOLS) < M:
-                    k = min(M, cfg.LANES)
-                    assert len({r * ors % cfg.LANES for r in range(k)}) == k, (name, ins.comment)
-                    n += 1
-    assert n > 10
+    assert assert_drains_keep_up([p for p, _ in P.values()], cfg) > 50
 
 
 @pytest.mark.parametrize("staged", [False, True])
