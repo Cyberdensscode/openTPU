@@ -303,7 +303,9 @@ def test_mxu_starve_counter(have_verilator):
         assert c[lat]["MXU_BUSY"] >= c[lat]["MXU_MAC"] + q[lat]["ms"] + q[lat]["mb"], (c[lat], q[lat])
     wait = {lat: q[lat]["ms"] + q[lat]["mb"] for lat in q}
     assert wait[400] > 0.9 * (c[400]["MXU_BUSY"] - c[400]["MXU_MAC"]), (c[400], q[400])
-    assert c[400]["DRAM_WAIT"] < wait[400] // 100 and c[20]["DRAM_WAIT"] == 0, (c[400], c[20])
+    # near 0 at either latency: the card's uarch (r2's TMEM input stage and registered wait release) sees a
+    # few cycles at 20 (3 of 13,398 on release-2 d8fe2c15), the default uarch none
+    assert c[400]["DRAM_WAIT"] < wait[400] // 100 and c[20]["DRAM_WAIT"] <= cyc[20] // 1000, (c[400], c[20])
     assert min(q[400]["ms"], q[400]["mb"]) > wait[400] // 5, q[400]
     assert wait[20] < wait[400] // 20, (q[400], q[20])
     assert cyc[20] < 0.3 * cyc[400], cyc
