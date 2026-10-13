@@ -223,14 +223,17 @@ late, on the implemented netlist) LOCs the array as a grid at MCOLS 8 and up; be
 leaves the array to the placer (MCOLS 4 is better without it, below). It reads MCOLS and D from
 the netlist's PE names and takes the part's column table:
 - Array column j goes on one DSP column, positions 0..D-1 in order up it (the chains stay whole,
-  position i is level in every column), with its column end (`otpu_mxce`, a 9-DSP cascade) in the
-  middle: chains 0..3 (positions 0..63), the column end, chains 4..7 (r2.1; `OTPU_MXU_CE=top`
-  puts it above them, as release r2 did). At MCOLS 8 that is DSP48_X1..X8 (tile X 14 29 34 49 54
-  69 74 89), rows 10..146 of 160, the column ends on rows 74..82 and the column's scale RAM level
-  with them. Each chain's last DSP feeds its own DSP of the column end through fabric from its P
-  register: above the array, chain 0's end crossed 113 DSP rows (r2.1's m8 163ab46d: 0 levels,
-  5.3-5.8 ns of route, -0.005 ns before userclk1's reroute; 76 such endpoints under +0.2 ns); in the
-  middle the longest is 65.
+  position i is level in every column), with its column end (`otpu_mxce`, a 9-DSP cascade) above
+  them and the column's scale RAM level with it. At MCOLS 8 that is DSP48_X1..X8 (tile X 14 29 34
+  49 54 69 74 89), rows 10..146 of 160. Each chain's last DSP feeds its own DSP of the column end
+  through fabric from its P register, so chain 0's end crosses 113 DSP rows (r2.1's m8 163ab46d:
+  0 levels, 5.3-5.8 ns of route, -0.005 ns before userclk1's reroute; 76 such endpoints under
+  +0.2 ns). `OTPU_MXU_CE=mid` puts the column end in the middle instead: chains 0..3 (positions
+  0..63), the column end on rows 74..82, chains 4..7, the longest chain-end hop 65 rows. It does
+  not pay: r2.1's m8 4f8be3d2 (mid) put the congestion on the column ends, three placer windows
+  at level 5 (101-103%, tile X 27-58, Y 200-238: u_mxu, u_mem, u_seq, u_ch1) against 163ab46d's
+  one, the weight feed's endpoints under +0.2 ns went from 88 to 455, and core_clk from -0.003 to
+  -0.156 ns, so the default stays above the array (`top`, the same LOCs as before `mid` existed).
 - The ACT RAM's memory of column j (`otpu_actram g_row[j]`: 4 pieces of 4 RAMB36, piece p = bytes
   32p..32p+31, and its scale RAM) goes in the block RAM column beside it, RAMB36_X1..X8 (tile X 17
   26 37 46 57 66 77 86). Each block RAM sits level with the 8 positions its bytes feed.

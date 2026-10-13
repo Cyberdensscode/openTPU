@@ -3,7 +3,10 @@
 # data or tristate input (D1..D8, T1..T4; D[7:0], T) goes in a pblock of the slices nearest its
 # I/O: per clock region of the pads, the OTPU_DDR_PHY_COLS slice columns (default 4) closest to
 # that region's I/O column, the region's height. The flops' own placement within it is the
-# placer's.
+# placer's. The pblocks are hard (IS_SOFT false, set here): r2.1's m8 4f8be3d2 reported IS_SOFT 1
+# on all six without it, and placed channel 1's address flops u_ld/FDRE_250..253 (in
+# otpu_ddr_phy_X0Y6, driving OSERDESE2_114 at OLOGIC_X0Y348, ddram1_a[4]) at SLICE_X32Y348: the
+# sys -> writeclocks1_outs0 paths into its D1..D4 met at +0.788 ns with 1.02 ns of route.
 #
 # Why. r2's m4 candidate (b10245f5, 133.33 MHz) placed channel 0's u_ld/FDRE_51..54 at SLICE_X29Y68,
 # 29 columns in from their OSERDES at OLOGIC_X0Y68: the sys clock -> writeclocks0_outs0 paths
@@ -69,7 +72,7 @@ proc ::otpu_ddr_phy_place::run {} {
     }
   }
   if {![array size ffs]} { error "otpu_ddr_phy_place: no OSERDES with a flop driver and a pad" }
-  set n 0; set desc {}
+  set n 0; set desc {}; set soft {}
   foreach cr [lsort [array names ffs]] {
     # the region's slice columns by their distance from its I/O column (RPM_X: one grid for all
     # site types)
@@ -89,11 +92,14 @@ proc ::otpu_ddr_phy_place::run {} {
     set cols [lsort -integer $cols]
     set pb [create_pblock otpu_ddr_phy_$cr]
     foreach c $cols { resize_pblock $pb -add "SLICE_X${c}Y${ymin}:SLICE_X${c}Y${ymax}" }
+    set_property IS_SOFT false $pb
     add_cells_to_pblock $pb [get_cells $ffs($cr)]
     incr n [llength $ffs($cr)]
     lappend desc "$cr: [llength $ffs($cr)] on SLICE_X[join $cols ,]"
+    lappend soft [get_property IS_SOFT $pb]
   }
-  puts "otpu_ddr_phy_place: $n flops of $nos OSERDES in [array size ffs] pblocks ([join $desc {; }])"
+  puts "otpu_ddr_phy_place: $n flops of $nos OSERDES in [array size ffs] pblocks ([join $desc {; }]),\
+        IS_SOFT [join [lsort -unique $soft] /]"
 }
 
 ::otpu_ddr_phy_place::run
