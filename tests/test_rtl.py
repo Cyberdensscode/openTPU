@@ -1130,6 +1130,8 @@ def test_tmem_dump_is_the_ram(have_verilator, port):
     copy only (port 4's: VPU B holds a copy of its own in both TMEMs, a copy per port and the
     banked one), the dump's check of the copies stops the simulation. Before, the dump was a
     shadow of the write requests and saw neither."""
+    if port is not None and rtlsim.UARCH.get("TMEM_IMPL") == 3:
+        pytest.skip("one TMEM copy (TMEM_IMPL 3): no port has a copy of its own to differ")
     cfg = Config(S=1)
     dram = np.random.default_rng(7).integers(0, 256, 1 << 16, dtype=np.uint8)
     prog = [I.ld(0, 64, 32), I.halt()]          # TMEM 64..95, never read again

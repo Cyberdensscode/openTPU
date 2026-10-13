@@ -261,6 +261,10 @@ def top_params(cfg, dram_lat: int = 8, uarch: dict | None = None, axi: bool | in
          "AXI": int(axi)}                                # otpu_top's memory path (2: LDC)
     p.update(UARCH)
     p.update(uarch or {})
+    if p.get("TMEM_IMPL") == 3 and "TMEM_SBP" not in p:
+        # the one copy's sub-bank bit sits above the lane banks' (otpu_tmem: SBP >= log2 LANES):
+        # the pick's SBP 3 is LANES 8's, a LANES 16 configuration's 4
+        p["TMEM_SBP"] = max(3, (cfg.LANES - 1).bit_length())
     return p
 
 

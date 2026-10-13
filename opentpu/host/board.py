@@ -554,6 +554,7 @@ class SimTransport:
         tm.update({k: v for k, v in rtlsim.UARCH.items()
                    if k.startswith("TMEM_") and k not in ("TMEM_RQ", "TMEM_NCP")})
         if tm.get("TMEM_IMPL") == 3:
+            tm.setdefault("TMEM_SBP", max(3, (cfg.LANES - 1).bit_length()))   # (rtlsim's)
             p.update(tm)
         p.update(self.params)
         # the configuration registers (register map 4) as the target's build of this
