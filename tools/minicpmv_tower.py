@@ -25,7 +25,9 @@ crop of --size patches, the weights zero (timing does not depend on the data) at
 addresses: its cycles, and the crop's total over the runs (VisionImage.programs' order, an
 encoder layer's phases at layer 0 for every layer). --profile: each phase's cycles by function
 with the VPU's and the MXU's busy cycles (moe_prefill_cosim.print_profile, on stderr), and its
-units' busy cycles, DRAM ports and roofline (opentpu/profile.py; the JSON's "profile").
+units' busy cycles, DRAM ports and roofline (opentpu/profile.py; the JSON's "profile"), the
+activity windows' sums (MXU pops, TMEM arbitration lost, port waits, MXU starved / blocked) and
+the MMs by shape with the MXU's stall counters.
 
 JSON: per crop the phases' runs, wall and device seconds (time), or cycles (cosim).
 """
@@ -190,6 +192,36 @@ def _print(r: dict) -> None:
     print(f"  Vision.encode (programs warm): {r['encode_s']} s", flush=True)
 
 
+def _windows(pf) -> dict:
+    """The slice's activity windows summed (opentpu/profile.py's P and Q lines): MXU pops (mx),
+    TMEM arbitration lost by the MXU drain, QUANT, the VPU, the collective (fm fq fv fc), port B
+    / A requests waiting (bs as), the MXU starved (no chunk) or blocked (chunks, no pop)."""
+    b = pf.buckets[0]
+    return {k: int(sum(b.get(k, []))) for k in ("mx", "fm", "fq", "fv", "fc", "bs", "as",
+                                                "ms", "mb")}
+
+
+def _mm_shapes(pf, cfg) -> dict:
+    """The MMs by shape: count, span (cycles since the MM before completed: the spans add up
+    to the MXU's time from its first start), pops (nominal: chunks x replay groups, ceil(M /
+    MCOLS)), and the MXU's counters over the spans (starved, back-pressured, the drain frozen
+    out of TMEM, the issuer denied)."""
+    from opentpu import isa as I
+    out, prev = {}, None
+    for r in sorted((r for r in pf.slice_recs(0) if r.op == I.MM and r.end >= 0),
+                    key=lambda r: r.end):
+        M = (pf.programs[0][r.pc].w[5] >> 16) & 0xFF
+        a = out.setdefault(r.detail, {"count": 0, "span": 0, "pops": 0, "starve": 0, "bp": 0,
+                                      "frz": 0, "deny": 0})
+        a["count"] += 1
+        a["span"] += r.end - (r.start if prev is None else max(prev, r.start))
+        a["pops"] += r.work * -(-M // cfg.MCOLS)
+        for k in ("starve", "bp", "frz", "deny"):
+            a[k] += r.stats.get(k, 0)
+        prev = r.end
+    return out
+
+
 def cosim(a) -> dict:
     sys.path.insert(0, str(ROOT / "tools"))
     import moe_prefill_cosim as MC
@@ -237,6 +269,14 @@ def cosim(a) -> dict:
                 print(f"  MXU gaps {prof[name]['mxu_gaps']['gaps']} cycles (prologue "
                       f"{gaps['prologue']}, epilogue {gaps['epilogue']}); blame: "
                       + ", ".join(f"{k[0]}@{k[1]} {v}" for k, v in blame[:8]), flush=True)
+                prof[name]["windows"] = win = _windows(pf)
+                prof[name]["mm_shapes"] = shapes = _mm_shapes(pf, cfg)
+                print("  windows: " + "  ".join(f"{k} {v} ({100 * v / pf.cycles:.1f}%)"
+                                                for k, v in win.items()), flush=True)
+                for k, x in sorted(shapes.items(), key=lambda x: -x[1]["span"]):
+                    print(f"  MM {k:34s} x{x['count']:5d} span {x['span']:9d} pops "
+                          f"{x['pops']:9d} starve {x['starve']:8d} bp {x['bp']:8d} frz "
+                          f"{x['frz']:8d} deny {x['deny']:7d}", flush=True)
     count: dict = {}
     for name, _ in runs:
         count[name] = count.get(name, 0) + 1
