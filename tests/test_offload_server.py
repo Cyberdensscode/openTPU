@@ -1791,3 +1791,42 @@ def test_the_isa_hosts_hook_polls_until_the_expert_runs_wait_holds():
     calls = []
     _isa_host(lambda: calls.append(1) or 0)(m)
     assert calls == [1]
+
+
+@pytest.mark.parametrize("policy", ["lfu", "lru"])
+def test_place_takes_free_slots_then_the_least_wanted_across_layers(policy):
+    """place (docs/minicpmv.md 4.2: a host run's pieces, the pool's entries past the experts):
+    free slots first, then the experts of least decayed use ("lru": the least recent of each
+    layer alike), each layer keeping k slots; the victims' entries cleared, the entries'
+    bytes in their slots, no tag; an entry already placed keeps its slot; more than the slots
+    past k is refused with nothing changed; release gives the slots back to their layers,
+    free, and the next misses take them."""
+    lay = Layout.build(4096, E, K, (4, 4), SLOT)
+    mem = SimDram(np.zeros(lay.end + 4096, np.uint8))
+    srv = ExpertServer(mem, lay, _pool, policy=policy)
+    srv.load([0, 1, 2, E, E + 1, E + 2])            # 3 of 4 slots a layer, one free
+    for seq, ids in enumerate(([0, 1], [E, E + 1], [1, 0], [E + 1, E]), 1):
+        _post(mem, lay, seq, ids)                   # all hits: 2 and E + 2 the least wanted
+        srv.poll()
+    G = 2 * E
+    with pytest.raises(RuntimeError):               # 2 a layer past k: 4 at most
+        srv.place([G, G + 1, G + 2, G + 3, G + 4])
+    assert srv.placed == {} and all(len(fr) == 1 for fr in srv.free)
+    at = srv.place([G + 3, G, G + 1, G + 2], sizes={G + i: 100 for i in range(4)})
+    assert len(set(at)) == 4 and all(mem.read(a, SLOT) == _pool(g) for g, a in
+                                      zip([G + 3, G, G + 1, G + 2], at))
+    for g in (2, E + 2):
+        assert _entry(mem, lay, g) == (0, 0.0)
+    for g in (0, 1, E, E + 1):
+        assert _entry(mem, lay, g)[1] == 1.0
+    assert all(np.frombuffer(mem.read(a + lay.tag, 4), np.uint32)[0] == 0 for a in at)
+    assert srv.place_victims == 2 and srv.place([G + 1]) == [at[2]]
+    with pytest.raises(RuntimeError):
+        srv.place([G + 4])
+    srv.release()
+    assert srv.placed == {} and [len(fr) for fr in srv.free] == [2, 2]
+    _post(mem, lay, 5, [2, 3])                      # misses into the freed slots
+    srv.poll()
+    assert {_entry(mem, lay, g)[0] for g in (2, 3)} <= set(at)
+    with pytest.raises(ValueError):
+        srv.place([E - 1])                          # an expert is no placed entry

@@ -144,7 +144,7 @@ def check_pool(pool, image, W, wformat: str = "fp4", formats: str | None = None)
         raise PoolError(f"no expert pool at {pool}: {_pack_hint(model, pool, wformat, formats)}")
     L = image.offload
     n = L.layers * L.E
-    if path.stat().st_size != n * L.slot_bytes:
+    if path.stat().st_size != MO.pool_entries(path, n) * L.slot_bytes:
         raise PoolError(f"{pool} is {path.stat().st_size} bytes, not this image's pool ({n} "
                         f"experts of {L.slot_bytes} bytes, {image.fmt.wformat}): another model "
                         f"or format (pack_pool.py MODEL {pool} info)")
@@ -153,7 +153,7 @@ def check_pool(pool, image, W, wformat: str = "fp4", formats: str | None = None)
     except ValueError as e:
         raise PoolError(str(e)) from None
     done = Path(str(path) + ".packed")
-    have = n if not done.exists() else int(sum(1 for b in done.read_bytes() if b))
+    have = n if not done.exists() else int(sum(1 for b in done.read_bytes()[:n] if b))
     if have < n and not any(".experts." in k for k in W.keys()):
         raise PoolError(f"{pool} holds {have} of {n} experts and {model} has none to pack the "
                         f"rest (a checkpoint without its experts): fill it from the whole "

@@ -334,6 +334,92 @@ def test_the_piece_table_is_the_static_layout(fmt):
         assert np.array_equal(got.view(np.uint32), outs[0].view(np.uint32))
 
 
+def test_staged_vision_is_the_resident_towers(tiny):
+    """Staged vision weights (Spec.vision_staged, docs/minicpmv.md 4.2): the pieces the
+    programs read are the pool's entries past the experts, placed in expert slots by the
+    expert server for an encode (its victims the least used experts, every slot warm here),
+    their table written, the slots released after it. Two images' crops give the resident
+    tower's rows bit for bit; the server's slots are each layer's again, and a prompt's
+    prefill (the evicted experts missing) and two decode steps give the resident engine's
+    logits bit for bit."""
+    from types import SimpleNamespace
+    from opentpu.llm import minicpmv as MV
+    m, d = tiny
+    spec = replace(load_spec(d), vision_patches=128, vision_rows=64)
+    W = dict(load_weights(d).items())
+    W.update(_tiny_vision_weights(spec.vision, np.random.default_rng(7)))
+    cfg = device_config(spec, 256, rows=1, lookup=True, S=1, experts=E)
+    kw = dict(cap=256, cfg=cfg, rows=1, resident=True, experts=E, layer_major=2)
+    a = Engine(spec, W, **kw)
+    b = Engine(replace(spec, vision_staged=True), W, **kw)
+    va, vb = a.image.vision, b.image.vision
+    assert va.resident and not vb.resident and vb.max_piece <= b.image.offload.slot_bytes
+    assert b.image.pool_extra[0] == vb.npieces and a.image.pool_extra is None
+    rng = np.random.default_rng(9)
+    ims = [SimpleNamespace(patches=[rng.uniform(-1, 1, (h * w, 3 * 14 * 14)).astype(
+        np.float32)], sizes=[(h, w)], tokens=h * w // 16) for h, w in ((8, 8), (4, 12))]
+    rows = []
+    for e in (a, b):
+        n = MV.Vision(e).encode(ims)
+        rows.append(e.backend.read(0, e.image.vision.work["vis"], 4 * n * spec.vision.out))
+    assert n == 7 and np.array_equal(rows[0], rows[1])
+    srv = b.server
+    assert srv.placed == {} and srv.place_victims > 0
+    assert srv.place_bytes >= sum(vb.piece_sizes()[i] for i in vb.used())
+    assert all(len(srv.lru[j]) + len(srv.free[j]) == E for j in range(srv.L.layers))
+    toks = [int(t) for t in rng.integers(0, V - 40, 21)]
+    la, lb = a.prefill_layers(toks), b.prefill_layers(toks)
+    assert np.array_equal(la.view(np.uint32), lb.view(np.uint32))
+    t = int(np.argmax(la))
+    for _ in range(2):
+        ga, gb = a.step(t), b.step(t)
+        assert np.array_equal(ga.view(np.uint32), gb.view(np.uint32))
+        t = int(np.argmax(ga))
+
+
+def test_a_pool_takes_the_vision_entries_past_its_experts(tmp_path):
+    """open_pool's extra entries (staged vision's pieces, pool_key's "vision"): an experts-only
+    pool grows by them, its experts kept and they not packed; a run without them opens it as
+    its experts'; the same vision key keeps them; another one replaces them (not packed)."""
+    from opentpu.host.offload import Layout
+    from opentpu.llm import moe as MO
+    lay = Layout.build(4096, 4, 2, (2, 2), 4096)
+    key = {"key": 2, "numerics": 1, "quant": "q", "format": "fp4", "D": 128,
+           "layout": {"layers": 2}, "checkpoint": None}
+    p = tmp_path / "pool.bin"
+    n = 8
+
+    def opened(k, extra=0):
+        pf = MO.open_pool(lay, p, key=k, extra=extra)
+        if pf.warm_t is not None:
+            pf.warm_t.join()
+        return pf
+    pf = opened(key)
+    pf.arr[:] = np.arange(n, dtype=np.uint8)[:, None] + 1
+    pf.packed[:] = 1
+    pf.arr.flush()
+    pf.packed.flush()
+    vk = {"entries": 3, "format": "int8", "pieces": "a"}
+    pf = opened({**key, "vision": vk}, 3)
+    assert p.stat().st_size == 11 * 4096 and list(pf.packed) == [1] * n + [0] * 3
+    assert all(pf.arr[g][0] == g + 1 for g in range(n)) and not pf.arr[n:].any()
+    pf.arr[n:] = 77
+    pf.packed[n:] = 1
+    pf.arr.flush()
+    pf.packed.flush()
+    pf = opened(key)                    # a run without vision: its experts
+    assert pf.arr.shape[0] == n and p.stat().st_size == 11 * 4096
+    assert json.loads((tmp_path / "pool.bin.key").read_text())["vision"] == vk
+    pf = opened({**key, "vision": vk}, 3)
+    assert list(pf.packed) == [1] * 11 and pf.arr[9][0] == 77
+    vk2 = {"entries": 2, "format": "attn=fp4", "pieces": "b"}
+    pf = opened({**key, "vision": vk2}, 2)
+    assert p.stat().st_size == 10 * 4096 and list(pf.packed) == [1] * n + [0] * 2
+    assert not pf.arr[n:].any() and pf.arr[3][0] == 4
+    with pytest.raises(ValueError):     # another experts' key is refused as before
+        opened({**key, "format": "int8", "vision": vk2}, 2)
+
+
 def test_the_card_order_puts_each_window_in_consecutive_rows():
     """card_order: each 4 x 4 block of the grid row-major, its 2 x 2 windows row-major, their
     4 patches row-major. Windows are consecutive rows (windows()' rows, in their order), and

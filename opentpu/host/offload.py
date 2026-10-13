@@ -628,6 +628,82 @@ class ExpertServer:
         # need lines served; their ids queued, already in a slot, landed from the queue
         self.need_lines = self.needs_queued = self.need_hits = self.needs_landed = 0
         self.drained = 0                    # needs end_prefill sent (none: each expert run's)
+        # the pool's entries past the experts (ids from layers x E, never a request's) placed
+        # in slots for host-orchestrated runs (place: MiniCPM-V's vision pieces), entry ->
+        # slot; the bytes place wrote, and its slots taken from experts (victims)
+        self.placed: dict = {}
+        self.place_bytes = self.place_victims = 0
+
+    def place(self, entries, sizes=None) -> list:
+        """The pool's entries `entries` (ids from layers x E up: pieces of weights the host's
+        own runs read, docs/minicpmv.md 4.2), each in a slot of its own until release(); returns
+        their slot addresses. Called between runs, outside a layer-major prefill: the card's
+        last request is served first (settle) and hinted experts still on their way are dropped.
+        An entry already placed keeps its slot; the others take free slots first, then the slots
+        of the experts of least decayed use across the layers ("lru": each layer's least
+        recent alike), each layer keeping k slots; the victims' entries are cleared on the card
+        before the entries' bytes are written. sizes[g]: the bytes of entry g its runs read
+        (written in whole RUN blocks; default the slot's). No tag and no directory entry: the
+        runs read the slots' addresses from the host (a table it writes)."""
+        L = self.L
+        G = L.layers * L.E
+        entries = [int(g) for g in entries]
+        if any(g < G for g in entries) or len(set(entries)) != len(entries):
+            raise ValueError(f"place: entries from {G} up (the pool's past its experts), each "
+                             f"once")
+        if self.pooled:
+            raise RuntimeError("place during a layer-major prefill")
+        self.settle()
+        self._unstage()
+        self.armed -= self._used            # (the runs before halted: the card zeroed the
+        self._used = set()                  # last request's tags)
+        for g in list(self.pending):        # hinted experts on their way: dropped
+            del self.pending[g]
+            j = g // L.E
+            self.free[j].append(self.lru[j].pop(g))
+            self.dropped += 1
+        new = [g for g in entries if g not in self.placed]
+        k = L.k
+        cap = [len(lru) + len(fr) for lru, fr in zip(self.lru, self.free)]
+        if sum(max(0, c - k) for c in cap) < len(new):
+            raise RuntimeError(f"place: {len(new)} entries, {sum(max(0, c - k) for c in cap)} "
+                               f"slots past k = {k} a layer")
+        slots = []
+        for j, fr in enumerate(self.free):
+            while fr and len(slots) < len(new) and cap[j] > k:
+                slots.append(self._reuse(fr.pop(0)))
+                cap[j] -= 1
+        if len(slots) < len(new):
+            cand = []                       # (its want, the layer, the expert)
+            for j, lru in enumerate(self.lru):
+                use = self.use[j]
+                for r, g in enumerate(lru):
+                    cand.append((use.get(g, -math.inf) if self.policy == "lfu" else r, j, g))
+            cand.sort(key=lambda c: (c[0], c[1]))
+            for _, j, g in cand:
+                if len(slots) == len(new):
+                    break
+                if cap[j] <= k:
+                    continue
+                slots.append(self._reuse(self.lru[j].pop(g)))
+                self._dir(g, 0)
+                cap[j] -= 1
+                self.place_victims += 1
+        self._dir_flush()
+        n = L.slot_bytes
+        for g, a in zip(new, slots):
+            m = n if sizes is None else min(n, -(-int(sizes[g]) // RUN) * RUN)
+            self._write(a, 0, self._part_of(g, 0, m))
+            self.placed[g] = a
+            self.place_bytes += m
+        self._flush()
+        return [self.placed[g] for g in entries]
+
+    def release(self) -> None:
+        """place's slots back to their own layers, free (decode's misses fill them)."""
+        for a in self.placed.values():
+            self.free[self.L.layer_of(a)].append(a)
+        self.placed.clear()
 
     def load(self, warm=()) -> None:
         """At image load: an empty directory, mailbox and answer, every slot's tag zero, then
@@ -647,6 +723,7 @@ class ExpertServer:
         for lru, fr in zip(self.lru, self.free):
             fr.extend(lru.values())
             lru.clear()
+        self.release()                      # (placed entries' slots)
         for a in self.scratch_slots:        # (a prefill that stopped: its scratch's slots)
             self.free[L.layer_of(a)].append(a)
         self.scratch_slots = []
@@ -1214,6 +1291,7 @@ class ExpertServer:
         if scratch and not expert_major:
             raise ValueError("a scratch is an expert-major prefill's")
         self.settle()
+        self.release()                      # (place's entries: their runs are done)
         self._drop_ahead()
         self._ahead_off = not ahead
         if part is not None:

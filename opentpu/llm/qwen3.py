@@ -2220,7 +2220,8 @@ class Engine:
         if pool_file is not None and getattr(self.image, "offload", None) is not None:
             from .moe import open_pool, pool_key    # its read into the page cache runs during
             pool_file = open_pool(self.image.offload, pool_file, mapped=pool_map,  # the build
-                                  key=pool_key(self.image, getattr(W, "model_dir", None)))
+                                  key=pool_key(self.image, getattr(W, "model_dir", None)),
+                                  extra=(getattr(self.image, "pool_extra", None) or (0,))[0])
         images = IC.build(self.image, W, self.layout)     # (opentpu/imgcache.py)
         # rollback's snapshots of the state the KV caches do not hold (snapshot.py)
         self.stateful = SN.stateful(self.image)

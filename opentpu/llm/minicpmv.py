@@ -426,6 +426,33 @@ def load_vision(model_dir) -> dict:
     return W
 
 
+class VisionWeights:
+    """load_vision's tensors read from the checkpoint as they are asked for, none kept (the
+    staged pieces' packing and the vectors of a staged image's build)."""
+
+    def __init__(self, model_dir):
+        from safetensors import safe_open
+        self.model_dir = Path(model_dir)
+        self._at = {}
+        for f in sorted(self.model_dir.glob("*.safetensors")):
+            with safe_open(str(f), "pt") as h:
+                for k in h.keys():
+                    if k.startswith((TOWER, MERGER)):
+                        self._at[k] = str(f)
+
+    def __contains__(self, k) -> bool:
+        return k in self._at
+
+    def keys(self):
+        return self._at.keys()
+
+    def __getitem__(self, k) -> np.ndarray:
+        import torch
+        from safetensors import safe_open
+        with safe_open(self._at[k], "pt") as h:
+            return h.get_tensor(k).to(torch.float32).numpy()
+
+
 def _ln(x, w, b, eps):
     m = x.mean(-1, keepdims=True)
     xc = x - m
@@ -778,10 +805,9 @@ class VisionImage:
             post=(self._v(0, self.post[0], C), self._v(0, self.post[1], C)))
 
     # ---- contents
-    def _matrices(self, W: dict):
-        """The float matrices by piece key, padded as laid out, and the vectors (address,
-        values): the checkpoint's tensors (load_vision's), each LayerNorm's bias folded into
-        the next linear's bias (float64)."""
+    def _matrix(self, W, key) -> np.ndarray:
+        """The float matrix of piece key `key` (pieces()), padded as laid out, from the
+        checkpoint's tensors W (load_vision's, or a mapping that reads each when asked)."""
         vs, C = self.vs, self.C
         f32 = np.float32
 
@@ -790,64 +816,99 @@ class VisionImage:
             out = np.zeros(shape, f32)
             out[tuple(slice(0, n) for n in a.shape)] = a
             return out
+        if key[0] == "l":
+            _, li, n = key
+            p = f"{TOWER}vit_merger." if li == vs.layers else f"{TOWER}encoder.layers.{li}."
+            if n in ("wq", "wk", "wv"):
+                return W[p + f"self_attn.{n[1]}_proj.weight"]
+            if n == "wo":
+                return W[p + "self_attn.out_proj.weight"]
+            shape = (self.F, C) if n == "w1" else (C, self.F)
+            if li == vs.layers:         # (the window merger's block has no MLP: zeros)
+                return np.zeros(shape, f32)
+            return pad(W[p + ("mlp.fc1.weight" if n == "w1" else "mlp.fc2.weight")], shape)
+        if key[0] == "m":
+            _, m, n = key
+            p, F = (TOWER + "vit_merger.", self.FW) if m == "wm" else (MERGER + "mlp.0.", 4 * C)
+            if n == "w1":
+                return pad(W[p + "linear_1.weight"], (F, 4 * C))
+            return pad(W[p + "linear_2.weight"], (self.mmats[m]["w2"].n, F))
+        wp = np.asarray(W[TOWER + "embeddings.patch_embedding.weight"], f32).reshape(C, -1)
+        return pad(wp, (C, self.KP))
+
+    def _vectors(self, W: dict) -> list:
+        """The vectors (address, values): the checkpoint's tensors (load_vision's), each
+        LayerNorm's bias folded into the next linear's bias (float64)."""
+        vs = self.vs
+
+        def pad(a, n):
+            out = np.zeros(n, np.float32)
+            out[:len(a)] = a
+            return out
 
         def folded(p, ln):      # the linear's bias with the LayerNorm's before it folded in
             return W[p + ".bias"] + W[p + ".weight"].astype(np.float64) @ W[ln + ".bias"]
-        mats, vecs = {}, []
+        vecs = []
         o = self.lofs
         for li in range(vs.layers + 1):
             base = self.layer0 + li * self.lstride
             merger = li == vs.layers
             p = f"{TOWER}vit_merger." if merger else f"{TOWER}encoder.layers.{li}."
             for n in "qkv":
-                mats["l", li, "w" + n] = W[p + f"self_attn.{n}_proj.weight"]
                 vecs.append((base + o["b" + n],
                              folded(p + f"self_attn.{n}_proj", p + "layer_norm1")))
-            mats["l", li, "wo"] = W[p + "self_attn.out_proj.weight"]
             vecs += [(base + o["bo"], W[p + "self_attn.out_proj.bias"]),
                      (base + o["ln1w"], W[p + "layer_norm1.weight"])]
-            if merger:                  # (no MLP: its block's W1 / W2 stay zero)
-                mats["l", li, "w1"] = np.zeros((self.F, C), f32)
-                mats["l", li, "w2"] = np.zeros((C, self.F), f32)
+            if merger:
                 continue
             vecs += [(base + o["ln2w"], W[p + "layer_norm2.weight"]),
-                     (base + o["b1"], pad(folded(p + "mlp.fc1", p + "layer_norm2"), (self.F,))),
+                     (base + o["b1"], pad(folded(p + "mlp.fc1", p + "layer_norm2"), self.F)),
                      (base + o["b2"], W[p + "mlp.fc2.bias"])]
-            mats["l", li, "w1"] = pad(W[p + "mlp.fc1.weight"], (self.F, C))
-            mats["l", li, "w2"] = pad(W[p + "mlp.fc2.weight"], (C, self.F))
-        for m, p, F in (("wm", TOWER + "vit_merger.", self.FW), ("proj", MERGER + "mlp.0.", 4 * C)):
+        for m, p, F in (("wm", TOWER + "vit_merger.", self.FW),
+                        ("proj", MERGER + "mlp.0.", 4 * self.C)):
             d = getattr(self, m)
             vecs += [(d["pre_w"], W[p + "pre_norm.weight"]), (d["pre_b"], W[p + "pre_norm.bias"]),
-                     (d["b1"], pad(W[p + "linear_1.bias"], (F,))),
+                     (d["b1"], pad(W[p + "linear_1.bias"], F)),
                      (d["b2"], W[p + "linear_2.bias"])]
-            mats["m", m, "w1"] = pad(W[p + "linear_1.weight"], (F, 4 * C))
-            mats["m", m, "w2"] = pad(W[p + "linear_2.weight"], (self.mmats[m]["w2"].n, F))
         vecs += [(self.post[0], W[TOWER + "post_layernorm.weight"]),
                  (self.post[1], W[TOWER + "post_layernorm.bias"]),
                  (self.emb["bp"], W[TOWER + "embeddings.patch_embedding.bias"])]
-        wp = np.asarray(W[TOWER + "embeddings.patch_embedding.weight"], f32).reshape(C, -1)
-        mats["emb", ] = pad(wp, (C, self.KP))
-        return mats, vecs
+        return vecs
+
+    def used(self) -> list:
+        """The pieces (pieces() indices) the programs read: all but the window merger's block's
+        MLP (its attention block has the layers' layout; vit_out_mlp runs it without the MLP)."""
+        return [i for i, (key, _, _) in enumerate(self.pieces())
+                if not (key[0] == "l" and key[1] == self.vs.layers and key[2] in ("w1", "w2"))]
+
+    def piece_sizes(self) -> list:
+        """Each piece's bytes (pieces() order)."""
+        return [lay.piece_bytes(i) for _, lay, i in self.pieces()]
+
+    def piece(self, W, i: int) -> np.ndarray:
+        """Piece i's bytes (uint8, pieces() order): its matrix quantized (the last one's kept
+        for the next piece of it)."""
+        from ..kernels import pieces as PC
+        key, lay, pi = self.pieces()[i]
+        c = getattr(self, "_packed", None)
+        if c is None or c[0] != key:
+            q, s = Q.quantize_mxu(np.asarray(self._matrix(W, key), np.float32), lay.fmt,
+                                  self.cfg.D)
+            c = self._packed = (key, PC.pack(lay, q, s))
+        return c[1][pi]
 
     def piece_bytes(self, W: dict) -> list:
         """Every piece's bytes in pieces() order (uint8, each its Layout's piece_bytes): the
         pool's vision entries, or the resident pieces."""
-        from ..kernels import pieces as PC
-        mats, _ = self._matrices(W)
-        out, done = [], {}
-        for key, lay, i in self.pieces():
-            if key not in done:
-                q, s = Q.quantize_mxu(np.asarray(mats[key], np.float32), lay.fmt, self.cfg.D)
-                done = {key: PC.pack(lay, q, s)}
-            out.append(done[key][i])
+        out = [self.piece(W, i) for i in range(self.npieces)]
+        self._packed = None
         return out
 
     def build(self, W: dict, put) -> None:
         """Write the vectors and (resident) the pieces and their table (W: load_vision's
         tensors) with put(addr, array); keep the position table for the host's rows
         (host_rows)."""
-        mats, vecs = self._matrices(W)
-        for addr, v in vecs:
+        for addr, v in self._vectors(W):
             put(addr, np.asarray(v, np.float32))
         if self.resident:
             for a, p in zip(self.resident_addresses(), self.piece_bytes(W)):
@@ -977,11 +1038,14 @@ class Spec(QW.Spec):
     `vision` (VisionSpec) in the model's image before the expert slots (Image): the tower's
     weights in `vision_fmt` (VisionImage.formats), a crop's work area of `vision_patches`
     patches, `vision_rows` rows of image tokens (the projector's output rows a prompt's
-    images take, docs/minicpmv.md 4.3)."""
+    images take, docs/minicpmv.md 4.3). `vision_staged`: the tower's weights are the expert
+    pool's entries past the experts, placed in expert slots for an image's runs (the expert
+    server's place) instead of resident (docs/minicpmv.md 4.2)."""
     vision: VisionSpec | None = VisionSpec()   # None: the language model alone
     vision_fmt: str = "int8"
     vision_patches: int = 2048
     vision_rows: int = 2048
+    vision_staged: bool = False
 
     @staticmethod
     def from_hf(model_dir) -> "Spec":
@@ -1005,13 +1069,57 @@ class Image(QW.Image):
     (layer 0's input, qwen35_layer_run embedded). The text path's programs are qwen35's: a
     text-only prompt runs exactly qwen35-35b's."""
 
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        v = self.vision
+        if v is not None and not v.resident:        # staged: the pieces in expert slots
+            L = self.offload
+            if L is None:
+                raise ValueError("staged vision weights need the expert slots (a MoE model)")
+            if max(v.piece_sizes()) > L.slot_bytes:
+                raise ValueError(f"vision pieces of up to {max(v.piece_sizes())} bytes, slots "
+                                 f"of {L.slot_bytes}")
+            v.set_bound(*L.slot_bounds)
+
     def before_slots(self, b) -> None:
         sp = self.spec
+        mp = None                       # staged: pieces of at most an expert slot's bytes
+        if sp.vision is not None and sp.vision_staged and sp.moe is not None:
+            from . import moe as MO
+            mp = min(VisionImage.MAX_PIECE,
+                     MO.ExpertFormat(sp.hidden, sp.moe.ffn, self.cfg.D, self.wformat).nbytes)
         self.vision = None if sp.vision is None else \
             VisionImage(sp.vision, self.cfg, b, nmax=sp.vision_patches, out_rows=sp.vision_rows,
-                        fmt=sp.vision_fmt)
+                        fmt=sp.vision_fmt, resident=not sp.vision_staged, max_piece=mp)
         if self.vision is not None:     # (an attribute of the image's own: the image cache keeps
             self.vis_tables = self.vision.tables    # its entries, opentpu/imgcache.py)
+
+    @property
+    def pool_extra(self):
+        """Staged vision: (the pool's entries past the experts, their key: moe.pool_key's
+        "vision"), else None. Entry layers x E + i is piece i (VisionImage.pieces())."""
+        v = self.vision
+        if v is None or v.resident:
+            return None
+        h = hashlib.blake2b(digest_size=16)
+        h.update(json.dumps([v.fmts, v.max_piece, v.piece_sizes(),
+                             [[list(k), lay.n, lay.k, i] for k, lay, i in v.pieces()]]).encode())
+        return v.npieces, {"entries": v.npieces, "format": self.spec.vision_fmt,
+                           "pieces": h.hexdigest()}
+
+    def expert(self, W, g: int) -> np.ndarray:
+        """Global expert g in its slot's bytes; past the experts (staged vision), piece
+        g - layers x E zero-padded to a slot (the vision tensors read as asked for)."""
+        L = self.offload
+        G = L.layers * L.E
+        if g < G:
+            return super().expert(W, g)
+        if getattr(self, "_vis_w", None) is None:
+            self._vis_w = VisionWeights(W.model_dir) if hasattr(W, "model_dir") else W
+        out = np.zeros(L.slot_bytes, np.uint8)
+        p = self.vision.piece(self._vis_w, g - G)
+        out[:p.size] = p
+        return out
 
     def build(self, W: dict) -> list:
         """qwen35's DRAM image, then the vision side's weights: load_vision's tensors of the
@@ -1019,7 +1127,8 @@ class Image(QW.Image):
         imgs = super().build(W)
         if self.vision is None:
             return imgs
-        Wv = load_vision(W.model_dir) if hasattr(W, "model_dir") else W
+        Wv = (load_vision(W.model_dir) if self.vision.resident else
+              VisionWeights(W.model_dir)) if hasattr(W, "model_dir") else W
 
         def put(addr, a):
             v = np.ascontiguousarray(a).view(np.uint8).reshape(-1)
@@ -1104,15 +1213,36 @@ class Vision:
         import time
         t, r = time.time(), row
         n = sum(im.tokens for im in images)
-        if row + n > self.img.vision.out_rows:
+        v = self.img.vision
+        if row + n > v.out_rows:
             raise ValueError(f"{n} image rows from {row}: the image holds "
-                             f"{self.img.vision.out_rows} (Spec.vision_rows)")
-        for im in images:
-            for P, size in zip(im.patches, im.sizes):
-                self.img.vision.encode(self.eng.backend, P, size, vis_row=r, cache=self.cache)
-                r += size[0] * size[1] // 16
+                             f"{v.out_rows} (Spec.vision_rows)")
+        if not images:
+            return 0
+        if not v.resident:
+            self.stage()
+        try:
+            for im in images:
+                for P, size in zip(im.patches, im.sizes):
+                    v.encode(self.eng.backend, P, size, vis_row=r, cache=self.cache)
+                    r += size[0] * size[1] // 16
+        finally:
+            if not v.resident:
+                self.eng.server.release()
         self.seconds += time.time() - t
         return r - row
+
+    def stage(self) -> None:
+        """Staged weights (Spec.vision_staged): the pieces the programs read placed in expert
+        slots by the expert server (the pool's entries layers x E + i, place), and their table
+        written: the address of each (the first's for a piece the programs never read)."""
+        v, srv = self.img.vision, self.eng.server
+        G = srv.L.layers * srv.L.E
+        used, sizes = v.used(), v.piece_sizes()
+        at = srv.place([G + i for i in used], {G + i: sizes[i] for i in used})
+        table = np.full(v.npieces, at[0], np.uint32)
+        table[used] = at
+        self.eng.backend.write(0, v.table, table)
 
     def prompt(self, ids, images: list, n: int = 0) -> list | None:
         """A prompt's image side (ids: the whole sequence's token ids, its images in order):

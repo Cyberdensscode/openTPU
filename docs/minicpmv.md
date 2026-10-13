@@ -326,8 +326,43 @@ not the card).
 
 `--max-slices` (HF's `max_slice_nums`) bounds the cost: 1 gives the thumbnail alone.
 
-**DRAM.** The vision side resident costs expert slots. `streamed.fit_experts` at a 4096-token
-cache, 1.637 MiB slots of 40 layers:
+**Pieces and their table** (`opentpu/kernels/pieces.py`).
+- Every matrix is cut into pieces of at most an expert slot's bytes (1,712,128 at the 35B's
+  fp4 slots), each its element rows, then its scale rows:
+  - q, k, v: whole heads;
+  - out and the patch embedding: stretches of D rows, one MM a piece, each into its output
+    columns;
+  - the MLPs' W1: whole chunks (the window merger's 512-row chunks span two pieces, one MM a
+    piece);
+  - the W2s: whole column parts.
+- The real tower is 446 pieces, 544.5 MiB. The programs read 438 of them: the window merger's
+  attention block has the layers' layout but no MLP.
+- The kernels read each piece's address from a table in DRAM: RLD into a register, the last 4
+  kept, given back at the end of each row group's body. So the same programs run with the
+  pieces resident or placed in expert slots.
+- The table's runs equal the static addresses' bit for bit (tests/test_minicpmv.py, int8 and
+  fp4, pieces small enough to split every kind).
+
+**Residence** (`Spec.vision_staged`).
+- **Resident**, the default (v1): the pieces after each layer's vectors. 621 MiB of the image,
+  543 of them weights.
+- **Staged**: the pieces are the expert pool's entries past the experts (entry L x E + i is
+  piece i; L the pool's layers, 41 with an MTP layer).
+  - For an image's runs the expert server places them in expert slots (`ExpertServer.place`):
+    free slots first, then the experts of least decayed use across the layers, each layer
+    keeping k. The victims' directory entries are cleared before the pieces are written.
+  - The host writes the table, runs the crops, then releases the slots to their layers, free;
+    decode's misses refill them.
+  - The image keeps 76 MiB: the vectors and the work area.
+  - The pool grows by 446 entries (763.6 MB), and its key's "vision" field names them.
+    `moe.open_pool` grows an experts-only pool in place and keeps its experts; a text-only run
+    opens a pool with them as its experts'.
+  - The ISA test: a staged engine's rows equal a resident one's bit for bit, with every slot
+    warm. Its prefill afterwards, refetching the evicted experts, and its decode steps give the
+    same logits.
+
+The resident vision side costs expert slots. `streamed.fit_experts` at a 4096-token cache,
+1.637 MiB slots of 40 layers:
 
 | vision side | MiB | slots a layer | slots |
 |---|---|---|---|
@@ -336,9 +371,7 @@ cache, 1.637 MiB slots of 40 layers:
 | int8, the ViT MLPs fp4 | 498 | 33 | 1320 |
 | fp4 everywhere | 379 | 35 | 1400 |
 
-The lead's decision: measure resident int8, resident fp4 and staged-through-the-slots on decode
-hit rate and TTFT, and pick by data; staging must not flush hot experts (stage into the least
-recently used slots). Measurements and the choice: section 5.3.
+The measurements and the choice: section 5.3.
 
 ### 4.3 Image rows into the prompt
 
@@ -481,14 +514,40 @@ Results (hwe-bench, ISA simulator):
 
 ### 5.3 The vision side's residence
 
-In progress: cachesim on qwen35-35b's router traces (lfu_layer, the card's policy) at the slot
-counts of 4.2, decode ms per token by its link model, and TTFT for staged and streamed weights.
+Method: cachesim on qwen35-35b's router traces (4 texts of 2048 tokens), lfu_layer (the card's
+policy), with its link model at the placed Gen2 rate of 3.0 GB/s, at the slot counts of 4.2.
+The model reads about 15% above the card in absolute tok/s, so the differences are what count.
+
+| option | slots | misses / token | model tok/s | ms / token against none |
+|---|---|---|---|---|
+| none / staged (between images) | 1640 | 85.5 | 6.39 | 0 |
+| streamed per crop (a ~115 MB buffer and the work area) | 1560 | 88.6 | 6.33 | +1.5 (+1.0%) |
+| resident, fp4 everywhere | 1400 | 95.3 | 6.22 | +4.3 (+2.7%) |
+| resident, int8 with the ViT MLPs fp4 | 1320 | 98.8 | 6.16 | +5.8 (+3.7%) |
+| resident int8 | 1240 | 102.6 | 6.09 | +7.7 (+4.9%) |
+
+- Accuracy rules out the fp4 ViT MLPs (5.2: row cosine minimum 0.63 / 0.67).
+- TTFT. The tower computes about 3.7 s a crop at MCOLS 4, 37 s for a 10-crop image.
+  - Resident: nothing more.
+  - Staged: 571 MB of pieces over the link once per prompt with images, about 0.2 s, then
+    refills of the evicted least-used experts (at most ~440 misses spread over the next tokens,
+    about 0.2 s of link).
+  - Streamed per crop: 543 MB a crop overlapped with compute. H2C contention (about 0.17 s/GB
+    of card time) is about +0.09 s a crop: +0.9 s, 2.5%, on 10 crops.
+- Data moved per 10-crop image: staged 0.6 GB plus at most 0.6 GB of refills; streamed 5.4 GB.
+
+The choice (the lead's, 2026-10-13): staged through the expert server (4.2). Decode keeps every
+slot between images, and it moves the fewest bytes. Resident int8 stays the default for the
+first card sessions.
 
 ## 6. Card plan
 
 On opentpu, `/data/otpu/minicpmv/` holds:
 - the slim checkpoint: 6,021,430,313 bytes (sha256 sums in `SUMS-slim`);
-- the MX pool: 17,532,190,720 bytes with its .packed, .format and .key (`SUMS-pool`).
+- the MX pool: 17,532,190,720 bytes with its .packed, .format and .key (`SUMS-pool`). Staged
+  vision adds its 446 entries after the experts (763.6 MB): packed by the first staged run, or
+  in the one repack that also adds the MTP layer (les's pool-extend: the experts byte for byte,
+  then layer 40, then the vision pieces from 41 x E).
 
 Relays go hwe-bench -> Mac -> opentpu, between card sessions. Nothing large goes on /home.
 
@@ -505,7 +564,8 @@ Sessions (the lead runs them; scripts prepared on this branch):
 4. The card host's storage: `/data/otpu/minicpmv/`.
 5. `--max-slices`: default 9, in otpu-chat and as otpu-serve's request field and option.
 6. M-RoPE rows written by the host's gather (4.3).
+7. The vision weights: int8 (the fp4 ViT MLPs fail on accuracy, 5.2); staged through the expert
+   server's slots (4.2, 5.3), resident for the first card sessions.
 
 Open:
-- the language model's formats (5.1: the single-kind swaps);
-- the vision side's residence and formats (4.2, 5.3).
+- the language model's formats (5.1).
