@@ -204,6 +204,63 @@ register (BRAM to BRAM, 5-6 levels), the AXI adapter (`qc` -> `qb_n` / `k1r_n`, 
 failing at MCOLS 2 too), and a few VPU / sequencer paths, all within -0.35 to -0.38 ns. The
 compute array itself (hops, chains, skews) is not among them.
 
+## Placement on the YPCB (release r2, MCOLS 8)
+
+r2's first MCOLS 8 build (`f55949f9`, FAST, 100 MHz; MX MXU, MXU_E 8, one TMEM copy) placed but did
+not route: "not routable, global congestion level 6", the router's first estimate South level 7
+over 23.8% of the tiles (tile X 32-95, Y 80-239), and the same with Congestion_SpreadLogic_high.
+Utilization was not the cause (60% LUT, 79% slices, 68% DSP). Each pin-box half perimeter per
+net, summed per driver > load sub-block over the placed design, put about 55% of the level 7
+window's wire demand on the array and its feed: the activation skews (`g_ask.g_p.u_a`) into the
+PEs 15.5%, the weight hops (`wc`) 12.4% + 9%, the weight skew into column 0 6.2%, the chain ends
+into the column ends 7%; the TMEM's single bank was not among the top 15. The placer had spread
+each array column's 16-DSP cascade chains over 5-7 of the device's 12 DSP columns, across the
+whole die, so position i of column j sat nowhere near position i of column j+1: the hop bits'
+pin boxes were ~220 tiles, the design's longest.
+
+`boards/ypcb-00338/constraints/otpu_mxu_place.tcl` (read by `create_project.tcl` for every build,
+late, on the implemented netlist) LOCs the array as a grid. It reads MCOLS and D from the
+netlist's PE names and takes the part's column table:
+- Array column j goes on one DSP column, positions 0..D-1 in order up it (the chains stay whole,
+  position i is level in every column), with its column end (`otpu_mxce`, a 9-DSP cascade) above.
+  At MCOLS 8 that is DSP48_X1..X8 (tile X 14 29 34 49 54 69 74 89), rows 10..146 of 160.
+- The ACT RAM's memory of column j (`otpu_actram g_row[j]`: 4 pieces of 4 RAMB36, piece p = bytes
+  32p..32p+31, and its scale RAM) goes in the block RAM column beside it, RAMB36_X1..X8 (tile X 17
+  26 37 46 57 66 77 86). Each block RAM sits level with the 8 positions its bytes feed.
+- The weight RAMs (`g_fd`, `u_fs0`, `u_fs1`) go in RAMB36_X0 (tile X 6), beside column 0, spread
+  over the array's height.
+- DSP X0 and X9..X11 (640 sites) stay free for the VPU, QUANT and the epilogue lanes.
+
+It stops (an error, and `build.tcl` fails the build if its summary line is missing from the run's
+log) when a name pattern matches no cells, the PEs are not MCOLS x D, or a chain is not in
+position order. The LOCs it set are in the run's `otpu_mxu_place.xdc`. The environment overrides
+the table: `OTPU_MXU_DSP_COLS`, `OTPU_MXU_BRAM_COLS`, `OTPU_MXU_WRAM_COL`, `OTPU_MXU_BASE`.
+`OTPU_MXU_PLACE=0` leaves the array to the placer. DSP cascades cross clock-region rows on the
+xc7k480t (25 of the free placement's 64 chains did, and every region boundary's PCOUT reaches the
+next PCIN through one pip), so the columns need no gaps.
+
+On the same opt checkpoint (`f55949f9`, default directives, 1,266 LOCs), the placer's congestion
+estimate fell from 64x64 regions (North) to 16x16 (8x8 West), with no window in
+`report_design_analysis -congestion`, and the design routed with no routing errors:
+
+| | free placement | the grid |
+|---|---|---|
+| route | not routable (level 6; router estimate South level 7) | routed, 0 errors |
+| core_clk (100 MHz) | post-place WNS -0.245 ns | routed WNS +0.013 ns, WHS +0.050 ns |
+| sum of pin-box half perimeters | 6.09M tiles | 4.59M (-25%) |
+| activation skews -> PEs | 587K | 33K |
+| weight hops (`wc`) | 549K | 121K |
+| weight skew -> column 0 | 340K | 50K |
+| ACT RAM -> activation skews | 72K | 38K |
+| chain ends -> column ends | 170K | 234K (the column ends above the array) |
+| LUT / FF / slices | 179.3K / 148.7K / 79.1% | 177.9K / 148.7K / 78.7% |
+
+The only failing endpoint was in the PCIe block's 500 MHz `userclk1` (-0.003 ns, inside the IP),
+the class `build.tcl`'s `userclk1_reroute.tcl` routes again. The router's final report keeps
+only Long-line level 5 windows (tile X 64-95, Y 240-271: XDMA's DMA 17% + 11%, u_mxu 16%). The SRL
+skews and the hop registers came next to their DSPs on their own, so there are no pblocks.
+No logic or cycles change.
+
 ## Plan and status
 
 1. Done: `IMPL=2` dot product with the unchanged epilogue, bit-exact on the MM / 4-bit / PAIR RTL

@@ -61,6 +61,13 @@ reset_run impl_1
 launch_runs impl_1 -jobs $jobs
 wait_on_run impl_1
 if {[get_property PROGRESS [get_runs impl_1]] != "100%"} { error "implementation failed" }
+# the MXU's grid (constraints/otpu_mxu_place.tcl) ran on this netlist: an unmanaged Tcl
+# constraint's error is only a critical warning in the run, so its summary line must be there
+set fh [open $out/otpu.runs/impl_1/runme.log]; set ilog [read $fh]; close $fh
+if {![regexp {otpu_mxu_place: (MCOLS \d+ x D \d+|off)} $ilog]} {
+  error "otpu_mxu_place.tcl did not place the MXU (no summary line in impl_1/runme.log; its error is\
+         a critical warning there; OTPU_MXU_PLACE=0 builds without it)"
+}
 open_run impl_1
 
 # ---- PCIe Gen2: the PCIe block's 500 MHz paths into its own block RAMs (userclk1_reroute.tcl)

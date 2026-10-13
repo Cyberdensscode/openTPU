@@ -112,12 +112,15 @@ set_property generic "SEQ_WC=1'b$SEQ_WC MCOLS=$MCOLS ACT_ROWS=$ACT_ROWS VPU_CL=$
 # ---- constraints: the board (otpu_top_ld.xdc) and the core's pads, VREF and synchronizers
 # (otpu_litedram.xdc); then, after the IP's constraints, as unmanaged Tcl on the implemented
 # netlist, each otpu_mem_ch's crossings (scoped to the module) and the top's (otpu_top_native.tcl);
-# with CLK2X the paths between core_clk and core_clk2x (otpu_clk2x.tcl)
+# with CLK2X the paths between core_clk and core_clk2x (otpu_clk2x.tcl); the MXU's systolic array
+# as a grid of LOCs, each column on its DSP column beside its ACT RAM memory, generated from the
+# netlist at any MCOLS (otpu_mxu_place.tcl; OTPU_MXU_PLACE=0 leaves it to the placer)
 set cons $root/boards/ypcb-00338/constraints
 add_files -fileset constrs_1 -norecurse [list $cons/otpu_top_ld.xdc \
   $root/boards/ypcb-00338/litedram/otpu_litedram.xdc]
 set late [list $cons/otpu_mem_ch.tcl $cons/otpu_top_native.tcl]
 if {$CLK2X} { lappend late $cons/otpu_clk2x.tcl }
+lappend late $cons/otpu_mxu_place.tcl
 add_files -fileset constrs_1 -norecurse $late
 set_property SCOPED_TO_REF otpu_mem_ch [get_files $cons/otpu_mem_ch.tcl]
 set_property PROCESSING_ORDER LATE [get_files $late]
