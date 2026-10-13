@@ -762,7 +762,10 @@ def test_ldc_sequential_is_the_card_bist(have_verilator, tmp_path, we):
 def test_ldc_memory_path(have_verilator, prog, seed, ldc, mhz):
     rng = np.random.default_rng(6200 + seed)
     cfg = Config(S=1, D=128, ACT_BLOCKS=16)
-    p = {"hazard": _hazard_program, "random": _random_program, "dma": _dma_program}[prog](rng, cfg)
+    # GATHERs where the board's collective unit runs them (its one slice's: BAR alone, _kinds),
+    # whichever uarch the session simulates
+    kw = {} if prog == "dma" else {"gather": rtlsim.gathers(cfg.S, rtlsim.BOARD_UARCH)}
+    p = {"hazard": _hazard_program, "random": _random_program, "dma": _dma_program}[prog](rng, cfg, **kw)
     img = rng.integers(0, 256, 1 << 20, dtype=np.uint8) if prog == "dma" else _images(rng, 1)[0]
     m = Machine(cfg, [p], [img.copy()]).run()
     drams, tmems, st = rtlsim.run(cfg, [p], [img.copy()], axi=True, boot=True, ldc=ldc,
