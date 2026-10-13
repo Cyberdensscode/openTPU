@@ -402,3 +402,288 @@ def test_mrope_rows_gather_the_table():
             assert c[j, i] == cos[pos[i % 3, j], i] and s_[j, i] == sin[pos[i % 3, j], i]
     with pytest.raises(ValueError):
         MV.mrope_rows((cos, sin), np.array([[50], [0], [0]]))
+
+
+def test_an_image_cache_hit_keeps_the_position_table(tiny, tmp_path, monkeypatch):
+    """The vision side's host table (the patch position embedding, which host_rows gathers)
+    is an entry of an attribute of the image's own (vis_tables): an image cache hit, which
+    skips the build, puts it back (opentpu/imgcache.py keeps what a build leaves on the image
+    and its dict attributes' entries, not on the objects under them)."""
+    from opentpu import imgcache as IC
+    monkeypatch.setenv("OTPU_IMG_CACHE", str(tmp_path / "img"))
+    monkeypatch.setenv("OTPU_IMG_CACHE_FREE_GB", "0")
+    m, d = tiny
+    ck = tmp_path / "ck"
+    ck.mkdir()
+    (ck / "config.json").write_text((d / "config.json").read_text())
+    spec = replace(load_spec(ck), vision_patches=128, vision_rows=64)
+    vw = _tiny_vision_weights(spec.vision, np.random.default_rng(4))
+    sd = safetensors.load_file(str(d / "model.safetensors"))
+    sd.update({k: torch.from_numpy(v) for k, v in vw.items()})
+    safetensors.save_file(sd, str(ck / "model.safetensors"))
+    cfg = device_config(spec, 256, rows=1, lookup=True, S=1, experts=2 * K)
+    P = np.random.default_rng(5).standard_normal((64, 3 * 14 * 14)).astype(np.float32)
+    got = []
+    for want in ("miss", "hit"):
+        e = Engine(spec, LazyWeights(ck), cap=256, cfg=cfg, rows=1, resident=True,
+                   experts=2 * K, layer_major=2)
+        assert IC.last[0] == want
+        got.append(e.image.vision.host_rows(P, (8, 8)))
+    pos = vw["model.vision_tower.embeddings.position_embedding.weight"]
+    assert np.array_equal(e.image.vis_tables["pos"], pos)
+    for a, b in zip(*got):
+        assert np.array_equal(a, b)
+
+
+def test_the_card_rope_rows_are_hfs_mrope(tiny):
+    """Vision.positions writes the device's RoPE table so that slot s holds HF's interleaved
+    M-RoPE cos / sin (Qwen3_5MoeTextRotaryEmbedding) at the sequence's canvas positions
+    (rope_index; s >= T: s + delta, the decode's), and pristine puts the 1-D rows back: a
+    thumbnail and a 1 x 2 grid of slices of different (h, w), between text."""
+    from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as HM
+    from opentpu.llm import minicpmv as MV
+    m, d = tiny
+    spec = replace(load_spec(d), vision_patches=128, vision_rows=64)
+    vs = spec.vision
+    W = dict(load_weights(d).items())
+    W.update(_tiny_vision_weights(vs, np.random.default_rng(6)))
+    cap = 256
+    cfg = device_config(spec, cap, rows=1, lookup=True, S=1, experts=2 * K)
+    eng = Engine(spec, W, cap=cap, cfg=cfg, rows=1, resident=True, experts=2 * K, layer_major=2)
+    v = MV.Vision(eng)
+    sizes = [(8, 12), (12, 8), (12, 8)]
+    P_ = vs.image_token
+    ids = [5, 6, 7, vs.image_start] + [P_] * 6 + [vs.image_end] + [vs.slice_start] + \
+        [P_] * 6 + [vs.slice_end] + [vs.slice_start] + [P_] * 6 + [vs.slice_end] + [9, 10, 11]
+    delta = v.positions(ids, sizes)
+    pos, _ = MV.rope_index(ids, sizes, vs)
+    T = len(ids)
+    rot = HM.Qwen3_5MoeTextRotaryEmbedding(m.config)
+    lk = eng.image.lookup
+    half = lk["half"]
+
+    def table():
+        return [eng.backend.read(0, lk[n], 4 * half * cap).view(np.float32).reshape(cap, half)
+                for n in ("cos_t", "sin_t")]
+
+    def hf(p):
+        c, s_ = rot(torch.zeros(1), torch.from_numpy(p)[:, None, :])
+        return c[0, :, :half].numpy(), s_[0, :, :half].numpy()
+    want = hf(np.concatenate([pos, np.tile(np.arange(T, cap) + delta, (3, 1))], 1))
+    assert delta != 0 and not np.array_equal(pos[1], pos[2])
+    for got, w in zip(table(), want):
+        assert np.abs(got - w).max() < 1e-4
+    v.pristine()
+    for got, w in zip(table(), hf(np.tile(np.arange(cap), (3, 1)))):
+        assert np.abs(got - w).max() < 1e-4
+
+
+# =============================================================================== otpu-serve
+class _Tok:
+    """One character per token id."""
+
+    def decode(self, ids, skip_special_tokens=False):
+        return "".join(chr(0x100 + int(i)) for i in ids)
+
+
+def test_serve_keys_contexts_by_their_images(tiny):
+    """otpu-serve's worker with images (scheduler.Request.images; prompts keyed by
+    minicpmv.keyed): two requests with different images after the same text, in turns, give
+    the tokens of their own runs on a fresh engine (the tower, the image rows, each context's
+    RoPE rows written at its switch); one that continues the first's conversation feeds only
+    what is new; one with a third image after the same text reuses no context past the text
+    (with the image tokens' one id it would take a saved one whole); a text-only one after
+    them runs on the table's own rows."""
+    import hashlib
+
+    from opentpu.llm import minicpmv as MV
+    from opentpu.serve import scheduler as SC
+    m, d = tiny
+    sp = load_spec(d)
+    vs = replace(sp.vision, image_token=1000, image_start=1001, image_end=1002,
+                 slice_start=1003, slice_end=1004)
+    spec = replace(sp, vision=vs, vision_patches=128, vision_rows=64)
+    rng = np.random.default_rng(7)
+    W = dict(load_weights(d).items())
+    W.update(_tiny_vision_weights(vs, rng))
+    cfg = device_config(spec, 256, rows=1, lookup=True, S=1, experts=2 * K)
+
+    def engine():
+        return Engine(spec, W, cap=256, cfg=cfg, rows=1, resident=True, experts=2 * K,
+                      layer_major=2)
+
+    def image(seed):
+        P = np.random.default_rng(seed).uniform(-1, 1, (96, 3 * 14 * 14)).astype(np.float32)
+        return MV.ImageInput([P], [(8, 12)], None, "", hashlib.sha256(P.tobytes()).hexdigest())
+
+    head = [int(t) for t in rng.integers(0, 900, 7)]
+    tail = [int(t) for t in rng.integers(0, 900, 5)]
+
+    def prompt(im, more=()):
+        ids = head + ([vs.image_start] + [vs.image_token] * im.tokens + [vs.image_end]
+                      if im is not None else []) + tail + list(more)
+        return ids, ([] if im is None else [im])
+
+    def ref(ids, ims, n):
+        """Greedy tokens of a fresh engine, as the worker feeds them (the device's loop: the
+        prompt's last token through the decode)."""
+        e = engine()
+        vis = MV.Vision(e).prompt(ids, ims) if ims else None
+        card = getattr(e, "can_generate", False)
+        a = len(ids) - 1 if card else len(ids)
+        lg = e.prefill_layers(ids[:a], logits=not card,
+                              **({} if vis is None else {"vis": vis[:a]}))
+        if card:
+            lg = e.step(ids[-1])
+        out = []
+        while True:
+            t = int(np.argmax(lg))
+            out.append(t)
+            if len(out) == n:
+                return out
+            lg = e.step(t)
+
+    def request(ids, ims, n=6):
+        key = MV.keyed(ids, ims, vs.image_token) if ims else ids
+        return SC.Request(key, max_new=n, stop_ids=frozenset({-1}), images=ims)
+
+    X, Y, Z = image(1), image(2), image(3)
+    w = SC.Worker(engine(), _Tok(), quantum=2, max_running=4).start()
+    try:
+        pa, pb = prompt(X), prompt(Y)
+        ra, rb = w.submit(request(*pa)), w.submit(request(*pb))
+        for r in (ra, rb):
+            r.wait(timeout=900)
+            assert r.error is None and r.finish == "length", r.error
+        assert ra.swaps + rb.swaps >= 2
+        assert ra.out == ref(*pa, 6) and rb.out == ref(*pb, 6) and ra.out != rb.out
+        pc = prompt(X, ra.out + [7, 8, 9])
+        rc = w.submit(request(*pc)).wait(timeout=900)
+        assert rc.error is None and rc.cached >= len(pa[0])
+        assert rc.out == ref(*pc, 6)
+        pz = prompt(Z)
+        rz = w.submit(request(*pz)).wait(timeout=900)
+        assert rz.error is None and rz.cached <= len(head) + 1
+        assert rz.out == ref(*pz, 6)
+        pt = prompt(None)
+        rt = w.submit(request(*pt)).wait(timeout=900)
+        assert rt.error is None and rt.out == ref(*pt, 6)
+        with pytest.raises(ValueError):    # (keys without their images)
+            w.submit(SC.Request(request(*pa).prompt, max_new=2))
+    finally:
+        w.stop(persist=False)
+
+
+class _VTok:
+    """A character tokenizer with MiniCPM-V's markers as single ids (1000 + i), and a template
+    that renders an image part as <|image_pad|>."""
+    chat_template = "minicpmv-like"
+    SPECIAL = ("<|image_pad|>", "<image>", "</image>", "<slice>", "</slice>", "<image_id>",
+               "</image_id>")
+
+    def __call__(self, text):
+        import re
+        out = []
+        for piece in re.split("(" + "|".join(re.escape(s) for s in self.SPECIAL) + ")", text):
+            if piece in self.SPECIAL:
+                out.append(1000 + self.SPECIAL.index(piece))
+            else:
+                out += [ord(c) % 900 for c in piece]
+        return {"input_ids": out}
+
+    def apply_chat_template(self, msgs, add_generation_prompt, enable_thinking, tokenize):
+        def text(c):
+            return c if isinstance(c, str) else "".join(
+                "<|image_pad|>" if p["type"] == "image" else p["text"] for p in c)
+        out = "".join(f"\x01{m['role']}\n{text(m['content'])}\x02\n" for m in msgs)
+        if add_generation_prompt:
+            out += "\x01assistant\n"
+        return out if not tokenize else self(out)["input_ids"]
+
+    def decode(self, ids, skip_special_tokens=True):
+        return "".join(chr(0x100 + int(i)) for i in ids)
+
+
+class _Worker:
+    """What Server takes of a scheduler.Worker; submit records the requests."""
+
+    def __init__(self, cap=4096):
+        import threading
+        from types import SimpleNamespace
+        self.tok_lock, self.stateful = threading.Lock(), False
+        self.eng = SimpleNamespace(cap=cap)
+        self.got = []
+
+    def busy(self):
+        return 0
+
+    def submit(self, r):
+        self.got.append(r)
+        return r
+
+
+def _png(w, h, seed):
+    import base64
+    import io
+    from PIL import Image as PI
+    a = np.random.default_rng(seed).integers(0, 256, (h, w, 3), dtype=np.uint8)
+    buf = io.BytesIO()
+    PI.fromarray(a).save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def test_serve_takes_image_url_parts():
+    """otpu-serve's chat with image_url parts (api.Server on MiniCPM-V's spec): each image
+    prepared at the request's max_slices, its placeholder in place of its <|image_pad|>, the
+    prompt's key its token ids with each image's tokens their content keys; the same image
+    gives the same keys, another image others; refused: an image for a model without a vision
+    side, an http(s) URL without --image-fetch, a max_slices out of range, a bad data URL."""
+    import base64
+    from types import SimpleNamespace
+
+    from opentpu.llm import minicpmv as MV
+    from opentpu.serve import api as API
+    vs = MV.VisionSpec(image_token=1000, image_start=1001, image_end=1002, slice_start=1003,
+                       slice_end=1004)
+    spec = SimpleNamespace(vision=vs, vision_rows=2048, eos=[999])
+    tok, w = _VTok(), _Worker()
+    srv = API.Server(w, tok, spec, "mcpv", dict(temperature=0.0, top_k=20, top_p=1.0,
+                                                 repetition_penalty=1.0))
+    a, b = _png(1000, 700, 1), _png(1000, 700, 2)
+
+    def chat(*urls, text="What is this?", **kw):
+        content = [{"type": "image_url", "image_url": {"url": u}} for u in urls] + \
+            [{"type": "text", "text": text}]
+        w.got.clear()
+        srv.chat({"messages": [{"role": "user", "content": content}], **kw})
+        return w.got[0]
+
+    r = chat(a, max_slices=4)
+    ims = [MV.prepare(base64.b64decode(a.split(",", 1)[1]), vs, 4, image_id=0)]
+    assert len(r.images) == 1 and r.images[0].sizes == ims[0].sizes and len(ims[0].sizes) > 1
+    ids = tok(MV.expand(tok.apply_chat_template(
+        [{"role": "user", "content": [{"type": "image"}, {"type": "text",
+                                                          "text": "What is this?"}]}],
+        True, False, False), ims))["input_ids"]
+    assert MV.unkeyed(r.prompt, vs.image_token) == ids
+    assert r.prompt == MV.keyed(ids, ims, vs.image_token)
+    assert sum(t < 0 for t in r.prompt) == ims[0].tokens
+    assert chat(a, max_slices=4).prompt == r.prompt             # the same image: the same key
+    r2 = chat(b, max_slices=4)
+    first = next(i for i, t in enumerate(r.prompt) if t < 0)
+    assert r2.prompt[:first] == r.prompt[:first] and r2.prompt[first] != r.prompt[first]
+    r3 = chat(a, b, max_slices=1)                                 # two images, numbered
+    assert [len(im.sizes) for im in r3.images] == [1, 1]
+    assert MV.unkeyed(r3.prompt, vs.image_token).count(1005) == 2   # (<image_id> twice)
+    for bad in ({"url": "http://example.com/x.png"}, {"url": "/etc/passwd"},
+                {"url": "data:image/png,abc"}):
+        with pytest.raises(API.APIError):
+            srv.chat({"messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": bad}]}]})
+    with pytest.raises(API.APIError):
+        chat(a, max_slices=0)
+    text = API.Server(w, tok, SimpleNamespace(vision=None, eos=[999]), "t", srv.defaults)
+    with pytest.raises(API.APIError):
+        w.got.clear()
+        text.chat({"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": a}}]}]})

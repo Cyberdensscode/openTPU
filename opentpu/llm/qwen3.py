@@ -2656,7 +2656,7 @@ class Engine:
         return n, progs, fit
 
     def prefill_chunks(self, tokens, seq: int = 0, chunk: int | None = None,
-                       logits: bool = True):
+                       logits: bool = True, vis=None):
         """Feed a prompt to sequence `seq` in device runs of up to `chunk` tokens (default:
         the image's rows); yields (the tokens of the run, logits) after each run, the logits
         after the prompt's last token with the last run and None before (always None without
@@ -2676,18 +2676,22 @@ class Engine:
         With the pipeline, the next run's program (after the last run: the first decode
         step's) is compiled while the device runs the current one. With layer_major (a MoE
         model) sequence 0's prompt goes layer by layer (prefill_layers), in one part: its runs'
-        stats are one entry, their cycles summed."""
+        stats are one entry, their cycles summed. vis: prefill_layers' image rows (MiniCPM-V;
+        the layer-major prompt only)."""
         from . import prefill as PF
         tokens = [int(t) for t in tokens]
         if self.layer_major and seq == 0 and chunk is None:
             if tokens:                                  # (docs/offload.md 13)
                 k = len(self.stats)
-                lg = self.prefill_layers(tokens, logits)
+                lg = self.prefill_layers(tokens, logits, **({} if vis is None else
+                                                            {"vis": vis}))
                 runs = self.stats[k:]
                 self.stats[k:] = [{"cycles": sum((s or {}).get("cycles") or 0 for s in runs),
                                    "runs": len(runs), "rows": len(tokens)}]
                 yield tokens, lg
             return
+        if vis is not None and max(vis, default=-1) >= 0:
+            raise ValueError("image rows go in a layer-major prompt (Engine(layer_major=R))")
         if self.prompt_runs and seq == 0 and chunk is None and PF.supported(self) \
                 and PF.covers(self, self.poss[0], self.poss[0] + len(tokens)):
             yield from PF.chunks(self, tokens, logits)  # docs/prefill.md

@@ -14,6 +14,7 @@ MiniCPM-V's own:
 """
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
 import math
@@ -127,20 +128,24 @@ def refine_size(h: int, w: int, grid, scale: int, patch: int) -> tuple:
 
 
 def decode(src):
-    """An image as HF's processor reads it: a path, a data: URL or base64 string (torchvision's
-    decode_image, RGB; its EXIF orientation is not applied, as HF's for a path), or a PIL image
-    (EXIF-transposed, RGB) -> uint8 [3, H, W] (a torch tensor)."""
+    """An image as HF's processor reads it: a path, a data: URL or base64 string, or the file's
+    bytes (torchvision's decode_image, RGB; its EXIF orientation is not applied, as HF's for a
+    path), or a PIL image (EXIF-transposed, RGB) -> uint8 [3, H, W] (a torch tensor)."""
     import torch
     try:
         from torchvision.io import ImageReadMode, decode_image
     except ImportError:                     # (no torchvision: PIL's decoder, RGB)
         decode_image = None
-    if not isinstance(src, (str, Path)):
+    if isinstance(src, (bytes, bytearray)):
+        src, raw = None, bytes(src)
+    elif not isinstance(src, (str, Path)):
         from PIL import ImageOps
         im = ImageOps.exif_transpose(src).convert("RGB")
         return torch.from_numpy(np.asarray(im).copy()).permute(2, 0, 1).contiguous()
-    s = str(src)
-    if Path(s).is_file():
+    s = None if src is None else str(src)
+    if s is None:
+        pass
+    elif not s.startswith("data:") and len(s) < 4096 and Path(s).is_file():
         raw = Path(s).read_bytes()
     else:
         import base64
@@ -211,12 +216,13 @@ def position_ids(h: int, w: int, side: int) -> np.ndarray:
 @dataclass
 class ImageInput:
     """One image as the host prepares it: its crops' patch rows and (h, w) in patches (the
-    thumbnail first), the slice grid, and the placeholder text that replaces its
-    <|image_pad|> in the prompt."""
+    thumbnail first), the slice grid, the placeholder text that replaces its <|image_pad|> in
+    the prompt, and its content's key (sha256 of the crops' sizes and patch rows: token_keys)."""
     patches: list
     sizes: list
     grid: tuple | None
     text: str
+    key: str = ""
 
     @property
     def tokens(self) -> int:
@@ -238,7 +244,10 @@ def prepare(src, vs: VisionSpec, max_slices: int | None = None, image_id: int | 
         text += "\n".join([row] * grid[0])
     if image_id is not None:
         text = f"<image_id>{image_id}</image_id>" + text
-    return ImageInput(ps, sizes, grid, text)
+    h = hashlib.sha256(repr(sizes).encode())
+    for p in ps:
+        h.update(np.ascontiguousarray(p).tobytes())
+    return ImageInput(ps, sizes, grid, text, h.hexdigest())
 
 
 def expand(text: str, images: list, pad: str = "<|image_pad|>") -> str:
@@ -248,6 +257,39 @@ def expand(text: str, images: list, pad: str = "<|image_pad|>") -> str:
     if len(parts) - 1 != len(images):
         raise ValueError(f"{len(parts) - 1} image placeholders for {len(images)} images")
     return parts[0] + "".join(im.text + p for im, p in zip(images, parts[1:]))
+
+
+def token_keys(im: ImageInput) -> list[int]:
+    """Stand-ins for an image's <|image_pad|> tokens in a context's key (otpu-serve's prefix
+    matching and KV store compare token ids, and every image's pads are the one id): negative
+    int32s, the k-th a hash of the image's content key and k, so the keys of two contexts part
+    at their first differing image's first token."""
+    h = bytes.fromhex(im.key)
+    return [-1 - int.from_bytes(hashlib.blake2b(h + k.to_bytes(4, "little"),
+                                                digest_size=4).digest(), "little") % (2**31 - 1)
+            for k in range(im.tokens)]
+
+
+def keyed(ids, images: list, image_token: int) -> list[int]:
+    """A prompt's key: its token ids with each image's pads its token_keys, in order."""
+    keys = [k for im in images for k in token_keys(im)]
+    out, i = [], 0
+    for t in ids:
+        if t == image_token:
+            if i == len(keys):
+                raise ValueError(f"more image tokens than the {len(images)} images' {len(keys)}")
+            out.append(keys[i])
+            i += 1
+        else:
+            out.append(int(t))
+    if i != len(keys):
+        raise ValueError(f"{i} image tokens for the {len(images)} images' {len(keys)}")
+    return out
+
+
+def unkeyed(keys, image_token: int) -> list[int]:
+    """The token ids of a key (keyed's inverse)."""
+    return [image_token if t < 0 else t for t in keys]
 
 
 def _frame_end(last: int, ids: list, markers: tuple, limit: int) -> int:
@@ -510,6 +552,7 @@ class VisionImage:
                  fmt: str = "int8"):
         D = cfg.D
         self.vs, self.cfg = vs, cfg
+        self.tables = {}                # the host's tables (build: "pos", the position table)
         self.fmts = self.formats(fmt)
         F_ = self.fmts
         C, H = vs.hidden, vs.heads
@@ -683,7 +726,7 @@ class VisionImage:
         wp = np.asarray(W[TOWER + "embeddings.patch_embedding.weight"], f32).reshape(C, -1)
         put_m(0, self.emb["wp"], pad(wp, (C, self.KP)))
         vec(self.emb["bp"], W[TOWER + "embeddings.patch_embedding.bias"])
-        self.pos_table = np.asarray(W[TOWER + "embeddings.position_embedding.weight"], f32)
+        self.tables["pos"] = np.asarray(W[TOWER + "embeddings.position_embedding.weight"], f32)
 
     # ---- the runs
     def programs(self, N: int, block: int = 256, R: int | None = None,
@@ -751,7 +794,7 @@ class VisionImage:
         o = card_order(h, w)
         p = np.zeros((h * w, self.KP), np.float32)
         p[:, :P.shape[1]] = P[o]
-        return p, self.pos_table[position_ids(h, w, self.vs.side)[o]]
+        return p, self.tables["pos"][position_ids(h, w, self.vs.side)[o]]
 
     def encode(self, backend, P: np.ndarray, size, vis_row: int = 0, proj_gelu=None,
                cache: dict | None = None, s: int = 0) -> np.ndarray:
@@ -839,6 +882,8 @@ class Image(QW.Image):
         self.vision = None if sp.vision is None else \
             VisionImage(sp.vision, self.cfg, b, nmax=sp.vision_patches, out_rows=sp.vision_rows,
                         fmt=sp.vision_fmt)
+        if self.vision is not None:     # (an attribute of the image's own: the image cache keeps
+            self.vis_tables = self.vision.tables    # its entries, opentpu/imgcache.py)
 
     def build(self, W: dict) -> list:
         """qwen35's DRAM image, then the vision side's weights: load_vision's tensors of the
@@ -940,6 +985,32 @@ class Vision:
                 r += size[0] * size[1] // 16
         self.seconds += time.time() - t
         return r - row
+
+    def prompt(self, ids, images: list, n: int = 0) -> list | None:
+        """A prompt's image side (ids: the whole sequence's token ids, its images in order):
+        the RoPE table's rows at its positions (positions), the images with tokens in ids[n:]
+        (what is fed) through the tower into vis rows from 0 (an image that started before n
+        whole), and each of ids[n:]'s vis row (-1: text): prefill_layers' vis. Without images
+        the table's own rows (pristine) and None."""
+        if not images:
+            self.pristine()
+            return None
+        self.positions(ids, [s for im in images for s in im.sizes])
+        at, j, k = [], 0, 0                 # each image token's (image, its k-th row)
+        for t in ids:
+            if int(t) == self.vs.image_token:
+                if k == images[j].tokens:
+                    j, k = j + 1, 0
+                at.append((j, k))
+                k += 1
+            else:
+                at.append(None)
+        new = sorted({a[0] for a in at[n:] if a is not None})
+        base, row = {}, 0
+        for j in new:
+            base[j], row = row, row + images[j].tokens
+        self.encode([images[j] for j in new])
+        return [-1 if a is None else base[a[0]] + a[1] for a in at[n:]]
 
     def rows(self, ids, row: int = 0) -> list:
         """Each token's vis row (prefill_layers' vis): the image tokens' in order from `row`,

@@ -16,6 +16,9 @@
     otpu-chat --model qwen35-35b --backend board  # a MoE bigger than the card's DRAM: its
                                               # experts streamed from a pool file into slots
                                               # (opentpu/host/streamed.py, docs/offload.md 14)
+    otpu-chat --model minicpmv-35b --backend board --image cat.jpg --prompt "What is this?"
+                                              # MiniCPM-V 4.7: images through the card's vision
+                                              # tower (docs/minicpmv.md); --max-slices N
 
 The interactive mode is a full-screen interface (opentpu/host/chat_tui.py): the conversation,
 and under the input a status line with TTFT, prefill and decode tokens/s (wall and device) and
@@ -315,6 +318,8 @@ class Turn:
     expert_misses: int = 0            # the bytes streamed for them, and the prompt's misses
     streamed: int = 0
     prefill_misses: int = 0
+    images: int = 0                   # images attached to this turn's message (MiniCPM-V),
+    vision_s: float = 0.0             # their crops' wall time through the card's tower
 
     @property
     def expert_hit_rate(self) -> float | None:
@@ -453,6 +458,10 @@ class Chat:
         self._next = None                   # logits after a reply cut at max_new (resume())
         self._reply: list[int] = []         # the last reply's tokens
         self.mtp = None                     # an MTP engine's decoder (opentpu/llm/mtp.py)
+        self.images: list = []              # the conversation's images (minicpmv.ImageInput)
+        self.pending: list = []             # images for the next message (attach)
+        self.max_slices = None              # their slices at most (None: the processor's)
+        self.vision = None                  # minicpmv.Vision, at the first image
         self._served = self._expert_counts()    # a streamed MoE's server's counts (_experts)
         cap = getattr(engine.spec, "softcap", None)
         if getattr(pick, "softcap", cap) != cap:    # it gets the engine's raw logits
@@ -469,14 +478,43 @@ class Chat:
         history = self.history if history is None else history
         if getattr(self.tok, "chat_template", "") is None:     # a base model: the text as is
             return list(self.tok("".join(m["content"] for m in history))["input_ids"])
+        if self.images:                     # each image's placeholder for its <|image_pad|>
+            from opentpu.llm import minicpmv as MV
+            text = self.tok.apply_chat_template(history, add_generation_prompt=add_prompt,
+                                                enable_thinking=self.think, tokenize=False)
+            return list(self.tok(MV.expand(text, self.images))["input_ids"])
         ids = self.tok.apply_chat_template(history, add_generation_prompt=add_prompt,
                                            enable_thinking=self.think, tokenize=True)
         return list(ids["input_ids"] if hasattr(ids, "keys") else ids)
 
+    def attach(self, src) -> None:
+        """An image (a path, a data: URL, base64 or PIL) for the next message: a model with a
+        vision side only (MiniCPM-V, minicpmv.Image)."""
+        if getattr(getattr(self.eng, "image", None), "vision", None) is None:
+            raise ValueError("this model takes no images")
+        self.pending.append(src)
+
     def reset(self) -> None:
         """Forget the conversation and the KV cache."""
         self.history, self.fed, self._next = [], [], None
+        self.images, self.pending = [], []
         self.eng.reset()
+        if self.vision is not None:         # (the RoPE table's text rows again)
+            self.vision.pristine()
+
+    def _image_rows(self, ids, n: int, turn: Turn) -> list | None:
+        """The images' side of a prompt (minicpmv.Vision.prompt: the RoPE rows of `ids`, the
+        whole conversation's, the images with tokens in ids[n:] through the card's tower) and
+        each of ids[n:]'s vis row; None without images."""
+        if not self.images:
+            return None
+        from opentpu.llm import minicpmv as MV
+        if self.vision is None:
+            self.vision = MV.Vision(self.eng)
+        t0 = time.perf_counter()
+        vis = self.vision.prompt(ids, self.images, n)
+        turn.vision_s += time.perf_counter() - t0
+        return vis
 
     def reply_start(self, ids) -> int | None:
         """Where the next turn's rendering will start to differ from `ids` (this turn's, with
@@ -521,10 +559,22 @@ class Chat:
         on_update = on_update or (lambda delta, turn: None)
         t0 = time.perf_counter()
         turn = Turn(clock_mhz=self.clock_mhz, cap=self.eng.cap, context=self.eng.pos)
-        self.history.append({"role": "user", "content": text})
+        imgs, self.pending = self.pending, []
+        if imgs:                            # (MiniCPM-V: the images before the text, as HF's)
+            from opentpu.llm import minicpmv as MV
+            vs = self.eng.spec.vision
+            imgs = [MV.prepare(src, vs, self.max_slices, image_id=len(self.images) + i)
+                    for i, src in enumerate(imgs)]
+            self.images += imgs
+            turn.images = len(imgs)
+            self.history.append({"role": "user", "content": [{"type": "image"}] * len(imgs) +
+                                 [{"type": "text", "text": text}]})
+        else:
+            self.history.append({"role": "user", "content": text})
         ids = self._template()
         if len(ids) >= self.eng.cap:         # no room for the prompt and a reply token
             self.history.pop()
+            del self.images[len(self.images) - len(imgs):]
             turn.end = "cap"
             return "", turn
         self._next = None
@@ -542,12 +592,15 @@ class Chat:
         if at is not None and not n < at <= len(ids):
             at = None
         logits = None
+        vis = self._image_rows(ids, n, turn)
         if self.use_mtp:
             logits = self._prefill_mtp(ids, n, turn, t0, on_update, stop, at)
         else:
             cut = [at] if at is not None and at < len(ids) else []
             for a, b in zip([n] + cut, cut + [len(ids)]):
                 kw = {} if b == len(ids) else {"logits": False}     # up to the snapshot: no head
+                if vis is not None:
+                    kw["vis"] = vis[a - n:b - n]
                 for part, logits in self.eng.prefill_chunks(ids[a:b], **kw):
                     self.fed += part
                     turn.prefill_tokens += len(part)
@@ -1008,6 +1061,14 @@ def main(argv=None):
     moe.add_argument("--embed-table", choices=("host", "card"),
                      help="an untied embedding table on the host (the default: more slots) or "
                           "on the card")
+    ap.add_argument("--image", action="append", default=[], metavar="PATH",
+                    help="an image for the first message (repeatable; MiniCPM-V: its crops "
+                         "run the card's vision tower, docs/minicpmv.md); --plain: /image PATH "
+                         "attaches one to the next message")
+    ap.add_argument("--max-slices", type=int,
+                    help="an image's slices at most besides its thumbnail (default the "
+                         "processor's 9): the latency knob, each crop about 3.7 s of vision at "
+                         "MCOLS 4 and 64 prompt tokens; 1 or less: the thumbnail alone")
     moe.add_argument("--poll-idle", metavar="spin|S|predict",
                      help="the host's polls while a run is in flight and no expert is asked "
                           "for: spin (the default), sleep S seconds, or predict each gap "
@@ -1107,6 +1168,12 @@ def main(argv=None):
     if a.mtp and not chat.use_mtp:
         print("otpu-chat: --mtp: these sampling settings stay on the host; plain decode",
               flush=True)
+    chat.max_slices = a.max_slices
+    try:
+        for src in a.image:
+            chat.attach(src)
+    except ValueError as e:
+        raise SystemExit(f"otpu-chat: --image: {e}") from None
     if a.prompt:
         chat.ask_plain(a.prompt)
         return
@@ -1115,7 +1182,7 @@ def main(argv=None):
         ChatApp(chat, panel_meta(eng, a.backend, a.dev, path.name,
                                  dict(sp, greedy=a.greedy), a.max_new, clock, weights)).run()
         return
-    print("type a message (/continue, /reset; empty line or Ctrl-D to quit)")
+    print("type a message (/continue, /reset, /image PATH; empty line or Ctrl-D to quit)")
     while True:
         try:
             text = input("\n> ").strip()
@@ -1125,6 +1192,11 @@ def main(argv=None):
             break
         if text == "/reset":
             chat.reset()
+        elif text.startswith("/image "):
+            try:
+                chat.attach(text[7:].strip())
+            except ValueError as e:
+                print(f"otpu-chat: {e}")
         elif text == "/continue":
             chat.ask_plain(None) if chat.can_resume else print("nothing to continue")
         else:
