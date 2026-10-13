@@ -16,6 +16,7 @@
 # cycle changes; pblocks only (not EXCLUDE_PLACEMENT: other cells may share the slices).
 #
 # - OTPU_DDR_PHY_PLACE=0 skips the whole file; OTPU_DDR_PHY_COLS sets the columns.
+# - The sys reset's first register (crg_rst_t0) goes midway between the channels (rst_mid, below).
 # It stops the run (error) when no OSERDES has a flop driver or a pad. Summary line:
 # "otpu_ddr_phy_place: N flops of M OSERDES in K pblocks (...)" (or "off").
 #
@@ -100,6 +101,54 @@ proc ::otpu_ddr_phy_place::run {} {
   }
   puts "otpu_ddr_phy_place: $n flops of $nos OSERDES in [array size ffs] pblocks ([join $desc {; }]),\
         IS_SOFT [join [lsort -unique $soft] /]"
+  rst_mid [lsort [array names ffs]]
+}
+
+# The sys reset's plain register (u_ld/crg_rst_t0, WLCRG rst_reg 2: 32143b30) midway between the two
+# channels. It feeds crg_rst1's replicas, which sit by both channels' controllers, and the placer put it
+# at one end: r2.1's m8 2343d61e had it at SLICE_X43Y334 and the replicas by channel 0 at Y76-82, 7.07 ns
+# of route, 0 levels, the sys clock's worst path (+0.058 ns; c819923f the same at X1Y333; production
+# b10245f5's FDPE_1 at Y345, +0.184). A hard pblock of the rows midway between the channels' PHY
+# regions (OTPU_DDR_RST_ROWS, default 20, about the middle row), the slice columns 8..31 from the I/O
+# column. Two channels only (the regions of the PHY pblocks in two groups by row); anything else: none.
+proc ::otpu_ddr_phy_place::rst_mid {crs} {
+  set t0 [get_cells -quiet -hier -filter {NAME =~ *crg_rst_t0_reg && IS_PRIMITIVE}]
+  if {[llength $t0] != 1} { puts "otpu_ddr_phy_place: crg_rst_t0: [llength $t0] cells, not placed"; return }
+  set rows {}
+  foreach cr $crs {
+    set ys {}
+    foreach s [get_sites -of_objects [get_clock_regions $cr] -filter {SITE_TYPE =~ SLICE*}] {
+      if {[regexp {SLICE_X\d+Y(\d+)} $s -> sy]} { lappend ys $sy }
+    }
+    set ys [lsort -integer $ys]
+    lappend rows [list [lindex $ys 0] [lindex $ys end]]
+  }
+  set rows [lsort -integer -index 0 $rows]
+  # the largest gap between consecutive PHY regions splits the two channels
+  set gap 0; set lo ""; set hi ""
+  for {set i 1} {$i < [llength $rows]} {incr i} {
+    set a [lindex $rows [expr {$i - 1}] 1]; set b [lindex $rows $i 0]
+    if {$b - $a > $gap} { set gap [expr {$b - $a}]; set lo $a; set hi $b }
+  }
+  if {$gap < 2} { puts "otpu_ddr_phy_place: crg_rst_t0: no gap between the PHY regions, not placed"; return }
+  set nr [expr {[info exists ::env(OTPU_DDR_RST_ROWS)] ? $::env(OTPU_DDR_RST_ROWS) : 20}]
+  set y0 [expr {($lo + $hi) / 2 - $nr / 2}]; set y1 [expr {$y0 + $nr - 1}]
+  # the slice columns by their distance from the I/O column of the first PHY region (RPM_X)
+  set io [get_sites -quiet -of_objects [get_clock_regions [lindex $crs 0]] -filter {SITE_TYPE =~ ILOGIC*}]
+  set x0 [lindex [lsort -integer [get_property RPM_X $io]] 0]
+  array set col {}
+  foreach s [get_sites -of_objects [get_clock_regions [lindex $crs 0]] -filter {SITE_TYPE =~ SLICE*}] {
+    if {[regexp {SLICE_X(\d+)Y} $s -> sx]} { set col($sx) [expr {abs([get_property RPM_X $s] - $x0)}] }
+  }
+  set byd {}
+  foreach sx [array names col] { lappend byd [list $col($sx) $sx] }
+  set cols [lsort -integer [lmap e [lrange [lsort -integer -index 0 $byd] 8 31] {lindex $e 1}]]
+  set pb [create_pblock otpu_ddr_rst]
+  resize_pblock $pb -add "SLICE_X[lindex $cols 0]Y${y0}:SLICE_X[lindex $cols end]Y${y1}"
+  set_property IS_SOFT false $pb
+  add_cells_to_pblock $pb $t0
+  puts "otpu_ddr_phy_place: crg_rst_t0 in SLICE_X[lindex $cols 0]Y${y0}:SLICE_X[lindex $cols end]Y${y1}\
+        (between the PHY rows $lo and $hi)"
 }
 
 ::otpu_ddr_phy_place::run
