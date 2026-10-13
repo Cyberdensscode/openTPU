@@ -10,6 +10,7 @@ import re
 import numpy as np
 import pytest
 
+from opentpu import rtlsim
 from opentpu.host import regs as R
 from opentpu.host.board import BASE, BEAT, Board, BoardBackend, SimTransport, join, split
 from opentpu.host.checks import (address_lines, channel_patterns, masked_program, partial_writes,
@@ -270,10 +271,14 @@ def test_stream_on_board_model(have_verilator):
     assert ok, msg
 
 
-@pytest.mark.parametrize("group,name,prog", op_checks(CFG, gen=True, waitw=True),
-                         ids=[name for _, name, _ in op_checks(CFG, gen=True, waitw=True)])
+_OPS = op_checks(CFG, gen=True, waitw=True, gather=rtlsim.gathers(CFG.S))
+
+
+@pytest.mark.parametrize("group,name,prog", _OPS, ids=[name for _, name, _ in _OPS])
 def test_op_check_on_board_model(have_verilator, group, name, prog):
-    """otpu-diag's per-instruction programs (opentpu/host/opchecks.py), bit for bit."""
+    """otpu-diag's per-instruction programs (opentpu/host/opchecks.py), bit for bit; GATHER where
+    the simulated collective unit has it, as otpu-diag takes it from CAPS2 (the card's: BAR
+    alone)."""
     ok, msg, _ = run_demo(Board(SimTransport(ch_bytes=CFG.DRAM_BYTES // 2)), CFG, prog,
                           diag_image(CFG))
     assert ok, msg
