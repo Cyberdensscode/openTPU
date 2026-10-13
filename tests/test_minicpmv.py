@@ -334,14 +334,16 @@ def test_the_piece_table_is_the_static_layout(fmt):
         assert np.array_equal(got.view(np.uint32), outs[0].view(np.uint32))
 
 
-def test_staged_vision_is_the_resident_towers(tiny):
+@pytest.mark.parametrize("pool", [False, True])
+def test_staged_vision_is_the_resident_towers(tiny, pool, tmp_path):
     """Staged vision weights (Spec.vision_staged, docs/minicpmv.md 4.2): the pieces the
     programs read are the pool's entries past the experts, placed in expert slots by the
     expert server for an encode (its victims the least used experts, every slot warm here),
     their table written, the slots released after it. Two images' crops give the resident
     tower's rows bit for bit; the server's slots are each layer's again, and a prompt's
     prefill (the evicted experts missing) and two decode steps give the resident engine's
-    logits bit for bit."""
+    logits bit for bit. pool: the entries in a pool file (the split format, each packed on
+    its first use, as on the card host) instead of host RAM."""
     from types import SimpleNamespace
     from opentpu.llm import minicpmv as MV
     m, d = tiny
@@ -351,7 +353,8 @@ def test_staged_vision_is_the_resident_towers(tiny):
     cfg = device_config(spec, 256, rows=1, lookup=True, S=1, experts=E)
     kw = dict(cap=256, cfg=cfg, rows=1, resident=True, experts=E, layer_major=2)
     a = Engine(spec, W, **kw)
-    b = Engine(replace(spec, vision_staged=True), W, **kw)
+    b = Engine(replace(spec, vision_staged=True), W,
+               **(dict(kw, pool_file=tmp_path / "pool.bin") if pool else kw))
     va, vb = a.image.vision, b.image.vision
     assert va.resident and not vb.resident and vb.max_piece <= b.image.offload.slot_bytes
     assert b.image.pool_extra[0] == vb.npieces and a.image.pool_extra is None
@@ -364,6 +367,11 @@ def test_staged_vision_is_the_resident_towers(tiny):
         rows.append(e.backend.read(0, e.image.vision.work["vis"], 4 * n * spec.vision.out))
     assert n == 7 and np.array_equal(rows[0], rows[1])
     srv = b.server
+    if pool:                            # (the pieces the programs read packed, in the file)
+        pf = srv.pool_file
+        G = srv.L.layers * srv.L.E
+        assert pf.split and len(pf.packed) == G + vb.npieces
+        assert all(pf.packed[G + i] for i in vb.used())
     assert srv.placed == {} and srv.place_victims > 0
     assert srv.place_bytes >= sum(vb.piece_sizes()[i] for i in vb.used())
     assert all(len(srv.lru[j]) + len(srv.free[j]) == E for j in range(srv.L.layers))
