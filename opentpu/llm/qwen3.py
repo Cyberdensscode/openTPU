@@ -149,6 +149,11 @@ def finite(v: np.ndarray, name: str) -> np.ndarray:
                      f"inf; the first at {at}): the checkpoint is corrupt or was converted wrong")
 
 
+# a multimodal checkpoint's vision tower and projector: Qwen3.5's model.visual, MiniCPM-V's
+# model.vision_tower and model.merger (docs/minicpmv.md; their loader is minicpmv's)
+VISION = ("model.visual.", "model.vision_tower.", "model.merger.")
+
+
 class Weights(Mapping):
     """The tensors of a HF safetensors checkpoint, read and converted to fp32 numpy arrays
     when first used (load_weights): a multi-billion-parameter model is never all in memory in
@@ -163,7 +168,7 @@ class Weights(Mapping):
         from safetensors import safe_open
         self.model_dir = Path(model_dir)
         self._files, self._where = [], {}
-        skip = ("model.visual.",) if mtp else ("model.visual.", "mtp.")
+        skip = VISION if mtp else VISION + ("mtp.",)
         for f in sorted(Path(model_dir).glob("*.safetensors")):
             h = safe_open(str(f), framework="pt")
             self._files.append(h)
@@ -226,9 +231,10 @@ class Weights(Mapping):
 
 def load_weights(model_dir, mtp: bool = False) -> Weights:
     """All tensors of a HF safetensors checkpoint as fp32 numpy arrays, converted when first
-    used (Weights). Of a multimodal checkpoint (Qwen3.5) only the language model is loaded,
-    under the names of a text-only one (model.language_model.* -> model.*): not the vision
-    tower, nor the multi-token prediction layers (mtp.*) unless `mtp` (Qwen3.5's drafter,
+    used (Weights). Of a multimodal checkpoint (Qwen3.5, MiniCPM-V) only the language model is
+    loaded, under the names of a text-only one (model.language_model.* -> model.*): not the
+    vision tower and projector (VISION), nor the multi-token prediction layers (mtp.*) unless
+    `mtp` (Qwen3.5's drafter,
     opentpu/llm/mtp.py). Gemma 4: gemma4.load_weights (its PLE table read by rows)."""
     cfg = Path(model_dir) / "config.json"
     if cfg.exists() and json.loads(cfg.read_text()).get("model_type") in ("gemma4",
@@ -253,7 +259,7 @@ class LazyWeights(dict):
         for f in sorted(Path(model_dir).glob("*.safetensors")):
             h = self._h[str(f)] = safe_open(str(f), "pt")
             for k in h.keys():
-                if not k.startswith(("model.visual.", "mtp.")):
+                if not k.startswith(VISION + ("mtp.",)):
                     self._at[k.replace("model.language_model.", "model.", 1)] = (str(f), k)
 
     def _open(self, k):
