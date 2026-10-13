@@ -3,10 +3,13 @@
 #
 #   ./run_vivado.sh [1066]                # native: `vivado` on PATH (x86-64 Linux / Windows WSL)
 #                                         # the LiteDRAM core (DDR3-1066, the one speed it is generated
-#                                         # for; host calibration), MCOLS=4, the systolic MXU
-#   MCOLS=2 ./run_vivado.sh               # 2 MXU columns (4, the default: faster prefill / batched decode)
+#                                         # for; host calibration), the target's default variant, the
+#                                         # systolic MXU
+#   TARGET=ypcb-00338:m4 ./run_vivado.sh  # the target's variant m4 (4 MXU columns at E 4, 64K TMEM words;
+#                                         # m8: 8 at E 8, 128K): targets/ypcb-00338.toml [variants]
+#   MCOLS=2 ./run_vivado.sh               # 2 MXU columns (over the target's)
 #   VPU_CL=4 ./run_vivado.sh              # 4 VPU lanes with exp2/recip/rsqrt (faster softmax)
-#   MXU_E=2 ./run_vivado.sh               # 2 MXU epilogue lanes (the target's: 4, full rate at MCOLS 4)
+#   MXU_E=2 ./run_vivado.sh               # 2 MXU epilogue lanes (the target's: MCOLS, full rate)
 #   LANES=16 ./run_vivado.sh              # 16 VPU lanes / TMEM banks
 #   TMEM_IMPL=1 ./run_vivado.sh           # the banked TMEM (three copies, docs/tmem_pump.md; 0 the default)
 #   TMEM_IMPL=1 TMEM_RQ=1 ./run_vivado.sh # the same with request-priority bank addresses

@@ -8,6 +8,7 @@ name = "ypcb-00338"
 kind = "fpga"
 platform_id = 1                 # the CFG_PLATFORM register
 description = "Inspur YPCB-00338: xc7k480t, 2 x DDR3-1066 (LiteDRAM), XDMA Gen2 x8"
+variant = "m8"                  # the default build's [variants.<name>] (below): ypcb-00338:m4 the other
 
 [arch]                          # opentpu.isasim.Config: what programs depend on
 S = 1
@@ -70,3 +71,16 @@ beat_bytes = 64
 host = "pcie"
 pcie_gen = 2
 pcie_lanes = 8
+
+# Variants (opentpu/target.py: TARGET / OTPU_TARGET = ypcb-00338:<name>): arch and uarch values
+# over the ones above, each variant its own CFG_HASH. The [arch] and [uarch] above state the default
+# variant's.
+[variants.m8]                   # release r2: 8 MX columns at E 8, 128K TMEM words (CFG_HASH 46b96e6d)
+MCOLS = 8
+MXU_E = 8
+TMEM_WORDS = 131072
+
+[variants.m4]                   # MX production 8b33206e's MXU (4 columns, E 4) with the rest of r2,
+MCOLS = 4                       # 64K TMEM words
+MXU_E = 4
+TMEM_WORDS = 65536

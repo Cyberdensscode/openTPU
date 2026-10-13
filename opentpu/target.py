@@ -21,6 +21,10 @@ the environment selects (OTPU_TARGET, default the YPCB-00338 card).
     python3 -m opentpu.target env [NAME]        shell assignments T_<PARAM>=<value> (flows)
     python3 -m opentpu.target files NAME        the RTL file list (sources())
     python3 -m opentpu.target list              the targets
+
+NAME may name a variant, NAME:VARIANT (a target file's [variants.<VARIANT>]: arch and uarch
+values over the file's; the file's [target] variant is the default): OTPU_TARGET=
+ypcb-00338:m8, make -C boards/ypcb-00338 bit TARGET=ypcb-00338:m8.
 """
 from __future__ import annotations
 
@@ -97,6 +101,7 @@ class Target:
     tech: dict
     platform: dict
     path: Path
+    variant: str = ""                   # the [variants.<name>] applied ("": none)
 
     @property
     def family(self) -> str:
@@ -112,8 +117,8 @@ class Target:
         return self.arch["ACT_ROWS"] or self.arch["MCOLS"]
 
     def to_dict(self) -> dict:
-        d = {k: getattr(self, k) for k in ("name", "kind", "platform_id", "description",
-                                          "arch", "uarch", "tech", "platform")}
+        d = {k: getattr(self, k) for k in ("name", "variant", "kind", "platform_id",
+                                          "description", "arch", "uarch", "tech", "platform")}
         d["arch_hash"] = f"{arch_hash(config(self)):08x}"
         return d
 
@@ -129,9 +134,12 @@ def _config_fields() -> dict:
 
 @lru_cache(maxsize=None)
 def load(name: str | None = None) -> Target:
-    """The target `name` (a name in targets/ or a path to a .toml file; None: current())."""
+    """The target `name` (a name in targets/ or a path to a .toml file; None: current()), with
+    a variant: `name:variant` (a [variants.<variant>] table of the file: arch and uarch values
+    over the file's), else the file's own [target] variant, if it names one."""
     if name is None:
         return current()
+    name, _, var = str(name).partition(":")
     p = Path(name)
     path = p if p.suffix == ".toml" and p.exists() else TARGETS / f"{name}.toml"
     if not path.exists():
@@ -142,6 +150,29 @@ def load(name: str | None = None) -> Target:
     for sec in ("target", "arch", "uarch", "tech", "platform"):
         if sec not in raw:
             raise TargetError(f"{path}: no [{sec}] section")
+    variants = raw.get("variants", {})
+    base = t.get("variant", "")         # the file states its default variant's values
+    if base:
+        if base not in variants:
+            raise TargetError(f"{path}: [target] variant {base!r} has no [variants.{base}]")
+        diff = sorted(k for k, v in variants[base].items()
+                      if raw["arch"].get(k, raw["uarch"].get(k)) != v)
+        if diff:
+            raise TargetError(f"{path}: [arch] / [uarch] {diff} differ from the default variant "
+                              f"{base!r}'s")
+    var = var or base
+    if var:
+        if var not in variants:
+            raise TargetError(f"{path}: no variant {var!r} (its variants: "
+                              f"{', '.join(sorted(variants)) or 'none'})")
+        raw["arch"], raw["uarch"] = dict(raw["arch"]), dict(raw["uarch"])
+        for k, v in variants[var].items():
+            if k in raw["arch"]:
+                raw["arch"][k] = v
+            elif k in raw["uarch"] or k in UARCH_KEYS + ("MXU_E",) + TMEM3_KEYS:
+                raw["uarch"][k] = v
+            else:
+                raise TargetError(f"{path}: variant {var!r}: {k} is not an [arch] or [uarch] key")
     cf = _config_fields()
     bad = sorted(set(raw["arch"]) - set(cf))
     if bad:
@@ -172,7 +203,8 @@ def load(name: str | None = None) -> Target:
                           f"(more slices, or the reserved window register: docs/targets.md)")
     return Target(name=path.stem, kind=t["kind"], platform_id=int(t.get("platform_id", 0)),
                   description=t.get("description", ""), arch=dict(a), uarch=dict(raw["uarch"]),
-                  tech=dict(raw["tech"]), platform=dict(raw["platform"]), path=path)
+                  tech=dict(raw["tech"]), platform=dict(raw["platform"]), path=path,
+                  variant=var)
 
 
 def by_platform(pid: int) -> Target | None:
@@ -321,7 +353,7 @@ def main(argv: list[str]) -> int:
     if cmd == "json":
         print(json.dumps(t.to_dict() | {"rtl_params": rtl_params(t)}, indent=1, default=str))
     elif cmd == "show":
-        print(f"{t.name} ({t.kind}): {t.description}")
+        print(f"{t.name}{':' + t.variant if t.variant else ''} ({t.kind}): {t.description}")
         for sec in ("arch", "uarch", "tech", "platform"):
             print(f"  [{sec}] " + " ".join(f"{k}={_fmt(v)}" for k, v in getattr(t, sec).items()))
         print(f"  arch_hash {arch_hash(config(t)):08x}")

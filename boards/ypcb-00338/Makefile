@@ -1,8 +1,8 @@
 # openTPU on the Inspur YPCB-00338.
 #   make lint       offline: Tcl syntax, XDC ports vs the top, Verilator lint of the build
 #                   (otpu_fpga_top_ld; lint-ld is the same)
-#   make bit        Vivado batch build (MCOLS=4|8, VPU_CL=2|4, LANES=8|16, CORE_MHZ=133.33|100, FAST=1) -> build/vivado/otpu.bit (VIVADO_DOCKER=image for Docker)
-#                   the LiteDRAM core (DDR3-1066, host calibration), the target's MCOLS 8, the systolic MXU
+#   make bit        Vivado batch build (TARGET=ypcb-00338:m4|m8, MCOLS=4|8, VPU_CL=2|4, LANES=8|16, CORE_MHZ=133.33|100, FAST=1) -> build/vivado/otpu.bit (VIVADO_DOCKER=image for Docker)
+#                   the LiteDRAM core (DDR3-1066, host calibration), the target's variant (its MCOLS, MXU_E, TMEM_WORDS), the systolic MXU
 #   make impl       rerun implementation only on the existing project (constraint changes)
 #   make program    JTAG load (openFPGALoader; BIT=path, default build/vivado/otpu.bit); make program-vivado with Vivado's hw_server
 #   make flash      write the BPI flash (permanent; MCS=path, default build/vivado/otpu.mcs)
@@ -13,12 +13,14 @@ DDR ?= 1066
 # CORE_MHZ: accelerator clock, default 133.33 (800 / 6: the 128-byte port matches both DDR3-1066
 #   channels, 17.07 GB/s; the production image closes it at full effort) or 100 with FAST=1 (a
 #   development build: Vivado's default strategies)
-# MCOLS: MXU columns, 4 or 8 (default the target's: 8; the host reads it from the bitstream's VERSION register)
+# TARGET: the target and its variant (targets/ypcb-00338.toml [variants]: m8, the default, 8 columns at E 8
+#   and 128K TMEM words; m4, 4 columns at E 4 and 64K); the knobs below override it
+# MCOLS: MXU columns, 4 or 8 (default the target's; the host reads it from the bitstream's VERSION register)
 # VPU_CL: VPU lanes with exp2/recip/rsqrt, 2 or 4 (timing only: the programs do not change)
 # LANES: VPU lanes / TMEM banks, 8 or 16 (timing only; the host reads it from VERSION)
 # ACT_ROWS: ACT RAM rows, the most rows of one MM (default the target's: 16, the MX build's; the
 #   MXU replays each streamed weight chunk per MCOLS rows; MCOLS: no replay)
-# MXU_E: the MXU's epilogue lanes (timing only; default the target's: 8, MCOLS: full rate)
+# MXU_E: the MXU's epilogue lanes (timing only; default the target's: MCOLS, full rate)
 # TMEM_IMPL: the TMEM (timing only; default the target's: 3), 0 a copy per read port (production
 #   8b33206e), 1 banked (three copies, docs/tmem_pump.md; TMEM_RQ=1 with it: the banks' addresses
 #   from the requests by priority), 3 one copy (docs/tmem_nocopy.md; TMEM_X its knobs over the
@@ -31,9 +33,9 @@ CORE_MHZ ?= 100
 else
 CORE_MHZ ?= 133.33
 endif
-MCOLS ?= 8
-VPU_CL ?= 2
-LANES ?= 8
+MCOLS ?=
+VPU_CL ?=
+LANES ?=
 ACT_ROWS ?=
 MXU_E ?=
 RTL := $(addprefix $(ROOT)/rtl/, vpu/otpu_fp.sv vpu/otpu_fpipe.sv top/otpu_pkg.sv \
@@ -48,7 +50,8 @@ RTL := $(addprefix $(ROOT)/rtl/, vpu/otpu_fp.sv vpu/otpu_fpipe.sv top/otpu_pkg.s
 # DSP48E1 comes from a lint stub
 MXU_IMPL ?= 2
 LINT := verilator --lint-only -Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNUSEDSIGNAL \
-  -Wno-UNUSEDPARAM -DSYNTHESIS -GMCOLS=$(MCOLS) -GACT_ROWS=$(or $(ACT_ROWS),16) -GMXU_E=$(or $(MXU_E),8) -GVPU_CL=$(VPU_CL) -GLANES=$(LANES) \
+  -Wno-UNUSEDPARAM -DSYNTHESIS $(if $(MCOLS),-GMCOLS=$(MCOLS)) $(if $(ACT_ROWS),-GACT_ROWS=$(ACT_ROWS)) $(if $(MXU_E),-GMXU_E=$(MXU_E)) \
+  $(if $(VPU_CL),-GVPU_CL=$(VPU_CL)) $(if $(LANES),-GLANES=$(LANES)) $(if $(TMEM_WORDS),-GTMEM_WORDS=$(TMEM_WORDS)) \
   -GMXU_IMPL=$(MXU_IMPL) sim/unisim_dsp48e1_stub.sv
 
 .PHONY: lint lint-ld bit impl program program-vivado flash
@@ -60,7 +63,7 @@ lint:
 lint-ld: lint
 
 bit:
-	MCOLS=$(MCOLS) $(if $(ACT_ROWS),ACT_ROWS=$(ACT_ROWS)) $(if $(MXU_E),MXU_E=$(MXU_E)) VPU_CL=$(VPU_CL) LANES=$(LANES) CORE_MHZ=$(CORE_MHZ) $(if $(TMEM_IMPL),TMEM_IMPL=$(TMEM_IMPL)) $(if $(TMEM_RQ),TMEM_RQ=$(TMEM_RQ)) $(if $(TMEM_X),TMEM_X=$(TMEM_X)) $(if $(TMEM_WORDS),TMEM_WORDS=$(TMEM_WORDS)) $(if $(BUILD_ID),BUILD_ID=$(BUILD_ID)) ./run_vivado.sh $(DDR)
+	$(if $(TARGET),TARGET=$(TARGET)) $(if $(MCOLS),MCOLS=$(MCOLS)) $(if $(ACT_ROWS),ACT_ROWS=$(ACT_ROWS)) $(if $(MXU_E),MXU_E=$(MXU_E)) $(if $(VPU_CL),VPU_CL=$(VPU_CL)) $(if $(LANES),LANES=$(LANES)) CORE_MHZ=$(CORE_MHZ) $(if $(TMEM_IMPL),TMEM_IMPL=$(TMEM_IMPL)) $(if $(TMEM_RQ),TMEM_RQ=$(TMEM_RQ)) $(if $(TMEM_X),TMEM_X=$(TMEM_X)) $(if $(TMEM_WORDS),TMEM_WORDS=$(TMEM_WORDS)) $(if $(BUILD_ID),BUILD_ID=$(BUILD_ID)) ./run_vivado.sh $(DDR)
 
 impl:
 	STEP=impl ./run_vivado.sh $(DDR)

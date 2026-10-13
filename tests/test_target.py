@@ -41,9 +41,10 @@ def test_every_target_loads():
 
 def test_board_config_is_the_card_by_default(no_env):
     """board_config() before targets: the same Config (its fields are in every cache key), but
-    for the MX build's ACT_ROWS 16 (0 before) and release r2's MCOLS 8 (4 before)."""
+    for the MX build's ACT_ROWS 16 (0 before) and release r2's MCOLS 8 (4 before) and 128K TMEM
+    words (64K before)."""
     legacy = Config(S=1, D=128, MCOLS=8, ACT_BLOCKS=128, LANES=8, ACT_ROWS=16,
-                    TMEM_WORDS=1 << 16, IMEM_WORDS=1 << 15, DRAM_BYTES=1 << 32, PAIR=False,
+                    TMEM_WORDS=1 << 17, IMEM_WORDS=1 << 15, DRAM_BYTES=1 << 32, PAIR=False,
                     DSTEP=False, STREAM=False)
     assert board_config() == legacy
     assert T.current().name == "ypcb-00338"
@@ -53,6 +54,9 @@ def test_board_config_is_the_card_by_default(no_env):
 
 
 def test_board_config_follows_otpu_target(no_env):
+    no_env.setenv("OTPU_TARGET", "ypcb-00338:m4")              # a variant (test_card_variants)
+    c = board_config()
+    assert (c.MCOLS, c.ACT_ROWS, c.TMEM_WORDS) == (4, 16, 1 << 16)
     no_env.setenv("OTPU_TARGET", "bcu1525")
     c = board_config()
     assert (c.S, c.D, c.MCOLS, c.DRAM_BYTES) == (2, 128, 4, 1 << 32)
@@ -96,6 +100,33 @@ def test_arch_hash_is_stable_and_sensitive():
         other = dataclasses.replace(card, **{f.name: (not v) if isinstance(v, bool) else v * 2
                                              if v else 1})
         assert T.arch_hash(other) != T.arch_hash(card), f.name
+
+
+def test_card_variants(tmp_path):
+    """targets/ypcb-00338.toml's variants (TARGET / OTPU_TARGET ypcb-00338:<name>): m8, the
+    default (release r2: 8 MX columns at E 8, 128K TMEM words), and m4 (MX production 8b33206e's
+    MXU, 4 columns at E 4, 64K words, with the rest of r2), each its own CFG_HASH (pinned: the
+    bitstreams report them)."""
+    m8, m4 = T.load("ypcb-00338:m8"), T.load("ypcb-00338:m4")
+    assert T.load("ypcb-00338").variant == "m8" and T.config("ypcb-00338") == T.config(m8)
+    c4 = T.config(m4)
+    assert (c4.MCOLS, c4.ACT_ROWS, c4.TMEM_WORDS, c4.SEQ_WC, m4.uarch["MXU_E"]) == \
+        (4, 16, 65536, True, 4)
+    assert f"{T.arch_hash(T.config(m8)):08x}" == "46b96e6d"
+    assert f"{T.arch_hash(c4):08x}" == "4ffd1e17"
+    p = T.rtl_params(m4)
+    assert (p["MCOLS"], p["MXU_E"], p["TMEM_WORDS"], p["ARCH_HASH"]) == (4, 4, 65536, 0x4ffd1e17)
+    # run_vivado.sh's CFG_HASH: the variant's knobs on the variant
+    assert T.arch_hash(T.build_config(m4, MCOLS=4, LANES=8, ACT_ROWS=16, TMEM_WORDS=65536,
+                                      DSTEP=1, SEQ_WC=1)) == 0x4ffd1e17
+    with pytest.raises(T.TargetError, match="no variant 'm9'"):
+        T.load("ypcb-00338:m9")
+    # the file's [arch] / [uarch] state its default variant's values
+    p = tmp_path / "ypcb-00338.toml"
+    p.write_text((ROOT / "targets/ypcb-00338.toml").read_text().replace(
+        'variant = "m8"', 'variant = "m4"'))
+    with pytest.raises(T.TargetError, match="differ from the default variant 'm4'"):
+        T.load(str(p))
 
 
 def test_build_config_applies_the_flow_knobs():
@@ -148,6 +179,9 @@ def test_target_cli():
     env = dict(line.split("=", 1) for line in run("env", "ypcb-00338").split())
     assert (env["T_MCOLS"], env["T_ACT_ROWS"], env["T_PLATFORM"], env["T_ARCH_HASH"],
             env["T_TMEM_WORDS"]) == ("8", "16", "1", "46b96e6d", "131072")  # release r2
+    env = dict(line.split("=", 1) for line in run("env", "ypcb-00338:m4").split())
+    assert (env["T_MCOLS"], env["T_MXU_E"], env["T_TMEM_WORDS"], env["T_ARCH_HASH"]) == \
+        ("4", "4", "65536", "4ffd1e17")                 # its variant m4 (run_vivado.sh TARGET)
     # r2's dev build 83740e79 (64K words); MX production 8b33206e's (MCOLS 4, no wait entries),
     # and its 4-row build's
     assert run("hash", "ypcb-00338", "MCOLS=8", "LANES=8", "ACT_ROWS=16", "TMEM_WORDS=65536",
