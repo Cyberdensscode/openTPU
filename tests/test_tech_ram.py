@@ -29,7 +29,7 @@ def _trace(tmp: Path, family: str, w: int, n: int, kind: int, seed: int) -> list
     obj.mkdir(parents=True)
     srcs = [ROOT / f"rtl/tech/{family}/otpu_tech_ram.sv", ROOT / "sim/tech/tb_tech_ram.sv"]
     if family == "asic":
-        ms = tiles("1rw" if kind == 2 else "1r1w", w, n)
+        ms = tiles({2: "1rw", 3: "1rw1r"}.get(kind, "1r1w"), w, n)
         for m in ms:
             srcs.append(fakeram.write(m, tmp / "macros")["v"])
         (tmp / "map.sv").write_text(flow.sram_map(sorted(ms, key=lambda m: m.name)))
@@ -48,7 +48,9 @@ def _trace(tmp: Path, family: str, w: int, n: int, kind: int, seed: int) -> list
 @pytest.mark.parametrize("w,n,kind", [(40, 8192, 0),      # depth tiles
                                       (200, 64, 0),       # width tiles (128 + 72)
                                       (64, 256, 1),       # byte enables
-                                      (130, 8192, 2)])    # one port, both tilings
+                                      (130, 8192, 2),     # one port, both tilings
+                                      (40, 8192, 3),      # two ports (1RW1R), read first
+                                      (200, 64, 3)])
 def test_asic_rams_match_generic(tmp_path, w, n, kind):
     g = _trace(tmp_path / "g", "generic", w, n, kind, 3)
     a = _trace(tmp_path / "a", "asic", w, n, kind, 3)
@@ -64,7 +66,7 @@ def test_families_define_the_same_rams():
             norm = lambda s: re.sub(r"\s+", " ", s).strip()   # noqa: E731
             mods[m.group(1)] = (norm(m.group(2)), norm(m.group(3)))
         return mods
-    pub = {"otpu_ram_1r1w", "otpu_ram_1r1w_be", "otpu_ram_1rw"}
+    pub = {"otpu_ram_1r1w", "otpu_ram_1r1w_be", "otpu_ram_1rw", "otpu_ram_1rw1r"}
     g = iface(ROOT / "rtl/tech/generic/otpu_tech_ram.sv")
     a = iface(ROOT / "rtl/tech/asic/otpu_tech_ram.sv")
     assert set(g) == pub and pub <= set(a)

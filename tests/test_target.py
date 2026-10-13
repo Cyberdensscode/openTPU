@@ -93,8 +93,8 @@ def test_arch_hash_is_stable_and_sensitive():
     # production's CFG_HASH (ACT_ROWS 4, the previous numerics), what a host of the previous
     # numerics computes for it: it refuses MX builds (T.NUMERICS)
     assert f"{_hash_without_numerics(four):08x}" == "e170f967"
-    # the ASIC reference keeps the card's arch but for its ACT RAM rows (MCOLS)
-    assert T.arch_hash(four) == T.arch_hash(T.config("nangate45")), "same arch, same programs"
+    # the ASIC's card point is the card's arch (release r2's m4: docs/asic.md)
+    assert T.arch_hash(card) == T.arch_hash(T.config("nangate45")), "same arch, same programs"
     for f in dataclasses.fields(Config):
         v = getattr(card, f.name)
         other = dataclasses.replace(card, **{f.name: (not v) if isinstance(v, bool) else v * 2

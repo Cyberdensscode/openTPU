@@ -2,16 +2,22 @@
 
 NanGate45 has no memory compiler. OpenROAD-flow-scripts' designs use bsg_fakeram's macros
 (fakeram45_*: one read/write port, 1RW); a banked openTPU TMEM needs one read and one write port
-per bank per cycle (1R1W, otpu_tmem IMPL 1), which bsg_fakeram does not make. This generator makes
-both, in bsg_fakeram's form (the same pin names, layers and power straps), so the flow treats them
-like the fakeram45 macros:
+per bank per cycle (1R1W, otpu_tmem IMPL 1), and the one copy (otpu_tmem IMPL 3 TDP) a dual-port
+RAM, one port reading or writing and the other reading (1RW1R), which bsg_fakeram does not make.
+This generator makes all three, in bsg_fakeram's form (the same pin names, layers and power
+straps), so the flow treats them like the fakeram45 macros:
 
-    1RW   clk, ce_in, we_in, addr_in[A], wd_in[W], w_mask_in[W], rd_out[W]
-    1R1W  clk, re_in, r_addr_in[A], we_in, w_addr_in[A], wd_in[W], w_mask_in[W], rd_out[W]
+    1RW    clk, ce_in, we_in, addr_in[A], wd_in[W], w_mask_in[W], rd_out[W]
+    1R1W   clk, re_in, r_addr_in[A], we_in, w_addr_in[A], wd_in[W], w_mask_in[W], rd_out[W]
+    1RW1R  clk, ce_in, we_in, addr_in[A], wd_in[W], w_mask_in[W], rd_out[W] (port 0: a read or
+           a write), ce1_in, addr1_in[A], rd1_out[W] (port 1: a read)
 
-All controls are active high. A read (ce_in & !we_in, or re_in) registers mem[addr] into rd_out at
-the rising edge, which holds otherwise; a write stores wd_in's bits where w_mask_in is 1. A 1R1W
-read of the word written at the same edge is undefined (the model returns X).
+All controls are active high. A read (ce_in & !we_in, re_in, ce1_in) registers mem[addr] into
+rd_out at the rising edge, which holds otherwise; a write stores wd_in's bits where w_mask_in is 1.
+A 1R1W read of the word written at the same edge is undefined (the model returns X). A 1RW1R
+macro reads first: port 0's write cycle registers the word before the write into rd_out, and a
+port-1 read of the word being written returns the word before it, as the FPGA's true dual-port
+block RAM in READ_FIRST (otpu_tmem's TDP replays depend on it: docs/asic.md).
 
 Model (fitted to the 24 fakeram45_* macros of ORFS's nangate45 platform, which bsg_fakeram made
 with CACTI; the 128x256 and 64x256 macros, whose heights were tuned by hand, are left out):
@@ -22,7 +28,8 @@ with CACTI; the 128x256 and 64x256 macros, whose heights were tuned by hand, are
     clk internal power = 4.569 * W^0.989 * N^0.485       (the library's units; worst 27%)
 
 A 1R1W macro is 1.5x the 1RW's area (an 8T bit cell, about 1.3x, and a second decoder) and 1.2x
-its clock power, with the same read timing. Setup and hold are 0.05 ns on every input, input
+its clock power, with the same read timing; a 1RW1R macro (the same two-port cell and decoders,
+write drivers on one port) the same as the 1R1W. Setup and hold are 0.05 ns on every input, input
 capacitance 5 fF (clk 25 fF), as in fakeram45. Leakage is 0, as in fakeram45 (the power estimate
 is dynamic). Geometry: the pins on the left edge on metal3 at a 0.28 um pitch (rd_out, wd_in,
 w_mask_in, then the addresses and controls, 2.24 um between groups; every pin on the 0.14 um
@@ -30,7 +37,8 @@ metal3 track grid), VDD / VSS straps on
 metal4 at a 4.48 um pitch, metal1-metal3 obstructed except the pin column, metal4 except the
 straps; the height fits the pins and the size is snapped to the 0.19 x 1.4 um site.
 
-    python3 tools/asic/fakeram.py OUT_DIR 1r1w:8192x32 1rw:1024x64 ...   (N x W: depth x width)
+    python3 tools/asic/fakeram.py OUT_DIR 1r1w:8192x32 1rw:1024x64 1rw1r:4096x32 ...
+                                                                    (N x W: depth x width)
 """
 from __future__ import annotations
 
@@ -47,7 +55,8 @@ SITE_W, SITE_H = 0.19, 1.4
 STRAP_W, STRAP_PITCH = 0.28, 4.48
 SETUP = HOLD = 0.05
 CAP_IN, CAP_CLK, MAX_CAP = 5.0, 25.0, 500.0
-R1W1_AREA, R1W1_POWER = 1.5, 1.2
+R1W1_AREA, R1W1_POWER = 1.5, 1.2          # two-port (1R1W, 1RW1R) against 1RW
+KINDS = ("1rw", "1r1w", "1rw1r")
 
 
 def _snap(v: float, step: float) -> float:
@@ -56,13 +65,13 @@ def _snap(v: float, step: float) -> float:
 
 @dataclass(frozen=True)
 class Macro:
-    kind: str           # "1rw" | "1r1w"
+    kind: str           # "1rw" | "1r1w" | "1rw1r"
     depth: int          # words
     width: int          # bits per word
 
     def __post_init__(self):
-        if self.kind not in ("1rw", "1r1w"):
-            raise ValueError(f"kind {self.kind!r}: 1rw or 1r1w")
+        if self.kind not in KINDS:
+            raise ValueError(f"kind {self.kind!r}: one of {', '.join(KINDS)}")
         if self.depth < 2 or self.width < 1:
             raise ValueError(f"{self.depth}x{self.width}: depth >= 2, width >= 1")
 
@@ -78,7 +87,7 @@ class Macro:
     @property
     def area_model(self) -> float:
         a = 1.486 * self.width ** 1.022 * self.depth ** 0.840
-        return a * (R1W1_AREA if self.kind == "1r1w" else 1.0)
+        return a * (1.0 if self.kind == "1rw" else R1W1_AREA)
 
     @property
     def clk_to_q(self) -> float:
@@ -93,7 +102,7 @@ class Macro:
     @property
     def clk_power(self) -> float:
         p = 4.569 * self.width ** 0.989 * self.depth ** 0.485
-        return round(p * (R1W1_POWER if self.kind == "1r1w" else 1.0), 3)
+        return round(p * (1.0 if self.kind == "1rw" else R1W1_POWER), 3)
 
     # ---- pins, in edge order: (group, [(name, direction)])
     def pin_groups(self) -> list[list[tuple[str, str]]]:
@@ -103,6 +112,10 @@ class Macro:
         if self.kind == "1rw":
             g += [bus("addr_in", a, "INPUT"), [("we_in", "INPUT"), ("ce_in", "INPUT"),
                                                 ("clk", "INPUT")]]
+        elif self.kind == "1rw1r":
+            g = [bus("rd_out", w, "OUTPUT"), bus("rd1_out", w, "OUTPUT")] + g[1:]
+            g += [bus("addr_in", a, "INPUT"), bus("addr1_in", a, "INPUT"),
+                  [("we_in", "INPUT"), ("ce_in", "INPUT"), ("ce1_in", "INPUT"), ("clk", "INPUT")]]
         else:
             g += [bus("r_addr_in", a, "INPUT"), bus("w_addr_in", a, "INPUT"),
                   [("re_in", "INPUT"), ("we_in", "INPUT"), ("clk", "INPUT")]]
@@ -216,31 +229,39 @@ def liberty(m: Macro) -> str:
         L += [f"    type ({n}_{t}) {{", "        base_type : array ;", "        data_type : bit ;",
               f"        bit_width : {bits};", f"        bit_from : {bits - 1};", "        bit_to : 0 ;",
               "        downto : true ;", "    }"]
-    raddr = "addr_in" if m.kind == "1rw" else "r_addr_in"
-    waddr = "addr_in" if m.kind == "1rw" else "w_addr_in"
+    # the read data buses and their addresses, the write's address, the controls, the addresses
+    if m.kind == "1rw":
+        reads, waddr = [("rd_out", "addr_in")], "addr_in"
+        ctrls, addrs = ["we_in", "ce_in"], ["addr_in"]
+    elif m.kind == "1rw1r":
+        reads, waddr = [("rd_out", "addr_in"), ("rd1_out", "addr1_in")], "addr_in"
+        ctrls, addrs = ["we_in", "ce_in", "ce1_in"], ["addr_in", "addr1_in"]
+    else:
+        reads, waddr = [("rd_out", "r_addr_in")], "w_addr_in"
+        ctrls, addrs = ["we_in", "re_in"], ["r_addr_in", "w_addr_in"]
     L += [f"    cell({n}) {{", f"        area : {w * h:.3f};", "        interface_timing : true;",
           "        memory() {", "            type : ram;", f"            address_width : {m.abits};",
           f"            word_width : {m.width};", "        }",
           "        pin(clk) {", "            direction : input;", f"            capacitance : {CAP_CLK:.3f};",
           "            clock : true;", f"            min_period : {m.min_period:.3f};"]
     L += _power("            ", m.clk_power)
-    L += ["        }", "        bus(rd_out) {", f"            bus_type : {n}_DATA;",
-          "            direction : output;", f"            max_capacitance : {MAX_CAP:.3f};",
-          "            memory_read() {", f"                address : {raddr};", "            }",
-          "            timing() {", '                related_pin : "clk";',
-          "                timing_type : rising_edge;", "                timing_sense : non_unate;",
-          f'                cell_rise(scalar) {{ values ("{m.clk_to_q:.3f}"); }}',
-          f'                cell_fall(scalar) {{ values ("{m.clk_to_q:.3f}"); }}',
-          f"                rise_transition({n}_slew) {{ index_1 (\"5.000, 500.000\"); "
-          'values ("0.009, 0.227"); }',
-          f"                fall_transition({n}_slew) {{ index_1 (\"5.000, 500.000\"); "
-          'values ("0.009, 0.227"); }', "            }", "        }"]
-    ctrls = ["we_in", "ce_in"] if m.kind == "1rw" else ["we_in", "re_in"]
+    L += ["        }"]
+    for rd, raddr in reads:
+        L += [f"        bus({rd}) {{", f"            bus_type : {n}_DATA;",
+              "            direction : output;", f"            max_capacitance : {MAX_CAP:.3f};",
+              "            memory_read() {", f"                address : {raddr};", "            }",
+              "            timing() {", '                related_pin : "clk";',
+              "                timing_type : rising_edge;", "                timing_sense : non_unate;",
+              f'                cell_rise(scalar) {{ values ("{m.clk_to_q:.3f}"); }}',
+              f'                cell_fall(scalar) {{ values ("{m.clk_to_q:.3f}"); }}',
+              f"                rise_transition({n}_slew) {{ index_1 (\"5.000, 500.000\"); "
+              'values ("0.009, 0.227"); }',
+              f"                fall_transition({n}_slew) {{ index_1 (\"5.000, 500.000\"); "
+              'values ("0.009, 0.227"); }', "            }", "        }"]
     for c in ctrls:
         L += [f"        pin({c}) {{", "            direction : input;",
               f"            capacitance : {CAP_IN:.3f};"]
         L += _constraints("            ") + _power("            ", pin_pow) + ["        }"]
-    addrs = ["addr_in"] if m.kind == "1rw" else ["r_addr_in", "w_addr_in"]
     for a in addrs:
         L += [f"        bus({a}) {{", f"            bus_type : {n}_ADDRESS;",
               "            direction : input;", f"            capacitance : {CAP_IN:.3f};"]
@@ -267,6 +288,20 @@ def verilog(m: Macro, blackbox: bool = False) -> str:
                 "  always @(posedge clk)\n    if (ce_in) begin\n"
                 "      if (we_in) mem[addr_in] <= (wd_in & w_mask_in) | (mem[addr_in] & ~w_mask_in);\n"
                 "      else rd_out <= mem[addr_in];\n    end\n")
+    elif m.kind == "1rw1r":
+        # read first: port 0's write cycle, and a port-1 read of the word written, take the word
+        # before the write
+        ports = (f"  input clk,\n  input ce_in,\n  input we_in,\n  input [{A - 1}:0] addr_in,\n"
+                 f"  input [{W - 1}:0] wd_in,\n  input [{W - 1}:0] w_mask_in,\n"
+                 f"  output reg [{W - 1}:0] rd_out,\n  input ce1_in,\n"
+                 f"  input [{A - 1}:0] addr1_in,\n  output reg [{W - 1}:0] rd1_out")
+        body = (f"  reg [{W - 1}:0] mem [0:{m.depth - 1}];\n"
+                "  always @(posedge clk) begin\n"
+                "    if (ce_in) begin\n"
+                "      rd_out <= mem[addr_in];\n"
+                "      if (we_in) mem[addr_in] <= (wd_in & w_mask_in) | (mem[addr_in] & ~w_mask_in);\n"
+                "    end\n"
+                "    if (ce1_in) rd1_out <= mem[addr1_in];\n  end\n")
     else:
         ports = (f"  input clk,\n  input re_in,\n  input [{A - 1}:0] r_addr_in,\n  input we_in,\n"
                  f"  input [{A - 1}:0] w_addr_in,\n  input [{W - 1}:0] wd_in,\n"

@@ -3,8 +3,8 @@
     python3 tools/asic/paths.py POINT [N] [STAGE]   # N worst endpoints (default 200) of STAGE
                                                     # (6_final; 4_cts, 5_route) -> paths.json
 
-Runs tools/asic/paths.tcl in the ORFS container on the design (report_checks, one path per
-endpoint), then names each path's start and end register by unit (the instance below the slice:
+Runs tools/asic/paths.tcl with ORFS (native where ORFS_HOME names one, else the container) on the
+design (report_checks, one path per endpoint), then names each path's start and end register by unit (the instance below the slice:
 u_seq, u_vpu, u_quant, u_mxu, u_dma, u_tmem, u_act; "slice" for the slice's own registers, the
 TMEM arbiter's) and stage, and gives the path a kind:
 
@@ -45,13 +45,20 @@ FADD_STAGE = {"s1": "fadd.s1", "s2": "fadd.s2", "s3": "fadd.s3", "r": "fadd.s4",
 
 
 def run(point: str, n: int, stage: str) -> Path:
+    """paths.tcl through ORFS's `make run`: the native ORFS where ORFS_HOME names one (as
+    flow.run), else the Docker image."""
     o = flow.out_dir(point)
     out = o / f"paths_{stage}.txt"
-    cmd = ["docker", "run", "--rm", "--platform", "linux/amd64", "--cpus=4",
-           "-v", f"{flow.ROOT}:{flow.ROOT}", "-w", str(flow.ROOT), flow.IMAGE, "bash", "-lc",
-           f"cd /OpenROAD-flow-scripts && source env.sh >/dev/null 2>&1; cd flow && "
-           f"PATHS_N={n} PATHS_ALL=100000 PATHS_OUT={out} PATHS_STAGE={stage} make DESIGN_CONFIG={o / 'config.mk'} "
-           f"WORK_HOME={o / 'work'} RUN_SCRIPT={HERE / 'paths.tcl'} run"]
+    make = (f"PATHS_N={n} PATHS_ALL=100000 PATHS_OUT={out} PATHS_STAGE={stage} make "
+            f"DESIGN_CONFIG={o / 'config.mk'} WORK_HOME={o / 'work'} "
+            f"RUN_SCRIPT={HERE / 'paths.tcl'} {os.environ.get('ORFS_VARS', '')} run")
+    orfs = flow.orfs_home()
+    if orfs:
+        cmd = ["bash", "-c", f"cd {orfs} && source env.sh >/dev/null 2>&1; cd flow && {make}"]
+    else:
+        cmd = ["docker", "run", "--rm", "--platform", "linux/amd64", "--cpus=4",
+               "-v", f"{flow.ROOT}:{flow.ROOT}", "-w", str(flow.ROOT), flow.IMAGE, "bash", "-lc",
+               f"cd /OpenROAD-flow-scripts && source env.sh >/dev/null 2>&1; cd flow && {make}"]
     with open(o / "paths.log", "w") as log:
         r = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT)
     if r.returncode or not out.exists():

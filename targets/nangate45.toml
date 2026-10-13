@@ -1,7 +1,9 @@
 # openTPU as an ASIC in NanGate45 (FreePDK45; not manufacturable: PPA numbers and a rehearsal
-# for a tapeout; docs/asic.md). The card's architecture, so it runs the card's programs: the
-# same token-exact tests apply to its RTL. ASIC micro-architecture: TMEM in LANES banks of one
-# 1R1W macro each (no per-port copies), the MXU's cells generic (rtl/tech/generic).
+# for a tapeout; docs/asic.md). The card's architecture (release r2's m4: targets/ypcb-00338.toml),
+# so it runs the card's programs: the same token-exact tests apply to its RTL. ASIC
+# micro-architecture: TMEM one copy of two-port 1RW1R macros at the core clock (no pump, no
+# per-port copies: docs/tmem_nocopy.md 6.4 and 9, the ASIC form), the MXU's cells generic
+# (rtl/tech/generic).
 
 [target]
 name = "nangate45"
@@ -14,7 +16,7 @@ S = 1
 D = 128
 MCOLS = 4
 ACT_BLOCKS = 128
-ACT_ROWS = 0
+ACT_ROWS = 16                   # the card's (r2 m4): MMs of up to 16 rows (replay)
 TMEM_WORDS = 65536
 IMEM_WORDS = 32768
 DRAM_BYTES = 4294967296
@@ -22,22 +24,30 @@ LANES = 8
 PAIR = true
 DSTEP = true
 STREAM = true
-SEQ_WC = false                  # the sequencer's wait entries (WAITC, EXPERIMENTAL: docs/seq_vpu.md):
-#                                 the host loads them with every program; needs WIN <= 16
+SEQ_WC = true                   # the sequencer's wait entries (WAITC v2, docs/seq_vpu.md; the
+#                                 card's since r2): the host loads them with every program
 
 [uarch]
 MXU_IMPL = 2
 MXU_CL = 16
+MXU_E = 4                       # the card's m4: MCOLS epilogue lanes
 VPU_CL = 2
 ULANES = 8
-TMEM_IMPL = 1                   # banked: one 1R1W macro per bank
-RPB = 1
+TMEM_IMPL = 3                   # one copy (docs/tmem_nocopy.md), its ASIC form r2xgR:
+TMEM_NSB = 2                    #   2 RAMs a bank: 16 macros of 4096 x 32 at 64K words,
+TMEM_RPL = true                 #   lost reads replayed under the board's arbiter,
+TMEM_TDP = true                 #   two-port RAMs (1RW1R macros: the write on port A),
+TMEM_GST = true                 #   QUANT 3 and COLL the DMA's guests,
+TMEM_PMP = 0                    #   not pumped: the macros at the core clock (docs/asic.md);
+                                #   SBP 3, SBH 0, PRK 0, SDM -1 (the unpumped sides) the RTL's
+RPB = 0                         # every read lane (TMEM_RPL: the slice reads as if no RAM were shared)
 WPB = 1
 WIN = 16
 FIFO_DEPTH = 1024
 TRACE_DEPTH = 0
 PQ_WIN = 1024
 CHASH = true
+COLL_GATHER = false             # the card's one-slice collective unit: BAR alone (otpu_coll_bar)
 
 [tech]
 family = "asic"

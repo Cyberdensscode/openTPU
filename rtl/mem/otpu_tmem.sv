@@ -697,6 +697,13 @@ module otpu_tmem #(
           // port A: the write, else its side's read; read-first (a replay of the written word
           // takes the word before the write)
           wire [RW-1:0] ra = wh ? ram_row(pw_a[b][0]) : s_a[b][k][1];
+`ifdef SYNTHESIS
+          // synthesis: the technology RAM (rtl/tech: inferred alike on an FPGA, the 1RW1R
+          // macros on an ASIC, which leave mem empty); simulation keeps it inferred here (above)
+          otpu_ram_1rw1r #(.W(32), .N(RD), .STYLE("block")) u_ram (
+            .clk, .ena(wh || s_en[b][k][1]), .wea(wh), .aa(ra), .wda(wd), .rda(s_q[b][k][1]),
+            .enb(s_en[b][k][0]), .ab(s_a[b][k][0]), .rdb(s_q[b][k][0]));
+`else
           always_ff @(posedge clk)
             if (wh || s_en[b][k][1]) begin
               if (wh) mem[ra] <= wd;
@@ -704,6 +711,7 @@ module otpu_tmem #(
             end
           always_ff @(posedge clk)
             if (s_en[b][k][0]) s_q[b][k][0] <= mem[s_a[b][k][0]];
+`endif
         end else begin : g_sdp
           always_ff @(posedge clk) begin
             if (wh) mem[ram_row(pw_a[b][0])] <= wd;
