@@ -319,7 +319,8 @@ op and no ISA change.
 | layers 7-26 at 256 tokens | 83 G |
 | projector | 2 G |
 
-That is about 250 G MAC, about 3.7 s per crop at full MXU rate. The unpadded projections save
+That is about 250 G MAC, about 3.7 s per crop at full MXU rate. The card measured 5.77 s for a
+crop of 1,008 patches (session mcpv2, 6). The unpadded projections save
 20% against the first estimate's padded heads (312 G). A 448^2 image is 1 crop and 64 tokens;
 a large image with 9 slices is 10 crops, about 37 s, and about 640 tokens. The m8 build
 (MCOLS 8) halves it. On hwe-bench's ISA simulator a crop takes 5-7 minutes (a simulator,
@@ -532,7 +533,35 @@ Results (hwe-bench, ISA simulator):
 | refract.png (3) | int8, ViT MLPs fp4 | 0.9611 | 0.673 | 3.6e-6 |
 
   The ViT MLPs stay int8. The first token's dKL hardly moves with the rows; the reply's dKL
-  (HF's greedy reply teacher-forced with each variant's rows) follows.
+  follows.
+- **The reply's dKL** (`tools/minicpmv_hf.py vision --rows`, hwe-bench). HF's greedy reply to
+  "Describe this image in one sentence." is cut at its first `<|im_end|>` (21, 32 and 32
+  tokens). The reply is then teacher-forced with each variant's rows in place of HF's, and the
+  table gives the KL from HF's next-token distribution in nats per reply token, plus the share
+  of reply tokens whose top token is HF's.
+  - card int8: the ISA simulator's rows, which equal the card's.
+  - emulated: the fp32 reference with the MXU's numerics (scratch vit_emul.py), int8, or
+    two-pass int8 weights (a second int8 pass on the first pass's remainder) in layers 0-1,
+    0-3 or 0-6.
+  - fp32 tanh: no quantization, the projector's GELU tanh as on the card.
+
+| variant | cats.jpg (3 crops) | refract.png (3) | doc.png (7) | mean | top token | tower s a crop | weights MB |
+|---|---|---|---|---|---|---|---|
+| card int8 | 7.6e-3 | 3.7e-3 | 4.6e-3 | 5.3e-3 | 0.95 / 1 / 0.97 | 5.77 (card) | 571 |
+| emulated int8 | 2.5e-2 | 2.6e-3 | 9.8e-3 | 1.2e-2 | 0.95 / 1 / 1 | 5.77 | 571 |
+| two-pass 0-1 | 2.4e-2 | 2.2e-3 | 7.6e-3 | 1.1e-2 | 0.95 / 1 / 0.97 | ~6.5 (+12% MAC) | +31 |
+| two-pass 0-3 | 4.4e-3 | 6.7e-3 | 1.8e-2 | 9.6e-3 | 0.95 / 1 / 0.97 | ~7.2 (+24%) | +61 |
+| two-pass 0-6 | 1.1e-2 | 3.3e-3 | 1.7e-2 | 1.1e-2 | 0.95 / 1 / 0.97 | ~8.3 (+43%) | +107 |
+| fp32 tanh | 2.8e-3 | 1.0e-3 | 1.6e-3 | 1.8e-3 | 1 / 1 / 1 | - | - |
+
+  - The two-pass times scale layers 0-6's measured linear phases (qkv and out, 364 ms a layer).
+  - At this sample size the reply dKL does not separate the int8 variants: the emulation and
+    the card differ 3x on cats.jpg. No two-pass range lowers it on all three images.
+  - The card's int8 tower costs ~5e-3 nats a reply token. That is ~3x the floor of tanh alone,
+    half the language model's int8 dKL (9.9e-3) and a ninth of its card formats' (4.7e-2 from
+    float, 5.1). Every variant's top token disagrees with HF's at most once per reply.
+  - Two-pass int8 would not pay for its cost. The recommendation is to keep the tower int8;
+    the decision is the lead's.
 - **The 0.776 row** is one row of 203: cats.jpg's second crop (40 x 28), output row 68, its
   bottom edge (refract.png's worst is 0.957; the next worst of cats.jpg 0.978). Stage by stage
   on the ISA simulator against the fp32 reference (scratch vit_stages2.py, the row's 16 patches
@@ -572,7 +601,8 @@ The model reads about 15% above the card in absolute tok/s, so the differences a
 | resident int8 | 1240 | 102.6 | 6.09 | +7.7 (+4.9%) |
 
 - Accuracy rules out the fp4 ViT MLPs (5.2: row cosine minimum 0.63 / 0.67).
-- TTFT. The tower computes about 3.7 s a crop at MCOLS 4, 37 s for a 10-crop image.
+- TTFT. The tower computes about 3.7 s a crop at MCOLS 4 (the card: 5.8 s, 6), 37 s for a
+  10-crop image.
   - Resident: nothing more.
   - Staged: 571 MB of pieces over the link once per prompt with images, about 0.2 s, then
     refills of the evicted least-used experts (at most ~440 misses spread over the next tokens,
@@ -615,7 +645,61 @@ Sessions (the lead runs them; scripts on this branch):
      image, another image does not.
    Each turn reports the crops' seconds through the card's tower, TTFT, prefill and decode
    tok/s and the slots' hits.
-2. Staged vision (`Spec.vision_staged`) against resident: decode hit rate and TTFT with images.
+
+   PASSED 2026-10-13 16:36 (opentpu): text, thumb and serve token-exact; serve's first reply
+   was thumb's, its repeat had 87 of 88 prompt tokens cached (TTFT 0.63 s) and its next turn
+   103. Its times are the cold ones explained under mcpv2.
+2. **mcpv2** (`tools/offload/sessions/mcpv2.sh`): where the time goes, and staged vision.
+   - tower: `tools/minicpmv_tower.py time`;
+   - text again, warm;
+   - staged: thumb with `--vision-staged`, after a warm-up run that builds its image and packs
+     the 446 pieces into the pool;
+   - stower: the tool with the staged tower.
+
+   Each run follows a page-cache reset: every other big file is dropped and the pool read in
+   with dd.
+
+   PASSED 2026-10-13 17:22 (opentpu; RUNS tower text staged stower, sliced waits for its
+   reference); text and staged are token-exact.
+
+   Findings:
+   - **The tower.** A crop of 1,008 or 1,024 patches takes 5.73-5.81 s of device time. Its
+     wall time is device time plus 0.07 s: 87 runs, 7.2 MB of rows written, the projector's
+     rows read.
+     - By phase (1,024 patches): out (o-proj and MLP of layers 0-6) 2.05 s, out2 (layers
+       7-26, 256 rows) 1.39 s, attend 0.63 s, qkv 0.50 s, wmerge 0.42 s, qkv2 0.36 s,
+       attend2 0.15 s, the rest 0.27 s.
+     - Against 512 MAC a cycle: qkv 84%, wmerge 91%, out and out2 58%, attend 54%. The RTL
+       co-simulation of each phase is in tools/minicpmv_tower.py cosim.
+   - **The first crop of a patch count.** It takes ~23 s more on the card host (doc.png's
+     first 32 x 32: 28.9 s). BoardBackend.start computes each new program's WAITC wait
+     entries (waits.entries) the first time it is started: attend 14.1 s, wmerge 2.5 s, qkv
+     1.4 s, the rest 4.7 s. On the Mac the same is 16.9 s, attend's 12.4 s for 214,534 visits.
+     - The entries are kept in the program cache's disk, keyed by the tree's sources, so this
+       comes once per host tree and patch count.
+     - It is mcpv1's thumb's vision_s, 30.3 s: 5.8 device + ~24. serve's first image TTFT,
+       16.6 s, is 10.8 s of prefill and 5.8 s of tower, its entries kept from thumb.
+     - The processor gives 17 patch counts (800 to 1,200). Over thumbnails and 9-slice
+       grids of 200-4000 px images, 1,008, 1,024, 960 and 1,056 are 78% of the crops.
+   - **mcpv1's cold text turns** (0.5 tok/s decode, load 200.8 s). Its image's first build
+     peaked at 28.4 GB of the host's 31 GB and took the pool out of the page cache. The pool
+     is on /data, a 7,200 rpm disk (sdb, WD10EZEX), so 2,979 misses became random disk
+     reads. "pool read in 0 s" was the relay's sha256 check's cache, before the build.
+     - Warm (mcpv2): turn 1 decode 3.71 tok/s (device 4.16), turn 2 4.44 (device 4.46).
+   - **Staged against resident**, thumb, both token-exact:
+     - slots: 1,440 a layer staged (36 a layer) against 1,080 resident (27);
+     - vision: 6.72 s against 5.8 s (the placement 0.24 s; device time +0.7% from the
+       table's RLDs);
+     - decode, device tok/s: turn 1 4.56 against 4.49, turn 2 4.80 against 4.43 (+8.4%);
+     - MB a token: 204.8 / 182.4 against 221.3 / 212.9;
+     - hits: 0.626 / 0.667 against 0.596 / 0.612.
+     - stower (the tool): the placement takes 0.22-0.24 s an image and the release 0.001 s;
+       a crop's device time is +0.7% (5.81 against 5.77 s). doc.png's 7 crops take
+       41.0-41.4 s against 40.5-40.9 s resident.
+     - The warm-up's first build of the staged image took 103 s; the pool grew by 763.6 MB.
+   - **Decode against qwen35-35b** (~5.3 tok/s at 41 slots). MiniCPM-V's formats (5.1, 7)
+     read 265 MiB more int8 weights every token (1,520 against 1,255 MiB), ~28 ms a token at
+     decode's ~9.8 GB/s. They also have fewer slots.
 
 ## 7. Decisions
 

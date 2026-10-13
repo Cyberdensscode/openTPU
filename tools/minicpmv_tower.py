@@ -4,7 +4,7 @@
         [--cap 2048] [--vision-staged] --image PATH[:SLICES]... [--reps 2] [--settle S]
         [--out JSON]
     python3 tools/minicpmv_tower.py cosim MODEL --cfg PKL [--size 28x36] [--phases a,b]
-        [--out JSON]
+        [--profile] [--out JSON]
 
 time: the engine as chatmoe.py opens it (streamed.engine, the family's formats), then per image
 the host's preprocessing (minicpmv.prepare: decode, resize, slices, patch rows), and each crop
@@ -21,7 +21,8 @@ cosim: each phase's program once on the RTL with the card's LiteDRAM controllers
 the core at 133.33 MHz; tools/moe_prefill_cosim.py's harness), the configuration of --cfg, one
 crop of --size patches, the weights zero (timing does not depend on the data) at their resident
 addresses: its cycles, and the crop's total over the runs (VisionImage.programs' order, an
-encoder layer's phases at layer 0 for every layer).
+encoder layer's phases at layer 0 for every layer). --profile: each phase's cycles by function
+with the VPU's and the MXU's busy cycles (moe_prefill_cosim.print_profile, on stderr).
 
 JSON: per crop the phases' runs, wall and device seconds (time), or cycles (cosim).
 """
@@ -207,7 +208,7 @@ def cosim(a) -> dict:
             prog, ra = P_[name]
             vals = {"vis_row": 0} if "vis_row" in vals else vals
             t0 = time.time()
-            _, st = MC._rtl(cfg, [prog], dram, args=arg_words(ra, vals))
+            _, st = MC._rtl(cfg, [prog], dram, args=arg_words(ra, vals), profile=a.profile)
             seen[name] = st["cycles"]
             print(f"{name:8s} {st['cycles']:11d} cycles {st['cycles'] / MHZ / 1e3:8.2f} ms "
                   f"(RTL {time.time() - t0:.0f} s)", flush=True)
@@ -240,6 +241,8 @@ def main(argv=None) -> int:
     ap.add_argument("--size", default="28x36", help="cosim: the crop's patches, h x w")
     ap.add_argument("--fmt", default="int8", help="cosim: the tower's formats")
     ap.add_argument("--phases", help="cosim: these phases only (default all)")
+    ap.add_argument("--profile", action="store_true",
+                    help="cosim: each phase's cycles by function, the VPU's and the MXU's")
     ap.add_argument("--out")
     a = ap.parse_args(argv)
     if a.mode == "cosim" and not a.cfg:
