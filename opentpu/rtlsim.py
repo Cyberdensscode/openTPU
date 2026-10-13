@@ -360,6 +360,12 @@ def _run(cfg, programs: list, images: list, dram_lat: int = 8, max_cycles: int =
     # alone (otpu_mxu xs_*)
     stats["mxu_scale"] = [{"areq": int(a), "sw": int(w)} for a, w in
                           re.findall(r"MXSCALE s\d+ areq=(\d+) sw=(\d+)", out)]
+    # per slice, the ACT RAM's reads (otpu_mxu xa_*): cycles, column reads (each D bytes and an
+    # 8-byte scale record), pops (advances), the columns of output rows at the pops, MCOLS, and
+    # the mask of the columns that ever read
+    stats["act_reads"] = [dict(zip(("cyc", "rd", "pop", "use", "cols", "any"), map(int, m)))
+                          for m in re.findall(r"MXACT s\d+ cyc=(\d+) rd=(\d+) pop=(\d+) "
+                                              r"use=(\d+) cols=(\d+) any=(\d+)", out)]
     if error_ok:
         stats["error"] = bool(err)
     if axi:

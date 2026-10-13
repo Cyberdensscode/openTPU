@@ -39,6 +39,11 @@ from opentpu.llm import gemma4 as G
 from opentpu.llm import moe as MO
 from opentpu.llm.qwen3 import ATTN_BLOCK, _fake_k, _fake_q, _qk, _v_parts
 
+# tools/formats_scan.py's KV format under test (docs/dataflow.md 4.8): None, the device's int8
+# K and V; else a function (k, v [T, n_kv, d], D) -> (Kw, Vp, Vw, window): K as the MX column
+# streams it (Kw [n_kv][T, d], None: int8), (V, its per-token scales) (None: int8), V^T as
+# weight rows (Vw [n_kv][d, Tb], None: V per token), P.V's window
+KV = [None]
 THREADS = 4     # experts quantized at once (numpy's 4-bit search releases the GIL: 2.8x on 4)
 
 
@@ -137,7 +142,7 @@ def emulate(spec, W, tokens, D=128, wformat="int8", hf=None, ple_format="int8", 
         pli = G._norm((fq(x) @ wpq.T).reshape(T, L, P), gpl, eps) + pe.reshape(T, L, P)
         del wp, wpq, pe
     ii = np.arange(T)[:, None]
-    K, V = {}, {}
+    K, V, KW, VT, VW = {}, {}, {}, {}, {}
     key, start = None, 0
     if ckpt is not None and all(spec.kv_src[i] == i for i in range(L)):
         key = repr((list(tokens), wformat, hf, ple_format, sorted(quant), sorted(wmap.items())))
@@ -166,7 +171,14 @@ def emulate(spec, W, tokens, D=128, wformat="int8", hf=None, ple_format="int8", 
             K[i] = _fake_k(k, D) if "kv" in quant else (ident(k), None)    # as the cache holds
             v = G._norm(v, None, eps)       # int8 values, per-token scales (folded into P)
             V[i] = _v_parts(v) if "kv" in quant else (ident(v), np.ones((T, n_kv)))
+            KW[i], VT[i], VW[i] = None, None, I.MX_W[I.W8]
+            if "kv" in quant and KV[0] is not None:
+                KW[i], Vp, VT[i], VW[i] = KV[0](k, v, D)
+                V[i] = V[i] if Vp is None else Vp
+                if VT[i] is not None:
+                    V[i] = (V[i][0], np.ones((T, n_kv)))
         (Kh, dK), (Vq, Vs) = K[spec.kv_src[i]], V[spec.kv_src[i]]
+        Kw, Vw, vwin = KW[spec.kv_src[i]], VT[spec.kv_src[i]], VW[spec.kv_src[i]]
         ok = np.arange(T)[None, :] <= ii                        # causal, and the window
         if kind == G.SLIDE:
             ok &= np.arange(T)[None, :] >= ii + 1 - spec.window
@@ -175,14 +187,15 @@ def emulate(spec, W, tokens, D=128, wformat="int8", hf=None, ple_format="int8", 
         for hq in range(n_q):
             g = hq // Gq
             qq = fq(q[:, hq])
-            sc = np.where(ok, _qk(qq, Kh[:, g], None if dK is None else dK[:, g], D), -np.inf)
+            sc = np.where(ok, _qk(qq, Kh[:, g], None if dK is None else dK[:, g], D)
+                          if Kw is None else qq @ Kw[g].T, -np.inf)
             pp = np.exp(sc - sc.max(1, keepdims=True))                  # [T, T]
             pf = np.zeros((T, Tb))
             pf[:, :T] = pp * Vs[:, g][None, :]
             vt = np.zeros((Tb, d))
             vt[:T] = Vq[:, g]
-            o[:, hq] = Q.mx_matmul(fp(pf, D, ATTN_BLOCK), vt.T, None, I.MX_W[I.W8], D) / \
-                pp.sum(1, keepdims=True)
+            o[:, hq] = (Q.mx_matmul(fp(pf, D, ATTN_BLOCK), vt.T, None, vwin, D) if Vw is None
+                        else fp(pf, D, ATTN_BLOCK) @ Vw[g].T) / pp.sum(1, keepdims=True)
         att = fq(o.reshape(T, -1)) @ wq(a + "o_proj.weight").T
         x = x + G._norm(att, W[p + "post_attention_layernorm.weight"], eps)
         h = fq(G._norm(x, W[p + "pre_feedforward_layernorm.weight"], eps))

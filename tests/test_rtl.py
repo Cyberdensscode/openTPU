@@ -289,6 +289,42 @@ def test_fuzz_mm_replay(have_verilator, mcols, rows, seed):
     assert np.array_equal(tmems[0], m.slices[0].tmem)
 
 
+@pytest.mark.parametrize("mcols,rows", [(4, 8), (8, 16)])
+@pytest.mark.parametrize("M,wf,pair", [(1, I.W8, False), (3, I.W8, False), (1, I.W4F, True),
+                                       (2, I.WNV, True), (4, I.W4I, False), (6, I.W4F, False),
+                                       (9, I.W8, False)])
+def test_act_reads_follow_the_mm_rows(have_verilator, mcols, rows, M, wf, pair):
+    """The ACT RAM reads only the columns of an MM's output rows (otpu_mxu act_ren): M of the
+    MCOLS columns (PAIR: 2M), every column with replay (M > MCOLS); the results are the ISA's.
+    Before the gating every column read every cycle (cyc * MCOLS)."""
+    if (pair and 2 * M > mcols) or M > rows:
+        pytest.skip("PAIR needs 2M <= MCOLS; M <= ACT_ROWS")
+    cfg = Config(S=1, MCOLS=mcols, ACT_ROWS=rows)
+    D, KB, N = cfg.D, 3, 20
+    srs = KB * D
+    rs = KB * D if wf == I.W8 else -(-KB // 2) * D
+    prog = [I.ld(DATA, 0, 4096), I.qact(0, M, 0, KB, srs, dup=pair),
+            I.mm(INT8, MX_BASE[wf], 4096, N, KB, rs, N, M, 0, MX_PITCH[wf], wf=wf, pair=pair),
+            I.halt()]
+    img = _images(np.random.default_rng(7), 1)[0]
+    m = Machine(cfg, [prog], [img.copy()]).run()
+    drams, tmems, st = rtlsim.run(cfg, [prog], [img.copy()])
+    assert np.array_equal(drams[0], m.slices[0].dram)
+    assert np.array_equal(tmems[0], m.slices[0].tmem)
+    a = st["act_reads"][0]
+    G = -(-M // mcols)
+    cols = mcols if G > 1 else min(mcols, 2 * M if pair else M)
+    adv = -(-KB // 2) if pair else KB
+    last = (M - (G - 1) * mcols) * (2 if pair else 1)        # the last group's columns
+    assert a["cols"] == mcols
+    assert a["any"] == (1 << cols) - 1                       # no other column ever read
+    assert a["pop"] == N * adv * G
+    assert a["use"] == N * adv * ((G - 1) * mcols + last)
+    assert a["rd"] % cols == 0 and a["use"] <= a["rd"] <= a["cyc"] * cols
+    if cols < mcols:
+        assert a["rd"] < a["cyc"] * mcols
+
+
 @pytest.mark.parametrize("lanes", [4, 16])
 def test_lane_count_does_not_change_results(have_verilator, lanes):
     """LANES only changes timing: the same kernels give the same bits at any lane count."""

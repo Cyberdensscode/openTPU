@@ -76,7 +76,7 @@ module otpu_mxu
   output logic [15:0]           act_blk2,    // PAIR: the odd block, read by the rows in act_hi
   output logic [MCOLS-1:0]      act_hi,
   output logic [7:0]            act_grp,
-  output logic                  act_ren,     // the ACT RAM read register advances (with S0)
+  output logic [MCOLS-1:0]      act_ren,     // per column: its ACT RAM read register advances
   input  logic [MCOLS*D*8-1:0]  act_data,
   input  logic [MCOLS*64-1:0]   act_scale,   // per column the record {da3, da2, da1, da0, Sa}
   // DRAM port A (scale lines) and B (chunks)
@@ -204,6 +204,7 @@ module otpu_mxu
     logic             g1;              // G == 1: a row's first group is its last
     logic [MW-1:0]    dnl;             // the last group's first drain step: its lanes (min(run,
     logic             dfl;             // Ml)) and whether it drains the group (Ml <= run)
+    logic [MCOLS-1:0] cm;              // the columns its advances read (act_ren)
   } qent_t;
   qent_t       h, n;                    // the head, the next command
   qent_t       cmd_e;                   // cmd as an entry (not yet released)
@@ -240,6 +241,10 @@ module otpu_mxu
     cmd_e.g1    = (g == 1);
     cmd_e.dnl   = (cmd_e.run < cmd_e.Ml) ? cmd_e.run : cmd_e.Ml;
     cmd_e.dfl   = (cmd_e.Ml <= cmd_e.run);
+    // the ACT RAM columns its advances read: every column with replay (G > 1), else rows j < M
+    // (PAIR: and the high rows j < 2M); the others are no output's
+    for (int j = 0; j < MCOLS; j++)
+      cmd_e.cm[j] = (g > 1) || 32'(j) < (cmd_pair ? 32'd2 : 32'd1) * 32'(cmd.w6[23:16]);
   end
 
   // Two heads (docs/mxu_systolic.md): the drain's head is h, the oldest command: its results are
@@ -429,7 +434,42 @@ module otpu_mxu
       end
     end
 `endif
-  assign act_ren = 1'b1;
+  // The ACT RAM's read enables (one per column): an advance reads its block in the cycle it pops
+  // (S0 takes the read register's output), and only the columns of an output row read it. A
+  // column's enable is the pop head's cm, gated with the head being released (p_act: every pop
+  // has it), so a command of M < MCOLS rows (decode: M = 1) reads M of the MCOLS columns, and no
+  // column reads while no command is released. Both are registers (pop_q, q_n) one LUT from the
+  // block RAMs' enables: pop itself is not on that path. A column that does not read holds its
+  // last block, which only its own products (no output's) take.
+  assign act_ren = {MCOLS{p_act}} & pop_e.cm;
+`ifndef SYNTHESIS
+  // every column of an output row reads its block when the advance pops: rows j < Ml of a
+  // command's last group (PAIR: and its high rows j < 2M), every row of the earlier groups
+  always @(posedge clk)
+    if (!rst && pop)
+      for (int j = 0; j < MCOLS; j++)
+        if (!act_ren[j] && (!last_g || 32'(j) < (c_pair ? 32'd2 : 32'd1) * 32'(pop_e.Ml)))
+          $fatal(1, "otpu_mxu: column %0d of an output row does not read its ACT block (M %0d)",
+                 j, p_M);
+  // co-sim statistic of the ACT RAM reads (otpu_slice prints them at the dump: rtlsim's
+  // stats["act_reads"]): cycles, column reads (enabled), pops, and the columns of output rows at
+  // the pops, and the columns that ever read. Each column read is D bytes and an 8-byte scale
+  // record.
+  longint unsigned xa_cyc, xa_rd, xa_pop, xa_use;
+  logic [MCOLS-1:0] xa_any;
+  initial begin xa_cyc = 0; xa_rd = 0; xa_pop = 0; xa_use = 0; xa_any = '0; end
+  always @(posedge clk)
+    if (!rst) begin
+      xa_cyc++;
+      xa_rd += longint'($countones(act_ren));
+      xa_any |= act_ren;
+      if (pop) begin
+        xa_pop++;
+        for (int j = 0; j < MCOLS; j++)
+          if (!last_g || 32'(j) < (c_pair ? 32'd2 : 32'd1) * 32'(pop_e.Ml)) xa_use++;
+      end
+    end
+`endif
 
   // ---- the tags of the requests in flight (LUT RAM) and the responses: a response is
   // registered with its tag (R1), then written into the scale entry at s_tail (R2)
