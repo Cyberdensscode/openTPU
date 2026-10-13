@@ -7,8 +7,12 @@
 #   text    chatmoe.py's two text turns (TURNS, --max-new 16): the language model alone
 #   thumb   cats.jpg at --max-slices 1 (its thumbnail: one crop), two turns
 #   sliced  doc.png at the processor's 9 slices (7 crops), one turn of --max-new 32
-# Each turn reports its images and their crops' seconds through the card's tower (vision_s), TTFT, prefill and decode
-# tok/s (wall and device) and the slots' hits.
+#   serve   otpu-serve on the card, tools/serve_bench.py's images part (docs/serve.md Images) at max_slices 1: cats.jpg
+#           with thumb's first question (its reply must be thumb's reference's first turn's), again (the context
+#           reused past the image), its next turn, doc.png with the same question (no context past it reused), a
+#           text-only question; each request's cached tokens and TTFT (no reference of its own)
+# Each chatmoe.py turn reports its images and their crops' seconds through the card's tower (vision_s), TTFT, prefill
+# and decode tok/s (wall and device) and the slots' hits.
 # Card: production deploy_r2m4_b10245f5 as loaded (EXPECT b10245f5, register map 5); its qual/cfg.pkl.
 # O (/data/otpu/minicpmv) holds MiniCPM-V-4.7-35B-A3B/ (the slim checkpoint), pool-mcpv35-mx.split.bin (+ .packed,
 # .format, .key), img/ (cats.jpg, doc.png), refs/minicpmv-<run>.json and pylib/ (PYLIB: hwe-bench's ~/mcpv/tf518,
@@ -16,14 +20,15 @@
 # resize as HF's processor, the packages the references ran with; without torchvision the resize differs).
 # One otpu-lock:
 # 1. selftest; the device configuration must be production's qual/cfg.pkl;
-# 2. per run (RUNS, default "text thumb sliced"): every other file of 100 MB or more under O, ~/openTPU/models and
-#    ~/otpu-build/offload out of the page cache, the pool read into it, then chatmoe.py --check its reference;
+# 2. per run (RUNS, default "text thumb sliced serve"): every other file of 100 MB or more under O, ~/openTPU/models
+#    and ~/otpu-build/offload out of the page cache, the pool read into it, then chatmoe.py --check its reference
+#    (serve: otpu-serve on PORT, default 8017, and serve_bench.py against it, then the server stopped);
 # 3. selftest; the summary per run and turn.
 # A build other than EXPECT, a failed selftest, another configuration or a missing file stops it; a failed run or a
-# token mismatch is reported and the next run goes on. The last line: MCPV1 PASS or MCPV1 FAIL. About 25 min (the
-# image's first build on the card host ~5 min, the pool's read ~40 s a run).
+# token mismatch is reported and the next run goes on. The last line: MCPV1 PASS or MCPV1 FAIL. About 35 min (the
+# image's first build on the card host ~5 min, otpu-serve's ~5 min more, the pool's read ~40 s a run).
 # References (REF=1: the same runs on the ISA simulator with REFCFG, no card, no selftest), on hwe-bench from this
-# tree, one run a call (each in a slot of its own), into RF:
+# tree, one run a call (each in a slot of its own), into RF (serve has none: thumb's):
 #   REF=1 O=~/mcpv PYLIB=~/mcpv/tf518 REFCFG=~/mcpv/cfg-b10245f5.pkl RUNS=thumb bash tools/offload/sessions/mcpv1.sh
 #   (O there: MiniCPM-V-4.7-35B-A3B -> slim/MiniCPM-V-4.7-35B-A3B, the pool, img/; RF default O/refs)
 # Stage (from the Mac, before the session; no host work while a session runs):
@@ -56,7 +61,8 @@ EXPECT=${EXPECT:-b10245f5}
 MAP=${MAP:-register map 5}
 MD=MiniCPM-V-4.7-35B-A3B
 POOL=pool-mcpv35-mx.split.bin
-RUNS=${RUNS:-text thumb sliced}
+RUNS=${RUNS:-text thumb sliced serve}
+PORT=${PORT:-8017}
 declare -A RUN=(        # chatmoe.py's options
   [text]=""
   [thumb]="--image 1:$O/img/cats.jpg --max-slices 1 --turn 'Describe this image in one sentence.' --turn 'What colors stand out? One sentence.'"
@@ -72,7 +78,7 @@ python -c "import torchvision, PIL, transformers; print('  python:', torchvision
   [ -f $O/img/doc.png ] && [ -f $REFCFG ] || { echo "STOP: $O/$MD, $O/$POOL, its key, img/ or $REFCFG missing"; exit 2; }
 if [ $REF = 1 ]; then
   mkdir -p $RF
-  for m in $RUNS; do
+  for m in ${RUNS/serve/}; do
     echo "=== ref $m $(date +%T)"
     t0=$SECONDS
     eval "python tools/qual/chatmoe.py $O/$MD --pool $O/$POOL --backend isa --cfg $REFCFG \
@@ -83,6 +89,7 @@ if [ $REF = 1 ]; then
   exit 0
 fi
 for m in $RUNS; do
+  [ $m = serve ] && m=thumb
   [ -f $RF/minicpmv-$m.json ] || { echo "STOP: no reference $RF/minicpmv-$m.json"; exit 2; }
 done
 st=$(timeout 600 python -m opentpu.host.selftest 2>&1)
@@ -125,6 +132,32 @@ print(f"  dropped from the page cache: {n} other files of {gb:.1f} GB")
 PY
   t0=$SECONDS; cat $O/$POOL > /dev/null       # the pool in the page cache (the RAM tier)
   echo "  (pool read in $((SECONDS - t0)) s, mem $(mem) GB)"
+  if [ $m = serve ]; then
+    timeout 3600 python -m opentpu.serve.api --model $O/$MD --backend board --pool $O/$POOL --port $PORT \
+      --kv-ram-gb 2 --kv-dir $R/kv > $R/serve.log 2>&1 &
+    sp=$!
+    timeout 2400 python tools/serve_bench.py --port $PORT --skip check,throughput,conversation,users,arrivals \
+      --image $O/img/cats.jpg --image $O/img/doc.png --image-slices 1 --image-tokens 16 \
+      --image-ref $RF/minicpmv-thumb.json --wait 1200 --out $R/serve-bench.json > $R/serve-bench.log 2>&1
+    rc=$?
+    kill $sp 2>/dev/null; wait $sp 2>/dev/null
+    echo "  exit $rc $(date +%T); server: $(grep -E "^weights|Error|Traceback" $R/serve.log | tail -2 | tr '\n' ' ')"
+    [ $rc = 0 ] || fail=1
+    python - $R/serve-bench.json <<'PY'
+import json, sys
+try:
+    r = json.load(open(sys.argv[1]))["images"]
+except (OSError, KeyError, ValueError) as e:
+    sys.exit(f"  no images part: {e!r}")
+print(f"  images {'PASS' if r['pass'] else 'FAIL'}: thumb's reply {r.get('ref_equal')}, again equal "
+      f"{r['again_equal']}")
+for k in ("first", "again", "turn2", "others", "text"):
+    for x in (r[k] if k == "others" else [r[k]]):
+        print(f"  {k}: prompt {x['prompt_tokens']}, cached {x['cached']}, TTFT {x['ttft_s']} s, "
+              f"{x['finish']}: {x['text']!r}")
+PY
+    continue
+  fi
   eval "timeout 3600 python tools/qual/chatmoe.py $O/$MD --pool $O/$POOL --backend board \
     --cfg $R/cfg-dev.pkl --check $RF/minicpmv-$m.json --out $R/minicpmv-$m.json ${RUN[$m]}" \
     > $R/minicpmv-$m.log 2>&1
