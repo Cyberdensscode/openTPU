@@ -101,7 +101,7 @@ def test_register_map(have_verilator):
 def test_cfg_registers(have_verilator):
     """Register map 4: the CFG_* registers report the target's build of the board model's
     configuration (opentpu/target.py), and the host builds that Config from them."""
-    from opentpu import target as T
+    from opentpu import rtlsim, target as T
     from opentpu.host.board import Board, device_config
     t = SimTransport(ch_bytes=1 << 20)
     info = Board(t).info()
@@ -109,12 +109,16 @@ def test_cfg_registers(have_verilator):
     assert info["regmap"] == 5 and info["caps2"] == {"gather": True}
     assert (c["S"], c["TMEM_WORDS"], c["IMEM_WORDS"], c["ACT_BLOCKS"]) == (1, 1 << 16, 1 << 15, 128)
     assert (c["DRAM_BYTES"], c["channels"], c["channel_bytes"]) == (1 << 32, 2, 1 << 31)
-    assert (c["MXU_IMPL"], c["TMEM_IMPL"], c["VPU_CL"], c["ULANES"]) == (2, 0, 2, 8)
+    # the TMEM as the target builds it (the board model's: release r2, one copy, TMEM_IMPL 3)
+    assert (c["MXU_IMPL"], c["TMEM_IMPL"], c["VPU_CL"], c["ULANES"]) == \
+        (2, T.current().uarch["TMEM_IMPL"], 2, 8)
     assert c["platform"] == T.current().platform_id
     cfg = device_config(info)                     # CFG_HASH agrees with the registers' Config
     assert c["hash"] == T.arch_hash(cfg)
+    # the board model's sequencer takes wait entries as the simulators' (rtlsim.UARCH SEQ_WC)
     assert cfg == T.build_config(T.current(), MCOLS=CFG.MCOLS, LANES=CFG.LANES,
-                                 ACT_ROWS=CFG.act_rows, DSTEP=1)
+                                 ACT_ROWS=CFG.act_rows, DSTEP=1,
+                                 SEQ_WC=int(bool(rtlsim.UARCH.get("SEQ_WC"))))
     assert t.reg_read(R.R_CFG_WIN0) == 0xDEADBEEF    # reserved
 
 

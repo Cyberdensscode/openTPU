@@ -41,8 +41,8 @@ def test_every_target_loads():
 
 def test_board_config_is_the_card_by_default(no_env):
     """board_config() before targets: the same Config (its fields are in every cache key), but
-    for the MX build's ACT_ROWS 16 (0 before)."""
-    legacy = Config(S=1, D=128, MCOLS=4, ACT_BLOCKS=128, LANES=8, ACT_ROWS=16,
+    for the MX build's ACT_ROWS 16 (0 before) and release r2's MCOLS 8 (4 before)."""
+    legacy = Config(S=1, D=128, MCOLS=8, ACT_BLOCKS=128, LANES=8, ACT_ROWS=16,
                     TMEM_WORDS=1 << 16, IMEM_WORDS=1 << 15, DRAM_BYTES=1 << 32, PAIR=False,
                     DSTEP=False, STREAM=False)
     assert board_config() == legacy
@@ -77,9 +77,12 @@ def _hash_without_numerics(cfg) -> int:
 
 def test_arch_hash_is_stable_and_sensitive():
     card = T.config("ypcb-00338")
-    # in the bitstreams' CFG_HASH: keep it (the MX build at ACT_ROWS 16; ff270e6e at ACT_ROWS 4)
-    assert f"{T.arch_hash(card):08x}" == "89417856"
-    four = dataclasses.replace(card, ACT_ROWS=0)
+    # in the bitstreams' CFG_HASH: keep them (release r2: MCOLS 8 with wait entries; MX production
+    # 8b33206e, MCOLS 4 at ACT_ROWS 16, without; ff270e6e at ACT_ROWS 4)
+    assert f"{T.arch_hash(card):08x}" == "19a2400e"
+    mx = dataclasses.replace(card, MCOLS=4, SEQ_WC=False)
+    assert f"{T.arch_hash(mx):08x}" == "89417856"
+    four = dataclasses.replace(mx, ACT_ROWS=0)
     assert f"{T.arch_hash(four):08x}" == "ff270e6e"
     # production's CFG_HASH (ACT_ROWS 4, the previous numerics), what a host of the previous
     # numerics computes for it: it refuses MX builds (T.NUMERICS)
@@ -182,9 +185,9 @@ def test_cfg_register_codec():
 
 def test_device_config_from_the_cfg_registers(no_env):
     """Map 4: the sizes come from the device; the hash must be the reported Config's."""
-    t = FakeTransport(devname=None, regmap=4, pair=True, dstep=True, stream=True)
-    info = Board(t).info()
-    assert info["cfg"]["platform"] == 1 and info["cfg"]["hash"] == 0x89417856
+    t = FakeTransport(devname=None, regmap=4, pair=True, dstep=True, stream=True, seq_wc=True)
+    info = Board(t).info()                      # (release r2's build: wait entries, CFG_UARCH 24)
+    assert info["cfg"]["platform"] == 1 and info["cfg"]["hash"] == 0x19a2400e
     assert info["act_rows"] == 16 and info["caps"]["act_rows"]
     cfg = device_config(info)
     assert cfg == T.config("ypcb-00338")
@@ -256,8 +259,8 @@ def test_a_bitstream_before_mx_is_refused(no_env, regmap):
 def test_device_config_before_map_4_is_the_card(no_env):
     info = Board(FakeTransport(devname=None, regmap=3, pair=True, dstep=True,
                                stream=True)).info()
-    assert info["cfg"] is None
-    assert device_config(info) == T.config("ypcb-00338")
+    assert info["cfg"] is None              # (no CFG_UARCH: a map 3 build takes no wait entries)
+    assert device_config(info) == dataclasses.replace(T.config("ypcb-00338"), SEQ_WC=False)
     check_fits(board_config(TMEM_WORDS=1 << 20), info)              # nothing to check against
 
 
@@ -331,7 +334,7 @@ def test_config_summary_names_the_target(no_env):
     from opentpu.host.board import config_summary
     kw = dict(devname=None, ddr_mts=1066, pair=True, dstep=True, stream=True)
     old = config_summary(Board(FakeTransport(regmap=3, **kw)).info())
-    assert old == "D=128 MCOLS=4 LANES=8, register map 3, core 100 MHz, DDR3-1066, build 1234abcd"
+    assert old == "D=128 MCOLS=8 LANES=8, register map 3, core 100 MHz, DDR3-1066, build 1234abcd"
     new = config_summary(Board(FakeTransport(regmap=4, **kw)).info())
     assert "register map 4, ypcb-00338 (S=1, 2 channels x 2048 MiB)" in new and "DDR3-1066" in new
     assert T.by_platform(2).name == "bcu1525" and T.by_platform(999) is None
