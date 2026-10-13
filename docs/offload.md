@@ -82,7 +82,8 @@ host fp4 kernel.
   4.7 (Qwen3.5-35B-A3B's backbone). Its prefetch of the next layer's predicted experts models
   at +1-3% here (+12% even for a perfect predictor), so it is closed. Its other half, the
   card doing the work it has while the misses stream, is taken: the shared expert now runs
-  beside the request.
+  beside the request. A k = 1 MTP loop bounds at 1.25x on the 35B (15.6), and the base's MTP
+  head drafts for MiniCPM-V, which has none, as well as for the base (0.78 accepted).
 
 The tools:
 
@@ -91,6 +92,8 @@ The tools:
 - `cachesim.py`: expert-cache hit rates on those traces, and path (a)'s event model.
 - `lesim.py`: the next layer's predictions against those traces, and the decode's timeline
   with and without their prefetch (section 15).
+- `mtp_bound.py`: the same timeline with a two-row MTP verify a step (15.6);
+  `mtp_transplant.py`: the base 35B's MTP head's acceptance on a model's own replies (15.6).
 
 ## 1. The memory hierarchy
 
@@ -4806,6 +4809,10 @@ operations on the same operands, bit for bit.
 - Only Qwen3.5-MoE's programs change. LFM2 and Gemma 4 have no shared expert.
 - On the ISA simulator, the tiny Qwen3.5-MoE gives the same logits as 217cf13a: decode with
   misses, and a layer-major prefill of R = 2 with the decode after.
+- The 35B's chatmoe reference on les (five turns, r2's configuration, the MX pool) gives
+  production's tokens in the turns production's reference has (its two layer-major prompts
+  and their decode). tools/offload/program_sha.py on r2's configuration: LFM2.5-8B-A1B's and
+  Gemma 4's programs are byte-identical to production's (the 26B at 16 slots a layer).
 
 The same branch (les) carries 13.18's slot-order fix, from moe-ab's design on emc2:
 - an expert-major need line counts as a request (one more of its layer's, and a use of each id);
@@ -4825,15 +4832,59 @@ both models, in ABBA order. It splits the two parts by turn:
 
 Not taken:
 - the prefetch (15.3);
-- DSpark: speculative decoding needs a verify step of more than one row on the MoE. That is a
-  project of its own (below).
+- LES's layer-wise mixed precision: experts below 4 bits are not pursued (the user's decision,
+  2026-10-13);
+- DSpark, MiniCPM-V's separate draft model: its 16-row block verify streams about 740 misses a
+  step on the 35B's slots (2075 distinct experts), against 85.5 for a token. Base 35B's MTP
+  head serves MiniCPM-V as well (15.6), so DSpark is not ported.
 
 Levers larger than LES's scheduling, from `lesim.py time` on the 35B. Not built; each needs its
 own decision:
-- **Experts in about 3.25 bits** instead of 4.35: 1.28 MB an expert, 54 slots a layer in the
-  same DRAM. Simulated 5.60 -> 6.63 tok/s (+18%). This is LES's "layer-wise mixed precision";
-  it is a numerics question (dKL at 2000 tokens or more).
 - **More slots**: +10 a layer gives +5.5%.
-- **An MTP verify of two rows a step**: the mixers' weights and the 29 ms head are read once
-  for about 1.7 tokens. Roughly +15-20% (estimate). Qwen3.5-35B-A3B has an MTP layer;
-  MiniCPM-V's draft (DSpark) is a separate checkpoint.
+- **An MTP verify of two rows a step** (15.6): bound 1.25x on the 35B, and the same on MiniCPM-V.
+
+### 15.6 MTP on the streamed MoE: the bound, and the transplant to MiniCPM-V
+
+A k = 1 MTP loop on path (a): each step is a verify run of two rows (the token and its draft)
+through every layer, then the MTP layer drafts the next. Per layer the card asks for both
+rows' experts: their union, 12.86 distinct a request against 8 (514 a step over 40 layers).
+
+**The bound** (`tools/offload/mtp_bound.py`: lesim's card timeline and session 16's fit, the four
+router traces, both rows' routes from consecutive tokens, the draft accepted with probability a):
+- the second row of a layer, co-simulated (`moe_prefill_cosim.py layer`, r2's configuration,
+  every expert present): DeltaNet 2.579 -> 2.974 ms, attention 2.053 -> 2.328 ms, so +0.365 ms a
+  layer; each union expert beyond the 8, 0.1025 ms (`expert`: one FFN on 2 rows, port bound);
+- the head on 2 rows +1 ms; the MTP draft 9.1 ms a step (the attention layer on 2 rows 2.33,
+  its 4.9 more union experts 0.50, fc 0.26, a 32K fp4 head 2.13, about 4 misses of its own
+  3.9); its slots come from the others (40 a layer).
+
+| a | ms a token | tok/s | vs plain (178.4 ms) | misses a token | c_2 + c_draft |
+|--:|--:|--:|--:|--:|--:|
+| 0.75 | 143.9 | 6.95 | 1.24x | 85.4 | 1.40 |
+| 0.78 | 142.3 | 7.03 | 1.25x | 85.3 | 1.41 |
+| 0.85 | 138.9 | 7.20 | 1.28x | 85.3 | 1.43 |
+| 1.00 | 132.6 | 7.54 | 1.35x | 85.0 | 1.48 |
+
+The misses a token barely move: a step of two tokens streams twice a token's. What MTP saves is
+the card's per-step time (the mixers' weights, the shared experts, the 29 ms head), read once
+for 1.77 tokens at a = 0.78.
+
+**The acceptance** (`tools/offload/mtp_transplant.py`, on hwe-bench: HF transformers 5.18 with
+minicpmv's LazyExperts, float32; greedy replies to tools/mtp_accept.py's nine prompts, up to
+256 tokens, thinking off; teacher-forced drafts; the 32K fp4 head with int8 activations, as
+docs/mtp.md's):
+
+| drafter on | drafts | full float head | fp4, 32K ids |
+|:--|--:|--:|--:|
+| Qwen3.5-35B-A3B, its own MTP | 1706 | 0.836 | 0.782 |
+| MiniCPM-V-4.7-35B-A3B, the base's MTP (its embedding and head) | 2295 | 0.850 | 0.796 |
+| the same, each prompt's first drafts as many as the base's | 1706 | 0.831 | 0.784 |
+| MiniCPM-V, the base's MTP with the base's embedding and head | 2295 | 0.854 | 0.795 |
+
+By kind (fp4 32K, matched drafts): chat 0.745 / 0.753, code 0.897 / 0.883, summaries 0.684 /
+0.699 (base / MiniCPM-V). MiniCPM-V's summaries run to the 256-token cap with 27-48% of their
+8-grams repeated, which raises its all-drafts row; matched, the transplant equals the base.
+
+So MiniCPM-V, which has no mtp.* weights, drafts with the base 35B's MTP layer as well as the
+base does, and one MTP port serves both. The bound is greedy; sampled acceptance (docs/mtp.md:
+about 0.04 lower on the dense models) and the host's per-step costs are not in it.
