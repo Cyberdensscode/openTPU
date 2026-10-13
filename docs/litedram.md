@@ -2307,6 +2307,19 @@ PHY-placed 4398cac9 +0.029; r2.1's m8 spec133_83740e79 +0.055):
   `regtimer.py`'s RefreshTimer (both timers, both channels) keeps done in a flip-flop: its next
   value is `wait & ~done & (count == 1)`, which is the stock `count == 0` a cycle later. The same
   cycles.
+- The serializers' reset registers (`wlrst`, by the pads, on the write clock `sys_w`): their input
+  was the sys reset OR the PHY's `rst` storage, straight from the die's far side (r2.1's m8
+  163ab46d: `crg_rst1_reg_rep__52` at SLICE_X8Y70 into channel 1's `wlrst_152` at SLICE_X0Y395,
+  6.57 ns of route, sys -> writeclocks1_outs2 +0.149; channel 0's `wl7ddrphy0_rst_storage` at Y94
+  into `wlrst` at Y139, +0.331; production 8b33206e +0.514 / +0.377). WL7DDRPHY registers it in
+  sys once per channel (`wl7ddrphy*_sys_rst`, by its loads): the serializers' reset and its
+  release move a sys cycle later, as their own registers. These are reset paths, not the write
+  data's (the OSERDES D pins: r2-ddr-phy's pblocks).
+- **The calibration's CSR accesses at 7 cycles:** every master handshakes. The host's `ddrcal`
+  goes AXI-Lite -> the clock crossing -> AXILite2Wishbone -> the bridge, and waits for each
+  response; the calibration CPU's firmware (`selfcal_fw`) waits on the Wishbone ack, and its
+  delays and timeouts are `hw_wait` / `wait_set` on the CPU's cycle timer (`hw_now`), not on loop
+  counts; `selfcal_sim.py` measured 41 cycles a PHY CSR access, the run otherwise identical.
 - **Checks:** `regtimer_check.py` (migen: the stock timer and this one at periods 2, 3, 7, 1040,
   4161 under the same random wait, 200,000 cycles: done and count equal every cycle; a mutant that
   holds done fails); `csr_pipe_check.py` (3,000 accesses: PASS, 3 -> 7 cycles); `selfcal_sim.py`

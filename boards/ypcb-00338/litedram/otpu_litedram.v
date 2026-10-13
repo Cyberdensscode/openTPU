@@ -11,7 +11,7 @@
 // Device     : xc7k480t-ffg1156-2
 // Hierarchy  : disabled
 // LiteX sha1 : --------
-// Date       : 2026-10-13 09:55:28
+// Date       : 2026-10-13 10:51:49
 //------------------------------------------------------------------------------
 
 `timescale 1ns / 1ps
@@ -167,8 +167,8 @@ OTPULiteDRAM
 ├── cpu (CPUNone)
 ├── identifier (Identifier)
 ├── wclk (WriteClocks)
-│    ├── [BB:BUFG]
 │    ├── [BB:MMCME2_ADV]
+│    ├── [BB:BUFG]
 │    ├── [BB:BUFG]
 │    ├── [BB:BUFG]
 │    ├── [BB:BUFG]
@@ -335,11 +335,21 @@ OTPULiteDRAM
 │    ├── bitslip_152 (BitSlip) [Gen]
 │    ├── tappeddelayline_2 (TappedDelayLine) [Gen]
 │    ├── tappeddelayline_3 (TappedDelayLine) [Gen]
+│    ├── [BB:ISERDESE2]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
@@ -356,31 +366,7 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
@@ -413,7 +399,6 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
@@ -423,16 +408,7 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
@@ -495,6 +471,13 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
@@ -516,6 +499,24 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
@@ -571,18 +572,22 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:IOBUF]
+│    ├── [BB:IOBUFDS]
+│    ├── [BB:IOBUFDS]
+│    ├── [BB:IOBUFDS]
 │    ├── [BB:IOBUF]
 │    ├── [BB:IOBUFDS]
 │    ├── [BB:IOBUFDS]
 │    ├── [BB:IOBUF]
 │    ├── [BB:IOBUFDS]
-│    ├── [BB:IOBUFDS]
-│    ├── [BB:IOBUFDS]
-│    ├── [BB:ISERDESE2]
 │    ├── [BB:IOBUF]
 │    ├── [BB:IOBUFDS]
-│    ├── [BB:IOBUF]
-│    ├── [BB:IOBUFDS]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
@@ -591,51 +596,32 @@ OTPULiteDRAM
 │    ├── [BB:IOBUFDS]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
 │    ├── [BB:IOBUFDS]
-│    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
 │    ├── [BB:IOBUF]
+│    ├── [BB:ISERDESE2]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:ISERDESE2]
 │    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:ISERDESE2]
 │    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
 │    ├── [BB:IDELAYE2]
 │    ├── [BB:IOBUF]
 │    ├── [BB:FDRE]
@@ -771,11 +757,6 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:ISERDESE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
 │    ├── [BB:IDELAYE2]
 │    ├── [BB:IOBUF]
 │    ├── [BB:FDRE]
@@ -911,6 +892,25 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
 │    ├── [BB:ISERDESE2]
 │    ├── [BB:IDELAYE2]
 │    ├── [BB:IDELAYE2]
@@ -1113,8 +1113,8 @@ OTPULiteDRAM
 ├── cal (Cal)
 ├── bist (BIST)
 ├── wclk1 (WriteClocks)
-│    ├── [BB:BUFG]
 │    ├── [BB:MMCME2_ADV]
+│    ├── [BB:BUFG]
 │    ├── [BB:BUFG]
 │    ├── [BB:BUFG]
 │    ├── [BB:BUFG]
@@ -1281,8 +1281,11 @@ OTPULiteDRAM
 │    ├── bitslip_152 (BitSlip) [Gen]
 │    ├── tappeddelayline_2 (TappedDelayLine) [Gen]
 │    ├── tappeddelayline_3 (TappedDelayLine) [Gen]
-│    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
 │    ├── [BB:OBUFDS]
 │    ├── [BB:FDRE]
@@ -1301,8 +1304,6 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
-│    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
@@ -1450,7 +1451,6 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
 │    ├── [BB:FDRE]
@@ -1526,6 +1526,9 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:IOBUFDS]
 │    ├── [BB:OSERDESE2]
+│    ├── [BB:FDRE]
+│    ├── [BB:IOBUFDS]
+│    ├── [BB:OSERDESE2]
 │    ├── [BB:IOBUFDS]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
@@ -1539,9 +1542,6 @@ OTPULiteDRAM
 │    ├── [BB:IOBUFDS]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:FDRE]
-│    ├── [BB:IOBUFDS]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:ISERDESE2]
 │    ├── [BB:IDELAYE2]
@@ -1729,36 +1729,6 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
-│    ├── [BB:IDELAYE2]
-│    ├── [BB:IOBUF]
-│    ├── [BB:FDRE]
-│    ├── [BB:OSERDESE2]
-│    ├── [BB:ISERDESE2]
 │    ├── [BB:IOBUF]
 │    ├── [BB:IDELAYE2]
 │    ├── [BB:FDRE]
@@ -1799,8 +1769,38 @@ OTPULiteDRAM
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:ISERDESE2]
-│    ├── [BB:IOBUF]
 │    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
+│    ├── [BB:FDRE]
+│    ├── [BB:OSERDESE2]
+│    ├── [BB:ISERDESE2]
+│    ├── [BB:IDELAYE2]
+│    ├── [BB:IOBUF]
 │    ├── [BB:FDRE]
 │    ├── [BB:OSERDESE2]
 │    ├── [BB:ISERDESE2]
@@ -19698,6 +19698,7 @@ reg           wl7ddrphy0_rdphase_wr_stb = 1'd0;
 reg           wl7ddrphy0_rst_storage = 1'd0;
 reg           wl7ddrphy0_rst_wr_stb = 1'd0;
 wire          wl7ddrphy0_self_r;
+reg           wl7ddrphy0_sys_rst = 1'd1;
 wire          wl7ddrphy0_tappeddelayline00;
 wire          wl7ddrphy0_tappeddelayline01;
 reg           wl7ddrphy0_tappeddelayline010 = 1'd0;
@@ -20781,6 +20782,7 @@ reg           wl7ddrphy1_rdphase_wr_stb = 1'd0;
 reg           wl7ddrphy1_rst_storage = 1'd0;
 reg           wl7ddrphy1_rst_wr_stb = 1'd0;
 wire          wl7ddrphy1_self_r;
+reg           wl7ddrphy1_sys_rst = 1'd1;
 wire          wl7ddrphy1_tappeddelayline10;
 wire          wl7ddrphy1_tappeddelayline11;
 reg           wl7ddrphy1_tappeddelayline110 = 1'd0;
@@ -64908,6 +64910,7 @@ always @(posedge sys_clk_1) begin
             writeclocks0_drp_dat_r_status <= writeclocks06;
         end
     end
+    wl7ddrphy0_sys_rst <= (sys_rst_1 | wl7ddrphy0_rst_storage);
     wl7ddrphy0_tappeddelayline0_tappeddelayline00 <= wl7ddrphy0_tappeddelayline00;
     wl7ddrphy0_tappeddelayline0_tappeddelayline01 <= wl7ddrphy0_tappeddelayline0_tappeddelayline00;
     wl7ddrphy0_dqspattern0_o1 <= wl7ddrphy0_dqspattern0_o0;
@@ -67277,6 +67280,7 @@ always @(posedge sys_clk_1) begin
             writeclocks1_drp_dat_r_status <= writeclocks16;
         end
     end
+    wl7ddrphy1_sys_rst <= (sys_rst_1 | wl7ddrphy1_rst_storage);
     wl7ddrphy1_tappeddelayline1_tappeddelayline10 <= wl7ddrphy1_tappeddelayline10;
     wl7ddrphy1_tappeddelayline1_tappeddelayline11 <= wl7ddrphy1_tappeddelayline1_tappeddelayline10;
     wl7ddrphy1_dqspattern1_o1 <= wl7ddrphy1_dqspattern1_o0;
@@ -72266,7 +72270,7 @@ FDRE #(
 	// Inputs.
 	.C  (sys_clk_1),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -76740,7 +76744,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -76803,7 +76807,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -76866,7 +76870,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -76929,7 +76933,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -76992,7 +76996,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -77055,7 +77059,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -77118,7 +77122,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -77181,7 +77185,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -77244,7 +77248,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -77307,7 +77311,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -77430,7 +77434,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -77553,7 +77557,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -77676,7 +77680,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -77799,7 +77803,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -77922,7 +77926,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -78045,7 +78049,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -78168,7 +78172,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -78291,7 +78295,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -78414,7 +78418,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -78537,7 +78541,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -78660,7 +78664,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -78783,7 +78787,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -78906,7 +78910,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -79029,7 +79033,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -79152,7 +79156,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -79275,7 +79279,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -79398,7 +79402,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -79521,7 +79525,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -79644,7 +79648,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -79767,7 +79771,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -79890,7 +79894,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -80013,7 +80017,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -80136,7 +80140,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -80259,7 +80263,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -80382,7 +80386,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -80505,7 +80509,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -80628,7 +80632,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -80751,7 +80755,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -80874,7 +80878,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -80997,7 +81001,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -81120,7 +81124,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -81243,7 +81247,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -81366,7 +81370,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -81489,7 +81493,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -81612,7 +81616,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -81735,7 +81739,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -81858,7 +81862,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -81981,7 +81985,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -82104,7 +82108,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -82227,7 +82231,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -82350,7 +82354,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -82473,7 +82477,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -82596,7 +82600,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -82719,7 +82723,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -82842,7 +82846,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -82965,7 +82969,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -83088,7 +83092,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -83211,7 +83215,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -83334,7 +83338,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -83457,7 +83461,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -83580,7 +83584,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -83703,7 +83707,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -83826,7 +83830,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -83949,7 +83953,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -84072,7 +84076,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -84195,7 +84199,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -84318,7 +84322,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -84441,7 +84445,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -84564,7 +84568,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -84687,7 +84691,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -84810,7 +84814,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -84933,7 +84937,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -85056,7 +85060,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -85179,7 +85183,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -85302,7 +85306,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -85425,7 +85429,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -85548,7 +85552,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -85671,7 +85675,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -85794,7 +85798,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -85917,7 +85921,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -86040,7 +86044,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw0_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy0_rst_storage)),
+	.D  (wl7ddrphy0_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -86445,7 +86449,7 @@ FDRE #(
 	// Inputs.
 	.C  (sys_clk_1),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -90919,7 +90923,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -90982,7 +90986,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -91045,7 +91049,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -91108,7 +91112,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -91171,7 +91175,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -91234,7 +91238,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -91297,7 +91301,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -91360,7 +91364,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -91423,7 +91427,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -91486,7 +91490,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -91609,7 +91613,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -91732,7 +91736,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -91855,7 +91859,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -91978,7 +91982,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -92101,7 +92105,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -92224,7 +92228,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -92347,7 +92351,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -92470,7 +92474,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -92593,7 +92597,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -92716,7 +92720,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -92839,7 +92843,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -92962,7 +92966,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -93085,7 +93089,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -93208,7 +93212,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -93331,7 +93335,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -93454,7 +93458,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -93577,7 +93581,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -93700,7 +93704,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -93823,7 +93827,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -93946,7 +93950,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -94069,7 +94073,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -94192,7 +94196,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -94315,7 +94319,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -94438,7 +94442,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -94561,7 +94565,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -94684,7 +94688,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -94807,7 +94811,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -94930,7 +94934,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -95053,7 +95057,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -95176,7 +95180,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -95299,7 +95303,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -95422,7 +95426,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -95545,7 +95549,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -95668,7 +95672,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -95791,7 +95795,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -95914,7 +95918,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -96037,7 +96041,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -96160,7 +96164,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -96283,7 +96287,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -96406,7 +96410,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -96529,7 +96533,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -96652,7 +96656,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -96775,7 +96779,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -96898,7 +96902,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -97021,7 +97025,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -97144,7 +97148,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -97267,7 +97271,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -97390,7 +97394,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -97513,7 +97517,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -97636,7 +97640,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -97759,7 +97763,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -97882,7 +97886,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -98005,7 +98009,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -98128,7 +98132,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -98251,7 +98255,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -98374,7 +98378,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -98497,7 +98501,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -98620,7 +98624,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -98743,7 +98747,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -98866,7 +98870,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -98989,7 +98993,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -99112,7 +99116,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -99235,7 +99239,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -99358,7 +99362,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -99481,7 +99485,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -99604,7 +99608,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -99727,7 +99731,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -99850,7 +99854,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -99973,7 +99977,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -100096,7 +100100,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -100219,7 +100223,7 @@ FDRE #(
 	// Inputs.
 	.C  (sysw1_clk),
 	.CE (1'd1),
-	.D  ((sys_rst_1 | wl7ddrphy1_rst_storage)),
+	.D  (wl7ddrphy1_sys_rst),
 	.R  (1'd0),
 
 	// Outputs.
@@ -105065,7 +105069,7 @@ FDPE #(
 endmodule
 
 // -----------------------------------------------------------------------------
-//  Auto-Generated by LiteX on 2026-10-13 09:56:11.
+//  Auto-Generated by LiteX on 2026-10-13 10:52:26.
 //------------------------------------------------------------------------------
 
 // VexRiscv_Min.v (modules renamed otpu_selfcal_*)
