@@ -39,7 +39,7 @@ import numpy as np
 
 from .. import isa as I
 from .. import language as ol
-from ..compiler import CompileError, Tensor, current
+from ..compiler import CompileError, current
 from . import generate as G
 from . import prefill as PF
 from ..host.offload import LINE
@@ -315,7 +315,8 @@ class MTPDecoder:
         {(bucket, kind): programs} (a split kind's first part; its second at (bucket, kind,
         1)). A V or E over IMEM (or any, self.split True) goes in two parts (compile_gen's
         split form, cut at the first of plan_cuts whose parts fit): the first in its slot and
-        table entry, the second in the slot's second half and its ptab2 entry."""
+        table entry, the second in the slot's second half, its entry at the first half's end
+        (ptab2_addr)."""
         eng, img = self.eng, self.img
         a = img.lookup["mtpgen"]
         mode = (forced, None if samp is None else samp.key)
@@ -332,7 +333,7 @@ class MTPDecoder:
             if (blk, V0) in done:
                 continue
             t0 = time.perf_counter()
-            tab, tab2 = np.zeros(2 * NK, np.uint32), np.zeros(2 * NK, np.uint32)
+            tab = np.zeros(2 * NK, np.uint32)
             for k in range(NK):
                 sk = samp if KINDS[k][0] in "VE" else None      # (D, D1: either mode's)
                 what = ("mtpgen", blk, k, eng.block, forced, None if sk is None else sk.key)
@@ -353,16 +354,19 @@ class MTPDecoder:
                         parts = [eng.cached(what + ("part", j, cut), lambda j=j: (
                             compile_gen(img, blk, k, eng.block, forced, sk, j, cut), None))[0]
                             for j in (0, 1)]
-                        if parts[0] is None or all(G.fits(img, p) for p in parts):
+                        if parts[0] is None or (all(G.fits(img, p) for p in parts) and all(
+                                4 * len(G.slot_words(eng.backend, p)) <= a["slot"] // 2 - 8
+                                for p in parts[0])):    # (room for the second's entry)
                             break
                     else:
                         raise over(k, parts[1] if parts else [[]])
                     if parts[0] is None:
                         continue
                     progs, p2 = parts[0], prog_addr(a, blk, k) + a["slot"] // 2
+                    ent = np.array([p2, len(I.assemble(parts[1][0])) // 8], np.uint32)
                     for s_, prog in enumerate(parts[1]):
                         eng.backend.write(s_, p2, G.slot_words(eng.backend, prog))
-                    tab2[2 * k], tab2[2 * k + 1] = p2, len(I.assemble(parts[1][0])) // 8
+                        eng.backend.write(s_, ptab2_addr(a, blk, k), ent)
                 for s_, prog in enumerate(progs):     # (with its wait entries: chained)
                     eng.backend.write(s_, prog_addr(a, blk, k), G.slot_words(eng.backend, prog))
                 tab[2 * k], tab[2 * k + 1] = prog_addr(a, blk, k), len(I.assemble(progs[0])) // 8
@@ -371,8 +375,6 @@ class MTPDecoder:
                     done[(blk, k, 1)] = parts[1]
             for s_ in range(img.cfg.S):
                 eng.backend.write(s_, ptab_addr(a, blk), tab)
-                if tab2.any():
-                    eng.backend.write(s_, ptab2_addr(a, blk, 0), tab2)
             if st is not None:
                 st.compile_s += time.perf_counter() - t0
         return done
@@ -504,17 +506,15 @@ V0, E0, D2, D1 = 0, 2, 4, 5
 def gen_alloc(b, cap: int, spec, block: int = ATTN_BLOCK,
               imem_words: int = 1 << 15, waitc: bool = False) -> dict:
     """DRAM of the MTP loop: a program slot per bucket and kind (with its wait entries on a
-    WAITC device: generate.prog_bytes; a split V's or E's second part in its second half), and
-    the chain table ([address, instructions] per bucket and kind); the sampled verify's row 1
-    logits (the generate loop's lg holds row 0's: generate.Sampler); the split parts' table
-    (ptab2: a split kind's second part at its kind's entry) and the two rows' residual between
-    the parts (xs)."""
+    WAITC device: generate.prog_bytes; a split V's or E's second part in its second half, the
+    part's chain entry at the first half's end: ptab2_addr), and the chain table ([address,
+    instructions] per bucket and kind); the sampled verify's row 1 logits (the generate loop's
+    lg holds row 0's: generate.Sampler)."""
     nb, slot = G.buckets(cap, block), G.prog_bytes(imem_words, waitc)
     return {"progs": b.alloc(slot * NK * nb), "ptab": b.alloc(8 * NK * nb), "nb": nb,
             "slot": slot,
             "dtab": b.alloc(4 * (cap + 2)),     # tests: the draft of each position
-            "lg": b.alloc(4 * G._vpad(spec)),
-            "ptab2": b.alloc(8 * NK * nb), "xs": b.alloc(4 * 2 * spec.hidden)}
+            "lg": b.alloc(4 * G._vpad(spec))}
 
 
 def gen_build(put, s: int, S: int, spec, a: dict) -> None:
@@ -533,8 +533,12 @@ def ptab_addr(a: dict, blocks: int, kind: int = 0) -> int:
 
 
 def ptab2_addr(a: dict, blocks: int, kind: int) -> int:
-    """A split kind's second part's [address, instructions] (its first part's HALT CHAIN)."""
-    return a["ptab2"] + 8 * (NK * (blocks - 1) + kind)
+    """A split kind's second part's [address, instructions] (its first part's HALT CHAIN): the
+    last 8 bytes of the slot's first half, past the first part's words and wait entries (a
+    program of IMEM's instructions with all its entries fills the half: the first part has
+    fewer, _gen_programs). No DRAM of its own: an MTP image's layout is the same, split or
+    not."""
+    return prog_addr(a, blocks, kind) + a["slot"] // 2 - 8
 
 
 def plan_cuts(image) -> list:
@@ -609,10 +613,10 @@ def _verify_gen(m, pos, block: int, c: int, R: int, samp: G.Sampling | None = No
     (docs/mtp.md 11.1).
 
     part 0 / 1 (a V or E over IMEM: compile_gen's split form): part 0 the layers before `cut`
-    (the rows' embedding rows gathered), their residual to the MTP area's xs, then HALT CHAIN
-    to part 1 through the bucket's ptab2 entry of its kind; part 1 the layers from `cut` on
-    (the residual from xs), the head and the rest as above. The same operations: the
-    residual's fp32 rows only pass through DRAM."""
+    (the rows' embedding rows gathered), their residual to m.hid (the hidden rows, which part
+    1 writes at its end), then HALT CHAIN to part 1 through its entry (ptab2_addr); part 1 the
+    layers from `cut` on (the residual from m.hid), the head and the rest as above. The same
+    operations: the residual's fp32 rows only pass through DRAM."""
     from .qwen35 import qwen35_rows
     b = current()
     g, a = m.gen, m.mtpgen
@@ -621,9 +625,8 @@ def _verify_gen(m, pos, block: int, c: int, R: int, samp: G.Sampling | None = No
     b.run_words = words
     span = xs = None
     if part is not None:
-        H = m.spec.hidden
         span = (0, cut) if part == 0 else (cut, m.spec.layers)
-        xs = Tensor(a["xs"], (2, H), (H, 1))
+        xs = m.hid
     if part == 0:
         qwen35_rows.fn(m, pos, R, [], block, None, R > 1, False, span, xs)
         _args(b, at, words)
