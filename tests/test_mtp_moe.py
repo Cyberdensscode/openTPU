@@ -6,6 +6,7 @@ greedy tokens equal plain greedy decode's bit for bit whatever the drafts, with 
 a layer (misses on every layer). A tiny random Qwen3.5-MoE (tests/test_qwen35_moe.py) with random
 mtp.* weights in the checkpoint's form (its experts a tensor each)."""
 import dataclasses
+import os
 
 import numpy as np
 import pytest
@@ -209,8 +210,11 @@ def test_a_loop_program_that_fits_is_not_split():
     """The split V / E (docs/mtp.md 10.3) changes neither an MTP image's layout nor a program
     of a model whose V and E fit IMEM: Qwen3.5-35B-A3B's loop programs of bucket 1 (its
     formats, the card's configuration, its 38 slots a layer) are byte for byte those of the
-    tree before the split (3af05a43). A change of the programs themselves updates the
-    sum here."""
+    tree before the split (3af05a43) without the image's mask tiles (OTPU_TILE=0). With them
+    (Qwen3.5-MoE's tiles on by default, em-tile 2bb7bb0b) the image is 1,331,200 bytes longer
+    and the areas the programs address move: the same instructions, only address words
+    differing (by 262,144, 1,331,200 and 1,331,328 bytes), their own sum. A change of the
+    programs themselves updates the sums here."""
     import hashlib
     from pathlib import Path
     from opentpu import isa as I
@@ -234,7 +238,10 @@ def test_a_loop_program_that_fits_is_not_split():
         for p in progs:
             h.update(np.asarray(I.assemble(p), "<u4").tobytes())
     assert n == 38
-    assert h.hexdigest() == "7f3bacfe386c84838742206943cb20db6ea989d2a4eb6cf63fdab651d5ffc103"
+    untiled = os.environ.get("OTPU_TILE", "").strip() == "0"
+    assert h.hexdigest() == ("7f3bacfe386c84838742206943cb20db6ea989d2a4eb6cf63fdab651d5ffc103"
+                             if untiled else
+                             "eb811fa4ebb43cb6c9fdbe9b43caf1a7a78ebc074e0ddf41c446549c8dfdfa6c")
 
 
 @pytest.mark.parametrize("P, drafter, sp", [
