@@ -4864,9 +4864,34 @@ and the card's prompt misses and needs queued. O's two parts and three variants
   was given. It hurts where the reply follows the previous reply more than the question: the
   26B's short expert-major turns (its EM_ROWS is 20), with 16 slots a layer for a top-8 router.
 - What each layer keeps at the prompt's end (keep) matters little; the decode's use counts do.
-- Proposal (not built): count need lines for Qwen3.5-MoE only, a family switch beside EM_ROWS,
-  without the reorder. Replayed: the 35B gets O's decode (turn 4 -14.8 MB a token), the 26B and
-  LFM2 nothing. A card A/B would confirm it.
+
+**Not the cache's capacity either** (`server_replay.py replay --slots N`: the same records on N
+slots a layer). A switch by capacity (count where the slots a layer are several times the
+router's top-k) would generalize without a per-model knob, but the sign is the model's at every
+capacity. The decode's MB a token over all five turns, base -> count:
+
+| slots a layer (x k = 8) | 35B | 26B |
+|:--|:--|:--|
+| 10 (1.2) | | 478.5 -> 483.5 (+1.0%) |
+| 16 (2.0) | 275.6 -> 271.3 (-1.5%) | 340.7 -> 352.1 (+3.3%) |
+| 24 (3.0) | 243.5 -> 238.7 (-2.0%) | 242.5 -> 257.7 (+6.3%) |
+| 32 (4.0) | 219.0 -> 214.2 (-2.2%) | 180.2 -> 196.8 (+9.2%) |
+| 38 (4.8) | 203.0 -> 198.8 (-2.1%) | 147.6 -> 159.9 (+8.3%) |
+| 41 (5.1) | 195.3 -> 191.5 (-1.9%) | 131.5 -> 142.5 (+8.4%) |
+| 48 (6.0) | 179.3 -> 175.9 (-1.9%) | 102.8 -> 106.4 (+3.5%) |
+| 64 (8.0) | 146.1 -> 142.3 (-2.6%) | |
+
+- At the same 16 slots the two go opposite ways, so no threshold on slots / k separates them.
+- Gentler counts do not escape it. Each expert a layer's lines name counted once at the layer
+  switch, or each line a use of weight 0.25 or 0.1: the effect shrinks with the weight on both
+  models, the 35B -0.8 to -1.5%, the 26B +0.2 to +2.9%. keep is about 0 on both at their own
+  capacities. Whether a prompt's experts predict its reply's is the model's and its prompts',
+  not the cache's.
+- **O is dropped, count and reorder both**; production's server stays. What it could give is
+  about -4 MB a token on the 35B: ~2.5 ms of ~190 at les1's 0.64 ms a MB, ~1.3% of its decode.
+- Parked: the one form without a per-model knob is a duel on the host. Two directories of ids
+  only (with the need lines' uses and without) follow the same requests, and the slots take the
+  policy whose ghost missed less over the last turns. Too much machinery for ~1% on one model.
 
 ### 15.5 What we did not take, and the bigger levers
 
