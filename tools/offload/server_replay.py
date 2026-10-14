@@ -3,7 +3,8 @@ recorded once on the ISA simulator, then replayed through this tree's ExpertServ
 its slot order, on a stand-in memory with the record's layout.
 
     python3 tools/offload/server_replay.py record OUT.json -- CHATMOE_ARGS...
-    python3 tools/offload/server_replay.py replay REC.json [--variant NAME ...] [--json OUT]
+    python3 tools/offload/server_replay.py replay REC.json [--variant NAME ...] [--slots N ...]
+                                                     [--json OUT]
 
 record runs tools/qual/chatmoe.py (its arguments after --) with the server's calls logged in order:
 the load's warm set, each prefill's begin (expert-major or not, its scratch slots) and end, the
@@ -17,7 +18,9 @@ its needs before the next layer's lines come), prefills through begin_prefill / 
 turn: the prompt's misses and needs queued (what the prompt streams), and the decode's hits, hit
 rate, misses a token and MB a token (MB: misses x the record's slot bytes). A replay of the
 card's server reproduces the card's hit rates (the card's timing changes no slot decision but
-the needs' landing order within a layer).
+the needs' landing order within a layer). --slots N: each layer N slots instead of the record's
+(the same routing on a cache of another capacity: the warm set while slots last); several give
+a sweep.
 
 The variants (--variant, default "base": this tree's server as it is):
 - count: a need line counts as a request does (a use of each id, one more of its layer's), as
@@ -160,11 +163,12 @@ def _variant(srv, name: str) -> None:
     srv.need, srv._at, srv.end_prefill, srv.begin_prefill = need, at, end_prefill, begin_prefill
 
 
-def replay(rec: dict, variant: str = "base") -> list:
+def replay(rec: dict, variant: str = "base", slots: int | None = None) -> list:
     from opentpu.host.offload import ExpertServer, Layout, SimDram
     info = rec["info"]
     SLOT = 4096
-    lay = Layout.build(4096, info["E"], info["k"], info["slots"], SLOT)
+    lay = Layout.build(4096, info["E"], info["k"], info["slots"] if slots is None else
+                       [slots] * info["layers"], SLOT)
     mem = SimDram(np.zeros(lay.end + 4096, np.uint8))
     data = bytes(SLOT)
     srv = ExpertServer(mem, lay, lambda g: data)
@@ -239,6 +243,8 @@ def main(argv=None):
     p = sub.add_parser("replay")
     p.add_argument("rec")
     p.add_argument("--variant", action="append")
+    p.add_argument("--slots", type=int, action="append",
+                   help="each layer's slots (default the record's; repeated: a sweep)")
     p.add_argument("--json")
     a = ap.parse_args(argv)
     if a.cmd == "record":
@@ -246,12 +252,15 @@ def main(argv=None):
         return record(a.out, args)
     rec = json.loads(Path(a.rec).read_text())
     out = {}
-    for v in a.variant or ["base"]:
-        out[v] = turns = replay(rec, v)
-        for i, t in enumerate(turns):
-            print(f"{v:6s} turn {i + 1}: prompt misses {t['p_misses']:5d} needs queued "
-                  f"{t['p_queued']:5d} | decode hits {t['hit_rate']:.4f}, {t['misses_tok']:5.1f}"
-                  f" misses / {t['mb_tok']:6.1f} MB a token ({t['tokens']} tokens)", flush=True)
+    for n in a.slots or [None]:
+        for v in a.variant or ["base"]:
+            name = v if n is None else f"{v}@{n}"
+            out[name] = turns = replay(rec, v, n)
+            for i, t in enumerate(turns):
+                print(f"{name:9s} turn {i + 1}: prompt misses {t['p_misses']:5d} needs queued "
+                      f"{t['p_queued']:5d} | decode hits {t['hit_rate']:.4f}, "
+                      f"{t['misses_tok']:5.1f} misses / {t['mb_tok']:6.1f} MB a token "
+                      f"({t['tokens']} tokens)", flush=True)
     if a.json:
         Path(a.json).write_text(json.dumps(out, indent=1))
 
