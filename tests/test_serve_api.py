@@ -269,3 +269,169 @@ def test_think_split():
             rs, cs = rs + a, cs + b
         a, b = sp.feed("", final=True)
         assert (rs + a, cs + b) == want
+
+
+class _HeldReads:
+    """PoolFile's reads held until released (a slow disk); the read of expert `fail` raises."""
+
+    def __init__(self, monkeypatch, slot, fail=None):
+        from opentpu.host import offload as OF
+        self.sem, real = threading.Semaphore(0), OF.preadv
+
+        def read(fd, bufs, off):
+            assert self.sem.acquire(timeout=60)
+            if fail is not None and off // slot == fail:
+                raise OSError(5, "Input/output error")
+            real(fd, bufs, off)
+        monkeypatch.setattr(OF, "preadv", read)
+
+    def release(self, k):
+        for _ in range(k):
+            self.sem.release()
+
+
+def _until(cond, s=30.0):
+    import time
+    t = time.time()
+    while not cond():
+        assert time.time() - t < s
+        time.sleep(0.01)
+
+
+def _pool_server(tmp_path, cap, n=8, slot=4096 * 2):
+    """A Server over a streamed MoE's pool file alone (a stand-in worker and engine), on HTTP."""
+    from types import SimpleNamespace
+
+    from opentpu.host.offload import PoolFile
+    f = tmp_path / "pool.bin"
+    f.write_bytes(np.random.default_rng(0).integers(0, 256, n * slot, dtype=np.uint8).tobytes())
+    pf = PoolFile(f, slot, split=False)
+    pf.ids = np.arange(n)
+    w = SimpleNamespace(tok_lock=threading.Lock(), usage=lambda: {"decode_s": 0, "generated": 0},
+                        eng=SimpleNamespace(cap=CAP, server=SimpleNamespace(pool_file=pf)))
+    srv = API.Server(w, _Tok(), None, "pool", {}, warm_cap=cap)
+    httpd = API.serve(srv, "127.0.0.1", 0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return pf, srv, httpd
+
+
+def test_health_is_warming_while_the_pool_is_read(tmp_path, monkeypatch):
+    """A streamed MoE's /health (moe.rewarm's read of its pool into the page cache): 503
+    "warming" with the share read while the warm thread runs, ok once it has read all of it;
+    /v1/stats keeps the read's record. A model without a pool: ok (test_models_health_and_stats)."""
+    from opentpu.host.offload import warm_report
+    pf, srv, httpd = _pool_server(tmp_path, cap=60.0)
+    port = httpd.server_address[1]
+    reads = _HeldReads(monkeypatch, pf.slot)
+    try:
+        t = pf.warm(pf.ids)
+        assert _call(port, "GET", "/health") == (503, {"status": "warming", "progress": 0.0})
+        reads.release(4)
+        _until(lambda: t.bytes == 4 * pf.slot)
+        assert _call(port, "GET", "/health") == (503, {"status": "warming", "progress": 0.5})
+        assert _call(port, "GET", "/health_generate")[0] == 503
+        reads.release(4)
+        t.join(60)
+        assert _call(port, "GET", "/health") == (200, {"status": "ok"})
+        st, s = _call(port, "GET", "/v1/stats")
+        r = s["pool_warm"]
+        assert st == 200 and r == warm_report(t)
+        assert r["of_gb"] == r["gb"] == round(8 * pf.slot / 1e9, 2) and r["end"] >= r["start"]
+        assert r["error"] is None and not r["stopped"] and r["resident"] in (None, 1.0)
+    finally:
+        reads.release(64)
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_health_is_ok_past_the_warm_cap_and_when_the_read_fails(tmp_path, monkeypatch):
+    """/health's 503 lasts at most warm_cap seconds from the read's start (then ok, "warm":
+    "incomplete", the cap in its note; warm_cap 0: never 503). A read that raises ends the warm
+    thread with its error, and /health says ok, incomplete, with the error; so does a thread
+    gone without its end recorded."""
+    import time
+    from types import SimpleNamespace
+    pf, srv, httpd = _pool_server(tmp_path, cap=0.3)
+    port = httpd.server_address[1]
+    reads = _HeldReads(monkeypatch, pf.slot, fail=5)
+    try:
+        t = pf.warm(pf.ids)
+        assert srv.health() == (503, {"status": "warming", "progress": 0.0})
+        _until(lambda: time.time() - t.t0 > 0.3)
+        assert srv.health() == (200, {"status": "ok", "warm": "incomplete", "progress": 0.0,
+                                      "note": "the pool's warm runs past the 0.3 s cap"})
+        srv.warm_cap = 0
+        assert srv.health()[0] == 200
+        srv.warm_cap = 60.0
+        assert srv.health()[0] == 503
+        reads.release(8)
+        t.join(60)
+        assert t.error == "OSError: [Errno 5] Input/output error" and t.bytes == 5 * pf.slot
+        assert _call(port, "GET", "/health") == (200, {"status": "ok", "warm": "incomplete",
+                                                       "progress": 0.625, "note": t.error})
+        pf.warm_t = SimpleNamespace(is_alive=lambda: False, bytes=0, total=pf.slot,
+                                    t0=time.time(), t1=None, error=None)
+        assert srv.health() == (200, {"status": "ok", "warm": "incomplete", "progress": 0.0,
+                                      "note": "the pool's warm thread died"})
+    finally:
+        reads.release(64)
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_the_warm_log_says_when_the_read_ends(tmp_path, monkeypatch):
+    """log_warm (otpu-serve's start): a line as the server starts, and the read's record when
+    it ends (start, end, GB, MB/s, the pool's share in the page cache), or why it did not."""
+    import io
+
+    from opentpu.host.offload import warm_report
+    pf, srv, httpd = _pool_server(tmp_path, cap=60.0)
+    reads = _HeldReads(monkeypatch, pf.slot, fail=7)
+    try:
+        out = io.StringIO()
+        t = pf.warm(pf.ids)
+        API.log_warm(t, out)
+        reads.release(8)
+        t.join(60)
+        _until(lambda: out.getvalue().count("\n") == 2)
+        first, last = out.getvalue().splitlines()
+        r = warm_report(t)
+        assert first.startswith("pool warm: started ") and first.endswith(" GB read")
+        assert last.startswith("pool warm: incomplete (OSError: [Errno 5] Input/output error): ")
+        assert f", {r['gb']:g} GB, {r['mb_s']} MB/s; " in last
+        assert last.endswith("of the pool in the page cache")
+    finally:
+        reads.release(64)
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_serve_bench_waits_for_a_warming_server(capsys):
+    """serve_bench.wait_up (the sessions' wait for otpu-serve): a 503 "warming" is a server up,
+    waited for past --wait (the server ends it at its warm cap); no answer, another 503 or a
+    body that is not JSON for --wait seconds: SystemExit."""
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location(
+        "serve_bench", Path(__file__).resolve().parents[1] / "tools" / "serve_bench.py")
+    SB = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(SB)
+
+    class Seq:
+        def __init__(self, *answers):
+            self.answers = list(answers)
+
+        def get(self, path):
+            assert path == "/health"
+            a = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+            if isinstance(a, Exception):
+                raise a
+            return a
+    warming = (503, {"status": "warming", "progress": 0.25})
+    nop = lambda s: None                                    # noqa: E731
+    assert SB.wait_up(Seq(warming, warming, warming, (200, {"status": "ok"})), -1, nop) >= 0
+    assert "its expert pool warming (0.25 read)" in capsys.readouterr().out
+    assert SB.wait_up(Seq(ConnectionRefusedError(), (200, {"status": "ok"})), 60, nop) >= 0
+    for never in (ConnectionRefusedError(), (503, {"status": "busy"}), ValueError("not JSON")):
+        with pytest.raises(SystemExit, match="did not come up"):
+            SB.wait_up(Seq(never), -1, nop)

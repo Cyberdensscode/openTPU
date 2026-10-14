@@ -30,7 +30,8 @@ r = c.chat.completions.create(model="Qwen3-0.6B", messages=[{"role": "user", "co
 | `POST /generate` | SGLang's native call: `text` or `input_ids` (one, or a list), `sampling_params` (`max_new_tokens` (default 128), `temperature`, `top_p`, `top_k` (-1: all), `repetition_penalty`, `stop`, `stop_token_ids`, `ignore_eos`, `n`), `stream` (each event the whole text so far); `output_ids` and `meta_info` (prompt, completion and cached tokens, `finish_reason`, `e2e_latency`) |
 | `GET /v1/models` | the model, its context length (`max_model_len`) |
 | `GET /v1/stats` | the queue, throughput, the slots, the KV store and prefix cache, the steps' timing |
-| `GET /health`, `/health_generate`, `/get_model_info`, `/get_server_info` | |
+| `GET /health`, `/health_generate` | ok; a streamed MoE's 503 `warming` while its expert pool is read into the page cache (below) |
+| `GET /get_model_info`, `/get_server_info` | |
 | `POST /flush_cache` | forget every saved context and what idle slots hold |
 
 `usage.prompt_tokens_details.cached_tokens` counts the prompt tokens the server did not feed
@@ -71,6 +72,17 @@ A model with a vision side (`minicpmv.Spec`, docs/minicpmv.md) takes images in
 
 `/v1/completions` and `/generate` take text and token ids only. An image request on a model
 without a vision side is refused (400).
+
+**A streamed MoE's expert pool** (`--pool`) serves the slots' misses from the host's page cache:
+~0.5 ms a miss, against 15-32 ms each from the card host's disks (docs/minicpmv.md 6, pooldisk:
+a turn 5-9x slower). The engine reads the whole pool into the page cache as it opens, and again,
+once the image is built, what the build's memory took back out (`moe.rewarm`): the card host's
+HDD reads an 18 GB pool in ~80 s, its SSD in ~37. Meanwhile `/health` answers 503
+`{"status": "warming", "progress": <the share read>}`, for at most `--warm-cap` seconds
+(default 300; 0: never); past that, or when the read failed or was stopped, it answers ok with
+`"warm": "incomplete"` and a note. It is advisory: requests are served during the read, their
+misses from the disk. The read's start, end, GB, MB/s and the pool's share in the page cache
+at its end are printed when it ends, and `/v1/stats` has them (`pool_warm`).
 
 ## The KV cache: pages, the store, the prefix cache
 

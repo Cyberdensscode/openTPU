@@ -318,6 +318,29 @@ def images(cl: Client, paths: list, max_tokens: int, max_slices: int | None = No
     return out
 
 
+def wait_up(cl: Client, wait: float, sleep=time.sleep) -> float:
+    """Waits for the server's /health to say 200; returns the seconds it took. A 503 "warming"
+    (a streamed MoE's expert pool read into the page cache, docs/serve.md) is a server up and
+    warming: waited for past `wait`, since the server ends it itself (its --warm-cap). No
+    answer, or another one, for `wait` seconds: SystemExit."""
+    t0, said = time.time(), False
+    while True:
+        try:
+            st, body = cl.get("/health")
+        except (OSError, ValueError):
+            st, body = None, None
+        if st == 200:
+            return time.time() - t0
+        warming = st == 503 and isinstance(body, dict) and body.get("status") == "warming"
+        if warming and not said:
+            print(f"serve_bench: the server is up, its expert pool warming "
+                  f"({body.get('progress')} read)", flush=True)
+            said = True
+        if not warming and time.time() - t0 > wait:
+            raise SystemExit("serve_bench: the server did not come up")
+        sleep(1)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--host", default="127.0.0.1")
@@ -335,7 +358,8 @@ def main(argv=None):
                     help="clients of the arrivals part, one every --arrival-interval s (0: none)")
     ap.add_argument("--arrival-interval", type=float, default=1.5)
     ap.add_argument("--user-tokens", type=int, default=64, help="max tokens of a user's reply")
-    ap.add_argument("--wait", type=float, default=900, help="seconds to wait for /health")
+    ap.add_argument("--wait", type=float, default=900,
+                    help="seconds to wait for /health (a 503 'warming' is waited for past them)")
     ap.add_argument("--image", action="append", default=[],
                     help="an image of the images part (repeated: the first is asked about twice "
                          "and followed up; none: no images part)")
@@ -349,17 +373,8 @@ def main(argv=None):
                     help="parts to skip: check,throughput,conversation,users,arrivals")
     a = ap.parse_args(argv)
     cl = Client(a.host, a.port, a.api_key)
-    t0 = time.time()
-    while True:
-        try:
-            if cl.get("/health")[0] == 200:
-                break
-        except OSError:
-            pass
-        if time.time() - t0 > a.wait:
-            raise SystemExit("serve_bench: the server did not come up")
-        time.sleep(1)
-    rep = {"models": cl.get("/v1/models")[1]}
+    up = wait_up(cl, a.wait)
+    rep = {"models": cl.get("/v1/models")[1], "up_s": round(up, 1)}
     skip = set(a.skip.split(","))
     if "check" not in skip:
         rep["check"] = correctness(cl, a.check_prompts, a.check_tokens)
