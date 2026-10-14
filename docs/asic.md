@@ -214,6 +214,59 @@ buffer 0.47 ns and the wire from it to the clock pin 0.35). The ports' worst is 
 data (-2.47 ns). Left for the repair: 1506 nets over their maximum capacitance and 126 pins over
 their maximum slew (56 and 6 after CTS).
 
+### The card's TMEM by its readers
+
+On the column floorplan the macro placer puts the TMEM's 16 macros in a 4 x 4 block in the core's
+bottom-right corner, 3-5 mm from the units that read it, and the clock tree reaches that corner's
+last column late (2.68-2.78 ns against 1.80-2.17 for the other TMEM macros and 1.89 for the
+registers' median). `mxu_macros.tcl` with `TMEM_GAP_UM` (off unless set) places them as a block
+of their own, that far right of the MXU's: two stacks of abutted macros, banks 0-3 on the left
+(pins to the right) and 4-7 on the right (pins to the left), facing a strip (`TMEM_STRIP_UM`, 200
+um) for the banks' muxes and the slice's arbiter, centred on the core's height; global placement
+puts the readers around it, and the macro placer's fence starts right of it. On a8's netlist with
+`TMEM_GAP_UM` 100 (the block at x 1.70-2.47 mm, y 1.10-3.42 mm), after CTS (placement parasitics
+for both):
+
+| | TMEM in the corner (the macro placer) | TMEM by its readers |
+|---|---|---|
+| the TMEM macros' clock pins | 1.80-2.78 ns, mean 2.09 | 1.67-1.86 ns, mean 1.79 |
+| all 90 macros / the registers' median | 1.71-2.78 / 1.885 ns | 1.67-2.03 / 1.872 ns |
+| clock skew | 0.96 ns | 0.31 ns |
+| register to register | 3.52 ns (284 MHz): a TMEM macro -> the DMA's `t_rq` | 2.69 ns (372 MHz): the VPU's grant -> an fmul s1 |
+| with the ports | 5.00 ns: port B's write data | 4.70 ns: port B's write data |
+| wire after detailed placement | 70.6 m | 83.7 m |
+| global placement's weighted congestion: first / best | 2.67 (9.0%) / 1.125 | 2.80 (11.8%) / 1.122 |
+| power at 400 MHz | 4.88 W | 4.79 W |
+
+The TMEM's reads by reader (the worst 300 paths into each, the wire the Manhattan length along the
+path's pins, the data delay from the macro's clock pin):
+
+| reader | corner: worst slack | wire mean / max | data delay | by its readers: worst slack | wire mean / max | data delay |
+|---|---|---|---|---|---|---|
+| DMA | -1.02 ns | 5.5 / 7.3 mm | 1.77 ns | +0.75 ns | 3.3 / 4.5 mm | 1.18 ns |
+| VPU | -0.88 ns | 5.6 / 6.9 mm | 1.75 ns | +0.67 ns | 2.9 / 4.1 mm | 1.05 ns |
+| quantizer | -0.62 ns | 4.1 / 5.5 mm | 1.42 ns | +0.50 ns | 3.5 / 6.1 mm | 1.30 ns |
+| MXU (drain) | -0.52 ns | 4.0 / 5.3 mm | 1.40 ns | +0.80 ns | 3.3 / 3.7 mm | 1.19 ns |
+| the TMEM's own registers | -0.60 ns | 5.2 / 6.0 mm | 1.62 ns | +0.71 ns | 3.3 / 4.6 mm | 1.24 ns |
+| the slice's arbiter | -0.66 ns | 4.8 / 6.0 mm | 1.60 ns | +0.63 ns | 3.8 / 4.2 mm | 1.32 ns |
+
+The distance is the NUMA cost of a memory read here: over all 1488 paths, data delay = 0.47 ns +
+0.220 ns per mm of wire (in the corner 0.55 ns + 0.213 ns per mm), so a reader 3 mm away pays
+about 0.66 ns of a 2.5 ns cycle in wire. Of each reader's 1.1-1.8 ns of slack gained about 1 ns
+is the clock (the worst paths launched from the corner's late macros, now with the registers) and
+0.1-0.7 ns the wire (its mean data delay; 0.6-2.7 mm less on average). Every TMEM read meets 2.5 ns with 0.5-0.8 ns to spare, and the
+register-to-register limit moves to the VPU's grant fanout (387 endpoints at -0.19 ns; +0.11 in
+the corner run, the VPU's registers now spread around the block: "Grant fanout", Open problems).
+The cost is wire: the block splits the core, 18.5% more after placement. It routes: global
+routing as a8's (metal4-6 at 7%, no repair) ends clean after 7 extra iterations, 112.2 m against
+99.2 m (usage 30.9% against 26.9%; metal4 47%, metal5 26%), 40 min, 27 GB; on its parasitics
+register to register is 2.59 ns (**386 MHz**, against 2.94 ns, 340 MHz, with the TMEM in the
+corner), 0.26 ns of skew, the VPU's grant the worst path, port B's write data -2.19 ns, 4.87 W
+at 400 MHz (4.96), 2213 nets over their maximum capacitance and 203 pins over their maximum slew
+left for the repair (1506 and 126). The macro placer then put port B's write-data pins on the
+right edge (830, beside the sequencer's IMEM macros) and the bottom edge (194), the line buffer
+in the bottom-right corner, and none of it congests.
+
 ### Before: the previous card point (2026-10-11)
 
 The card's arch before r2 (113 macros, three TMEM copies, ACT_ROWS 4), 35%, the macro placer's
@@ -347,7 +400,9 @@ clock on the operator) pays once those are fixed, from about 540 MHz.
 - **The card's TMEM placement.** The macro placer puts the TMEM's 16 macros in a corner of the
   card's core, and its reads into the VPU, the quantizer, the DMA and the MXU are the card's
   register-to-register limit (-1.02 ns at 2.5 after CTS, -0.44 ns on the global route, with the
-  macros' clock 0.7-1 ns late).
+  macros' clock 0.7-1 ns late). Placed by its readers (`TMEM_GAP_UM`: "The card's TMEM by its
+  readers") every read meets 2.5 ns and the global route's period is 2.59 ns, for 13% more wire;
+  the card point does not take it yet.
 - **The weight chunk's layout** (a data-movement fix, not made). The MXU's FIFO holds the D-byte
   chunk as DRAM brings it, and array position i takes byte i in int8 but nibble i of the chunk's
   low half and nibble i of its high half in the 4-bit formats (`otpu_mxu` `wsel` / `dec4`: int4,
