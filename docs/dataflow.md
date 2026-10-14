@@ -858,7 +858,7 @@ against the float model:
 D-block a column a cycle; VPU 8 lanes, exp2 2), against DSTEP's 2,048 (its datapath: the state's
 16K words once through, 8 a cycle). "split": an operand as its int8 part plus the int8 of the
 remainder, three MXU passes (~16-bit operands on today's MXU). MiniCPM-V's 488-row image prompt
-(30 DeltaNet layers x 32 heads) takes 7.2 s of DSTEP (about 55% of it exposed).
+(30 DeltaNet layers x 32 heads) takes 7.2 s of DSTEP, 57% of it exposed (4.1 s, below).
 
 | C | matmuls | MXU | VPU | DRAM | x DSTEP (units overlapped) | the prompt's recurrence |
 |---:|---|---:|---:|---:|---:|---:|
@@ -871,6 +871,34 @@ remainder, three MXU passes (~16-bit operands on today's MXU). MiniCPM-V's 488-r
 | 16 | the chunk's on the VPU in fp32, the state's int8 | 320 | 1,022 | 64 | 2.0 | 3.6 s |
 | 64 | the chunk's on the VPU in fp32, the state's int8 | 128 | 2,854 | 16 | 0.7 | 10.0 s |
 
+**At MCOLS 8 (r2.1).** The mixer's MXU work shrinks there and DSTEP does not. Co-simulated, the
+m8 variant (ypcb-00338:m8: MCOLS 8, MXU_E 8, 128K TMEM words) against m4 on docs/tiled_prefill.md
+14.2's layers (MiniCPM-V's formats, tiles of 8 rows at position 256, ms a row), each also with
+DSTEP's cost removed (a timing hack) for its exposed part; DSTEP itself is 0.49 ms a row and
+layer (32 heads x 2,048 cycles):
+
+| layer | m4 | m4, no DSTEP | DSTEP exposed | m8 | m8, no DSTEP | DSTEP exposed |
+|---|---:|---:|---:|---:|---:|---:|
+| DeltaNet, int8 (layers 0-19) | 1.027 | 0.722 | 0.305 (62%) | 1.020 | 0.722 | 0.298 (61%) |
+| DeltaNet, nvfp4 (layers 20-39) | 0.975 | 0.720 | 0.255 (52%) | 0.963 | 0.509 | 0.454 (92%) |
+| attention, nvfp4 | 0.710 | | | 0.488 | | |
+
+- MCOLS 8 takes the nvfp4 DeltaNet layer's other work from 0.720 to 0.509 ms a row, and DSTEP's
+  exposed part grows by about as much (0.255 -> 0.454): the layer gains 1%. Over the 40 layers
+  (15 + 15 DeltaNet, 10 attention) the mixer goes from 37.1 to 34.6 ms a row, nearly all of it
+  the attention layers', and DSTEP's exposed part from 8.4 ms a row (57% of its 14.7; 23% of the
+  mixer) to 11.3 (76%; 33% of the mixer): 4.1 -> 5.5 s of the image prompt.
+- The int8 DeltaNet layers do not move, for their tile program's sake, not the MXU's: their
+  projections run in pieces of 4 rows (the image's gr / on rows, `grows`: RUN_ROWS 4) and the MoE
+  prologue (the router and the shared expert) in groups of 2 rows (a need line's), so an 8-row
+  tile streams the projections twice and the shared expert four times, and int8 weights go at
+  port B's chunk a cycle whatever MCOLS (docs/tiled_prefill.md 14.3).
+- The candidate (all split, C = 64) at MCOLS 8: the MXU's 768 cycles a row and head halve to 384
+  and the VPU's 598 stay (8 lanes): VPU-bound, 3.4x DSTEP, 2.1 s of the prompt (2.7 s on m4).
+  Against DSTEP's exposed 5.5 s that is ~3.4 s back (~20% of the mixer's 16.9 s), against ~1.4 s
+  on m4. Half of its VPU work is the split's residuals (304 of 598 cycles), which an MM taking
+  ~16-bit operands itself would remove with two of the three passes.
+
 **ASIC architecture item: a short-K MM, and the state's traffic.** MM contracts whole D-blocks,
 so a contraction over the chunk's C < D rows pads to D: M8 (Kd^T . U, d x d over C rows) takes
 4,096 cycles a chunk at MCOLS 4 whatever C is, and M2, M3 and M7 pad the same way. An MM mode
@@ -878,9 +906,9 @@ that takes a short K at C / D of a block's cycles cuts the small chunks' MXU cos
 all int8: 424 -> 116 cycles a row and head; C = 32: 304 -> 136). The data movement is the case
 for the chunked form: MiniCPM-V's image prompt moves 61 GB of DeltaNet state with DSTEP (128 KB
 a row and head, read and written), ~1 GB at C = 64 (0.96 GB; 3.8 GB at C = 16), about 10% of the
-request's ~590 GB, where the card gains only ~1-1.5 s of its 90 s with the candidate (all split at
-C = 64: 2.7 s of the units' issue against DSTEP's 7.2 s, ~4 s of it exposed). Not built: no
-kernel until the arch decision.
+request's ~590 GB, where the card gains only ~1.4 s of its 90 s with the candidate (all split at
+C = 64: 2.7 s of the units' issue against DSTEP's 7.2 s, 4.1 s of it exposed; ~3.4 s at MCOLS
+8, above). Not built: no kernel until the arch decision.
 
 ### 4.10 ACT RAM reads gated to the MM's columns (done)
 
@@ -1337,7 +1365,8 @@ the fold and every proposal below are next-release items.
    architecture item. The DeltaNet state once a chunk instead of once a row: MiniCPM-V's image
    prompt's 61 GB of state traffic to ~1 GB at C = 64, for +0.13 points of dKL with every
    matmul's operands split (three int8 passes); an MM mode for a contraction shorter than D cuts
-   the small chunks' MXU cost about 3x. The card gains ~1-1.5 s of a 90 s request; no kernel.
+   the small chunks' MXU cost about 3x. The card gains ~1.4 s of a 90 s request (~3.4 s at
+   MCOLS 8, where the MXU work around DSTEP shrinks and DSTEP does not); no kernel.
 
 ### 7.3 Staging
 
