@@ -2,7 +2,7 @@
 the pool in the page cache and out of it.
 
     python3 tools/offload/pool_disk.py MODEL --pool POOL --backend board --cfg PKL
-        [--arms cached,dropped,dropped,cached] [--turn TEXT] [--max-new 32] [--out JSON]
+        [--arms cached,dropped,dropped,cached | ""] [--turn TEXT] [--max-new 32] [--out JSON]
 
 The engine opens as otpu-chat's (tools/qual/chatmoe.py's: streamed.engine, the family's formats,
 its image built or read from the image cache) and a first turn warms it (its programs, the
@@ -52,7 +52,8 @@ def cache(path, on: bool, pf=None) -> float:
     Out of it: posix_fadvise DONTNEED drops only pages no process maps, and the engine's
     PoolFile maps the pool (its `mapped` touches, its packing memmap), so those maps' pages
     are unmapped from this process first (madvise DONTNEED: the maps stay, a later read
-    faults the page in again). Session mcpv3b's dropped arms (2026-10-13) dropped nothing."""
+    faults the page in again), and the file is synced (a page a packing wrote stays until it is
+    written back). Session mcpv3b's dropped arms (2026-10-13) dropped nothing."""
     import mmap
     t = time.time()
     if not on and pf is not None and hasattr(mmap, "MADV_DONTNEED"):
@@ -67,6 +68,7 @@ def cache(path, on: bool, pf=None) -> float:
             while os.read(fd, 16 << 20):
                 pass
         elif hasattr(os, "posix_fadvise"):         # (Linux; elsewhere the cache stays)
+            os.fsync(fd)                            # (a dirty page, a packing's, stays too)
             os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
     finally:
         os.close(fd)
@@ -120,7 +122,9 @@ def main(argv=None) -> int:
     pf = eng.server.pool_file
     if pf.warm_t is not None:                   # (the open's read of every packed expert)
         pf.warm_t.join()
-    for arm in a.arms.split(","):
+    for arm in filter(None, a.arms.split(",")):    # (--arms "": the open and the warm-up only)
+        if arm not in ("cached", "dropped"):
+            raise SystemExit(f"arm {arm!r}: cached or dropped")
         s = cache(a.pool, arm == "cached", pf)
         res = pf.resident(pf.ids)
         total = len(pf.ids) * pf.slot
