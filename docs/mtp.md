@@ -870,6 +870,34 @@ DDR3-1066), tree dfac215. Setup as 10.1: phase 0's prompts 0, 3 and 7, 48 tokens
     compiles. Plain greedy: 26.45 / 12.16 / 5.97.
   - Phase 2's host-driven loop was host-bound (a compile per iteration).
 
+### 10.3 A loop program over IMEM: the split V and E
+
+A model whose layers form more than one run of the plan (lfm2.plan: a run is one hardware loop
+over its unit) carries a loop body per run, so its programs grow with its runs. MiniCPM-V 4.7's
+formats (the 35B's backbone, its DeltaNet in layers 0-19 and its MLPs int8) give two runs,
+layers 0-19 and 20-39, and its V took 6173 instructions and its E 4566 against the card's 4096
+(the 35B's one run: 3295 and 2383; ISA run mcpvmtp, 2026-10-14).
+
+Such a V or E goes in two programs (MTPDecoder._gen_programs; MTPDecoder.split True takes it for
+every V and E, the tests' way), cut at a run's first layer (mtp.plan_cuts, the most even first;
+qwen35.plan_span takes whole runs, whose layers address their blocks from the run's first):
+- part 0 gathers the rows' embedding rows, runs the layers before the cut and stores the two
+  rows' residual to m.hid, then HALT CHAINs to part 1;
+- part 1 loads the residual and the rows' RoPE rows, runs the rest, the head and the token's
+  logic, and chains to D or D1 as the whole V does.
+
+Part 1 sits in the chain slot's second half (generate.prog_bytes holds two programs), and its
+chain entry in the first half's last 8 bytes (mtp.ptab2_addr): no DRAM of its own, so an MTP
+image's layout and the programs of a model whose V and E fit are those of before (the 35B's,
+byte for byte: tests/test_mtp_moe.py). The same operations, the residual's fp32 rows through
+DRAM; one more chain an iteration (microseconds against ~150 ms). MiniCPM-V: V 3014 + 3192
+instructions, E 2262 + 2329.
+
+Nesting the plan's loops (a DeltaNet layers' loop inside the period's, as prefill-choice's "A"
+does for Qwen3.5's prompt programs: the 4B's unit body ~3.9K -> ~2.6K instructions) would shrink
+the decode-time programs too, about a third (MiniCPM-V's V ~4.1K: still at the edge). The split
+stays the fix; a nested decode-time loop is a later, general shrink, not done now.
+
 ## 11. Phase 4 design: sampled decoding on the card
 
 **The plain loop already samples on the card.** `generate.Sampler` (docs/autodecode.md,

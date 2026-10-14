@@ -204,6 +204,38 @@ def test_moe_mtp_loop_in_two_parts_is_plain_greedy(tiny_moe_mtp, P, drafter, N):
                zip(_states(eng, spec, dec.slot), _states(ref, spec, 0)))
 
 
+def test_a_loop_program_that_fits_is_not_split():
+    """The split V / E (docs/mtp.md 10.3) changes neither an MTP image's layout nor a program
+    of a model whose V and E fit IMEM: Qwen3.5-35B-A3B's loop programs of bucket 1 (its
+    formats, the card's configuration, its 38 slots a layer) are byte for byte those of the
+    tree before the split (mcpv-mtp 71d9eb3a). A change of the programs themselves updates the
+    sum here."""
+    import hashlib
+    from pathlib import Path
+    from opentpu import isa as I
+    from opentpu.host import streamed as ST
+    from opentpu.llm import load_spec
+    from opentpu.llm import mtp as MT
+    d = Path(__file__).resolve().parents[1] / "models" / "Qwen3.5-35B-A3B"
+    if not (d / "config.json").exists():
+        pytest.skip("no models/Qwen3.5-35B-A3B")
+    cfg = board_config(PAIR=True, DSTEP=True, STREAM=True)
+    spec = dataclasses.replace(load_spec(d), mtp=True)
+    wf, hf, fm = ST.defaults(spec)
+    probe = ST.probe(spec, cfg, 2048, rows=2, wformat=wf, head_format=hf, formats=fm,
+                     lookup=True)
+    n = ST.fit_experts(spec, cfg, 2048, probe)
+    img = spec.image(cfg, 2048, 1, 2, wf, hf, lookup=True, experts=n, formats=fm)
+    h = hashlib.sha256()
+    for k in range(MT.NK):
+        progs = MT.compile_gen(img, 1, k, 256)
+        assert all(len(p) <= cfg.IMEM_WORDS // 8 for p in progs)
+        for p in progs:
+            h.update(np.asarray(I.assemble(p), "<u4").tobytes())
+    assert n == 38
+    assert h.hexdigest() == "7f3bacfe386c84838742206943cb20db6ea989d2a4eb6cf63fdab651d5ffc103"
+
+
 @pytest.mark.parametrize("P, drafter, sp", [
     (250, "right", (0.8, 5, 0.9, 1.1)),     # penalty: row 1's counts the draft
     (251, "mixed", (1.5, 20, 1.0, 1.0)),    # E at 255; no penalty, top-k 20
