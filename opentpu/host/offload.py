@@ -301,33 +301,53 @@ class PoolFile:
         while self._touches:
             self._touch(*self._touches.pop())
 
-    def resident(self, ids) -> int | None:
-        """Bytes of these experts in the page cache (mincore over the file's pages), or None
-        where the host cannot tell."""
+    def _pages(self) -> np.ndarray | None:
+        """The file's pages in the page cache (mincore: 1 a page in it), or None where the host
+        cannot tell."""
         import ctypes
         import mmap
         size = os.fstat(self.fd).st_size
-        if not size or not len(ids):
-            return 0
+        if not size:
+            return np.zeros(0, np.uint8)
         try:
             libc = ctypes.CDLL(None, use_errno=True)
             mm = mmap.mmap(self.fd, size, prot=mmap.PROT_READ)
         except (OSError, AttributeError, ValueError):
             return None
-        pg = mmap.PAGESIZE
-        vec = (ctypes.c_ubyte * -(-size // pg))()
+        vec = (ctypes.c_ubyte * -(-size // mmap.PAGESIZE))()
         try:
             v = np.frombuffer(mm, np.uint8)
             rc = libc.mincore(ctypes.c_void_p(v.ctypes.data), ctypes.c_size_t(size), vec)
             del v
         finally:
             mm.close()
-        if rc != 0:
+        return None if rc != 0 else np.frombuffer(vec, np.uint8) & 1
+
+    def _held(self, ids) -> tuple | None:
+        """(the experts' ids, the bytes of each in the page cache), or None where the host
+        cannot tell."""
+        import mmap
+        g = np.asarray(ids, np.int64).reshape(-1)
+        vec = self._pages() if len(g) else np.zeros(0, np.uint8)
+        if vec is None:
             return None
-        cum = np.concatenate([[0], np.cumsum(np.frombuffer(vec, np.uint8) & 1)])
-        g = np.asarray(ids, np.int64)
-        lo, hi = g * self.slot // pg, -(-(g + 1) * self.slot // pg)
-        return int(np.minimum((cum[hi] - cum[lo]) * pg, self.slot).sum())
+        pg = mmap.PAGESIZE
+        cum = np.concatenate([[0], np.cumsum(vec, dtype=np.int64)])
+        lo = np.minimum(g * self.slot // pg, len(vec))
+        hi = np.minimum(-(-(g + 1) * self.slot // pg), len(vec))
+        return g, np.minimum((cum[hi] - cum[lo]) * pg, self.slot)
+
+    def resident(self, ids) -> int | None:
+        """Bytes of these experts in the page cache (mincore over the file's pages), or None
+        where the host cannot tell."""
+        h = self._held(ids)
+        return None if h is None else int(h[1].sum())
+
+    def absent(self, ids) -> np.ndarray | None:
+        """Those of these experts with bytes not in the page cache, in file order (mincore),
+        or None where the host cannot tell."""
+        h = self._held(ids)
+        return None if h is None else np.sort(h[0][h[1] < self.slot])
 
     def _absent(self, off: int, n: int) -> int | None:
         """Bytes of the file's pages under [off, off + n) not in the page cache (mincore), or
@@ -392,20 +412,52 @@ class PoolFile:
                 os.posix_fadvise(self.fd, int(g) * self.slot, self.slot, os.POSIX_FADV_WILLNEED)
 
     def warm(self, ids) -> threading.Thread:
+        """The thread reading these experts once into the page cache (warm_t). Its record
+        (warm_report): `bytes` read of `total`; t0 and t1, its start and end (time.time(); t1
+        None while it runs); `error`, what ended it early (a read's exception), or None;
+        `stop`, an Event that ends it at the next expert; and at its end `resident`, the share
+        of the pool's packed experts (ids, else these) in the page cache (mincore; None where
+        the host cannot tell)."""
         import mmap
         scratch = memoryview(mmap.mmap(-1, self.slot))
+        ids = np.asarray(ids, np.int64).reshape(-1)
 
         def run():
-            for g in ids:
-                preadv(self.fd, [scratch], int(g) * self.slot)
-                if self.mapped:
-                    self._touch(int(g) * self.slot, self.slot)
-                t.bytes += self.slot
+            try:
+                for g in ids:
+                    if t.stop.is_set():
+                        break
+                    preadv(self.fd, [scratch], int(g) * self.slot)
+                    if self.mapped:
+                        self._touch(int(g) * self.slot, self.slot)
+                    t.bytes += self.slot
+            except Exception as e:          # (otpu-serve's /health: the warm incomplete)
+                t.error = f"{type(e).__name__}: {e}"
+            finally:
+                pool = ids if self.ids is None else self.ids
+                r = self.resident(pool) if len(pool) else None
+                t.resident = None if r is None else r / (len(pool) * self.slot)
+                t.t1 = time.time()
         t = threading.Thread(target=run, daemon=True, name="otpu-pool-warm")
-        t.bytes = 0
+        t.bytes, t.total, t.t0, t.t1 = 0, len(ids) * self.slot, time.time(), None
+        t.error, t.resident, t.stop = None, None, threading.Event()
         t.start()
         self.warm_t = t
         return t
+
+
+def warm_report(t) -> dict | None:
+    """A PoolFile.warm thread's record: its start and end (time.time(); end None while it
+    runs), the GB it read of how many, its MB/s, the pool's share in the page cache at its end
+    (mincore), and what ended it early (error; stopped: its stop set)."""
+    if t is None:
+        return None
+    s = (t.t1 or time.time()) - t.t0
+    return {"start": round(t.t0, 1), "end": None if t.t1 is None else round(t.t1, 1),
+            "gb": round(t.bytes / 1e9, 2), "of_gb": round(t.total / 1e9, 2),
+            "mb_s": round(t.bytes / 1e6 / s, 1) if s > 0 else None,
+            "resident": None if t.resident is None else round(t.resident, 4),
+            "error": t.error, "stopped": t.stop.is_set()}
 
 
 @dataclass(frozen=True)

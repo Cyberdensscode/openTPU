@@ -1791,3 +1791,79 @@ def test_the_isa_hosts_hook_polls_until_the_expert_runs_wait_holds():
     calls = []
     _isa_host(lambda: calls.append(1) or 0)(m)
     assert calls == [1]
+
+
+def test_rewarm_reads_again_what_left_the_page_cache(tmp_path, monkeypatch):
+    """moe.rewarm (the Engine's, once its image is built and the build's memory freed): the
+    open's warm stopped if it still runs, then the packed experts with bytes out of the page
+    cache (PoolFile.absent: mincore) read on a new thread in the order given (absent's: file
+    order). The open's thread is kept when it had ended with nothing out; one stopped with
+    nothing out gives an empty read (its record: done); where the host cannot tell (no
+    mincore) the open's read is left to run. On Linux, experts dropped from the page cache
+    come back."""
+    import os
+    import sys
+    import threading
+
+    from opentpu.host import offload as OF
+    from opentpu.llm.moe import rewarm
+    slot, n = 4096 * 2, 8
+    f = tmp_path / "pool.bin"
+    f.write_bytes(np.random.default_rng(0).integers(0, 256, n * slot, dtype=np.uint8).tobytes())
+    pf = OF.PoolFile(f, slot, split=False)
+    pf.ids = np.arange(n)
+    if pf.resident(pf.ids) is None:
+        pytest.skip("no mincore here")
+    assert list(pf.absent(pf.ids)) == []
+    os.truncate(f, (n + 2) * slot)                      # experts 8, 9: a hole, not cached
+    assert list(pf.absent(range(n + 2))) == [8, 9] and list(pf.absent([9, 3, 8])) == [8, 9]
+    t = pf.warm(pf.ids)
+    t.join(60)
+    assert rewarm(pf) is t and pf.warm_t is t           # ended, nothing out: kept
+    held, real = [threading.Semaphore(0)], OF.preadv
+
+    def read(fd, bufs, off):                            # a slow disk: reads held until released
+        assert held[0].acquire(timeout=60)
+        real(fd, bufs, off)
+    monkeypatch.setattr(OF, "preadv", read)
+    release = lambda k: [held[0].release() for _ in range(k)]   # noqa: E731
+
+    t = pf.warm(pf.ids)                                 # still running: stopped, what is out
+    monkeypatch.setattr(pf, "absent", lambda ids: np.array([2, 5]))     # read again
+    threading.Timer(0.2, release, (3,)).start()         # (the read it waits in, then 2)
+    t2 = rewarm(pf)
+    assert t.stop.is_set() and not t.is_alive() and t.bytes == slot
+    assert t2 is pf.warm_t and t2 is not t and t2.total == 2 * slot
+    t2.join(60)
+    assert t2.bytes == 2 * slot and OF.warm_report(t2)["error"] is None
+
+    held[0] = threading.Semaphore(0)                    # stopped with nothing out: an empty read
+    t = pf.warm(pf.ids)
+    monkeypatch.setattr(pf, "absent", lambda ids: np.zeros(0, np.int64))
+    threading.Timer(0.2, release, (1,)).start()
+    t3 = rewarm(pf)
+    assert t.stop.is_set() and t3 is not t and t3.total == 0
+    t3.join(60)
+    r = OF.warm_report(t3)
+    assert r["end"] is not None and r["error"] is None and not r["stopped"]
+
+    held[0] = threading.Semaphore(0)                    # no mincore: the open's read left to run
+    t = pf.warm(pf.ids)
+    monkeypatch.setattr(pf, "_pages", lambda: None)
+    assert rewarm(pf) is t and not t.stop.is_set() and t.is_alive()
+    release(n)
+    t.join(60)
+    assert t.bytes == n * slot
+    monkeypatch.undo()
+    if sys.platform != "linux":
+        return
+    pf = OF.PoolFile(f, slot, split=False)
+    pf.ids = np.arange(n)
+    fd = os.open(f, os.O_RDONLY)
+    os.fsync(fd)
+    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    os.close(fd)
+    if pf.resident(pf.ids) < n * slot:                  # (tmpfs keeps its pages)
+        pf.warm_t = None
+        rewarm(pf).join(60)
+        assert pf.resident(pf.ids) == n * slot and list(pf.absent(pf.ids)) == []

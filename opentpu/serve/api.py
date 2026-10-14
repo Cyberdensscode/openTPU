@@ -6,7 +6,8 @@
 Endpoints: POST /v1/chat/completions and /v1/completions (stream or not, n choices, stop
 strings and token ids, the model's sampling defaults, usage with the prompt tokens the KV
 cache already held), SGLang's POST /generate (text or input_ids, sampling_params, meta_info),
-GET /v1/models, /health, /v1/stats (the queue, throughput, the slots, the KV store), POST
+GET /v1/models, /health (503 "warming" while a streamed MoE's expert pool is read into the page
+cache), /v1/stats (the queue, throughput, the slots, the KV store), POST
 /flush_cache (forget the saved contexts). Many clients at once: a model whose image holds
 several sequences decodes their requests together in KV slots (opentpu/serve/batching.py),
 the others run them in turns (opentpu/serve/scheduler.py); contexts move in and out of the
@@ -31,6 +32,10 @@ from pathlib import Path
 
 from . import scheduler as SC
 from . import store as ST
+
+
+WARM_CAP = 300.0         # /health's 503 "warming" at most this long (s; the card host's HDD
+                         # reads an 18 GB pool in ~80 s, its SSD in ~37: docs/minicpmv.md 6)
 
 
 class APIError(Exception):
@@ -123,7 +128,8 @@ class Server:
 
     def __init__(self, worker: SC.Worker, tok, spec, name: str, defaults: dict,
                  think: bool = False, reasoning: str | None = None, aliases=(),
-                 api_key: str | None = None, max_queue: int = 256, info: dict | None = None):
+                 api_key: str | None = None, max_queue: int = 256, info: dict | None = None,
+                 warm_cap: float = WARM_CAP):
         self.w, self.tok, self.spec, self.name = worker, tok, spec, name
         self.defaults, self.think, self.reasoning = dict(defaults), think, reasoning
         self.names = {name, *aliases}
@@ -132,6 +138,9 @@ class Server:
         self.info = info or {}
         self.lock = worker.tok_lock
         self.t0 = time.time()
+        # a streamed MoE's expert pool file: its read into the page cache gates /health
+        self.pool = getattr(getattr(worker.eng, "server", None), "pool_file", None)
+        self.warm_cap = warm_cap
 
     # ---- rendering
     def encode(self, text: str) -> list[int]:
@@ -355,10 +364,36 @@ class Server:
         u = self.w.usage()
         up = time.time() - self.t0
         dec = u["decode_s"]
+        warm = {}
+        if self.pool is not None:
+            from ..host.offload import warm_report
+            warm = {"pool_warm": warm_report(self.pool.warm_t)}
         return {"model": self.name, "uptime_s": round(up, 1), **self.info,
                 "throughput": {"generated_tok_s": round(u["generated"] / up, 2) if up else 0,
                                "decode_tok_s": round(u["generated"] / dec, 2) if dec else None},
-                **u}
+                **warm, **u}
+
+    def health(self) -> tuple[int, dict]:
+        """/health's status and body. While the expert pool's read into the page cache runs
+        (its warm thread: moe.rewarm's, after the engine's open), 503 "warming" with the read's
+        progress, for at most warm_cap seconds from its start; then ok, with "warm":
+        "incomplete" and a note where it did not read all it was to (still running past the
+        cap, an error, stopped). Advisory: requests are served while it runs, their misses
+        from the disk (docs/minicpmv.md 6, pooldisk)."""
+        t = getattr(self.pool, "warm_t", None)
+        if t is None:
+            return 200, {"status": "ok"}
+        prog = round(t.bytes / t.total, 3) if t.total else 1.0
+        if t.is_alive():
+            if time.time() - t.t0 < self.warm_cap:
+                return 503, {"status": "warming", "progress": prog}
+            return 200, {"status": "ok", "warm": "incomplete", "progress": prog,
+                         "note": f"the pool's warm runs past the {self.warm_cap:g} s cap"}
+        if t.error or t.t1 is None or t.bytes < t.total:
+            return 200, {"status": "ok", "warm": "incomplete", "progress": prog,
+                         "note": t.error or ("the pool's warm thread died" if t.t1 is None
+                                             else "the pool's warm stopped")}
+        return 200, {"status": "ok"}
 
 
 def _sse(obj) -> bytes:
@@ -423,7 +458,7 @@ def make_handler(srv: Server):
                 self._auth()
                 path = self.path.split("?")[0].rstrip("/")
                 if path in ("/health", "/v1/health", "/health_generate"):
-                    return self._json(200, {"status": "ok"})
+                    return self._json(*srv.health())
                 if path == "/v1/models":
                     return self._json(200, srv.models())
                 if path.startswith("/v1/models/"):
@@ -682,6 +717,32 @@ def load(a):
     return eng, tok, spec, path, defaults, weights
 
 
+def log_warm(t, out=None) -> None:
+    """The expert pool's read into the page cache (a PoolFile.warm thread) on `out` (stdout):
+    a line now, and one when it ends (a watcher thread): its start and end, GB, MB/s, the
+    pool's share in the page cache at its end (mincore), and what ended it early."""
+    import threading
+
+    from ..host.offload import warm_report
+    if t is None:
+        return
+    hm = lambda x: time.strftime("%H:%M:%S", time.localtime(x))     # noqa: E731
+    pr = lambda s: print(f"pool warm: {s}", file=out or sys.stdout, flush=True)   # noqa: E731
+    r = warm_report(t)
+    pr(f"started {hm(r['start'])}, {r['gb']:g} of {r['of_gb']:g} GB read"
+       + ("" if r["end"] is None else ", ended"))
+
+    def watch():
+        t.join()
+        r = warm_report(t)
+        how = "done" if not r["error"] and not r["stopped"] and t.bytes >= t.total else \
+            f"incomplete ({r['error'] or 'stopped'})"
+        res = "?" if r["resident"] is None else f"{100 * r['resident']:.1f}%"
+        pr(f"{how}: {hm(r['start'])} - {hm(r['end'])}, {r['gb']:g} GB, {r['mb_s']} MB/s; "
+           f"{res} of the pool in the page cache")
+    threading.Thread(target=watch, daemon=True, name="otpu-warm-log").start()
+
+
 def batchable(spec) -> bool:
     """The model's image holds several sequences' KV caches (Qwen3 and the Llama-likes)."""
     from ..llm import qwen3
@@ -739,6 +800,9 @@ def main(argv=None):
     ap.add_argument("--no-prompt-runs", action="store_true")
     ap.add_argument("--pool", help="a streamed MoE's expert pool file")
     ap.add_argument("--experts", type=int, default=0)
+    ap.add_argument("--warm-cap", type=float, default=WARM_CAP,
+                    help="a streamed MoE: /health says 503 'warming' while its expert pool is "
+                         "read into the page cache, at most this many seconds (0: never)")
     a = ap.parse_args(argv)
     return busy_exits(_main)(a)
 
@@ -762,7 +826,10 @@ def _main(a):
                  aliases=(a.model,), api_key=a.api_key, max_queue=a.max_queue,
                  info={"path": str(path), "backend": a.backend, "weights": weights,
                        "cap": a.cap, "kv_page_bytes": w.io.layout.page_bytes(),
-                       "staged": w.io.area is not None, "slots": eng.batch})
+                       "staged": w.io.area is not None, "slots": eng.batch},
+                 warm_cap=a.warm_cap)
+    if srv.pool is not None:
+        log_warm(srv.pool.warm_t)
     httpd = serve(srv, a.host, a.port)
     print(f"otpu-serve: {name} on http://{a.host}:{a.port}/v1 (context {a.cap}, KV store "
           f"{a.kv_ram_gb:g} GB RAM + {a.kv_disk_gb:g} GB disk, sampling {defaults})",

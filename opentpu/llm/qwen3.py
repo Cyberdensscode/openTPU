@@ -2334,6 +2334,16 @@ class Engine:
         if self.prompt_runs:                # bucket 1's prompt programs, ahead (prefill.warm)
             from . import prefill as PF
             PF.warm(self)
+        # the pool's experts the build took out of the page cache, read in again once its
+        # memory is freed (moe.rewarm); the server's pool_warm is that read
+        pf = getattr(self.server, "pool_file", None)
+        if pf is not None:
+            import gc
+
+            from .moe import rewarm
+            del images
+            gc.collect()
+            self.server.pool_warm = rewarm(pf)
 
     # ---- the compile pipeline
     def _compile(self, pos: int, tok: int | None = None) -> list:

@@ -316,6 +316,30 @@ def open_pool(layout: Layout, pool_file, mapped: bool = True,
     return pf
 
 
+def rewarm(pf: PoolFile):
+    """The pool's experts that left the page cache since the open's read began, read into it
+    again; the Engine calls it once the image is built and the build's memory freed. A 35B
+    MoE image's build peaks at 28-30 GB of the card host's 31 and takes the pool out of the
+    page cache again (docs/minicpmv.md 6, pooldisk: its turns then read their experts from the
+    disk, ~15-32 ms each against 0.5 ms). The open's read is stopped (it may still run: an
+    image from the image cache), then those of the packed experts with bytes out of the page
+    cache (mincore) are read in file order on a new thread. Returns the warm thread now: the
+    open's when it had ended and nothing left the page cache, or where the host cannot tell
+    (no mincore: the open's read is left to run)."""
+    t = pf.warm_t
+    if pf._pages() is None:                 # (no mincore here; and no map of its own made:
+        return t                            # pool_map False keeps none)
+    stopped = t is not None and t.is_alive()
+    if stopped:
+        t.stop.set()
+        t.join()
+    gone = pf.absent(pf.ids)
+    if gone is None and stopped:            # (mincore failed: all of them again)
+        gone = pf.ids
+    # (a stopped read with nothing left out: an empty one, so the record says done)
+    return t if gone is None or not (len(gone) or stopped) else pf.warm(gone)
+
+
 def serve(layout: Layout, expert, backend, pool_file=None, warm=True,
           policy: str = "lfu") -> ExpertServer:
     """The host's expert server on the backend's DRAM (slice 0); with `warm`, the slots filled

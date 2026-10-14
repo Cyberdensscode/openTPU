@@ -16,6 +16,7 @@ import pytest
 
 from opentpu.host import streamed as ST
 from opentpu.host.chat import Chat, Session, Turn, sampler
+from opentpu.host.offload import warm_report
 from opentpu.isasim import board_config
 
 torch = pytest.importorskip("torch")
@@ -233,6 +234,12 @@ def test_a_chat_turn_is_moe_cards_run(ckpt, formats, tmp_path):
     assert 0 < packed.sum() <= len(packed)
     eng = ST.engine(d, CFG, "isa", 256, pool, experts=K, wformat=wf, head_format=hf)
     assert eng.layer_major == lm and eng.image.offload.slots[0][1] == K
+    pw = eng.server.pool_warm               # the open's read, or moe.rewarm's after the build
+    assert pw is eng.server.pool_file.warm_t
+    pw.join(60)
+    r = warm_report(pw)
+    assert r["end"] and r["error"] is None and pw.bytes == pw.total
+    assert r["resident"] in (None, 1.0)
     chat = _greedy_chat(eng)
     reply, turn = chat.ask(" ".join(map(str, ids)))
     want = _until_eos(ref["tokens"], eng.spec.eos)
