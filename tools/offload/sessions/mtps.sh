@@ -35,7 +35,7 @@ M1=${M1:-$HOME/otpu-build/les/mtp1}               # (mtp1's MTP checkpoint and p
 R=${R:-$LS/runs}
 source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env.sh   # (T: this tree; O: card2; OTPU_QUIET claimed)
 exec > >(tee -a $R/session.log) 2>&1
-EXPECT=${EXPECT:?the card's build (selftest's "build ...")}
+EXPECT=${EXPECT:?the card build as the selftest prints it, e.g. 039b34d5}
 ORDER=${ORDER:-A1 B1 B2 A2}                     # (after the warm-ups WA, WB)
 MAXTOK=${MAXTOK:-128}
 ADDON=${ADDON:-0}

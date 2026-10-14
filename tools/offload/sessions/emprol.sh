@@ -17,9 +17,11 @@
 # A build other than EXPECT, a failed selftest, another configuration, a missing file, a failed run or a token
 # mismatch stops it (then the final selftest). About 45 min (the warm-ups ~10 min each model with first builds).
 # Stage (from the Mac): B's tree (git archive of em-prologue's commit) to ~/otpu-build/emprol/host with COMMIT;
-#   A defaults to the r2.1 deploy's host (its COMMIT is printed). Run (no pipe; the lead's GO):
-#   setsid -f ~/.local/bin/otpu-lock --wait 3600 -- bash ~/otpu-build/emprol/host/tools/offload/sessions/emprol.sh \
-#     > ~/otpu-build/emprol/session.log 2>&1 < /dev/null
+#   A defaults to the r2.1 deploy's host (its COMMIT is printed). Run (no pipe; the lead's GO), e.g.:
+#   EXPECT=039b34d5 A=$HOME/otpu-build/production/host \
+#   REFCFG=$HOME/otpu-build/production/refcache/configs/cfg_E3.pkl setsid -f ~/.local/bin/otpu-lock --wait 3600 -- \
+#     bash ~/otpu-build/emprol/host/tools/offload/sessions/emprol.sh > ~/otpu-build/emprol/session.log 2>&1 < /dev/null
+# (No apostrophe inside a ${...:?...} / ${...:-...} word: bash takes it as an open quote, to the next one.)
 set -u
 [ -n "${OTPU_LOCK_HELD:-}" ] || { echo "run under otpu-lock"; exit 1; }
 for v in $(env | grep -o '^OTPU_[A-Z0-9_]*' | grep -vE '^OTPU_LOCK_(HELD|PID|WAIT)$'); do unset $v; done
@@ -27,9 +29,9 @@ export OTPU_IMG_CACHE_GB=30 OTPU_IMG_CACHE_FREE_GB=6      # (the card host's, fr
 E=${E:-$HOME/otpu-build/emprol}
 A=${A:-$HOME/otpu-build/deploy_rel21_039b34d5/host}
 B=${B:-$E/host}
-EXPECT=${EXPECT:?the card's build (e.g. 039b34d5)}
+EXPECT=${EXPECT:?the card build to expect, e.g. 039b34d5}
 MAP=${MAP:-register map 5}
-REFCFG=${REFCFG:?the configuration the arms run on (the deploy's qual/cfg.pkl)}
+REFCFG=${REFCFG:?the configuration the arms run on, e.g. the deploy refcache/configs/cfg_E3.pkl}
 ORDER=${ORDER:-A1 B1 B2 A2}
 P=$HOME/otpu-venv/bin/python
 MO=/data/otpu/minicpmv; C2=$HOME/otpu-build/offload/card2
