@@ -132,8 +132,14 @@ rest.
 arbiters see `sw_rdy_i = !sw_v || sw_rdy`: one write per cycle still goes out, and the
 quantizer's grant is withheld exactly when the port cannot take a write); a write held there counts
 as one the DRAM has not taken (`wr_idle_i = wr_idle && !sw_v`), so a QST, a HALT CHAIN and a
-WAITW timeout end only once the DRAM has it; only the loader's reset clears it. A target turns it
-on with `[uarch] SW_REG = true` (on in `nangate45-small`; `OTPU_SW_REG=1` in simulation).
+WAITW timeout end only once the DRAM has it; only the loader's reset clears it. This iteration
+ran it as a parameter (`SW_REG`: a target's `[uarch] SW_REG = true`, on in `nangate45-small`
+only; `OTPU_SW_REG=1` in simulation). It is now unconditional: every target builds it (the card's
+FPGA build too, where the quantizer -> the DRAM adapter's SW gather registers had been near
+critical: -0.260 ns in an r2 candidate, -0.092 ns in an r2.1 one, and r2.1's E3 build's worst
+endpoint at +0.007 ns), every simulation runs it, and
+the parameter is gone. `sw_req` is the register's valid bit, so outside the block every write is
+taken once `wr_idle && !sw_req` (`otpu_board`'s STATUS WR_IDLE and run start read that).
 
 Verified with it on: `OTPU_TARGET=nangate45-small OTPU_UARCH=board pytest tests/test_rtl.py`, 131
 passed and the 2 known failures of main (`test_additive_mask_block_rtl`: the ISA simulator's
