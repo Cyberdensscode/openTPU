@@ -30,12 +30,17 @@ with CACTI; the 128x256 and 64x256 macros, whose heights were tuned by hand, are
 A 1R1W macro is 1.5x the 1RW's area (an 8T bit cell, about 1.3x, and a second decoder) and 1.2x
 its clock power, with the same read timing; a 1RW1R macro (the same two-port cell and decoders,
 write drivers on one port) the same as the 1R1W. Setup and hold are 0.05 ns on every input, input
-capacitance 5 fF (clk 25 fF), as in fakeram45. Leakage is 0, as in fakeram45 (the power estimate
-is dynamic). Geometry: the pins on the left edge on metal3 at a 0.28 um pitch (rd_out, wd_in,
-w_mask_in, then the addresses and controls, 2.24 um between groups; every pin on the 0.14 um
-metal3 track grid), VDD / VSS straps on
-metal4 at a 4.48 um pitch, metal1-metal3 obstructed except the pin column, metal4 except the
-straps; the height fits the pins and the size is snapped to the 0.19 x 1.4 um site.
+capacitance 5 fF (clk 25 fF), as in fakeram45. The read data's outputs drive like NanGate45's
+BUF_X4 (a compiled SRAM's output buffer: its delay and transition over the load at a 17 ps input
+transition, its 242 fF max_capacitance), with clk->q the model's at 7.6 fF of load: fakeram45's
+scalar clk->q, a 500 fF limit and a 0.227 ns transition there let a macro drive a 2-3 mm wire
+unbuffered (the resizer saw no violation; the card's FIFO to the MXU's decode was 3.4 ns of
+wire, docs/asic.md). Leakage is 0, as in fakeram45 (the power estimate is dynamic). Geometry:
+the pins on the left edge on metal3 at a 0.28 um pitch (rd_out, wd_in, w_mask_in, then the
+addresses and controls, 2.24 um between groups; every pin on the 0.14 um metal3 track grid),
+VDD / VSS straps on metal4 at a 4.48 um pitch, metal1-metal3 obstructed except the pin column,
+metal4 except the straps; the height fits the pins and the size is snapped to the 0.19 x 1.4 um
+site.
 
     python3 tools/asic/fakeram.py OUT_DIR 1r1w:8192x32 1rw:1024x64 1rw1r:4096x32 ...
                                                                     (N x W: depth x width)
@@ -54,7 +59,16 @@ MARGIN = 2.8          # top and bottom keep-out for the straps' ends
 SITE_W, SITE_H = 0.19, 1.4
 STRAP_W, STRAP_PITCH = 0.28, 4.48
 SETUP = HOLD = 0.05
-CAP_IN, CAP_CLK, MAX_CAP = 5.0, 25.0, 500.0
+CAP_IN, CAP_CLK = 5.0, 25.0
+# the read outputs' drive: NanGate45 BUF_X4's Z (NangateOpenCellLibrary_typical: cell_rise / fall,
+# rise / fall_transition at an input transition of 0.0171859 ns, the tables' third row, over its
+# load index) and its max_capacitance; clk->q is the delay at LOAD_REF
+DRV_LOAD = (0.365616, 7.57219, 15.1444, 30.2888, 60.5775, 121.155, 242.31)
+DRV_RISE = (0.0193796, 0.0243348, 0.0290476, 0.0382822, 0.0566239, 0.0931423, 0.166005)
+DRV_FALL = (0.0258174, 0.0296289, 0.0328068, 0.0382686, 0.0480393, 0.0666218, 0.103403)
+DRV_RTR = (0.00410698, 0.00765819, 0.0117212, 0.0202394, 0.0375246, 0.0721523, 0.141414)
+DRV_FTR = (0.00383059, 0.00564352, 0.00744274, 0.0110284, 0.0184481, 0.0339994, 0.0658447)
+MAX_CAP, LOAD_REF = 242.31, 1
 R1W1_AREA, R1W1_POWER = 1.5, 1.2          # two-port (1R1W, 1RW1R) against 1RW
 KINDS = ("1rw", "1r1w", "1rw1r")
 
@@ -246,18 +260,19 @@ def liberty(m: Macro) -> str:
           "            clock : true;", f"            min_period : {m.min_period:.3f};"]
     L += _power("            ", m.clk_power)
     L += ["        }"]
+    idx = ", ".join(f"{c:g}" for c in DRV_LOAD)
+    tab = lambda name, vs: (f'                {name}({n}_slew) {{ index_1 ("{idx}"); '   # noqa: E731
+                            f'values ("{", ".join(f"{v:.4f}" for v in vs)}"); }}')
+    rise = [m.clk_to_q + d - DRV_RISE[LOAD_REF] for d in DRV_RISE]
+    fall = [m.clk_to_q + d - DRV_FALL[LOAD_REF] for d in DRV_FALL]
     for rd, raddr in reads:
         L += [f"        bus({rd}) {{", f"            bus_type : {n}_DATA;",
               "            direction : output;", f"            max_capacitance : {MAX_CAP:.3f};",
               "            memory_read() {", f"                address : {raddr};", "            }",
               "            timing() {", '                related_pin : "clk";',
               "                timing_type : rising_edge;", "                timing_sense : non_unate;",
-              f'                cell_rise(scalar) {{ values ("{m.clk_to_q:.3f}"); }}',
-              f'                cell_fall(scalar) {{ values ("{m.clk_to_q:.3f}"); }}',
-              f"                rise_transition({n}_slew) {{ index_1 (\"5.000, 500.000\"); "
-              'values ("0.009, 0.227"); }',
-              f"                fall_transition({n}_slew) {{ index_1 (\"5.000, 500.000\"); "
-              'values ("0.009, 0.227"); }', "            }", "        }"]
+              tab("cell_rise", rise), tab("cell_fall", fall), tab("rise_transition", DRV_RTR),
+              tab("fall_transition", DRV_FTR), "            }", "        }"]
     for c in ctrls:
         L += [f"        pin({c}) {{", "            direction : input;",
               f"            capacitance : {CAP_IN:.3f};"]

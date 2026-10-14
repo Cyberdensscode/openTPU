@@ -48,7 +48,14 @@ def test_lef_lib_consistent(tmp_path, kind, depth, width):
     buses = set(re.findall(r"bus\((\w+)\)", lib)) | set(re.findall(r"pin\((\w+)\)", lib))
     names = {p.split("[")[0] for p in pins} - {"VDD", "VSS"}
     assert buses == names
-    assert f'cell_rise(scalar) {{ values ("{m.clk_to_q:.3f}")' in lib
+    # the read data drives like BUF_X4: clk->q at the reference load, more over a longer wire, and
+    # BUF_X4's load limit (the resizer buffers a long net from a macro)
+    rise = re.search(r'cell_rise\(\w+\) \{ index_1 \("([^"]+)"\); values \("([^"]+)"\)', lib)
+    load = [float(v) for v in rise.group(1).split(",")]
+    delay = [float(v) for v in rise.group(2).split(",")]
+    assert delay[F.LOAD_REF] == pytest.approx(m.clk_to_q, abs=1e-4)
+    assert delay == sorted(delay) and delay[-1] - delay[0] > 0.1 and load[-1] == F.MAX_CAP
+    assert f"max_capacitance : {F.MAX_CAP:.3f}" in lib
     if kind == "1r1w":
         assert "address : r_addr_in" in lib and "address : w_addr_in" in lib
         assert m.area_model == pytest.approx(F.Macro("1rw", depth, width).area_model * 1.5)
