@@ -3,12 +3,14 @@
 //   TMEM   each bank serves 3 reads + 1 write per cycle; units are granted all-or-nothing in
 //          the priority order DMA, COLL, VPU, MXU drain, QUANT (a unit that is not granted holds)
 //   DRAM B DMA first, then the MXU stream (read responses are routed back by tag)
-//   DRAM A the MXU scale stream (reads); QST writes have their own scalar write port (SW)
+//   DRAM A the MXU scale stream (reads); QST writes have their own scalar write port (SW), whose
+//          outputs come from a register (sw_req its valid bit)
 // The slice's DRAM sits outside (otpu_top) so that board wrappers can swap it. The DRAM may
 // refuse requests (a_rdy/b_rdy, which must not depend on this cycle's requests), return reads
 // after any latency (in order per port), and acknowledge writes late (wr_idle: none pending);
 // rd_idle: no read of the slice's in flight (a run stopped by the host, rst, leaves its reads
-// to come back after it).
+// to come back after it). Every write the slice gave is taken once wr_idle && !sw_req (a write
+// in the SW register is in neither the units nor the DRAM).
 //
 // Loader: while the slice is held in reset (rst), ld_start copies ld_n instructions from DRAM
 // byte address ld_addr (chunk aligned) into IMEM, one chunk (D/32 instructions) per cycle.
@@ -73,9 +75,7 @@ module otpu_slice
                                       //   at bit 3p; 0: PRANK3, below)
   parameter int TMEM_SDM   = -1,      // TMEM_TDP: the read ports' RAM sides (bit p: port p on
                                       //   port A; -1: TM_SIDED, below)
-  parameter bit SEQ_WC     = 1'b0,    // EXPERIMENTAL: otpu_seq's wait counts (WAITC, docs/seq_vpu.md)
-  parameter bit SW_REG     = 1'b0     // the SW port's outputs from a register (the ASIC block;
-                                      //   timing only: see "the SW port's output register")
+  parameter bit SEQ_WC     = 1'b0     // EXPERIMENTAL: otpu_seq's wait counts (WAITC, docs/seq_vpu.md)
 ) (
   input  logic          clk,
   input  logic          clk_f,      // TMEM_PMP 1: 2 x clk, rising with it (the MMCM's); else unused
@@ -136,8 +136,8 @@ module otpu_slice
   input  logic          dump
 );
   localparam int BW = $clog2(LANES);
-  // the DRAM's SW ready and write idle as the units and the arbiters see them (SW_REG: with the
-  // SW port's output register; see there)
+  // the DRAM's SW ready and write idle as the units and the arbiters see them: with the SW port's
+  // output register (see there)
   logic sw_rdy_i, wr_idle_i;
   // the stream engine (docs/stream.md): the DMA moves a stream (DSTEP, STREAM) through SE in
   // the VPU; streams need 8 lanes on both sides (otpu_dma W = 8: D >= 32). Without it DSTEP and
@@ -872,34 +872,29 @@ module otpu_slice
     cgl_q = ok[G_COLL];
   end
 
-  // ---- the SW port's output register (SW_REG: the ASIC block, docs/asic.md "The ports"): the
-  // QST writes leave the slice from flip-flops, not through the quantizer's scale-row words and
-  // the TMEM grant. The register takes a write when it is empty or drains this cycle (sw_rdy_i,
-  // what the arbiters see: sw_rdy does not depend on sw_req), and a write in it counts as one
-  // the DRAM has not taken (wr_idle_i), so a QST, a HALT CHAIN and a WAITW timeout still end
-  // only once the DRAM has every write. Only the loader's reset clears it: a write the
-  // quantizer gave before a run's reset (rst) still goes out, as without the register.
-  wire         sw_req_c = q_areq && q_awe;
-  if (SW_REG) begin : g_swr
-    logic sw_v;
-    assign sw_rdy_i  = !sw_v || sw_rdy;
-    assign wr_idle_i = wr_idle && !sw_v;
-    assign sw_req    = sw_v;
-    always_ff @(posedge clk) begin
-      if (sys_rst) sw_v <= 1'b0;
-      else if (sw_rdy_i) sw_v <= sw_req_c;
-      if (sw_rdy_i && sw_req_c) begin
-        sw_addr <= q_aaddr; sw_wdata <= q_awdata; sw_be <= q_abe;
-      end
+  // ---- the SW port's output register (docs/asic.md "The ports"): the QST writes leave the slice
+  // from flip-flops, not through the quantizer's scale-row words and the TMEM grant (on the card
+  // the quantizer -> the DRAM adapter's gather registers: 5-14 levels, 4-7 ns of route; -0.260 ns
+  // in an r2 candidate, -0.092 ns in an r2.1 one). The register takes a write when it is empty or
+  // drains this cycle (sw_rdy_i, what the arbiters see: sw_rdy does not depend on sw_req), and a
+  // write in it counts as one the DRAM has not taken (wr_idle_i), so a QST, a HALT CHAIN and a
+  // WAITW timeout still end only once the DRAM has every write. sw_req is its valid bit: outside
+  // the slice, every write it gave is taken once wr_idle && !sw_req (otpu_board's STATUS WR_IDLE
+  // and go_ok). Only the loader's reset clears it: a write the quantizer gave before a run's reset
+  // (rst) still goes out, as one in the DRAM's queues does. The units and the arbiters read the
+  // DRAM's sw_rdy and wr_idle only through it (tests/test_target.py)
+  wire  sw_req_c = q_areq && q_awe;
+  logic sw_v;
+  assign sw_rdy_i  = !sw_v || sw_rdy;
+  assign wr_idle_i = wr_idle && !sw_v;
+  assign sw_req    = sw_v;
+  always_ff @(posedge clk) begin : sw_reg
+    if (sys_rst) sw_v <= 1'b0;
+    else if (sw_rdy_i) sw_v <= sw_req_c;
+    if (sw_rdy_i && sw_req_c) begin
+      sw_addr <= q_aaddr; sw_wdata <= q_awdata; sw_be <= q_abe;
     end
-  end else begin : g_swc
-    assign sw_rdy_i  = sw_rdy;
-    assign wr_idle_i = wr_idle;
-    assign sw_req    = sw_req_c;
-    assign sw_addr   = q_aaddr;
-    assign sw_wdata  = q_awdata;
-    assign sw_be     = q_abe;
-  end
+  end : sw_reg
 `ifndef SYNTHESIS
   // the arbiters withhold the quantizer's grant while the port cannot take its write
   always @(posedge clk)

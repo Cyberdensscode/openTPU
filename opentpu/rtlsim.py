@@ -222,9 +222,6 @@ for _k in ("NSB", "SBP", "SBH", "RPL", "TDP", "GST", "PMP", "PRK", "SDM"):
 # TMEM lanes of the MXU and the quantizer when fewer than LANES (timing only): OTPU_ULANES=8
 if os.environ.get("OTPU_ULANES"):
     UARCH["ULANES"] = int(os.environ["OTPU_ULANES"])
-# The slice's SW port (QST writes) from a register, as the ASIC block (timing only): OTPU_SW_REG=1
-if os.environ.get("OTPU_SW_REG"):
-    UARCH["SW_REG"] = int(os.environ["OTPU_SW_REG"])
 
 # The memory path. AXI: the board's memory path -- its adapter (otpu_native_dram) in front of a
 # two-channel native memory model (sim/verilator/otpu_native_mem.sv) with random stalls (percent)
