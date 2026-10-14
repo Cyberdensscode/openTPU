@@ -1221,10 +1221,10 @@ def qwen35_layer_tile(m, li: int, pos, row, T: int, block: int = ATTN_BLOCK,
     li. The MoE layer before ends first (moe.moe_combine_rows, EM_GROUP rows at a time); a
     DeltaNet layer's rows in runs of `drows` (default T; at most the image's gr / on rows),
     an attention layer tiled (_attention_tile, gated; spill: x in the records' X while the
-    heads attend); x to X; a MoE layer's route, need lines and shared expert over groups of
-    rows (moe.moe_prologue_rows, LINE / 4 ids a line), a dense layer's MLP tiled. Each row's
-    arithmetic is qwen35_layer_run's."""
-    from .moe import LINE, em_x, moe_combine_rows, moe_prologue_rows
+    heads attend); x to X; a MoE layer's route and shared expert over the T rows, its need
+    lines between the shared expert's chunks (moe.moe_prologue_rows), a dense layer's MLP
+    tiled. Each row's arithmetic is qwen35_layer_run's."""
+    from .moe import em_x, moe_combine_rows, moe_prologue_rows
     from .qwen35 import LIN, _deltanet_rows
     spec, dev = m.spec, m.moe_dev
     if not isinstance(pos, RunRows) or pos.amask is None or spec.moe is None:
@@ -1260,9 +1260,7 @@ def qwen35_layer_tile(m, li: int, pos, row, T: int, block: int = ATTN_BLOCK,
         ol.store(X, x)
         return
     ol.store(X, x)
-    g = max(1, (LINE // 4) // mo.k)             # rows a need line
-    for r0 in range(0, T, g):
-        moe_prologue_rows(x[r0:r0 + min(g, T - r0), :], lw, mo, dev, spec.eps, row + r0)
+    moe_prologue_rows(x, lw, mo, dev, spec.eps, row)
 
 
 @ol.jit

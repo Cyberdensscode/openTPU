@@ -30,7 +30,7 @@ def down_chunk(f_loc: int, D: int, fmt: str) -> int:
     return _chunk(f_loc, D, D if fmt == "int8" else 2 * D)
 
 
-def swiglu_down(xs, w_gate, w_up, w_down, chunk=None, act=silu, loop=False):
+def swiglu_down(xs, w_gate, w_up, w_down, chunk=None, act=silu, loop=False, each=None):
     """This slice's output columns of W_down( act(W_gate x) * (W_up x) ), x quantized in `xs`
     (act: SiLU, or e.g. lib.gelu_tanh for Gemma's GeGLU).
 
@@ -38,6 +38,9 @@ def swiglu_down(xs, w_gate, w_up, w_down, chunk=None, act=silu, loop=False):
     s of the down projection. See `mlp` for the pipelining. `loop`: the chunks run as a
     hardware loop (_swiglu_down_loop), the same operations in the same order in fewer
     instructions (a model whose program would not fit IMEM with every chunk unrolled).
+    `each(i)`: called as chunk i's work begins, once the next chunk's gate and up MMs are
+    issued (instructions of the caller's that wait while the MXU works: moe_prologue_rows'
+    need lines), not with `loop`.
     """
     S = ol.num_programs()
     f_loc = w_gate.shape[0]
@@ -45,6 +48,8 @@ def swiglu_down(xs, w_gate, w_up, w_down, chunk=None, act=silu, loop=False):
     C = chunk or (w_down.pw if w_down.parts is not None else
                   _chunk(f_loc, D, D if w_down.wf == 0 else 2 * D))
     if loop and f_loc // C >= 6:                # two iterations at least
+        if each is not None:
+            raise ol.CompileError("swiglu_down: each= with the chunks as a hardware loop")
         return _swiglu_down_loop(xs, w_gate, w_up, w_down, C, act)
     starts = list(range(0, f_loc, C))
 
@@ -57,6 +62,8 @@ def swiglu_down(xs, w_gate, w_up, w_down, chunk=None, act=silu, loop=False):
         g, u = nxt
         if i + 1 < len(starts):
             nxt = gate_up(starts[i + 1])                # MXU streams ahead while the VPU works
+        if each is not None:
+            each(i)
         a = ol.all_gather(act(g) * u)                   # [M, S*C]: chunk c of every slice
         for t in ol.static_range(S):
             cols = w_down[:, t * f_loc + c0:t * f_loc + c0 + C]
