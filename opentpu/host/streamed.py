@@ -201,7 +201,9 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
     check_pool). W: the weights (default LazyWeights of `model`). mtp: an MTP image (Spec.mtp,
     opentpu/llm/mtp.py; Qwen3.5's drafter, its MoE one more layer of the pool's: default_pool's
     -mtp pool) of 2 rows, the mtp.* tensors from `mtp_from` when given (MiniCPM-V 4.7: its base
-    Qwen3.5-35B-A3B's, docs/offload.md 15.6). vision_staged: MiniCPM-V's Spec.vision_staged
+    Qwen3.5-35B-A3B's, docs/offload.md 15.6), its layer runs untiled unless tile_runs says (a
+    tiled run takes the DeltaNet states' slot 0 alone, and the MTP loop commits slot 1: a
+    chat's next expert-major call would refuse it; branch mtp-slot-fix). vision_staged: MiniCPM-V's Spec.vision_staged
     (None: the Spec's); vision_warm: its tower programs' wait entries computed ahead in a
     background process (opentpu/host/vision_warm.py; the engine's `vision_warm`, the process or
     None). kw: Engine's own."""
@@ -221,6 +223,7 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
     if mtp:                                     # (the MTP loop's verify: 2 rows)
         spec = replace(spec, mtp=True)
         kw.setdefault("rows", 2)
+        kw.setdefault("tile_runs", False)       # (its layer runs untiled: slot 1, above)
     if vision_staged is not None:               # (MiniCPM-V: its tower through the slots)
         spec = replace(spec, vision_staged=vision_staged)
     if W is None:

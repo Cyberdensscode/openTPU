@@ -200,6 +200,9 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
         if cfg is not None and cfg != want:
             raise SystemExit(f"the device's configuration is not {cfg_file}'s: {cfg} / {want}")
         cfg = want
+    if mtp and tile_rows is not None:           # (streamed.engine: an MTP engine's runs untiled)
+        raise SystemExit("--tile-rows with --mtp: an MTP engine's layer runs stay untiled (a "
+                         "tiled run takes the states' slot 0 alone; branch mtp-slot-fix)")
     t = time.time()
     eng = ST.engine(path, cfg or board_config(), be, cap, pool or ST.DEFAULT, experts=experts,
                     wformat=wformat, head_format=head, formats=formats, layer_major=layer_major,
