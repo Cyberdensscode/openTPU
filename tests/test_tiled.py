@@ -298,6 +298,65 @@ def test_qwen35_tiles_fit_the_cards_imem(dims, T):
             assert G.fits(img, progs), (blocks, kind, max(map(len, progs)))
 
 
+def test_lfm2_stack_in_one_loop_is_the_plans_runs(monkeypatch):
+    """LFM2's tiled runs take a dense stack of both kinds in one formats group in one loop over
+    its layers (tiled._lfm2_stack, tiled.STACK: a TMEM table of the layers' kinds, a loop of 0
+    or 1 iterations around each kind's mixer at the kind's Counter, then the MLP of the layer's
+    common part): on an irregular stack (its plan: four runs, one a loop), two prompts' last
+    logits and every slice's DRAM (KV caches, conv rings) bit for bit as the plan's runs give
+    them, the same rows, in shorter programs; the wait counts checked against every run
+    (OTPU_WAITS_CHECK) and every MM's drain keeping up with its array."""
+    from conftest import assert_drains_keep_up, waits_programs
+    from test_prefill import _lfm2
+    W, spec, cfg = _lfm2(("conv", "conv", "attn", "conv", "attn", "attn", "conv"))
+    cfg = dataclasses.replace(cfg, MCOLS=4, ACT_ROWS=16)
+    r = np.random.default_rng(11)
+    p1, p2 = ([int(t) for t in r.integers(0, 1000, n)] for n in (250, 20))
+    monkeypatch.setenv("OTPU_WAITS_CHECK", "1")
+
+    def run():
+        e = Engine(spec, W, cap=512, cfg=cfg, rows=16, resident=True, prompt_runs=True)
+        e.tile_runs = True
+        progs = waits_programs(e)
+        return e, [e.prefill(p1), e.prefill(p2)], progs
+
+    a, got, progs = run()
+    assert a.image.stack is not None and len(a.image.plan) == 4      # (c), (c A) x 2, (A), (c)
+    monkeypatch.setattr(tiled, "STACK", False)
+    b, want, _ = run()
+    assert [s["rows"] for s in a.stats] == [s["rows"] for s in b.stats]
+    assert "prompt tile" in {k[0] for k in a._prompt_progs}
+    for x, y in zip(got, want):
+        assert np.array_equal(x.view(np.uint32), y.view(np.uint32))
+    assert all(np.array_equal(x, y) for x, y in zip(_dram_but_scratch(a, 270),
+                                                    _dram_but_scratch(b, 270)))
+    n = {e: {k: max(map(len, v[0])) for k, v in e._prompt_progs.items() if k[0] == "prompt tile"}
+         for e in (a, b)}
+    assert n[a].keys() == n[b].keys() and all(n[a][k] < n[b][k] for k in n[a])
+    assert_drains_keep_up(progs, cfg)
+
+
+def test_lfm2_tiles_fit_the_cards_imem():
+    """LFM2-2.6B's dims and stack (layout only, no weights) on the card's configuration (m4:
+    MCOLS 4, ACT_ROWS 16, 4K-instruction IMEM; otpu-chat's formats, the model's mix; the image's
+    rows grown to 16): its stack in one loop (tiled.STACK) fits a tile of 4 rows in IMEM at
+    every bucket of a 2K context, P and L. The plan's runs unroll its 30 layers: 6,228
+    instructions at bucket 1 and 14,110 at bucket 8, so today's prompt runs took it (1 row a run
+    from bucket 5)."""
+    from opentpu.llm import generate as G
+    from opentpu.llm.lfm2 import Spec as SL
+    kinds = tuple({"c": "conv", "A": "attn"}[k] for k in "ccAccAcccAcccAcccAcccAccAccAcc")
+    spec = SL(2048, kinds, 32, 8, 64, 10752, 65536, mix="conv=nvfp4,gateup=nvfp4,down=fp4")
+    cfg = board_config(PAIR=True, DSTEP=True, STREAM=True, SEQ_WC=True, DRAM_BYTES=1 << 33)
+    assert cfg.MCOLS == 4 and cfg.act_rows == 16 and cfg.IMEM_WORDS // 8 == 4096
+    img = spec.image(cfg, 2048, 1, 16, wformat="mix", lookup=True)
+    assert img.stack is not None
+    for blocks in range(1, 9):
+        for kind in ("P", "L"):
+            progs, _ = tiled.compile_tile_run(img, blocks, 4, kind)
+            assert G.fits(img, progs), (blocks, kind, max(map(len, progs)))
+
+
 @pytest.mark.parametrize("P1, P2", [(36, 24), (250, 20)])
 def test_tiled_prompt_runs_pair_alike(tmp_path_factory, P1, P2):
     """4-bit Qwen3.5 with PAIR: a tiled run and today's are the same bits whether or not one
@@ -446,8 +505,8 @@ def test_tiled_forms_placed_next_fit_first():
     ("kh8", 4, 16, 300, 16, None),      # channel parts; Qwen3.5: DeltaNet rows (DSTEP), gated
     ("gemma4-1", 4, 16, 600, 4, None),  # Gemma 4: the sliding window's start-masked block (IMEM:
     ("gemma4-2", 8, 16, 300, 8, None),  # 4 rows in bucket 3); E4B's groups of 4, two rows a tile
-    ("kh8", 4, 16, 300, 16, {"spill": True, "drows": 5}),  # x stored and loaded back in place,
-    #                                                         DeltaNet in runs of 5 rows
+    ("kh8", 4, 16, 300, 12, {"spill": True, "drows": 5}),  # x stored and loaded back in place,
+    #                                                         DeltaNet in runs of 4 x 3
     ("kh8", 4, 16, 300, 16, "ranges"),  # W_o's operand in QACT ranges: an MM a range (ACC)
     ("kh8", 4, 16, 300, 12, {"spill": True, "drows": 4, "oscr": False}),  # outputs in TMEM
 ])

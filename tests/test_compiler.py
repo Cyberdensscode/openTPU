@@ -725,3 +725,68 @@ def test_register_allocation_fuzz():
     values give the model's sums exactly."""
     bad = [s for s in range(600) if _fuzz_one(s) is False]
     assert not bad, f"seeds {bad[:10]}"
+
+
+@pytest.mark.parametrize("words", [False, True], ids=["argument", "run_words"])
+def test_a_counter_steps_where_the_program_says(words):
+    """compiler.Counter (Builder.counter, step, end_counter; tiled._lfm2_stack's layer block):
+    five layers in a loop, each one's kind from a TMEM table, the counter stepped by its kind's
+    block size (256 or 128 bytes) in loops of 0 or 1 iterations after the layer's loads. Each
+    layer loads at the counter alone and, in an inner loop, at the counter plus a run-time value
+    (Builder._derived: a register of their sum stepped with it, from tok's argument register or,
+    under run_words, an RLD MUL of tok's TMEM word): the words of every layer's block, for two
+    values of tok. Stepping it while a loop's address adds it is refused."""
+    tok = RunVar("tok", bound=16)
+    cfg = Config(DRAM_BYTES=1 << 16)
+    kinds = [1, 0, 0, 1, 0]
+    size = {1: 256, 0: 128}
+
+    def kernel(t, early=False):
+        @ol.jit
+        def k():
+            b = current()
+            if words:
+                b.run_words = {"tok": ol.full([1], float(t)).base}
+            tab = ol.zeros([10])                    # [kind 1? | kind 0?]
+            for i, kd in enumerate(kinds):
+                tab[i + 5 * (1 - kd):i + 5 * (1 - kd) + 1].set(1.0)
+            acc = ol.zeros([4])
+            blk = b.counter("block")
+            r = [b.scratch(), b.scratch()]
+            for it in ol.range(5):
+                for o in (0, 1):
+                    ra, imm = b.addr(Affine(tab.base + 5 * o) + Affine.of(it))
+                    b.emit(I.rld(r[o], imm, ra=ra, bound=(0, 1)))
+                acc.set(acc + ol.load(Tensor(Affine(0) + blk, (4,), (1,))))
+                for j in ol.range(2):
+                    acc.set(acc + ol.load(Tensor(Affine(2048) + blk + tok * 16 + j * 64, (4,),
+                                                 (1,))))
+                    if early:
+                        b.step(blk, 16)
+                for o, kd in ((0, 1), (1, 0)):
+                    lp = b.begin_loop(0, rcount=r[o])
+                    b.step(blk, size[kd])
+                    b.end_loop(lp)
+            for x in r:
+                b.unscratch(x)
+            b.end_counter(blk)
+            ol.store(Tensor(Affine(1 << 15), (4,), (1,)), acc)
+        return k
+
+    xs = np.random.default_rng(3).integers(0, 16, 4096).astype(np.float32)
+    for t in (3, 9):
+        b = kernel(t).trace(cfg, 0, {})
+        prog = b.finish()
+        steps = [i for i in prog if i.op == I.ADDI and i.comment in ("block + 256", "block + 128")]
+        assert len(steps) == 4                  # the counter's and its sum with 16 * tok, twice
+        got = _run_out(cfg, b, prog, xs, {"tok": t}, 1 << 15)
+        want, blk = np.zeros(4), 0
+        for kd in kinds:
+            want = want + xs[blk // 4:blk // 4 + 4]
+            for j in range(2):
+                a = (2048 + blk + 16 * t + 64 * j) // 4
+                want = want + xs[a:a + 4]
+            blk += size[kd]
+        assert np.array_equal(got, want.astype(np.float32)), t
+    with pytest.raises(CompileError, match="stepped while a loop's address adds it"):
+        kernel(3, early=True).trace(cfg, 0, {})

@@ -1050,3 +1050,145 @@ default's; OTPU_TILE=0 and =1 have keys of their own.
 - **The scratch's round trip** (11.2) is the price of one Sa over W_o's operand; dataflow's
   epilogue fold (the row scale applied in the MXU's epilogue lanes) may let the parts be
   quantized as they end without it.
+
+## 12. The card's routes, and two loops that lift IMEM (2026-10-13)
+
+### 12.1 What the card took
+
+`tools/prefill_routes.py` (90b17fd7) runs prefill.py's own rules on a weightless image of the
+whole model as otpu-chat makes it (resident, prompt runs, the image's rows grown to ACT_ROWS, the
+model's formats: otpu-chat's auto) on the card's configuration (m4: MCOLS 4, ACT_ROWS 16, 64K
+TMEM words, 4K instructions of IMEM; PAIR, DSTEP, STREAM, SEQ_WC), bucket by bucket over a 2K
+context: the tile's T (_tile_fit), today's prompt runs' R and whether they cover the bucket
+(_fit), and the form prefill.tiled takes. Release r2's tree (hwe-bench); t: tiled, p: today's
+prompt runs, buckets 1-8:
+
+| model | rows a run |
+|---|---|
+| Qwen3-0.6B | 16t 16t 16t 12t 12t 12t 8t 12t |
+| Qwen3.5-0.8B, Qwen3.5-2B | 4t everywhere |
+| Qwen3.5-4B | 4t (1-4), 2t (5-8) |
+| LFM2-2.6B | 4p, 2p (2-4), 1p (5-8) |
+| LFM2.5-230M | 16t, 12t (2-3), 8t (4-8) |
+| SmolLM3-3B | 8t (1-2), 4t (3-8) |
+| Phi-4-mini | 4t 3t 3p 2t 2p 1t 1t 1t |
+| Gemma 4 E2B | 4t everywhere |
+| Gemma 4 E4B | 3t 2t 2t 2t 2p 2p 2p 1t |
+
+IMEM, not TMEM, set these on most models (11.1 compiled the first layers; the whole models' tile
+programs are longer): it unrolls each layer of an irregular stack (LFM2-2.6B's 30 layers: 7,250
+instructions at 4 rows in bucket 2, 14,076 in bucket 8) and each kind's packed attention (rows x
+KV heads x blocks), which grows with the context. Co-simulated (tools/perf_prompt.py --phases, the
+card's memory path, the models' first layers, otpu-chat's formats), cycles a row:
+
+- LFM2-2.6B (6 layers): bucket 5, today's 1-row runs 2,402.8K against a 4-row tile 1,039.9K
+  (-56.7%); bucket 2, today's 2 rows 1,212.6K against 4 rows 1,007.7K (-16.9%).
+- Qwen3.5-4B (4 layers), bucket 5: the tile's 2 rows 1,272.9K against 4 rows 1,029.6K (-19.1%).
+
+The tile's rows at other IMEM sizes (--imem; TMEM and ACT RAM the card's): data for the IMEM
+question, not a proposal (buckets in parentheses where they differ):
+
+| model | 4K instructions (the card) | 8K | 16K | unbounded |
+|---|---|---|---|---|
+| Qwen3-0.6B | 16 (1-3), 12, 8 (7) | 16 | 16 | 16 |
+| Qwen3.5-0.8B | 4 | 12 | 16 | 16 |
+| Qwen3.5-4B | 4 (1-4), 2 | 8 (1-2), 4 | 8 | 8 |
+| LFM2-2.6B | none: today's 4, 2, 1 | 4 (1-2), 2 | 8 (1-3), 4 | 12 |
+| LFM2.5-230M | 16 (1), 12 (2-3), 8 | 16 | 16 | 16 |
+| SmolLM3-3B | 8 (1-2), 4 | 16 (1-2), 12, 8 (5) | 16 | 16 |
+| Gemma 4 E2B | 4 | 8 (1-4), 4 | 12 | 12 |
+
+### 12.2 Qwen3.5: a unit's DeltaNet layers in a loop (0fff0c44)
+
+Qwen3.5's stack is (3 DeltaNet layers, 1 attention layer) x n: plan's one loop over the unit with
+its three DeltaNet layers unrolled. lfm2.subs plans each run's unit again and run_layers(nest)
+loops its repeated part inside the unit's loop (the part's blocks at jt x its bytes), as
+gemma4's subs do its sliding layers: one copy of a DeltaNet layer in the program instead of
+three (qwen35.NEST: qwen35_rows and tiled.qwen35_tile; MTP's verify rows, decode-time programs,
+stay unrolled). The same arithmetic in the same order, so today's bits by construction
+(test_qwen35_nested_layers_are_the_unrolled_ones, tiled and today's prompt runs; the RTL cases of
+test_tiled_prompt_run_on_rtl). Loop depth: the unit, its part, the layer's own.
+
+Cycles, nested against unrolled at equal rows (perf_prompt, 8 layers: two units): Qwen3.5-4B's
+4-row tile in bucket 5 8,197,653 / 8,198,988 (-0.02%), Qwen3.5-0.8B's 12-row tile 7,100,076 /
+7,097,265 (+0.04%), the 4B's 2-row prompt run in bucket 2 5,000,603 / 5,001,703 (-0.02%): the
+joins at the inner loop's exit cost nothing measurable.
+
+### 12.3 LFM2: the stack in one loop
+
+LFM2-2.6B's 30 layers (ccA ccA cccA x 4 ccA ccA cc) repeat no unit long enough for plan, so its
+tile unrolled nearly every layer. tiled._lfm2_stack runs a dense stack of both kinds in one
+formats group (lfm2.Image.stack) as one hardware loop over its layers, whatever the pattern:
+
+- a TMEM table, a word per layer and kind (1.0 where the layer is of that kind: ol.zeros and a
+  FILL per run of layers of a kind at the start), RLD (bounded: 0 or 1) into two counts;
+- a loop of 0 or 1 iterations around each kind's mixer (LOOP runs R[ra] + w2 times and skips its
+  body at 0), then the MLP: LFM2's blocks start with the common part (norms, MLP) at the same
+  offsets in both kinds;
+- the layer's block from a compiler.Counter, a register the program steps itself
+  (Builder.counter / step / end_counter): 0 before the layer loop, ADDI of the kind's block size
+  in a loop of 0 or 1 iterations after the MLP, freed after the loop. An address adds 1 x the
+  counter and with it at most one run-time value of the host's (the KV rows at tpos, a conv
+  layer's ring row): a register of their sum, which starts at c x var before the layer loop
+  (an RLD MUL of the word, bounded by the variable's bound) and steps with the counter
+  (Builder._derived). The run-word fix f1c025a1 is what makes the ring word one the host writes
+  before each run: it is read only through such a register.
+
+The image is today's: its blocks lie one after the other in layer order, each its kind's size,
+with no padding (a uniform stride would add 110.7 MB, 4.2%, to LFM2-2.6B's 2,664 MB) and no
+change to the image, its key or today's programs. Blocks grouped by kind (a region a kind, a
+counter each, the common parts in a region of their own) were tried first: three strides in
+every plan loop, and today's prompt runs and the decode loop, which already take 14 of the 15
+address registers, ran out of them ("generate b1: R10 is taken, argument 5 needs it").
+
+Waits (opentpu.waits): the analysis runs the layer loop's iterations with the counter as an
+interval, at the counts' 0 / 1 loops the join of both outcomes, so layer i's addresses span the
+blocks from the stack's base to i times a conv and an attention block: a run's writes (KV rows,
+conv rings) and the weight streams after them are conservative over that window, inside the
+layers' region and the head and tables after it (the I/O area, which the runs write, lies before
+the base).
+They cost nothing measurable (below). Loop depth: the layers, the 0 / 1 loop, the layer's own (3;
+4 where an attention layer's block loop nests: the tile's depth-2 forms take bucket 8).
+
+Bits: today's (test_lfm2_stack_in_one_loop_is_the_plans_runs: an irregular 7-layer stack, two
+prompts, the logits and every slice's DRAM bit for bit against the plan's runs, the wait counts
+checked against every run, OTPU_WAITS_CHECK; the tiny LFM2's tiled-against-today's and RTL cases,
+whose (conv, attn) x 2 + conv now runs this way; test_a_counter_steps_where_the_program_says).
+Programs, LFM2-2.6B on the card, 4 rows, P / L: bucket 1 1,604 / 1,626 instructions (the plan's
+6,194 / 6,216), bucket 5 3,012 / 3,034 (10,418 / 10,440), bucket 8 2,824 / 2,846 (14,076 /
+14,098): test_lfm2_tiles_fit_the_cards_imem. Cycles, the stack against the plan's runs at equal
+rows (perf_prompt, LFM2-2.6B, the card): 6 layers, 4 rows in bucket 5 4,158,517 / 4,159,466
+(-0.02%), 8 rows in bucket 2 8,003,181 / 8,007,873 (-0.06%); 12 layers, 4 rows in
+bucket 5 8,227,065 / 8,229,002 (-0.02%) and bucket 8 8,415,530 / 8,417,819 (-0.03%; 30 layers
+overflow the co-simulation's DRAM model); LFM2.5-230M (6 layers), 12 rows in bucket 2 2,054,026 /
+2,054,702 (-0.03%); port B's bytes the same. The prototype on a uniform layout (every block padded to the larger kind's)
+measured the same: 4,158,523 and 8,003,814.
+
+Rows a run on the card now (prefill_routes; before, in parentheses):
+
+| model | buckets 1-8 |
+|---|---|
+| Qwen3.5-0.8B | 16t, 12t (2-8) (4t) |
+| Qwen3.5-2B | 8t (4t) |
+| Qwen3.5-4B | 8t, 4t (2-8) (4t, then 2t from 5) |
+| LFM2-2.6B | 12t, 8t (2-3), 4t (4-8) (4p, 2p, 1p) |
+| LFM2.5-230M | 16t (1-3), 12t 8t 12t 8t 12t (16t, 12t, 8t) |
+
+### 12.4 Ties
+
+prefill.tiled takes the tile where its T equals today's R. At equal rows the tile was slower on
+every production dense model under the card's formats (co-sim, as 12.1; tile against today's):
+Qwen3.5-0.8B 4 rows +0.50% (bucket 2) / +0.48% (5), Qwen3.5-4B 2 rows +0.36% (5), Gemma 4 E2B 4
+rows +1.24% / +1.08%, SmolLM3-3B 4 rows +0.63% (5), Phi-4-mini 3 rows +0.83% (2), 2 rows +0.96%
+(4), 1 row +0.59% (7), Gemma 4 E4B 2 rows +0.60% (3), 1 row +0.53% (8); port B's bytes equal
+within 0.2%. With 12.2 Qwen3.5's ties are gone (the tile takes more rows); E2B (buckets 1-6),
+SmolLM3 (3-6), Phi-4-mini (2, 4, 6-8) and E4B (2-4, 8) keep theirs. The rule this asks for,
+today's runs on a tie (prefill.tiled: covered and R >= T), is not made yet; a tile of the probe's
+largest rows would still be taken unprobed (no production model's today's runs reach it).
+
+### 12.5 Next
+
+- **Phi-4-mini and E4B's 1-row runs** (from bucket 5-6): one kind of layer, so neither loop above
+  helps; their packed attention's entries are what fills IMEM. The looped attention
+  (docs/prefill.md 10: an entry loop over a KV head's packed tiles) is the next step, with no
+  IMEM growth.

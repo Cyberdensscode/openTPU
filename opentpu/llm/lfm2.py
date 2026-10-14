@@ -481,6 +481,13 @@ class Image(EmbedHost):
         self.plan = plan(self.keys)
         self.mlp_loop = sum(len(u) for _, u, _ in self.plan) > MLP_UNROLL_BODIES
         self.loc = _place(b, self.plan, lambda k: self.layouts[k[1]].size[_kind(k[0])])
+        # the stack in one loop (tiled._lfm2_stack): a dense model's layers of both kinds in
+        # one formats group, whose blocks lie one after the other in layer order (the runs'
+        # do, a block its kind's size) from base
+        self.stack = None
+        if mo is None and len(set(self.lf)) == 1 and set(spec.kinds) == {CONV, ATTN}:
+            g0 = self.layouts[self.lf[0]]
+            self.stack = SimpleNamespace(base=self._off(0).const, size=dict(g0.size))
         dk = self.dk
         n_attn = spec.kinds.count(ATTN)
         head = cap * dk + cap * k_scale_bytes(dk, D) + dk * cap + 4 * cap
@@ -743,16 +750,18 @@ class Image(EmbedHost):
         spec, cfg = self.spec, self.cfg
         D, d, H, K, n = cfg.D, spec.head_dim, spec.hidden, spec.conv_k, self.h_loc
 
-        def layer(li, it=None):
+        def layer(li, it=None, at=None):
             """Descriptors of layer `li` (static), or of element li of its run's unit at
             iteration `it` (a hardware-loop variable). Its kind (for a MoE model: kind, is a MoE
-            layer; Spec.lkinds) and formats group from self.keys."""
+            layer; Spec.lkinds) and formats group from self.keys. at (the stack in one loop,
+            self.stack): li's kind and group in the block at the stack's base + the Counter at
+            (compiler.Counter: the bytes of the blocks before it); `it` is not used."""
             kind, g = self.keys[li]
             moe = False
             if isinstance(kind, tuple):
                 kind, moe = kind
             g = self.layouts[g]
-            off = self._off(li, it)
+            off = self._off(li, it) if at is None else Affine(self.stack.base) + Affine.of(at)
             lofs, mf = g.lofs[kind], g.mf
             ns = SimpleNamespace(g_in=Tensor(off + lofs["g_in"], (H,), (1,)),
                                  g_post=Tensor(off + lofs["g_post"], (H,), (1,)), moe=moe,
@@ -802,7 +811,7 @@ class Image(EmbedHost):
                                   tag=L.tag, fmt=self.fmt, slots=L.slot_bounds,
                                   ids=L.layers * L.E)
         return SimpleNamespace(
-            spec=spec, layer=layer, plan=self.plan, moe_dev=dev,
+            spec=spec, layer=layer, plan=self.plan, moe_dev=dev, stack=self.stack,
             x=_tdesc(self.io["x"], (1, H)), cos=_tdesc(self.io["cos"], (d // 2,)),
             sin=_tdesc(self.io["sin"], (d // 2,)), g_final=_tdesc(self.io["gf"], (H,)),
             logits=_tdesc(self.io["logits"], (1, spec.vocab)),

@@ -543,7 +543,9 @@ def qwen35_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, hidden: boo
 def lfm2_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool = False,
               depth: int = ATTN_DEPTH, whole: bool = True, oscr: bool = True):
     """lfm2_rows tiled: T rows of a prompt run (pos a RunRows), its attention layers, its
-    convolution blocks and its MLPs tiled. spill, depth, whole: as qwen3_tile's."""
+    convolution blocks and its MLPs tiled. spill, depth, whole: as qwen3_tile's. A stack the
+    image lays out for it (m.stack) runs in one loop over its layers (_lfm2_stack, STACK);
+    else the runs of its plan (lfm2.run_layers)."""
     from .lfm2 import CONV, run_layers
     spec = m.spec
     if not isinstance(pos, RunRows):
@@ -554,18 +556,74 @@ def lfm2_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool =
     parts, sub = _widths(m, T)
     D, W = ol.block_size(), ol.tmem_words()
 
-    def layer(li, it):
-        lw = m.layer(li, it)
+    def mixer(lw):
         if lw.kind == CONV:
             n = lw.taps.shape[1]
             _conv_tile(res.x, lw, pos, spec, parts, conv_parts(n, spec.conv_k, D, T, W))
         else:
             _attention_tile(res, lw, c, s_, pos, T, spec, block, parts, depth=depth,
                             whole=whole, oscr=_oscr(m, oscr))
+
+    def mlp(lw):
         _mlp_tile(res.x, lw, spec, parts, sub(lw))
 
-    run_layers(m.plan, layer)
+    def layer(li, it):
+        lw = m.layer(li, it)
+        mixer(lw)
+        mlp(lw)
+
+    if STACK and getattr(m, "stack", None) is not None:
+        _lfm2_stack(m, mixer, mlp)
+    else:
+        run_layers(m.plan, layer)
     _lm_head_rows(res.x, m, spec, logit_rows)
+
+
+STACK = True        # LFM2's tiled runs: a stack laid out for it in one loop (_lfm2_stack)
+
+
+def _lfm2_stack(m, mixer, mlp) -> None:
+    """LFM2's layers in one hardware loop, whatever its kinds' pattern (docs/tiled_prefill.md
+    12.3): a layer's kind from a TMEM table (a word per layer and kind, 1.0 where the layer is of
+    that kind: FILLs at the start), RLD (bounded: 0 or 1) into the counts of loops of 0 or 1
+    iterations: the kind's mixer, then after the MLP (the blocks' common part, at the same
+    offsets in both kinds) the step of the layer's block Counter (compiler.Counter: the blocks
+    before it, lfm2.Image.stack) by the kind's block size. One copy of each kind's code, where
+    the plan's runs unroll every layer of an irregular stack (LFM2-2.6B's 30: 1 or 2 rows a run
+    in the card's IMEM)."""
+    import itertools
+    from .lfm2 import ATTN, CONV
+    b = current()
+    kinds = list(m.spec.kinds)
+    L, st = len(kinds), m.stack
+    tab = ol.zeros((2 * L,))                    # [conv layer? | attention layer?]
+    i = 0
+    for kd, run in itertools.groupby(kinds):    # a FILL a run of layers of a kind
+        n = len(list(run))
+        o = i + (0 if kd == CONV else L)
+        tab[o:o + n].set(1.0)
+        i += n
+    first = {kd: kinds.index(kd) for kd in (CONV, ATTN)}
+    blk = b.counter("layer block")
+    r = {CONV: b.scratch(), ATTN: b.scratch()}
+    for it in ol.range(L):
+        b.check_live(tab)
+        for o, kd in ((0, CONV), (L, ATTN)):
+            ra, imm = b.addr(Affine(tab.base + o) + Affine.of(it))
+            b.emit(I.rld(r[kd], imm, ra=ra, bound=(0, 1), comment=f"a {kd} layer?"))
+        for kd in (CONV, ATTN):
+            lp = b.begin_loop(0, rcount=r[kd])
+            mixer(m.layer(first[kd], at=blk))
+            b.end_loop(lp)
+        mlp(m.layer(first[CONV], at=blk))      # (the common part: the same offsets)
+        for kd in (CONV, ATTN):
+            lp = b.begin_loop(0, rcount=r[kd])
+            b.step(blk, st.size[kd])
+            b.end_loop(lp)
+    for x in r.values():
+        b.unscratch(x)
+    b.end_counter(blk)
+    del tab
 
 
 def pack_seq(seqs, G: int, block: int, cap: int):
