@@ -8,7 +8,10 @@ The engine opens as otpu-chat's (tools/qual/chatmoe.py's: streamed.engine, the f
 its image built or read from the image cache) and a first turn warms it (its programs, the
 slots); the pool's disk (rotational or not, /sys/block) is reported. Then each arm, in order:
 - cached: the whole pool read into the page cache (its seconds: the disk's sequential rate);
-- dropped: the pool's pages dropped from the page cache (posix_fadvise DONTNEED);
+- dropped: the pool's pages dropped from the page cache (the engine's maps of it released, then
+  posix_fadvise DONTNEED);
+an arm whose page cache is not what it says (mincore: under 95% of the pool's experts in it
+cached, over 2% dropped) is marked INVALID;
 then the conversation reset and the same turn asked, greedy. Per arm: prefill and decode tok/s
 (wall and device), the slots' misses, and the pool's reads by where they came from (PoolFile.io:
 "cached" reads whose pages were all in the page cache, "disk" the others; each its reads,
@@ -44,9 +47,20 @@ def disk_of(path) -> dict:
         return {}
 
 
-def cache(path, on: bool) -> float:
-    """The file into the page cache (on: read through) or out of it; returns the seconds."""
+def cache(path, on: bool, pf=None) -> float:
+    """The file into the page cache (on: read through) or out of it; returns the seconds.
+    Out of it: posix_fadvise DONTNEED drops only pages no process maps, and the engine's
+    PoolFile maps the pool (its `mapped` touches, its packing memmap), so those maps' pages
+    are unmapped from this process first (madvise DONTNEED: the maps stay, a later read
+    faults the page in again). Session mcpv3b's dropped arms (2026-10-13) dropped nothing."""
+    import mmap
     t = time.time()
+    if not on and pf is not None and hasattr(mmap, "MADV_DONTNEED"):
+        m = pf._map() if pf.mapped else None
+        maps = [m[0]] if m is not None else []
+        maps += [x._mmap for x in (pf.arr, pf.packed) if getattr(x, "_mmap", None) is not None]
+        for mm in maps:
+            mm.madvise(mmap.MADV_DONTNEED)
     fd = os.open(path, os.O_RDONLY)
     try:
         if on:
@@ -107,8 +121,15 @@ def main(argv=None) -> int:
     if pf.warm_t is not None:                   # (the open's read of every packed expert)
         pf.warm_t.join()
     for arm in a.arms.split(","):
-        s = cache(a.pool, arm == "cached")
+        s = cache(a.pool, arm == "cached", pf)
         res = pf.resident(pf.ids)
+        total = len(pf.ids) * pf.slot
+        # an arm counts when the cache step did what it says: (nearly) all of the pool's
+        # experts in the page cache, or (nearly) none
+        valid = res is None or (res >= 0.95 * total if arm == "cached" else res <= 0.02 * total)
+        if not valid:
+            print(f"  {arm}: INVALID, {res / 1e9:.2f} GB of the pool's {total / 1e9:.2f} GB in "
+                  f"the page cache", flush=True)
         chat.reset()
         pf.io = {}
         reply, tr = chat.ask(a.turn)
@@ -116,7 +137,8 @@ def main(argv=None) -> int:
         pf_io, pf.io = pf.io, None
         io = {k: {"reads": v[0], "s": r(v[1]), "ms_a_read": r(1e3 * v[1] / max(v[0], 1), 2),
                   "mb": r(v[2] / 1e6, 1)} for k, v in pf_io.items()}
-        x = dict(arm=arm, cache_s=r(s, 1), resident_gb=None if res is None else r(res / 1e9, 2),
+        x = dict(arm=arm, valid=valid, cache_s=r(s, 1),
+                 resident_gb=None if res is None else r(res / 1e9, 2),
                  ms_a_miss=r(1e3 * sum(v[1] for v in pf_io.values()) / max(tr.expert_misses, 1), 2),
                  prefill_tok_s=r(tr.prefill_tok_s, 2),
                  prefill_dev_tok_s=r(tr.prefill_dev_tok_s, 2), decode_tok_s=r(tr.decode_tok_s, 2),
@@ -125,7 +147,7 @@ def main(argv=None) -> int:
                  reply=reply)
         out["arms"].append(x)
         print(f"  {arm:8s} (page cache set in {x['cache_s']} s, the pool's {x['resident_gb']} GB "
-              f"in it): prefill {x['prefill_tok_s']} "
+              f"in it{'' if valid else ': INVALID'}): prefill {x['prefill_tok_s']} "
               f"tok/s (device {x['prefill_dev_tok_s']}), decode {x['decode_tok_s']} tok/s "
               f"(device {x['decode_dev_tok_s']}), {x['misses']} misses at {x['ms_a_miss']} ms "
               f"of reads each; reads "

@@ -788,6 +788,36 @@ Sessions (the lead runs them; scripts on this branch):
        streamed.engine.
      - test_the_real_staged_layout_has_room_at_the_cards_slots builds the real layout on the
        card's 4 GiB: the probe at 8 slots a layer, the engine's 36.
+   - **mcpv3b PASSED** (2026-10-13 19:56 opentpu; tree 3e3190ab). ECC 0/0, selftest all pass.
+     - Token-exact: warmup, text and thumb. Also sliced, for the first time: doc.png's 7
+       crops, 488 prompt tokens, 32 reply tokens.
+   - **The tower, as co-simulated.**
+     - A crop's device time is 4.78-4.83 s (mcpv2: 5.73-5.81 s, -17%).
+     - out: 206.1 ms a run at 1,008 patches and 209.3 at 1,024 (co-simulation 206.0 /
+       209.3). out2: 51.5 / 52.3. last: 53.2 / 54.0.
+     - doc.png's 7 crops encode in 34.5 s (mcpv2 staged: 41.0-41.4); the thumbnail in 5.7 s.
+     - A new patch count's first crop builds its programs in 0.42-0.67 s, with no
+       wait-entry analysis at its start (vision_warm and waits._MemoPass). mcpv1's took
+       ~23 s more.
+   - **Decode** (staged, device tok/s): 4.4-4.7 in the chat turns, 5.1-5.2 in pooldisk's
+     longer turn.
+   - **The cold pool, once more.**
+     - The warm-up's first build of the image (load 102.6 s, a 30.2 GB peak) took the pool
+       out of the page cache.
+     - Its turn 1 decoded at 1.25 tok/s (device 4.42), its prompt in 15.7 s. The same turn
+       warm (text): 3.88 tok/s, 4.9 s, with the same 2,950 misses.
+   - **pooldisk: the dropped arms are INVALID.**
+     - Both reported the whole pool still in the page cache: the engine's PoolFile maps the
+       pool and touches every page it reads, and posix_fadvise DONTNEED does not drop a
+       mapped page.
+     - The cached arms stand: 2,523-2,605 misses at 0.52-0.55 ms of reads each (0.18-0.19
+       ms a read, about 2.9 reads a miss), decode 5.1-5.2 tok/s.
+     - Fixed in pool_disk.py: the engine's maps of the pool are released first (madvise
+       DONTNEED), then posix_fadvise. An arm whose page cache is not what it says (mincore)
+       is marked INVALID.
+     - Checked on a Linux host, with a mapped, touched PoolFile of 512 MB: plain DONTNEED
+       left all 537 MB cached; the fix left 0.
+     - For the next session: the pool on /data and an SSD pool, the same arms.
 
 ## 7. Decisions
 
