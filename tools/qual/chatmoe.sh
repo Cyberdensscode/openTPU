@@ -13,9 +13,11 @@
 # The checkpoints and pools are the offload sessions' (tools/offload/sessions/env.sh: O), each
 # pool stamped with its key (pack_pool.py MODEL POOL stamp); the references are
 # RF/chatmoe-<model>.json. A model whose files are not staged is skipped. Before each model
-# every other file of 100 MB or more under O and ~/openTPU/models leaves the page cache (as
-# card_moe.sh's DROPOTHER; a link out of ~/openTPU and ~/otpu-build is skipped, never opened)
-# and its pool is read into it. Selftest before and after.
+# every other file of 100 MB or more under O, ~/openTPU/models and /data/otpu leaves the page
+# cache (as card_moe.sh's DROPOTHER; a link out of ~/openTPU, ~/otpu-build and /data/otpu is
+# skipped, never opened) and its pool is read into it. /data/otpu: MiniCPM-V's pool (18 GB) stayed
+# in the page cache after session hostr21 (2026-10-14), and the card host's 31 GB then held 63% of
+# the 35B's pool. Selftest before and after.
 # The references, on a host with the whole checkpoints (CFG: the card's refs.py cfg, REFCFG):
 #   python3 tools/qual/chatmoe.py CHECKPOINT --cfg CFG --pool POOL --out chatmoe-<model>.json
 #   (--pool-create where the host has no pool: the experts packed as they are asked for)
@@ -51,10 +53,11 @@ for m in ${RUNS:-lfm2-8b qwen35-35b gemma4-26b}; do
   if [ ! -f $O/$md/config.json ] || [ ! -f $O/$pool ] || [ ! -f $ref ]; then
     echo "  [SKIP] $m: not staged ($O/$md, $O/$pool, $ref)"; continue; fi
   echo "=== $m $(date +%T)"
-  python - $O/$md $O/$pool $O:$HOME/openTPU/models <<'PY'
+  python - $O/$md $O/$pool $O:$HOME/openTPU/models:/data/otpu <<'PY'
 import os, sys                                # every other file of 100 MB or more out of the
 keep = {os.path.realpath(sys.argv[1]), os.path.realpath(sys.argv[2])}    # page cache
-ours = tuple(os.path.realpath(os.path.expanduser(d)) + os.sep for d in ("~/openTPU", "~/otpu-build"))
+ours = tuple(os.path.realpath(os.path.expanduser(d)) + os.sep
+             for d in ("~/openTPU", "~/otpu-build", "/data/otpu"))
 gb = n = 0
 seen = set()
 for d in sys.argv[3].split(":"):

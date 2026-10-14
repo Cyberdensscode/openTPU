@@ -42,11 +42,12 @@ source "$(dirname "$0")/env.sh"
 PSFX=${PSFX-.split}       # the pool files: the split format (.split.bin), or "" for the slot format
 G26POOL=${G26POOL:-../g26/pool-g26-fp4.split.bin}     # (relative to O)
 # before each run every other file of 100 MB or more under these leaves the page cache (MGLRU
-# keeps once-mmapped checkpoints over the pool's reads: docs/offload.md 10.6); "" for none. A
-# link whose target is outside ~/openTPU and ~/otpu-build is skipped (and logged), never opened.
+# keeps once-mmapped checkpoints over the pool's reads: docs/offload.md 10.6; /data/otpu: the
+# pools there, as tools/qual/chatmoe.sh's); "" for none. A link whose target is outside ~/openTPU,
+# ~/otpu-build and /data/otpu is skipped (and logged), never opened.
 # HOG=dir:dir (after DROPOTHER): the files of 100 MB or more there mapped and touched first by
 # another process, as a user's host would have them (docs/offload.md 10.7)
-DROPOTHER=${DROPOTHER-$HOME/openTPU/models:$O:$O/$(dirname $G26POOL)}
+DROPOTHER=${DROPOTHER-$HOME/openTPU/models:$O:$O/$(dirname $G26POOL):/data/otpu}
 echo "card_moe start $(date +%T) tree $rev mem $(mem) GB"
 timeout 1800 python -m opentpu.host.selftest 2>&1 | grep -E "\[(PASS|FAIL)\]|config" | tail -12
 timeout 300 python tools/qual/refs.py cfg $R/cfg-dev.pkl > /dev/null 2>&1; echo "cfg exit $?"
@@ -120,7 +121,8 @@ PY
     python - $O/$md $O/$pool $DROPOTHER <<'PY'  # 10: MGLRU kept the mmapped checkpoints of the
 import os, sys                                # session before, 13.6 GB, over the pool's reads)
 keep = {os.path.realpath(sys.argv[1]), os.path.realpath(sys.argv[2])}
-ours = tuple(os.path.realpath(os.path.expanduser(d)) + os.sep for d in ("~/openTPU", "~/otpu-build"))
+ours = tuple(os.path.realpath(os.path.expanduser(d)) + os.sep
+             for d in ("~/openTPU", "~/otpu-build", "/data/otpu"))
 gb = n = 0
 seen = set()
 for d in sys.argv[3].split(":"):
