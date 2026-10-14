@@ -1478,12 +1478,13 @@ def untiled_rows(img) -> int:
 
 def layer_variants(img, fam: str, T: int) -> list:
     """A tiled layer run's forms (variants'): Qwen3.5's DeltaNet rows in runs of at most the
-    image's gr / on rows (grows), then fewer; the run's rows are the engine's (layer_major),
+    image's gr / on rows (dnrows) and MCOLS (more only replay the MXU's groups), then fewer; the
+    run's rows are the engine's (layer_major),
     so then the attention's outputs a part at a time (ranges: the 26B's global layers'
     [8, 16 x 512] outputs alone are TMEM's 64K words)."""
     if fam != "qwen35":
         return ranges(wholes([{}, {"spill": True}]))
-    d = min(T, img.grows)
+    d = min(T, img.dnrows, img.cfg.MCOLS)
     out = [{"drows": d}, {"spill": True, "drows": d}]
     while d > 1:
         d = d - img.cfg.MCOLS if d > img.cfg.MCOLS else d - 1

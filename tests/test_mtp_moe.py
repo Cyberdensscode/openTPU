@@ -213,8 +213,9 @@ def test_a_loop_program_that_fits_is_not_split():
     tree before the split (3af05a43) without the image's mask tiles (OTPU_TILE=0). With them
     (Qwen3.5-MoE's tiles on by default, em-tile 2bb7bb0b) the image is 1,331,200 bytes longer
     and the areas the programs address move: the same instructions, only address words
-    differing (by 262,144, 1,331,200 and 1,331,328 bytes), their own sum. A change of the
-    programs themselves updates the sums here."""
+    differing (by 262,144, 1,331,200 and 1,331,328 bytes), their own sum; the tiles' DeltaNet
+    rows (Image.dnrows: 8 of the image's gr / on rows for 4) move them by 9,216 and 12,288 bytes
+    more. A change of the programs themselves updates the sums here."""
     import hashlib
     from pathlib import Path
     from opentpu import isa as I
@@ -241,7 +242,7 @@ def test_a_loop_program_that_fits_is_not_split():
     untiled = os.environ.get("OTPU_TILE", "").strip() == "0"
     assert h.hexdigest() == ("7f3bacfe386c84838742206943cb20db6ea989d2a4eb6cf63fdab651d5ffc103"
                              if untiled else
-                             "eb811fa4ebb43cb6c9fdbe9b43caf1a7a78ebc074e0ddf41c446549c8dfdfa6c")
+                             "99da9dd63f736e7c92e4602d9a5a71ba84ba1b23ee78d5b3b2a4a7a349687e49")
 
 
 @pytest.mark.parametrize("P, drafter, sp", [

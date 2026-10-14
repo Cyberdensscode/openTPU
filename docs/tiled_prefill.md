@@ -1438,15 +1438,35 @@ about 18.1 s: -5.1 s of its 90.4 s.
   MMs' cycles, so it should cut the expert runs a lot, toward their bytes: to check in the r2.1
   window's chatmoe.
 - The tiles at MCOLS 8 (r2.1). Co-simulated on the m8 variant (docs/dataflow.md 4.9.1), the
-  int8 DeltaNet layer at T = 8 does not move (1.027 -> 1.020 ms a row; 0.722 both without DSTEP's
-  cost), while the nvfp4 one's other work does (0.720 -> 0.509) and the attention layer (0.710 ->
-  0.488). The tile program is why: a DeltaNet layer's rows run in pieces of 4 (`layer_variants`'
+  int8 DeltaNet layer at T = 8 did not move (1.027 -> 1.020 ms a row; 0.722 both without DSTEP's
+  cost), while the nvfp4 one's other work did (0.720 -> 0.509) and the attention layer (0.710 ->
+  0.488). The tile program was why: a DeltaNet layer's rows ran in pieces of 4 (`layer_variants`'
   drows: the image's gr / on rows, `grows`, RUN_ROWS 4), and the MoE prologue (the router and the
   shared expert, `moe_prologue_rows`) in groups of 2 rows (a need line's LINE / 4 / k ids). So an
-  8-row tile streams the DeltaNet projections twice and the shared expert and the router four
-  times, and int8 weights go at port B's chunk a cycle. To lift for r2.1: gr / on rows for the
-  tile's rows where TMEM holds their projections (m8's 128K words), and the prologue's MMs over
-  the tile's rows with its need lines still written 2 rows at a time; the same bits (an MM's row
-  groups leave its integer sums as they are). The prologue's groups cost m4 too: 16% of the int8
-  DeltaNet layer's run without DSTEP (122K of 770K cycles for 8 rows), ~1 s of MiniCPM-V's image
-  prompt in groups of 4 (estimated from the profile).
+  8-row tile streamed the DeltaNet projections twice and the shared expert and the router four
+  times, and int8 weights go at port B's chunk a cycle. Both are lifted, compile-side, with the
+  same bits (an MM's row groups leave its integer sums as they are):
+  - A tile's MoE prologue takes its rows at once: the router one MM of the T rows, the shared
+    expert in whole column groups of min(T, MCOLS) rows (T would not fit m4's TMEM). Its need
+    lines stay `moe.need_rows(k)` rows each: the first goes out before the shared expert, the
+    others as its passes begin (`swiglu_down(each=)`). A post waits for the host to serve the one
+    before, so back to back they would add the host's poll (~150 us with parts in flight) two or
+    three times a tile; the co-simulation serves at once and cannot show it, the card's A/B can.
+  - A tiled MoE image's gr / on rows are its tile's (16-20 KB more; no expert slot lost at 2048
+    or 4096 tokens), and a DeltaNet layer runs up to MCOLS rows at a time (more only replays).
+  - Co-simulated, ms a row (T = 8, position 256), before / the prologue / both:
+
+    | layer | m4 | m8 |
+    |---|---|---|
+    | DeltaNet, MiniCPM-V's int8 | 1.026 / 0.967 / 0.968 | 1.020 / 0.936 / 0.871 |
+    | DeltaNet, MiniCPM-V's nvfp4 | 0.976 / 0.918 / 0.917 | 0.964 / 0.877 / 0.864 |
+    | attention, MiniCPM-V's | 0.710 / 0.651 / 0.651 | 0.488 / 0.401 / 0.401 |
+    | DeltaNet, qwen35-35b's | 0.936 / - / 0.917 | 0.923 / - / 0.863 |
+    | attention, qwen35-35b's | 0.670 / - / 0.650 | 0.448 / - / 0.400 |
+
+    MiniCPM-V's mixer: m4 37.1 -> 34.8 ms a row (-6.3%: -1.15 s of the image prompt), m8 34.6 ->
+    30.0 (-13.3%: -2.25 s); qwen35-35b's -2.2% and -7.1% (its shared expert 4-bit: half the
+    bytes, and paired at 2 rows). On m4 the gr / on rows change nothing (the same program).
+  - `tests/test_em_tile.py` test_a_tiles_moe_prologue_takes_its_rows_at_once: a tiny model at
+    k = 4 (two need lines a tile): the router's and the shared expert's rows, the posts, and the
+    prompt, blocks and decode steps against today's runs bit for bit, every need landed.

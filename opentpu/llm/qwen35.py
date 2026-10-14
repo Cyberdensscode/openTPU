@@ -723,17 +723,22 @@ class Image(EmbedHost):
         self.slots = 2 if spec.mtp else 1               # DeltaNet state and window slots
         self.CVW = self.CV0 + (self.slots - 1) * (K - 1) * self.CP     # (then window 1)
         b = _Bump()
-        # the layer-major prefill's rows a chunk (a MoE model's: compile_layer_run), and the
-        # rows of _deltanet_rows' DRAM scratch (gr, on)
+        # the layer-major prefill's rows a chunk (a MoE model's: compile_layer_run), the rows of
+        # a run from the host's slot (layer 0's, the MTP layer's K / V), and of _deltanet_rows'
+        # DRAM scratch (gr, on): a tiled MoE image's, its tile's (its DeltaNet runs of MCOLS rows)
         self.prefill_rows = (PREFILL_CHUNK if spec.moe is not None else 0) \
             if prefill_rows is None else prefill_rows
-        self.grows = max(rows, RUN_ROWS) if self.prefill_rows else rows
+        self.grows = self.dnrows = max(rows, RUN_ROWS) if self.prefill_rows else rows
+        from .prefill import layer_tile_flag
+        if self.prefill_rows and spec.moe is not None and layer_tile_flag(None, True):
+            from .tiled import LAYER_ROWS
+            self.dnrows = max(self.grows, min(LAYER_ROWS["qwen35"], cfg.act_rows))
         self.io = {"x": b.alloc(4 * H * rows), "cos": b.alloc(2 * spec.rope_dim * rows),
                    "sin": b.alloc(2 * spec.rope_dim * rows), "gf": b.alloc(4 * H),
                    "logits": b.alloc(4 * spec.vocab * rows),
                    "hs": b.alloc(4 * 2 * self.nl),     # per pair: decays of a, b; betas
-                   "gr": b.alloc(4 * 2 * self.nl * self.grows),    # chunked prefill, per row:
-                   "on": b.alloc(4 * 4 * spec.lin_dv * self.grows)}    # decays, betas; a head
+                   "gr": b.alloc(4 * 2 * self.nl * self.dnrows),   # chunked prefill, per row:
+                   "on": b.alloc(4 * 4 * spec.lin_dv * self.dnrows)}   # decays, betas; a head
         from .prefill import tile_scratch   # a tiled run's attention outputs, a part at a time
         if tile_scratch(spec, layer_runs=True, default=True):   # (tiled.py; a MoE image's: on
             #                                   unless OTPU_TILE=0, tiled.LAYER_ROWS)
@@ -1429,8 +1434,8 @@ class Image(EmbedHost):
             oscr=_tdesc(self.io["o"], (self.cfg.act_rows, self.nq_loc * spec.head_dim))
             if "o" in self.io else None,
             hs=_tdesc(self.io["hs"], (nl // 2, 4)),
-            gr=_tdesc(self.io["gr"], (self.grows, 2 * nl)),
-            on=_tdesc(self.io["on"], (self.grows, self.og * dv)),
+            gr=_tdesc(self.io["gr"], (self.dnrows, 2 * nl)),
+            on=_tdesc(self.io["on"], (self.dnrows, self.og * dv)),
             xbuf=_tdesc(self.io["xbuf"], (self.prefill_rows, H)) if self.prefill_rows else None,
             head=_qdesc(*self.head, self.v_loc, H, D, self.head_format), v_loc=self.v_loc,
             **_lookup_desc(self.lookup, spec, self.cap))
