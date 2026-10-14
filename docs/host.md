@@ -592,7 +592,9 @@ compile. Without it, a new process compiles before the second token of its first
 256-position bucket: about 0.1 s for plain decode and 0.5-0.7 s for `--mtp`'s six programs
 (Qwen3.5 on the card, [mtp.md](mtp.md) 11.7). `--no-prog-cache` turns it off;
 `OTPU_PROG_CACHE=0` keeps it in memory only. (Until 2026-10-08 the key held otpu-lock's pid,
-`OTPU_LOCK_PID`: a chat under otpu-lock never found the programs of the session before.)
+`OTPU_LOCK_PID`: a chat under otpu-lock never found the programs of the session before.
+Until 2026-10-14 it held `OTPU_VISION_WARM` too: a chat with the tower's warm off found
+none of the programs and wait entries of the runs with it on.)
 
 A tree's first process still compiled each bucket at its first reply there, and with the
 card's wait entries that took seconds: Qwen3.5-35B-A3B's (MiniCPM-V's) ~3.6 s a bucket, so a

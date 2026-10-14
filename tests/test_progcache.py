@@ -60,9 +60,10 @@ def test_the_key_sees_the_layout_the_environment_and_what(monkeypatch):
     k = PC.key(("spec", 512), ("gen", 1))
     for var, val in (("OTPU_QUIET", "/tmp/q"), ("OTPU_BUILD_JOBS", "3"),
                      ("OTPU_IMG_CACHE", "/tmp/i"), ("OTPU_LOCK_HELD", "xdma0"),
-                     ("OTPU_LOCK_PID", str(os.getpid()))):
+                     ("OTPU_LOCK_PID", str(os.getpid())), ("OTPU_VISION_WARM", "0")):
         monkeypatch.setenv(var, val)        # read by the host's tools only (otpu-lock sets its
-        assert PC.key(("spec", 512), ("gen", 1)) == k, var  # pid: each session's misses)
+        assert PC.key(("spec", 512), ("gen", 1)) == k, var  # pid: each session's misses;
+                                            # vision_warm's switch: its entries, the engine's)
 
 
 def test_the_key_sees_the_host_modules_the_programs_take(monkeypatch):
