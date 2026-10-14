@@ -1437,12 +1437,14 @@ def layer_family(img) -> str | None:
     return name if ok else None
 
 
-def compile_layer_tile(img, li: int, blocks: int, T: int, block: int = ATTN_BLOCK):
+def compile_layer_tile(img, li: int, blocks: int, T: int, block: int = ATTN_BLOCK,
+                       slot: int = 0):
     """(programs, run_args): layer li's expert-major run tiled (LAYER_KERNELS), T rows at a
     run-time position of bucket `blocks` (from conv_k - 1) and a run-time chunk row ("row"),
     in place of the image's compile_layer_run(li, blocks, R=T, em=True) (Engine.prefill_layers'
     runs of more than one row with tiling on: Engine.layer_tile); the first of its forms that
-    fits TMEM, ACT RAM and IMEM (_first_fit)."""
+    fits TMEM, ACT RAM and IMEM (_first_fit). slot: the DeltaNet states' and windows' slot of an
+    MTP image (its committed one, mtp.MTPDecoder: a chat's next turn), as compile_layer_run's."""
     from ..compiler import RunVar
     fam = layer_family(img)
     if fam is None:
@@ -1459,8 +1461,8 @@ def compile_layer_tile(img, li: int, blocks: int, T: int, block: int = ATTN_BLOC
 
     def trace(kw, fit):
         return [LAYER_KERNELS[fam].trace(cfg, 0, {
-            "m": img.descriptors(0), "li": li, "pos": pos, "row": row, "T": T, "block": block,
-            **kw}, fit=fit)]
+            "m": img.descriptors(0, slot) if slot else img.descriptors(0), "li": li, "pos": pos,
+            "row": row, "T": T, "block": block, **kw}, fit=fit)]
 
     return _first_fit(trace, layer_variants(img, fam, T), cfg)
 

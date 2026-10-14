@@ -1989,10 +1989,9 @@ def layer_programs(image, key, block: int, hint: bool = False, em: bool = False,
     if key[0] == "v":                       # (("v", rows): image rows, minicpmv.Image)
         return image.compile_vis_run(key[1], em=em)
     if key[-1] == "tile":
-        if slot:
-            raise ValueError("a tiled layer run takes the states' slot 0")
         from . import tiled as TL
-        return TL.compile_layer_tile(image, key[0], key[1], key[2], block)
+        return TL.compile_layer_tile(image, key[0], key[1], key[2], block,
+                                     **({"slot": slot} if slot else {}))
     kw = {"hint": True} if hint and key[0] >= 0 else {}
     if em:
         kw["em"] = True

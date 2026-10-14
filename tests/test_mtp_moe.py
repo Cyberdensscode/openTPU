@@ -417,7 +417,6 @@ def test_moe_mtp_rollback_to_a_held_snapshot_is_a_rerun(tiny_moe_mtp, em, monkey
                                                     _states(ref.eng, spec, ref.slot)))
 
 
-@pytest.mark.xfail(strict=True, raises=ValueError, reason="slot-1 tiled runs: mtp-slot-fix")
 def test_moe_mtp_layer_major_continues_from_slot_1(tiny_moe_mtp, monkeypatch):
     """A chat's next turn on the layer-major path: the first turn's loop (drafts all right)
     leaves the states committed in slot 1, and the next prompt's layer runs read and write that
@@ -437,6 +436,8 @@ def test_moe_mtp_layer_major_continues_from_slot_1(tiny_moe_mtp, monkeypatch):
     ctx = p1 + t1 + p2
     st = dec.generate_card([t1[-1]] + p2, max_new=10, stop=[])
     assert any(k[1:] == ("slot", 1) for k in dec.eng._layer_runs if len(k) == 3)
+    assert any(k[0][-1] == "tile" for k in dec.eng._layer_runs     # (the turn's tiled runs,
+               if len(k) == 3 and k[1:] == ("slot", 1))            # on slot 1)
     fresh = MTPDecoder(_layered(spec, W, True)).generate_card(ctx, max_new=10, stop=[])
     assert st.tokens == fresh.tokens == _plain(spec, W, ctx, 10)
 
@@ -449,9 +450,8 @@ def test_streamed_mtp_engine_from_a_checkpoint_and_an_extended_pool(tiny_moe_mtp
     asks for from the checkpoint). The loop's tokens equal plain greedy decode's from the
     model's pool. MiniCPM-V 4.7's case: a checkpoint without mtp.* is refused, and takes them
     from another (mtp_from), whose identity the pool's key holds: the pool extended for the
-    model's own MTP layer is refused, one extended with --mtp-from serves it. Its engines run
-    their layer runs untiled, the plain one's expert-major runs tiled (a tiled run takes the
-    states' slot 0 alone: branch mtp-slot-fix)."""
+    model's own MTP layer is refused, one extended with --mtp-from serves it. Its expert-major
+    engine runs its layer runs tiled, as the plain one does."""
     import json
     import runpy
     import sys
@@ -512,10 +512,9 @@ def test_streamed_mtp_engine_from_a_checkpoint_and_an_extended_pool(tiny_moe_mtp
     want = ST.engine(m, CFG, pool=a, **kw).generate(prompt, max_new=N)
     eng = ST.engine(m, CFG, pool=b, mtp=True, **kw)
     assert eng.image.rows == 2 and eng.image.offload.layers == spec.layers + 1
-    assert eng.tile_runs is False and not eng.layer_tile    # (untiled: mtp-slot-fix)
     em = dict(kw, expert_major=True, layer_major=2)
-    assert ST.engine(m, CFG, pool=a, **em).layer_tile       # (the plain engine's tiles)
-    assert not ST.engine(m, CFG, pool=b, mtp=True, **em).layer_tile
+    assert ST.engine(m, CFG, pool=a, **em).layer_tile
+    assert ST.engine(m, CFG, pool=b, mtp=True, **em).layer_tile
     dec = MTPDecoder(eng)
     assert dec.generate_card(prompt, max_new=N, stop=[]).tokens == want
     got = np.fromfile(str(b) + ".packed", np.uint8)[nE:]
