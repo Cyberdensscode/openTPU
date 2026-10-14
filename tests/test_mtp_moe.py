@@ -324,6 +324,52 @@ def test_moe_mtp_layer_major_prefill(tiny_moe_mtp, em, fmt, drafter, monkeypatch
         assert all(np.array_equal(x, y) for x, y in zip(_mtp_kv(a.eng, P), _mtp_kv(b.eng, P)))
 
 
+@pytest.mark.parametrize("P, em, drafter", [(40, True, "mtp"), (256, False, "mtp"),
+                                           (255, False, "mixed")])
+def test_moe_mtp_loop_drafts_the_prompts_last_row_first(tiny_moe_mtp, P, em, drafter,
+                                                        monkeypatch):
+    """A lazy layer-by-layer prefill (MTPDecoder.prefill(lazy=True), otpu-chat's) returns a0
+    with no draft run, and the loop's first run is the D1 of P - 1's bucket over (hid[0], a0):
+    the same draft, the MTP layer's K / V row at P - 1 and so the same iterations, tokens,
+    accepted drafts, last draft, committed slot and MTP KV cache as the eager prefill's draft
+    run and a loop from the verify, bit for bit. P 256: the D1 at the first bucket's last
+    position chains to the next bucket's V; P 255: to its own bucket's E. A loop that does not
+    run (max_new 1) drafts on its own (_settle), as the eager prefill does."""
+    from opentpu.llm import qwen35 as Q35
+    from opentpu.llm.mtp import MTPStats
+    from test_mtp import _mtp_kv
+    monkeypatch.setattr(Q35, "PREFILL_CHUNK", 24)
+    W, spec = tiny_moe_mtp
+    prompt = [int(t) for t in np.random.default_rng(P).integers(0, 1000, P)]
+    N = 12
+    want = _plain(spec, W, prompt, N)
+    right = np.zeros(514, np.float32)
+    right[P:P + len(want)] = want
+    drafts = None if drafter == "mtp" else np.where(np.arange(514) % 3, right, (right + 7) % 1000)
+    got, drafted = [], []
+    for lazy in (False, True):
+        dec = MTPDecoder(_layered(spec, W, em))
+        st = MTPStats()
+        a0, d = dec.prefill(prompt, st, lazy=lazy)
+        assert (d is None) == lazy and dec.pending == ((P - 1, a0) if lazy else None)
+        drafted.append([k for k, _, _ in st.runs].count("mtp prefill"))
+        out = dec.loop_card(a0, d, max_new=N, stop=[], drafts=drafts)
+        assert dec.pending is None and out.tokens == want
+        got.append((out.accepted, dec.draft, dec.slot, dec.eng.pos, _mtp_kv(dec.eng, dec.eng.pos)))
+    assert drafted[0] == drafted[1] + 1         # (the rows before conv_k - 1 draft as before)
+    (acc, d0, s0, p0, kv0), (acc1, d1, s1, p1, kv1) = got
+    assert (acc, d0, s0, p0) == (acc1, d1, s1, p1)
+    assert all(np.array_equal(x, y) for x, y in zip(kv0, kv1))
+    if P == 40:
+        dec = MTPDecoder(_layered(spec, W, em))
+        a0, _ = dec.prefill(prompt, MTPStats(), lazy=True)
+        assert dec.loop_card(a0, None, max_new=1, stop=[]).tokens == [a0] == want[:1]
+        eager = MTPDecoder(_layered(spec, W, em))
+        assert eager.prefill(prompt, MTPStats()) == (a0, dec.draft) and dec.pending is None
+        assert all(np.array_equal(x, y) for x, y in zip(_mtp_kv(dec.eng, P),
+                                                        _mtp_kv(eager.eng, P)))
+
+
 def test_moe_mtp_layer_major_continues_from_slot_1(tiny_moe_mtp, monkeypatch):
     """A chat's next turn on the layer-major path: the first turn's loop (drafts all right)
     leaves the states committed in slot 1, and the next prompt's layer runs read and write that

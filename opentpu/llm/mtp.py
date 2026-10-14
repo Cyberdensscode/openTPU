@@ -101,6 +101,8 @@ class MTPDecoder:
         self.eng, self.img = engine, img
         self.slot = 0
         self.draft = None           # the draft after the token at Engine.pos (prefill, the loop)
+        self.pending = None         # (p, a0): a lazy prefill's last row, its draft not run yet
+                                    # (the loop's first run drafts it: loop_card; else _settle)
         self.split = None           # the loop's V and E in two parts: None when over IMEM (tests:
                                     # True always, False never; _gen_programs)
         # the MTP layer's rows a prefill run (a MoE's: its experts' request names R k ids)
@@ -142,7 +144,7 @@ class MTPDecoder:
 
     # ---- generation
     def prefill(self, tokens, st: MTPStats, chunk: int | None = None, pick=None, on_run=None,
-                follow: int | None = None, vis=None):
+                follow: int | None = None, vis=None, lazy: bool = False):
         """Feed `tokens` from Engine.pos in plain prefill's runs (qwen3.fit_chunk,
         Engine.prefill's: their rows and so their MMs' pairing are its), each storing its rows'
         hidden, then the MTP layer over them, (h_q, x_(q + 1)), in runs of up to `chunk` rows;
@@ -154,7 +156,12 @@ class MTPDecoder:
         prefill feeds the rest). follow: the token after `tokens` (a part of a prompt, the rest
         fed later): the last row's MTP input, no logits, a0 None. vis: each token's image row
         or -1 (Engine.prefill_layers': MiniCPM-V's images, a layer-by-layer prompt's only; the
-        MTP layer's input of an image token is its placeholder's embedding row)."""
+        MTP layer's input of an image token is its placeholder's embedding row). lazy (a
+        layer-by-layer prompt's, by_layers: the others draft in their last run): the last row's
+        draft is left to the loop's first run (loop_card: a D1 before the first verify, served
+        in the loop's run), a0 returned at once with no draft (self.pending; a prefill or a
+        rollback before any loop settles it: _settle)."""
+        self._settle(st)
         toks = [int(t) for t in tokens]
         vis = None if vis is None or max(vis, default=-1) < 0 else [int(v) for v in vis]
         if vis is not None and len(vis) != len(toks):
@@ -190,7 +197,7 @@ class MTPDecoder:
                 self.draft = None
                 return None, None
             return self._prefill_layers(toks[n:], st, pick, on_run, follow,
-                                        None if vis is None else vis[n:])
+                                        None if vis is None else vis[n:], lazy)
         a0 = draft = None
         fit = self.img.rows
         head = follow is None
@@ -231,14 +238,16 @@ class MTPDecoder:
         return (getattr(self.img.spec, "moe", None) is not None and bool(self.eng.layer_major)
                 and bool(getattr(self.img, "embed_host", False)))
 
-    def _prefill_layers(self, toks, st: MTPStats, pick, on_run, follow, vis=None):
+    def _prefill_layers(self, toks, st: MTPStats, pick, on_run, follow, vis=None,
+                        lazy: bool = False):
         """prefill on a streamed MoE whose Engine runs the prompt layer by layer
         (Engine.prefill_layers with the MTP layer's K / V, docs/mtp.md 12), from conv_k - 1
         on: each chunk's rows through the model a layer at a time (the expert slots pooled),
         then the MTP layer's K / V of its rows that have their next token (the prompt's, or
         `follow`); then, the slots back to decode's, the last row's draft: qwen35_mtp over the
-        head's hidden row and a0 (its MoE a request in the MTP layer's slots). The states in
-        the committed slot. on_run(tokens) once, after it. vis: the tokens' image rows."""
+        head's hidden row and a0 (its MoE a request in the MTP layer's slots; lazy: left to
+        the loop, self.pending). The states in the committed slot. on_run(tokens) once, after
+        it. vis: the tokens' image rows."""
         eng = self.eng
         head = follow is None
         P, n0 = eng.pos + len(toks), len(eng.stats)
@@ -252,9 +261,21 @@ class MTPDecoder:
             self.draft = None
             return None, None
         a0 = int(np.argmax(lg)) if pick is None else int(pick(lg))
+        if lazy:
+            self.draft, self.pending = None, (P - 1, a0)
+            return a0, None
         draft = self._draft(P - 1, [a0], st, "mtp prefill")[0]
         self.draft = draft
         return a0, draft
+
+    def _settle(self, st: MTPStats | None = None) -> None:
+        """A lazy prefill's pending draft run on its own (the 1-row MTP run an eager prefill
+        takes), when no loop came to take it: the MTP layer's K / V row at its position and
+        self.draft as an eager prefill leaves them."""
+        if self.pending is None:
+            return
+        (q, a0), self.pending = self.pending, None
+        self.draft = self._draft(q, [a0], MTPStats() if st is None else st, "mtp prefill")[0]
 
     def snapshot(self) -> bool:
         """Engine.snapshot of the committed slot's states and windows."""
@@ -268,7 +289,7 @@ class MTPDecoder:
         if k >= self.eng.pos:
             return self.eng.pos
         t = self.eng.rollback(max(0, k - 1), self.slot)
-        self.draft = None
+        self.draft = self.pending = None    # (the next prefill computes the rows from t on)
         if t == 0:
             self.slot = 0
         return t
@@ -413,7 +434,7 @@ class MTPDecoder:
             u = np.minimum(np.float32(rng.random()), np.float32(1 - 2.0 ** -24))
             return G.reference_pick(lg, samp, ctx, u, self.img.cfg.S,
                                     getattr(self.img.spec, "softcap", None))
-        a0, d = self.prefill(prompt, st, pick=None if samp is None else pick)
+        a0, d = self.prefill(prompt, st, pick=None if samp is None else pick, lazy=True)
         st.prefill_s, st.prefill_compile_s = time.perf_counter() - t0, st.compile_s
         return self.loop_card(a0, d, max_new, stop, on_token, drafts, st, deadline,
                               samp, ctx + [a0], rng)
@@ -426,7 +447,12 @@ class MTPDecoder:
         draft of the next position: self.draft after a prefill or a run) -> the device's run
         of the MTP loop from the committed slot (see generate_card); sampled with samp, the
         uniforms from rng and the penalty's context (the ids so far, a0 with them). halt()
-        (polled while a card runs): true writes the host's stop word, as the deadline does."""
+        (polled while a card runs): true writes the host's stop word, as the deadline does.
+        d None after a lazy prefill (self.pending, the prompt's last row at P - 1 and a0): the
+        run starts with that bucket's D1 over (hid[0], a0) at P - 1, as an E's iteration would
+        leave it (n = 0), which drafts d, appends the MTP layer's row and chains to the first
+        verify; its MoE request is served in the run. No run (a0 a stop id, no tokens left):
+        the draft runs on its own (_settle)."""
         eng, img = self.eng, self.img
         spec, block = img.spec, eng.block
         ids = list(spec.eos if stop is None else stop)
@@ -436,9 +462,15 @@ class MTPDecoder:
             on_token(a0)
         P = eng.pos
         n = min(max_new - 1, img.cap - P - 2)
+        lazy = d is None and self.pending is not None
+        if lazy and self.pending != (P - 1, a0):
+            raise ValueError(f"the pending draft is {self.pending}'s, not ({P - 1}, {a0})'s")
         if a0 in ids or n <= 0:
+            self._settle(st)
             return st
-        b0, b1 = P // block + 1, (P + n) // block + 1
+        if d is None and not lazy:
+            raise ValueError("loop_card needs the draft (a prefill's or a run's: self.draft)")
+        b0, b1 = (P - lazy) // block + 1, (P + n) // block + 1
         progs = self._gen_programs(b0, b1, st, drafts is not None, samp)
         g = img.lookup["gen"]
         if samp is not None:        # u[P + 1 .. P + n], then a stand-in for row 1 of the
@@ -451,13 +483,21 @@ class MTPDecoder:
             eng.backend.write(0, img.lookup["mtpgen"]["dtab"], dt)
             d = int(dt[P + 1])
         words = G.state_words(spec, a0, P, n, ids, block, samp)
-        words[S_DRAFT], words[S_PAR] = d, self.slot
-        if getattr(img, "embed_host", False):   # the first V's rows (the E's row 0); then
-            eng._write_host_rows([a0, d])       # each program posts the next one's
-        for s_ in range(img.cfg.S):
-            eng.backend.write(s_, g["state"], words)
+        words[S_PAR] = self.slot
+        if lazy:                    # the D1 of P - 1's bucket: an E's iteration there (n = 0),
+            q = P - 1               # the next position P (tpos block: the next bucket's first)
+            words[G.S_TPOS], words[S_TPOS0] = q % block + 1, q % block
+            words[S_A0], words[S_A1], words[S_N] = a0, a0, 0
+            first = progs[(b0, D1)]
+        else:
+            words[S_DRAFT] = d
+            first = progs[(b0, (E0 if P % block == block - 1 else V0) + self.slot)]
+        if getattr(img, "embed_host", False):   # the first program's rows: the V's (the E's
+            eng._write_host_rows([a0] if lazy else [a0, d])     # row 0), the D1's a0; then
+        for s_ in range(img.cfg.S):                             # each program posts the next
+            eng.backend.write(s_, g["state"], words)            # one's
             eng.backend.write(s_, g["out"] + 4 * (P + 1), np.full(n, G.OUT_MARK, np.uint32))
-        first = progs[(b0, (E0 if P % block == block - 1 else V0) + self.slot)]
+        self.pending = None
         run = getattr(eng.backend, "run_generate", None)
         if run is not None:
             end = None if deadline is None else time.perf_counter() + deadline

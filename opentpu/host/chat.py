@@ -655,7 +655,9 @@ class Chat:
                      at: int | None = None, vis=None):
         """ids[n:] through the MTP decoder's prefill (each run's rows' hidden, then the MTP
         layer over them): the first token is picked from the last row's logits inside it (the
-        draft after it needs it), so this returns it, _Picked; None when stopped. at: the
+        draft after it needs it), so this returns it, _Picked; None when stopped. Lazy: on a
+        layer-by-layer prompt the draft after the first token is the loop's first run (the
+        token is shown before it, MTPDecoder.loop_card). at: the
         snapshot's position (the prefill parts there, the token after it the MTP's input).
         vis: ids[n:]'s image rows (_image_rows) or None."""
         from opentpu.llm.mtp import MTPStats
@@ -685,7 +687,7 @@ class Chat:
         if at is not None and self.eng.pos == at:
             self.mtp.snapshot()
         a0, _ = self.mtp.prefill(ids[n:], st, pick=lambda lg: self.pick(lg, ids), on_run=on_run,
-                                 **rows(n, len(ids)))
+                                 lazy=True, **rows(n, len(ids)))
         return None if a0 is None else _Picked(a0)
 
     def _mtp_run(self, t: int, left: int, take, stop, samp, turn: Turn) -> tuple[list, int]:
