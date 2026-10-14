@@ -390,10 +390,10 @@ def test_moe_on_board_model(tiny, have_verilator):
     their first read and no host serves (the board model runs a script, with no host during a
     run). Per-position programs (positions 0, 1), then the resident decode, then the card's
     generate loop: the ISA simulator's logits and tokens bit for bit."""
+    from conftest import sim_board_config
     from opentpu.host.board import Board, BoardBackend, SimTransport
-    from opentpu.isasim import board_config
     _, W, spec = tiny
-    cfg = board_config(DRAM_BYTES=1 << 24)
+    cfg = sim_board_config(DRAM_BYTES=1 << 24)
     tr = SimTransport(ch_bytes=cfg.DRAM_BYTES // 2, stall=20, seed=5)
     # the tree's RTL has WAITW (otpu_ctrl.sv's CAPS): a board model without it is a regression,
     # not a reason to skip
