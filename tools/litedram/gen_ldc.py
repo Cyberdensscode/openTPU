@@ -87,16 +87,17 @@ class Channel(Module):
                  postponing=CONTROLLER["refresh_postponing"], nports=1,
                  read_time=CONTROLLER["read_time"], write_time=CONTROLLER["write_time"],
                  rtw=MULTIPLEXER["rtw"], same_cycle=MULTIPLEXER["same_cycle"],
-                 direct_wtr=MULTIPLEXER["direct_wtr"], idle_refresh=None):
+                 direct_wtr=MULTIPLEXER["direct_wtr"], idle_refresh=None, rd_reg=False):
         clk_freq = SYS_MHZ * 1e6
         module = MT41K256M8_tRFC160(clk_freq, "1:4")
-        # WL7DDRPHY's latencies (tools/litedram/wl7ddrphy.py): read 8, write 1
+        # WL7DDRPHY's latencies (tools/litedram/wl7ddrphy.py): read 8, write 1; with rd_reg (a
+        # register after the read bitslip mux) read 9
         cl, cwl = CL, CWL
         cl_sys, cwl_sys = get_sys_latency(4, cl), get_sys_latency(4, cwl)
         phase_cycles, rdphase = divmod(get_sys_phase(4, cl_sys, cl) + 1, 4)
         cl_sys -= phase_cycles
         self.lat = dict(cl=cl, cwl=cwl, rdphase=rdphase, wrphase=get_sys_phase(4, cwl_sys, cwl),
-                        read_latency=cl_sys + 6, write_latency=cwl_sys - 1)
+                        read_latency=cl_sys + 6 + int(rd_reg), write_latency=cwl_sys - 1)
         ps = PhySettings(phytype="A7DDRPHY", memtype="DDR3", databits=72, strobes=9,
                          dfi_databits=144, nranks=1, nphases=4, cmd_latency=0, cmd_delay=None,
                          write_latency_calibration=True, read_leveling=True, delays=32,
@@ -146,6 +147,8 @@ def main():
                     default=MULTIPLEXER["direct_wtr"])
     ap.add_argument("--idle-refresh", metavar="AHEAD,BEHIND,BURST,MIN_IDLE",
                     help="idlerefresh.py's refresher (e.g. 8,8,2,4) instead of LiteDRAM's")
+    ap.add_argument("--rd-reg", action="store_true",
+                    help="WL7DDRPHY rd_reg's read latency (+1: a register after the read bitslip mux)")
     a = ap.parse_args()
     ir = None
     if a.idle_refresh:
@@ -160,7 +163,7 @@ def main():
             orig(self)
         xbar.LiteDRAMCrossbar.do_finalize = do_finalize
     ch = Channel(a.cmd_buffer_depth, not a.no_refresh, a.postponing, a.ports, a.read_time,
-                 a.write_time, a.rtw, a.same_cycle, a.direct_wtr, ir)
+                 a.write_time, a.rtw, a.same_cycle, a.direct_wtr, ir, a.rd_reg)
     for i, u in enumerate(ch.users):
         pre = f"p{i}_" if a.ports > 1 else ""
         for sig, n in ((u.cmd.valid, "cmd_valid"), (u.cmd.ready, "cmd_ready"),

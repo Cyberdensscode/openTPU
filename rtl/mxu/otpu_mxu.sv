@@ -1098,7 +1098,16 @@ module otpu_mxu
   // completes, which needs mx_done), and it is false in the completing cycle (mx_done), so a new
   // head never sees a stale mx_q.
   logic mx_q;
-  wire mx_go     = mx_q && !mx_done;
+  // mx_go (mx_q && !mx_done) is a register of its own (mx_gq, r2.1): it starts the MXU's TMEM
+  // write request (the RMAX lanes), which the slice's write-bank arbiter turns into the grant;
+  // from mx_done through the request, the arbiter, the grant's read enables and the TMEM's
+  // replay logic was r2.1's m8 163ab46d's one failing path (-0.003 ns, 14 levels)
+  logic mx_gq;
+  wire mx_go     = mx_gq;
+`ifndef SYNTHESIS
+  always @(posedge clk) if (!rst && mx_gq != (mx_q && !mx_done))
+    $fatal(1, "otpu_mxu: mx_gq %0d, mx_q %0d, mx_done %0d", mx_gq, mx_q, mx_done);
+`endif
   wire c_fin     = c_drained && (!c_rmax || mx_done || c_tz);
   // the head completes (while the pop head may pop the next command's chunks)
   wire c_done    = c_fin;
@@ -1205,7 +1214,7 @@ module otpu_mxu
       al_st <= 2'd0; al_i <= '0; mx_i <= '0;
       r0 <= '0; rA <= '0; rx <= '0; rmw_n <= '0; ln_n <= '0;
       st_starve <= '0; st_bp <= '0; st_frz <= '0; st_deny <= '0;
-      st_c <= '0; st_f <= 1'b0; mx_q <= 1'b0;
+      st_c <= '0; st_f <= 1'b0; mx_q <= 1'b0; mx_gq <= 1'b0;
     end else begin
       logic [1:0] qn;
       logic [RFW:0] rn;
@@ -1459,6 +1468,10 @@ module otpu_mxu
                more && f_count != 0 && !pop, more && f_count == 0};
       st_f <= c_done;
       mx_q <= c_drained && c_rmax && !mx_done && !c_tz;
+      // mx_q's next value and mx_done's (set by the last RMAX lanes' grant; a completing head
+      // clears it, and then mx_q's next is low: it completes only with mx_done or c_tz)
+      mx_gq <= c_drained && c_rmax && !mx_done && !c_tz &&
+               !(t_gnt && mx_go && 32'(mx_i) + LANES >= 32'(c_M));
       st_starve <= st_starve + 32'(st_g[0]);
       st_bp <= st_bp + 32'(st_g[1]);
       st_frz <= st_frz + 32'(st_g[2]);

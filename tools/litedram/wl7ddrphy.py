@@ -160,7 +160,14 @@ class WL7DDRPHY(Module, AutoCSR):
                                       i_CE=1, i_R=0, i_D=x, o_Q=r, attr={("DONT_TOUCH", "TRUE")})
             return r
 
-        sys_rst = ResetSignal("sys") | self._rst.storage
+        # the serializers' reset in sys, registered here once (r2.1): the serdes_rst registers by
+        # the pads took the sys reset replicas and this PHY's rst storage straight from the die's
+        # far side (r2.1's m8 163ab46d: crg_rst1_reg_rep__52 at SLICE_X8Y70 -> channel 1's
+        # wlrst_152 at SLICE_X0Y395, 6.57 ns of route, sys -> the write clock +0.149 ns; channel 0's
+        # wl7ddrphy0_rst_storage at Y94 -> wlrst at Y139, +0.331); this register sits by them. The
+        # serializers' reset and its release move a sys cycle later, as their own registers'
+        sys_rst = Signal(reset=1, reset_less=True)
+        self.sync += sys_rst.eq(ResetSignal("sys") | self._rst.storage)
         ck_rst_n = nreg(sys_rst)                # to the shifted domain, then one per 8 pads
         ck_rsts = []
 

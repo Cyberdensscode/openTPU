@@ -570,13 +570,44 @@ module otpu_dma
   // TMEM's input stage (release r2, docs/tmem_nocopy.md 7): the read request (t_*_c) goes to
   // TMEM from flip-flops, a cycle after it forms, moving with adv (a held request is asked
   // again once adv returns); the stream fill's address (fs_k's lanes) and ST's segment
-  // arithmetic end at the register, not at the TMEM's ranks and pumped banks
-  logic [LANES-1:0]       t_ren_c, t_re_q;
+  // arithmetic end at the register, not at the TMEM's ranks and pumped banks. t_rv is the
+  // pending request (it moves with adv, held while adv is low); t_re_q, what TMEM reads, is
+  // that request where adv will be up: adv_nx, adv a cycle ahead from its flip-flops' next
+  // values, so no adv gate sits between the register and TMEM (the r2 slice OOC's worst clk ->
+  // clk2x path: pl -> adv -> the gate -> the TMEM's ranks -> a pumped bank's address, 12 levels)
+  logic [LANES-1:0]       t_ren_c, t_rv, t_re_q;
   logic [LANES-1:0][31:0] t_raddr_c;
+  // st_pend, pl and oc_nf move in the ST branch of the process below (st_pend and pl with adv,
+  // occ with the push and the issue); a start clears st_pend; elsewhere st_pend is low, so adv
+  // stays up
+  logic       adv_nx;
+  logic [1:0] oc_st;
+  always_comb begin
+    oc_st = oc_nx(occ, st_push, st_iss);
+    if (rst || start) adv_nx = 1'b1;
+    else if (!ackw && busy && is_st)
+      adv_nx = !((adv ? pa : st_pend) && (adv ? pla : pl)) || oc_st[1];
+    else adv_nx = adv;
+  end
   always_ff @(posedge clk)
-    if (rst) t_re_q <= '0;
-    else if (adv) begin t_re_q <= t_ren_c; t_raddr <= t_raddr_c; end
-  assign t_ren = adv ? t_re_q : '0;
+    if (rst) begin t_rv <= '0; t_re_q <= '0; end
+    else begin
+      if (adv) begin t_rv <= t_ren_c; t_raddr <= t_raddr_c; end
+      t_re_q <= adv_nx ? (adv ? t_ren_c : t_rv) : '0;
+    end
+  assign t_ren = t_re_q;
+`ifndef SYNTHESIS
+  // the prediction is adv, and TMEM reads the pending request exactly while adv is up
+  logic adv_q;
+  bit   adv_rst;
+  initial adv_rst = 1'b0;
+  always @(posedge clk) begin
+    adv_q <= adv_nx;
+    if (rst) adv_rst <= 1'b1;
+    if (!rst && adv_rst && (adv_q != adv || t_re_q != (adv ? t_rv : '0)))
+      $fatal(1, "otpu_dma: adv %0d predicted %0d, read %b of pending %b", adv, adv_q, t_re_q, t_rv);
+  end
+`endif
   always_comb begin
     b_req = ld_req; b_we = 1'b0; b_addr = ic;
     t_ren_c = '0; t_raddr_c = '0;

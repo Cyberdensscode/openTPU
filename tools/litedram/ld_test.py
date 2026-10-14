@@ -126,7 +126,11 @@ class WLCRG(LiteXModule):
     max_fanout, a cycle later: the production core's sys reset reaches both channels' ends of the
     die (3,794 loads, 6.8 ns of route in the 812bb01 build). max_fanout 64 (256 until g2fix
     0885d436, whose worst sys path, +0.009 ns, was a replica into a bankmachine's level register
-    across the die: 0 levels, 97% route): more replicas, each placed nearer its loads."""
+    across the die: 0 levels, 97% route): more replicas, each placed nearer its loads.
+    rst_reg N > 1: N - 1 plain registers before it (a reset tree, N - 1 cycles later still), so a
+    replica sits between a tree register and its loads: the replicas are placed by their loads at
+    both ends of the die, the tree register between them (r2.1's m8 spec133_83740e79: a replica at
+    SLICE_X31Y131 drove channel 1's bankmachines at Y344, 6.73 ns of route, +0.055 ns)."""
     def __init__(self, platform, f, clk50=None, rst_reg=False):
         self.rst = Signal()
         self.cd_sys = ClockDomain()
@@ -144,7 +148,12 @@ class WLCRG(LiteXModule):
             rst.attr.add(("max_fanout", 64))
             self.comb += [self.cd_sys_ars.clk.eq(self.cd_sys.clk), self.cd_sys.rst.eq(rst)]
             self.specials += AsyncResetSynchronizer(self.cd_sys_ars, ~mmcm.locked)
-            self.sync.sys_ars += rst.eq(ResetSignal("sys_ars"))
+            src = ResetSignal("sys_ars")
+            for i in range(int(rst_reg) - 1):
+                t = Signal(reset=1, reset_less=True, name=f"rst_t{i}")
+                self.sync.sys_ars += t.eq(src)
+                src = t
+            self.sync.sys_ars += rst.eq(src)
         self.comb += mmcm.reset.eq(self.rst)
         platform.add_false_path_constraints(self.cd_sys.clk, mmcm.clkin)
         self.pll = pll = S7PLL(speedgrade=-2)

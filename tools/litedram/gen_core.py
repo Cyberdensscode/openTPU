@@ -15,8 +15,8 @@ The module (every port is a plain Verilog port; the DDR3 pads are the only I/O):
     ctl_clk, ctl_rst    in   the CSR port's clock and reset (XDMA's axi_aclk / BAR0)
     ctl_*               AXI-Lite slave, 16-bit byte address, 32-bit data: the CSRs (calibration,
                         ECC counters, the ready bits), csr.csv offsets; crosses into sys_clk.
-                        The CSR bus has a register stage per channel's banks (csr_pipe.py):
-                        an access takes 5 sys cycles
+                        The CSR bus has two register stages per channel's banks (csr_pipe.py):
+                        an access takes 7 sys cycles
     c0_* / c1_*         each channel's first native port in sys_clk, 512-bit data through
                         LiteDRAM's ECC (SECDED per 64-bit word): cmd_valid/ready/we/addr[24:0]
                         (64-byte beat index in the channel), wdata_valid/ready/data[511:0]/we[63:0],
@@ -93,6 +93,7 @@ from csr_pipe import PipelinedCSR                               # noqa: E402
 from dfii_q import registered_injector                         # noqa: E402
 from ctl_settings import CONTROLLER, MULTIPLEXER                # noqa: E402
 from fastmux import tuned_multiplexer                          # noqa: E402
+from regtimer import registered_timers                          # noqa: E402
 import calcpu                                                   # noqa: E402
 from calcpu import Cal, FirmwareBuilder, build_firmware, one_file  # noqa: E402
 
@@ -131,7 +132,7 @@ class OTPULiteDRAM(PipelinedCSR, SoCCore):
         platform.add_extension(USER)
         clk50 = platform.request("clk50g")
         self.crg = CRG(platform, f, dqs_phase, two=True, clk50=clk50) if phy == "a7" else \
-            WLCRG(platform, f, clk50=clk50, rst_reg=True)
+            WLCRG(platform, f, clk50=clk50, rst_reg=2)
         self.comb += self.crg.rst.eq(platform.request("rst"))
         SoCCore.__init__(self, platform, f, ident="openTPU LiteDRAM", cpu_type=None,
                          integrated_rom_size=0, integrated_sram_size=0, with_uart=False,
@@ -156,8 +157,9 @@ class OTPULiteDRAM(PipelinedCSR, SoCCore):
                                       write_latency_calibration=True, ddr_clk="sys4x" + sfx)
             setattr(self, "ddrphy" + sfx, p)
             # the software-injected commands (calibration) a cycle after their CSR write (dfii_q.py);
-            # the multiplexer's options (fastmux.py, ctl_settings.py)
-            with registered_injector(), tuned_multiplexer(**MULTIPLEXER):
+            # the multiplexer's options (fastmux.py, ctl_settings.py); the refresher's timers'
+            # done from a flip-flop (regtimer.py)
+            with registered_injector(), tuned_multiplexer(**MULTIPLEXER), registered_timers():
                 self.add_sdram("sdram" + sfx, phy=p, module=MT41K256M8_tRFC160(f, "1:4"),
                                with_soc_interconnect=False,
                                controller_settings=ControllerSettings(**CONTROLLER))

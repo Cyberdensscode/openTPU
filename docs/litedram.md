@@ -2304,3 +2304,47 @@ serializers, at +0.15 to +0.35 ns in 812bb01 and 110ec6d.
   - Calibration and BIST on both channels.
   - Write and read leveling results equal to the production image's: the injected commands'
     timing is the calibration's.
+
+### r2.1: a reset tree, two CSR stages, the refresher's timers (2026-10-13)
+
+r2's builds at 133.33 MHz left the sys clock between +0.019 and +0.055 ns, on the same families as
+ld-fmax's, and placement moved them by more than their margin (r2m4 b10245f5 +0.031 ... the
+PHY-placed 4398cac9 +0.029; r2.1's m8 spec133_83740e79 +0.055):
+- The sys reset: a `max_fanout` replica of `crg_rst1` drove loads at the die's other end
+  (spec133: `crg_rst1_reg_rep__28` at SLICE_X31Y131 into channel 1's bankmachines at Y344, 0
+  levels, 6.73 ns of route; `rep__9` at Y84 into the calibration CPU's mailbox at Y352). Synthesis
+  makes the replicas, all driven from the one register after the synchronizer, so each is placed
+  between that register and its loads. `WLCRG(rst_reg=2)` (`ld_test.py`) puts a plain register
+  (`crg_rst_t0`) before the replicated one: a replica sits between it and its loads, so the die's
+  span is two hops. The sys reset releases a cycle later again.
+- The CSR bus: a group's register sat by the bridge and drove its banks at the other end
+  (spec133: `interface0_dat_w1` at SLICE_X19Y344 into channel 0's phase injectors at Y77, 7.04 ns
+  of route, +0.066). `csr_pipe.py`'s STAGES 2: two register stages a group each way, so one copy
+  can sit in the middle; an access takes 7 sys cycles (Wishbone2CSRWait WAIT 4). Both masters
+  handshake; the injected DFI commands still leave within their own access.
+- The refresher: the ZQCS timer's done is a 27-bit compare with zero, and the refresher's command
+  valid, through the multiplexer's choosers, reaches every bankmachine's command FIFO (4398cac9's
+  worst sys path: `zqcs_timer_count1[24]` -> `bankmachine1` FIFO read enable, 15 levels, +0.029).
+  `regtimer.py`'s RefreshTimer (both timers, both channels) keeps done in a flip-flop: its next
+  value is `wait & ~done & (count == 1)`, which is the stock `count == 0` a cycle later. The same
+  cycles.
+- The serializers' reset registers (`wlrst`, by the pads, on the write clock `sys_w`): their input
+  was the sys reset OR the PHY's `rst` storage, straight from the die's far side (r2.1's m8
+  163ab46d: `crg_rst1_reg_rep__52` at SLICE_X8Y70 into channel 1's `wlrst_152` at SLICE_X0Y395,
+  6.57 ns of route, sys -> writeclocks1_outs2 +0.149; channel 0's `wl7ddrphy0_rst_storage` at Y94
+  into `wlrst` at Y139, +0.331; production 8b33206e +0.514 / +0.377). WL7DDRPHY registers it in
+  sys once per channel (`wl7ddrphy*_sys_rst`, by its loads): the serializers' reset and its
+  release move a sys cycle later, as their own registers. These are reset paths, not the write
+  data's (the OSERDES D pins: r2-ddr-phy's pblocks).
+- **The calibration's CSR accesses at 7 cycles:** every master handshakes. The host's `ddrcal`
+  goes AXI-Lite -> the clock crossing -> AXILite2Wishbone -> the bridge, and waits for each
+  response; the calibration CPU's firmware (`selfcal_fw`) waits on the Wishbone ack, and its
+  delays and timeouts are `hw_wait` / `wait_set` on the CPU's cycle timer (`hw_now`), not on loop
+  counts; `selfcal_sim.py` measured 41 cycles a PHY CSR access, the run otherwise identical.
+- **Checks:** `regtimer_check.py` (migen: the stock timer and this one at periods 2, 3, 7, 1040,
+  4161 under the same random wait, 200,000 cycles: done and count equal every cycle; a mutant that
+  holds done fails); `csr_pipe_check.py` (3,000 accesses: PASS, 3 -> 7 cycles); `selfcal_sim.py`
+  (stride 16, `--hold-test`: 643,724 CSR writes identical to `ddrcal`'s, both channels' results
+  equal, PASS); `check_core.sh` reproduces the committed core; `csr.csv` and `sdram_init.py` are
+  unchanged. The co-simulation's controller model (`gen_ldc.py`) keeps the stock timers: the
+  registered done is cycle-exact.
