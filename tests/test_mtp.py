@@ -365,6 +365,22 @@ def test_mtp_continues_its_context(sampled):
                zip(_mtp_kv(dec.eng, dec.eng.pos), _mtp_kv(fresh.eng, fresh.eng.pos)))
 
 
+def _same_dram(eng, a, b) -> None:
+    """The ISA simulator's DRAM a and the RTL's b after the same MTP loop run: equal but the
+    loop's chain area, where the RTL's slots hold each program's WAITC wait entries after its
+    words (RtlBackend.slot_words, the board uarch's SEQ_WC) and the ISA simulator's the words
+    alone (every difference there, release-2 217cf13a on: 12948 bytes, all after the programs'
+    words); there each written program's words are equal."""
+    from opentpu.llm import mtp as MT
+    g = eng.image.lookup["mtpgen"]
+    lo, hi = g["progs"], g["progs"] + g["slot"] * MT.NK * g["nb"]
+    assert np.array_equal(a[:lo], b[:lo]) and np.array_equal(a[hi:], b[hi:])
+    for key, progs in eng._mtp_gen.items():
+        at = MT.prog_addr(g, key[0], key[1]) + (g["slot"] // 2 if len(key) == 3 else 0)
+        w = np.asarray(I.assemble(progs[0]), "<u4").view(np.uint8)
+        assert np.array_equal(a[at:at + w.size], w) and np.array_equal(b[at:at + w.size], w), key
+
+
 @pytest.mark.parametrize("split", [False, True])
 def test_mtp_loop_on_rtl(have_verilator, split):
     """The MTP loop on the Verilator RTL (the board's memory path): from the same DRAM state (a
@@ -399,7 +415,7 @@ def test_mtp_loop_on_rtl(have_verilator, split):
     eng.__dict__.pop("_mtp_gen")            # the chain area: written again, to the RTL's DRAM
     got = dec.loop_card(a0, d, N, drafts=drafts)
     assert got.tokens == want
-    assert np.array_equal(isa.machine.slices[0].dram[:n], rtl.drams[0][:n])
+    _same_dram(eng, isa.machine.slices[0].dram[:n], rtl.drams[0][:n])
 
 
 def test_mtp_sampled_loop_on_rtl(have_verilator):
@@ -437,7 +453,7 @@ def test_mtp_sampled_loop_on_rtl(have_verilator):
     eng.__dict__.pop("_mtp_gen")            # the chain area: written again, to the RTL's DRAM
     got = dec.loop_card(a0, d, N, rng=rng(), **kw)
     assert got.tokens == want
-    assert np.array_equal(isa.machine.slices[0].dram[:n], rtl.drams[0][:n])
+    _same_dram(eng, isa.machine.slices[0].dram[:n], rtl.drams[0][:n])
 
 
 class _Chars:
