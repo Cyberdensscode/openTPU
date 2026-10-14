@@ -1357,3 +1357,96 @@ prefill_routes (as 12.1, the card's m4, a 2K context, the tie rule of 12.4), row
   work, not the attention. The levers are the same loops over their layers that 12.2-12.3 gave
   Qwen3.5 and LFM2, or an 8K IMEM (docs/infra_hunt.md, parked until the looped attention was
   costed).
+
+## 14. MoE expert-major runs in tiles (2026-10-14)
+
+A Qwen3.5-MoE prompt (MiniCPM-V's language model and production's qwen35-35b, the same backbone)
+runs layer by layer, and in a call of EM_ROWS rows or more expert-major ([offload.md](offload.md)
+13.11-13.18). Each layer's mixer runs over the chunk's rows R = 2 at a time (`layer_major`),
+then one expert run takes every row's experts. The mixer's weights stream once a run: at R = 2 a
+DeltaNet layer's projections are read once for every two rows of the prompt.
+
+The expert-major calls' layer runs now go in tiles of T rows (`tiled.compile_layer_tile`,
+sections 10-11), on by default as the dense models' prompt tiles are:
+- A Qwen3.5-MoE image holds the mask tiles and the I/O scratch unless `OTPU_TILE=0` as it is
+  built (`prefill.layer_tile_flag`, the family's default: `tiled.LAYER_ROWS`), and its engine
+  runs tiles of `tiled.LAYER_ROWS` = 8 rows, at most ACT_ROWS (`Engine.tile_rows`; otpu-chat's,
+  otpu-serve's and chatmoe's engines through `streamed.engine`); `chatmoe.py --tile-rows T`
+  overrides T. With `OTPU_TILE=0` the image is today's (the same expert slots) and the runs are
+  today's. Gemma 4's tiled layer runs stay opt-in (`OTPU_TILE=1`): its global layers take range
+  forms at 8 rows.
+- The image's extra 1.25 MiB costs no expert slot at otpu-chat's and otpu-serve's 2048-token
+  cache (qwen35-35b 41, MiniCPM-V 36 a layer, `streamed.fit_experts` on the card's 4 GiB); at
+  4096 tokens qwen35-35b has 40 instead of 41.
+- The calls gate_expert_major runs layer-major (a chat turn's short ones) keep today's runs of R
+  rows, untiled. Before, `tile_runs` tiled them too, at R rows: today's run in a slower form.
+- Layer 0's runs that gather the host's rows, and the image rows from the vision side, stay
+  today's runs of R rows.
+
+### 14.1 Bits
+
+Under MX a tile in its whole forms gives today's bits (section 11): a 4-bit MM's output is one
+exact integer whether it pairs or not, so the fp4 and nvfp4 layers keep their bits as the int8
+ones do. On the card's configuration (MCOLS 4, ACT_ROWS 16) compile_layer_tile takes whole forms
+for every 35B layer kind at T = 8 in buckets 2, 8 and 16 (positions 256, 2047 and 4095 of a
+4096-token cache; the attention's program 1,980, 2,926 and 3,982 instructions of IMEM's 4K). At
+T = 16 the attention layers fall to range forms, which are not today's bits and are slower
+(0.791 against 0.710 ms a row, below). So T = 8.
+
+- `tests/test_em_tile.py`: a tiny Qwen3.5-MoE in the 35B's shape (a DeltaNet pair sharing its q
+  and k), a 43-row call expert-major in tiles of 8 rows and a 5-row call layer-major, against the
+  same calls in today's runs of R = 2: the logits, the layers' blocks and two decode steps after
+  them, bit for bit, in int8 and in fp4. A default engine runs tiles of 8 rows (4 at ACT_ROWS
+  4), and one made with `OTPU_TILE=0` today's runs of 2 rows on an image without the mask tiles,
+  with the default's logits, blocks and decode steps bit for bit.
+- `tests/test_minicpmv.py` test_image_rows_run_in_expert_major_tiles: MiniCPM-V's image (Qwen3.5's,
+  subclassed: `tiled.layer_family` by the class's bases) with 20 image rows from vis among 31 text
+  rows, tiles of 8 rows against today's runs: logits and three decode steps bit for bit.
+- Tokens against today's runs, on the ISA simulator with the card's configuration (b10245f5),
+  `chatmoe.py --check` (hwe-bench, 2026-10-14): qwen35-35b, a 260-token text prompt (its 256-row
+  call expert-major in 1,418 runs) and 16 decoded tokens; MiniCPM-V's two image requests of session
+  hostr21, thumb (88 rows expert-major in 548 runs, and a second turn of 23 rows layer-major; 16
+  tokens each) and sliced (488 rows in 2,893 runs, against today's ~10,000; 32 tokens). The same
+  tokens, all three. No dKL run: the tiles take whole forms only, today's bits.
+
+### 14.2 Co-simulated
+
+One layer at position 256, the card's configuration and memory path (b10245f5: PAIR, DSTEP,
+STREAM, SEQ_WC; 133.33 MHz, DDR3-1066), ms a row:
+
+| layer | formats | today's R = 2 | tile T = 4 | tile T = 8 |
+|---|---|---:|---:|---:|
+| DeltaNet, layers 0-19 | MiniCPM-V: int8 | 1.541 | 1.028 | 1.027 |
+| DeltaNet, layers 20-39 | MiniCPM-V: nvfp4, shared expert int8 | 1.111 | 0.980 | 0.975 |
+| attention | MiniCPM-V: nvfp4 | 0.784 | 0.716 | 0.710 |
+| DeltaNet | qwen35-35b: nvfp4, shared expert nvfp4 | 1.070 | 0.940 | 0.936 |
+| attention | qwen35-35b: nvfp4 | 0.742 | 0.675 | 0.670 |
+
+Over the 40 layers (30 DeltaNet, 10 attention) the mixer takes 47.6 -> 37.1 ms a row on MiniCPM-V
+(-22%) and 39.5 -> 34.8 on qwen35-35b (-12%). The int8 DeltaNet layers gain the most: their
+projections are nearly twice the bytes of the 4-bit ones'. MiniCPM-V's image request of session
+hostr21 (488 prompt rows; its mixer runs 23.2 s on the card, the co-sim's 47.6 ms x 488) would take
+about 18.1 s: -5.1 s of its 90.4 s.
+
+### 14.3 Next
+
+- The card A/B (chatmoe.py --tile-rows 8 against today's) in the next host batch.
+- The expert run after the tiles. Co-simulated (Qwen3.5-35B-A3B's layer 3 at MiniCPM-V's 488
+  rows: 210 experts used, 3,904 row-expert entries in 1,054 passes, 59 slots), it takes 238.1 ms
+  against a DRAM bound of 130.4 ms for its 1,721 MiB of experts: MXU-bound, at 1.8x its bytes
+  (the passes' MMs 78% of its 31.7 M cycles; the MXU busy 27.2 M). r2.1's MCOLS 8 halves those
+  MMs' cycles, so it should cut the expert runs a lot, toward their bytes: to check in the r2.1
+  window's chatmoe.
+- The tiles at MCOLS 8 (r2.1). Co-simulated on the m8 variant (docs/dataflow.md 4.9.1), the
+  int8 DeltaNet layer at T = 8 does not move (1.027 -> 1.020 ms a row; 0.722 both without DSTEP's
+  cost), while the nvfp4 one's other work does (0.720 -> 0.509) and the attention layer (0.710 ->
+  0.488). The tile program is why: a DeltaNet layer's rows run in pieces of 4 (`layer_variants`'
+  drows: the image's gr / on rows, `grows`, RUN_ROWS 4), and the MoE prologue (the router and the
+  shared expert, `moe_prologue_rows`) in groups of 2 rows (a need line's LINE / 4 / k ids). So an
+  8-row tile streams the DeltaNet projections twice and the shared expert and the router four
+  times, and int8 weights go at port B's chunk a cycle. To lift for r2.1: gr / on rows for the
+  tile's rows where TMEM holds their projections (m8's 128K words), and the prologue's MMs over
+  the tile's rows with its need lines still written 2 rows at a time; the same bits (an MM's row
+  groups leave its integer sums as they are). The prologue's groups cost m4 too: 16% of the int8
+  DeltaNet layer's run without DSTEP (122K of 770K cycles for 8 rows), ~1 s of MiniCPM-V's image
+  prompt in groups of 4 (estimated from the profile).
