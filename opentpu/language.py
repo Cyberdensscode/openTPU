@@ -97,9 +97,12 @@ def stationary(rows: int, cols: int) -> Stationary:
     return current().stationary(rows, cols)
 
 
-def quantize_into(st: Stationary, x: Tile, col: int) -> None:
-    """Quantize x's rows into the stationary `st`'s columns col .. col + x.cols."""
-    current().quantize_into(st, x, col)
+def quantize_into(st: Stationary, x: Tile, col: int, cscale: Tile | None = None,
+                  at=None) -> None:
+    """Quantize x's rows into the stationary `st`'s columns col .. col + x.cols (times
+    cscale[None, :]: QACT CSCALE; at: a TMEM offset with loop terms added to x's address,
+    Builder.quantize_into)."""
+    current().quantize_into(st, x, col, cscale, at)
 
 
 def dot(a, w: QTensor, acc: Tile | None = None, out: Tile | None = None,

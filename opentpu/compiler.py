@@ -1326,8 +1326,10 @@ class Builder:
             return out
         raise CompileError(f"cannot use {x!r} as a tile")
 
-    def vop(self, func: int, dst: Tile, a: Tile | None, b) -> None:
-        """Emit dst = func(a, b) over dst's shape; b may be a Tile, Bcast or float."""
+    def vop(self, func: int, dst: Tile, a: Tile | None, b, at=None) -> None:
+        """Emit dst = func(a, b) over dst's shape; b may be a Tile, Bcast or float. at: a TMEM
+        word offset with loop terms added to dst's address (VOP's dst = R[ra] + w1: rows of a
+        buffer the loop walks, the looped attention's outputs, tiled._attention_loop)."""
         self.check_live(dst, a, b, b.t if isinstance(b, Bcast) else None)
         rows, cols = dst.rows, dst.cols
         a_base, ars = (a.base, a.rs if len(a.shape) == 2 else 0) if a is not None else (dst.base, 0)
@@ -1355,8 +1357,9 @@ class Builder:
         elif b is not None:
             raise CompileError(f"bad operand {b!r}")
         drs = dst.rs if len(dst.shape) == 2 else 0
-        self.emit(I.vop(func, dst.base, a_base, b_base, rows, cols, drs, ars, brs, bmode, imm,
-                        comment=I.VFUNCS[func]))
+        ra, d_base = (0, dst.base) if at is None else self.addr(Affine(dst.base) + Affine.of(at))
+        self.emit(I.vop(func, d_base, a_base, b_base, rows, cols, drs, ars, brs, bmode, imm,
+                        ra=ra, comment=I.VFUNCS[func]))
 
     def binop(self, func: int, x, y):
         swap = {I.V_ADD: I.V_ADD, I.V_MUL: I.V_MUL, I.V_MAX: I.V_MAX, I.V_MIN: I.V_MIN,
@@ -1598,23 +1601,32 @@ class Builder:
         st.loop = self.loops[-1].loop if self.loops else None
         return st
 
-    def quantize_into(self, st: Stationary, x: Tile, col: int) -> None:
+    def quantize_into(self, st: Stationary, x: Tile, col: int, cscale: Tile | None = None,
+                      at=None) -> None:
         """Quantize the rows of x into the blocks of `st` (from stationary()) from column
-        `col` on (QACT at the part's first block)."""
+        `col` on (QACT at the part's first block). cscale [cols]: x * cscale[None, :] (QACT
+        CSCALE, as quantize's). at: a TMEM word offset with loop terms added to x's address
+        (QACT's src = R[ra] + w1: x's rows in a buffer the loop walks, the looped attention's
+        query tiles, tiled._attend_loop); x is then those rows at offset 0."""
         x = self.materialize(x)
-        self.check_live(x)
+        self.check_live(x, cscale)
         D = self.cfg.D
         if not isinstance(st.src, _Parts):
             raise CompileError("quantize_into: a stationary from stationary()")
         if x.rows != st.src.rows or x.cols % D or col % D or col + x.cols > st.KB * D:
             raise CompileError(f"quantize_into: a {x.shape} tile at column {col} of a "
                                f"{st.src.shape} stationary")
+        if cscale is not None and cscale.shape != (x.cols,):
+            raise CompileError(f"quantize_into: a column scale of {cscale.shape} for {x.shape}")
         if not self.stationary_valid(st):
             raise CompileError("stationary operand was overwritten in ACT RAM")
         (ab, mc), = st.chunks
         rs = x.rs if len(x.shape) == 2 else x.cols
-        self.emit(I.qact(x.base, mc, ab + col // D, x.cols // D, rs, dup=st.pair,
-                         comment="quantize -> ACT (part)" + (" dup" if st.pair else "")))
+        ra, src = (0, x.base) if at is None else self.addr(Affine(x.base) + Affine.of(at))
+        self.emit(I.qact(src, mc, ab + col // D, x.cols // D, rs, dup=st.pair, ra=ra,
+                         cscale=None if cscale is None else cscale.base,
+                         comment="quantize -> ACT (part)" + (" dup" if st.pair else "")
+                         + (" x col scale" if cscale is not None else "")))
         st.add_qrange(col // D, (col + x.cols) // D)
 
     def fuse_cscale(self, x: Tile):

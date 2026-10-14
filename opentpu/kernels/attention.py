@@ -154,6 +154,55 @@ class _Head:
                 self.groups = 0
 
 
+def _scores(st, t0, n, out):
+    """s = q.K^T for tokens [t0, t0+n) of head state `st` (_Head) into `out`; the MXU epilogue
+    also writes the row maxima (a masked block: min with its mask row, then the row maxima of
+    that; an Additive mask: the mask tile plus q.K^T, the maxima from the MXU epilogue too)."""
+    row = None
+    if isinstance(t0, int):
+        row = st.masks.get(t0)
+        if st.masked is not None and st.masked[0] == t0:
+            bk = st.masked[1]
+            row = bk.row(t0, n) if bk.add is None else bk.add
+    if isinstance(row, Additive):                   # the mask tile, then q.K^T added
+        ol.load(row.tile(st.G, n), out=out)
+        ol.dot(st.qs, st.K[t0:t0 + n, :], acc=out, rowmax=True)
+        return out
+    if isinstance(row, (RowMasks, RowTiles)):       # built in place, then q.K^T added
+        row.fill(out, n)
+        ol.dot(st.qs, st.K[t0:t0 + n, :], acc=out, rowmax=True)
+        return out
+    if row is not None:
+        ol.dot(st.qs, st.K[t0:t0 + n, :], out=out)
+        s = ol.minimum(out, ol.load(row)[None, :])
+        st.rowmax[t0] = ol.max(s, axis=1)
+        return s
+    ol.dot(st.qs, st.K[t0:t0 + n, :], out=out, rowmax=True)
+    return out
+
+
+def _finish(st, s, t0, n):
+    """Online-softmax update and acc += P.V for the block whose scores are in `s`."""
+    D = ol.block_size()
+    G = st.G
+    vs = ol.load(st.VS[t0:t0 + n])
+    rm = st.rowmax.pop(t0) if isinstance(t0, int) and t0 in st.rowmax else s.rowmax
+    m_new = ol.maximum(st.m, rm)
+    p = ol.exp2(s - m_new[:, None])                           # fused EXP2SUB
+    alpha = ol.exp2(st.m - m_new)
+    npad = -(-n // D) * D
+    if npad == n:
+        pq = ol.quantize(p * vs[None, :])                     # V scales folded (QACT CSCALE)
+    else:                                                     # tail block: pad P with zeros
+        pp = ol.zeros([G, npad])
+        pp[:, :n].set(p * vs[None, :])
+        pq = ol.quantize(pp)
+    vt = st.VT.padded_cols(0, st.VT.shape[0], t0, npad, n)             # zero-padded P
+    ol.dot(pq, vt, acc=st.acc, acc_scale=alpha)                         # acc*alpha + P.V
+    st.m.set(m_new)                                           # the next block needs m first
+    st.l.set(st.l * alpha + ol.sum(p, axis=1))                # off the critical path
+
+
 def _attend_heads(qhs, kv, hs, seq_len: int, block: int, scale: float | None = None,
                   depth: int = 3, ahead: int = 1, emit=None):
     """Flash attention (online softmax) of several KV heads' query groups, software-pipelined
@@ -173,7 +222,6 @@ def _attend_heads(qhs, kv, hs, seq_len: int, block: int, scale: float | None = N
     l) as soon as entry i is complete and releases its state (TMEM then holds only the entries
     in flight).
     """
-    D = ol.block_size()
     P = depth
     kvs = kv if isinstance(kv, (list, tuple)) else [kv] * len(hs)
     lens = seq_len if isinstance(seq_len, (list, tuple)) else [seq_len] * len(hs)
@@ -186,63 +234,17 @@ def _attend_heads(qhs, kv, hs, seq_len: int, block: int, scale: float | None = N
             heads.append(_Head(qh, kvs[j], hs[j], scale, lens[j], block, P))
         return heads[min(i, len(hs) - 1)]
 
-    def scores(st, t0, n, out):
-        """s = q.K^T for tokens [t0, t0+n); the MXU epilogue also writes the row maxima (a
-        masked block: min with its mask row, then the row maxima of that; an Additive mask:
-        the mask tile plus q.K^T, the maxima from the MXU epilogue too)."""
-        row = None
-        if isinstance(t0, int):
-            row = st.masks.get(t0)
-            if st.masked is not None and st.masked[0] == t0:
-                bk = st.masked[1]
-                row = bk.row(t0, n) if bk.add is None else bk.add
-        if isinstance(row, Additive):                   # the mask tile, then q.K^T added
-            ol.load(row.tile(st.G, n), out=out)
-            ol.dot(st.qs, st.K[t0:t0 + n, :], acc=out, rowmax=True)
-            return out
-        if isinstance(row, (RowMasks, RowTiles)):       # built in place, then q.K^T added
-            row.fill(out, n)
-            ol.dot(st.qs, st.K[t0:t0 + n, :], acc=out, rowmax=True)
-            return out
-        if row is not None:
-            ol.dot(st.qs, st.K[t0:t0 + n, :], out=out)
-            s = ol.minimum(out, ol.load(row)[None, :])
-            st.rowmax[t0] = ol.max(s, axis=1)
-            return s
-        ol.dot(st.qs, st.K[t0:t0 + n, :], out=out, rowmax=True)
-        return out
-
-    def finish(st, s, t0, n):
-        """Online-softmax update and acc += P.V for the block whose scores are in `s`."""
-        G = st.G
-        vs = ol.load(st.VS[t0:t0 + n])
-        rm = st.rowmax.pop(t0) if isinstance(t0, int) and t0 in st.rowmax else s.rowmax
-        m_new = ol.maximum(st.m, rm)
-        p = ol.exp2(s - m_new[:, None])                           # fused EXP2SUB
-        alpha = ol.exp2(st.m - m_new)
-        npad = -(-n // D) * D
-        if npad == n:
-            pq = ol.quantize(p * vs[None, :])                     # V scales folded (QACT CSCALE)
-        else:                                                     # tail block: pad P with zeros
-            pp = ol.zeros([G, npad])
-            pp[:, :n].set(p * vs[None, :])
-            pq = ol.quantize(pp)
-        vt = st.VT.padded_cols(0, st.VT.shape[0], t0, npad, n)             # zero-padded P
-        ol.dot(pq, vt, acc=st.acc, acc_scale=alpha)                         # acc*alpha + P.V
-        st.m.set(m_new)                                           # the next block needs m first
-        st.l.set(st.l * alpha + ol.sum(p, axis=1))                # off the critical path
-
     def prime(st):
         """Put the head's first P-1 score blocks in flight."""
         blocks = st.blocks
         if st.groups:
             st.S = [ol.empty([st.G, block]) for _ in range(P)]
             for j in range(P - 1):
-                scores(st, j * block, block, st.S[j])
+                _scores(st, j * block, block, st.S[j])
         else:
             for f in range(min(P - 1, len(blocks))):
                 t0, n = blocks[f]
-                st.buf[f] = scores(st, t0, n, ol.empty([st.G, n]))
+                st.buf[f] = _scores(st, t0, n, ol.empty([st.G, n]))
 
     head(ahead)
     prime(head(0))
@@ -257,8 +259,8 @@ def _attend_heads(qhs, kv, hs, seq_len: int, block: int, scale: float | None = N
             for g in ol.range(groups):
                 t0 = g * (P * block)
                 for p in range(P):
-                    scores(st, t0 + (p + P - 1) * block, block, S[(p + P - 1) % P])   # prefetch
-                    finish(st, S[p], t0 + p * block, block)
+                    _scores(st, t0 + (p + P - 1) * block, block, S[(p + P - 1) % P])   # prefetch
+                    _finish(st, S[p], t0 + p * block, block)
             nb = groups * P
             for j in range(P - 1):
                 st.buf[nb + j] = S[j]
@@ -267,14 +269,14 @@ def _attend_heads(qhs, kv, hs, seq_len: int, block: int, scale: float | None = N
             for f in range(b, min(b + P, len(blocks))):           # keep P-1 blocks in flight
                 if f not in st.buf:
                     t0, n = blocks[f]
-                    st.buf[f] = scores(st, t0, n, ol.empty([st.G, n]))
+                    st.buf[f] = _scores(st, t0, n, ol.empty([st.G, n]))
             if nxt is not None and not primed and b + P - 1 >= len(blocks):
                 prime(nxt)                                        # ... continuing into the next head
                 primed = True
             if b + 1 == len(blocks):
                 st.qs = None                                      # its ACT RAM blocks are free
             t0, n = blocks[b]
-            finish(st, st.buf.pop(b), t0, n)
+            _finish(st, st.buf.pop(b), t0, n)
         if nxt is not None and not primed:
             prime(nxt)
         if emit is not None:
