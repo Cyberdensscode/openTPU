@@ -140,7 +140,7 @@ class MTPDecoder:
 
     # ---- generation
     def prefill(self, tokens, st: MTPStats, chunk: int | None = None, pick=None, on_run=None,
-                follow: int | None = None):
+                follow: int | None = None, vis=None):
         """Feed `tokens` from Engine.pos in plain prefill's runs (qwen3.fit_chunk,
         Engine.prefill's: their rows and so their MMs' pairing are its), each storing its rows'
         hidden, then the MTP layer over them, (h_q, x_(q + 1)), in runs of up to `chunk` rows;
@@ -150,8 +150,13 @@ class MTPDecoder:
         before Engine.pos, the committed slot the states). on_run(tokens): after each prefill
         run (Engine.pos past it); a true return stops the prefill there (-> None, None; a later
         prefill feeds the rest). follow: the token after `tokens` (a part of a prompt, the rest
-        fed later): the last row's MTP input, no logits, a0 None."""
+        fed later): the last row's MTP input, no logits, a0 None. vis: each token's image row
+        or -1 (Engine.prefill_layers': MiniCPM-V's images, a layer-by-layer prompt's only; the
+        MTP layer's input of an image token is its placeholder's embedding row)."""
         toks = [int(t) for t in tokens]
+        vis = None if vis is None or max(vis, default=-1) < 0 else [int(v) for v in vis]
+        if vis is not None and len(vis) != len(toks):
+            raise ValueError(f"vis: {len(vis)} rows for {len(toks)} tokens")
         chunk = self.mtp_rows if chunk is None else chunk
         p0 = p = self.eng.pos
         P = p0 + len(toks)
@@ -160,6 +165,8 @@ class MTPDecoder:
                              f"{self.img.cap}, and the next token needs a position")
         if p0 == 0:
             self.slot = 0
+        if vis is not None and not (self.by_layers and P > self.img.spec.conv_k - 1):
+            raise ValueError("image rows go in a layer-by-layer prompt (a streamed MoE's)")
         if self.eng.prompt_runs and PF.supported(self.eng) and PF.covers(self.eng, p0, P):
             a0, draft = PF.mtp(self, toks, st, pick, on_run, follow)    # docs/prefill.md
             self.draft = draft
@@ -173,12 +180,15 @@ class MTPDecoder:
                 stop.append(bool(on_run(part)))
                 return stop[-1]
             if n:
+                if vis is not None and max(vis[:n]) >= 0:
+                    raise ValueError(f"an image row before position {K - 1}")
                 self.prefill(toks[:n], st, chunk, on_run=None if on_run is None else first,
                              follow=toks[n])
             if any(stop):
                 self.draft = None
                 return None, None
-            return self._prefill_layers(toks[n:], st, pick, on_run, follow)
+            return self._prefill_layers(toks[n:], st, pick, on_run, follow,
+                                        None if vis is None else vis[n:])
         a0 = draft = None
         fit = self.img.rows
         head = follow is None
@@ -219,18 +229,19 @@ class MTPDecoder:
         return (getattr(self.img.spec, "moe", None) is not None and bool(self.eng.layer_major)
                 and bool(getattr(self.img, "embed_host", False)))
 
-    def _prefill_layers(self, toks, st: MTPStats, pick, on_run, follow):
+    def _prefill_layers(self, toks, st: MTPStats, pick, on_run, follow, vis=None):
         """prefill on a streamed MoE whose Engine runs the prompt layer by layer
         (Engine.prefill_layers with the MTP layer's K / V, docs/mtp.md 12), from conv_k - 1
         on: each chunk's rows through the model a layer at a time (the expert slots pooled),
         then the MTP layer's K / V of its rows that have their next token (the prompt's, or
         `follow`); then, the slots back to decode's, the last row's draft: qwen35_mtp over the
         head's hidden row and a0 (its MoE a request in the MTP layer's slots). The states in
-        the committed slot. on_run(tokens) once, after it."""
+        the committed slot. on_run(tokens) once, after it. vis: the tokens' image rows."""
         eng = self.eng
         head = follow is None
         P, n0 = eng.pos + len(toks), len(eng.stats)
-        lg = eng.prefill_layers(toks, logits=head, mtp=toks[1:] + [follow], slot=self.slot)
+        lg = eng.prefill_layers(toks, logits=head, mtp=toks[1:] + [follow], slot=self.slot,
+                                **({} if vis is None else {"vis": vis}))
         st.runs.append(("prefill", len(toks),
                         {"cycles": sum((s or {}).get("cycles", 0) for s in eng.stats[n0:])}))
         if on_run is not None:

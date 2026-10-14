@@ -594,7 +594,7 @@ class Chat:
         logits = None
         vis = self._image_rows(ids, n, turn)
         if self.use_mtp:
-            logits = self._prefill_mtp(ids, n, turn, t0, on_update, stop, at)
+            logits = self._prefill_mtp(ids, n, turn, t0, on_update, stop, at, vis)
         else:
             cut = [at] if at is not None and at < len(ids) else []
             for a, b in zip([n] + cut, cut + [len(ids)]):
@@ -652,11 +652,12 @@ class Chat:
         return self.mtp is not None and self.on_card
 
     def _prefill_mtp(self, ids, n: int, turn: Turn, t0: float, on_update, stop,
-                     at: int | None = None):
+                     at: int | None = None, vis=None):
         """ids[n:] through the MTP decoder's prefill (each run's rows' hidden, then the MTP
         layer over them): the first token is picked from the last row's logits inside it (the
         draft after it needs it), so this returns it, _Picked; None when stopped. at: the
-        snapshot's position (the prefill parts there, the token after it the MTP's input)."""
+        snapshot's position (the prefill parts there, the token after it the MTP's input).
+        vis: ids[n:]'s image rows (_image_rows) or None."""
         from opentpu.llm.mtp import MTPStats
         st, k = MTPStats(), [0]
 
@@ -672,14 +673,19 @@ class Chat:
                 turn.end = "stopped"
                 return True
             return False
+        n0 = n
+
+        def rows(a: int, b: int) -> dict:   # (ids[a:b]'s image rows)
+            return {} if vis is None else {"vis": vis[a - n0:b - n0]}
         if at is not None and at < len(ids):
-            self.mtp.prefill(ids[n:at], st, on_run=on_run, follow=ids[at])
+            self.mtp.prefill(ids[n:at], st, on_run=on_run, follow=ids[at], **rows(n, at))
             if turn.end:
                 return None
             n = at
         if at is not None and self.eng.pos == at:
             self.mtp.snapshot()
-        a0, _ = self.mtp.prefill(ids[n:], st, pick=lambda lg: self.pick(lg, ids), on_run=on_run)
+        a0, _ = self.mtp.prefill(ids[n:], st, pick=lambda lg: self.pick(lg, ids), on_run=on_run,
+                                 **rows(n, len(ids)))
         return None if a0 is None else _Picked(a0)
 
     def _mtp_run(self, t: int, left: int, take, stop, samp, turn: Turn) -> tuple[list, int]:
