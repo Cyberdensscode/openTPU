@@ -14,6 +14,7 @@ from opentpu.isasim import Machine, SimError, Slice
 from opentpu.kernels import attention_decode, attention_layer, mlp
 from opentpu.runtime import compile_kernel, run
 from opentpu import rtlsim
+from opentpu import target as _target
 
 from conftest import assert_same_state, rel
 from test_kernels import attn_args, layer_args, mlp_args
@@ -305,6 +306,10 @@ def test_fuzz_mm_replay(have_verilator, mcols, rows, seed):
 # the single pumped TMEM copy as release r2 builds it (targets/ypcb-00338.toml: r2pgRs)
 R2_TMEM = {"TMEM_IMPL": 3, "TMEM_NSB": 2, "TMEM_SBP": 3, "TMEM_RPL": 1, "TMEM_TDP": 1,
            "TMEM_GST": 1, "TMEM_PMP": 1}
+# and the slice's arbiter its replays run under (otpu_slice ARB_MASK: RPB every read lane, the
+# card's RPB 0 as rtlsim builds it, and WPB 1), whatever the selected target's TMEM
+# (nangate45-small's banked one: RPB 1); a board top sets its own (otpu_board RPB)
+R2_ARB = {"RPB": _target.NRP * _target.SIM_LANES_MAX, "WPB": 1}
 
 
 @pytest.mark.parametrize("mcols,rows,seed", [(2, 8, 1), (2, 6, 3)])
@@ -322,7 +327,7 @@ def test_one_copy_replays_make_progress(have_verilator, mcols, rows, seed):
     imgs = _images(rng, 1)
     m = Machine(cfg, [prog], [i.copy() for i in imgs]).run()
     drams, tmems, _ = rtlsim.run(cfg, [prog], [i.copy() for i in imgs],
-                                 uarch={**rtlsim.BOARD_UARCH, **R2_TMEM, "COLL_GATHER": 1},
+                                 uarch={**rtlsim.BOARD_UARCH, **R2_TMEM, **R2_ARB, "COLL_GATHER": 1},
                                  max_cycles=1_000_000)
     assert np.array_equal(drams[0], m.slices[0].dram)
     assert np.array_equal(tmems[0], m.slices[0].tmem)
@@ -341,7 +346,7 @@ def test_one_copy_tmem_of_128k_words(have_verilator, mcols, rows, seed):
     m = Machine(cfg, [prog], [i.copy() for i in imgs]).run()
     assert m.slices[0].tmem[1 << 16:].any()                 # (words past 64K written)
     drams, tmems, _ = rtlsim.run(cfg, [prog], [i.copy() for i in imgs],
-                                 uarch={**rtlsim.BOARD_UARCH, **R2_TMEM, "COLL_GATHER": 1},
+                                 uarch={**rtlsim.BOARD_UARCH, **R2_TMEM, **R2_ARB, "COLL_GATHER": 1},
                                  max_cycles=1_000_000)
     assert np.array_equal(drams[0], m.slices[0].dram)
     assert np.array_equal(tmems[0], m.slices[0].tmem)
@@ -376,7 +381,8 @@ def test_collective_reads_held_behind_dma_reads(have_verilator, seed, tmp_path, 
     imgs = _images(rng, 2)
     m = Machine(cfg, progs, [i.copy() for i in imgs]).run()
     drams, tmems, _ = rtlsim.run(cfg, progs, [i.copy() for i in imgs],
-                                 uarch={**rtlsim.BOARD_UARCH, **R2_TMEM}, max_cycles=1_000_000)
+                                 uarch={**rtlsim.BOARD_UARCH, **R2_TMEM, **R2_ARB},
+                                 max_cycles=1_000_000)
     for s in range(2):
         assert np.array_equal(tmems[s], m.slices[s].tmem), f"slice {s} TMEM"
         assert np.array_equal(drams[s], m.slices[s].dram), f"slice {s} DRAM"
@@ -1373,6 +1379,7 @@ def test_additive_mask_block_rtl(have_verilator, board):
     prog, cases, t, qa = [], [], 0, Q
     for M, tpos, KB in [(1, 0, 1), (2, 255, 2), (3, 77, 1), (4, 1, 2), (4, 0, 1), (4, 255, 1),
                         (3, 254, 2), (4, -1, 1)]:
+        M = min(M, cfg.MCOLS)                              # a score tile's rows (the table's)
         q = (rng.standard_normal((M, KB * D)) * 2).astype(np.float32)
         img[qa:qa + q.nbytes] = q.view(np.uint8).ravel()
         tq = t
