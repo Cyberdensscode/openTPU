@@ -174,6 +174,64 @@ def test_engines_share_the_bucket_programs(tmp_path, monkeypatch):
     PC.clear()
 
 
+def test_the_generate_buckets_warmed_ahead_are_read_back(tmp_path, monkeypatch):
+    """opentpu/host/gen_warm.py: its process (spawned, the engine's arguments pickled) compiles
+    every bucket's generate programs, greedy and the default sampler's, into the disk cache
+    under the engine's layout; a new process's engine then compiles none of them for its
+    replies in buckets 1 and 2 (read back from the disk) and gives the tokens of an engine
+    without the cache. With wait entries (warm's waitc), the board's computation of a read-back
+    program's entries finds them on the disk. A second warm compiles nothing; start() leaves an
+    engine without the program cache alone."""
+    from types import SimpleNamespace
+
+    from opentpu import waits as WC
+    from opentpu.host import gen_warm as GW
+    from opentpu.llm import generate as G
+    from opentpu.llm.qwen3 import PREFILL_ROWS, Engine, device_config
+    monkeypatch.setenv("OTPU_PROG_CACHE", str(tmp_path))
+    PC.clear()
+    W, spec = _tiny("qwen3")
+    cfg = device_config(spec, 512, rows=PREFILL_ROWS, lookup=True)
+    toks = [int(t) for t in np.random.default_rng(4).integers(0, 1000, 248)]
+    sp = dict(temperature=0.7, top_k=20, top_p=0.9, repetition_penalty=1.1)
+
+    def run(e, samp=None):
+        t0 = int(np.argmax(e.prefill(toks)))
+        return e.generate_card(t0, 12, stop_ids=[], sampling=samp, context=toks + [t0],
+                               rng=np.random.default_rng(5))     # buckets 1 and 2
+
+    want = [run(Engine(spec, W, cap=512, cfg=cfg, resident=True, prog_cache=False), s)
+            for s in GW.samplings(sp)]
+    e = Engine(spec, W, cap=512, cfg=cfg, resident=True, prog_cache=True)
+    assert GW.start(SimpleNamespace(can_generate=True, prog_cache=False)) is None
+    assert [None if s is None else s.key for s in GW.samplings(sp)] == [None, (24, True)]
+    p = GW.start(e, sp)
+    p.join(300)
+    assert p.exitcode == 0
+    chain = bool(getattr(e.backend, "chains", False))
+    for b in range(1, G.buckets(512, e.block) + 1):
+        for s in GW.samplings(sp):
+            assert not GW.warm(e.image, e.layout, e.block, e._conv_lo, b, chain, s,
+                               e.gen_debug, e.gen_split)
+    PC.clear()
+    s0 = dict(PC.stats)
+    got = [run(Engine(spec, W, cap=512, cfg=cfg, resident=True, prog_cache=True), s)
+           for s in GW.samplings(sp)]
+    assert got == want
+    assert PC.stats["compile"] == s0["compile"] and PC.stats["disk"] - s0["disk"] == 4
+    PC.clear()
+    GW.warm(e.image, e.layout, e.block, e._conv_lo, 1, chain, waitc=True)
+    WC._mem.clear()
+    c0 = WC.stats["computed"]
+    progs = PC.get(e.layout, GW.gen_what(e.block, e._conv_lo, 1, chain, None, e.gen_debug,
+                                         e.gen_split), None)[0]
+    for part in progs if isinstance(progs, tuple) else (progs,):
+        for prog in part:
+            WC.entries(I.assemble(prog), cfg.D, cfg.S, prog=prog)
+    assert WC.stats["computed"] == c0
+    PC.clear()
+
+
 def test_filling_and_plain_decodes_are_cached_apart(tmp_path, monkeypatch):
     """A streamed decode's programs fill their logits (qwen3.fill_logits), the others not: the
     cache keeps the two apart for one layout and bucket (a card engine and its ISA reference in

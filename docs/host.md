@@ -594,6 +594,16 @@ compile. Without it, a new process compiles before the second token of its first
 `OTPU_PROG_CACHE=0` keeps it in memory only. (Until 2026-10-08 the key held otpu-lock's pid,
 `OTPU_LOCK_PID`: a chat under otpu-lock never found the programs of the session before.)
 
+A tree's first process still compiled each bucket at its first reply there, and with the
+card's wait entries that took seconds: Qwen3.5-35B-A3B's (MiniCPM-V's) ~3.6 s a bucket, so a
+reply after a 488-token image prompt waited 7.2 s for buckets 2 and 3 (session hostr21,
+[minicpmv.md](minicpmv.md) 6). Now otpu-chat and otpu-serve start `opentpu/host/gen_warm.py`
+once their engine is open: a spawned process at nice 19 compiles every bucket's programs,
+greedy and the default sampler's, into the disk cache with their wait entries, from bucket 1
+up. The engine never waits for it: a bucket it has not reached yet is compiled in the engine
+as before. It needs the disk cache (none with `--no-prog-cache` or `OTPU_PROG_CACHE=0`) and
+the device's decode loop; `--mtp`'s loop has programs of its own and is not warmed.
+
 A dense Qwen3.5's prompt runs programs at run-time positions ([prefill.md](prefill.md)): its
 tokens go to the device's out[] and each run of up to R_max rows takes its position from the
 state block, so a bucket's programs are compiled once (and kept in the program cache), not per
