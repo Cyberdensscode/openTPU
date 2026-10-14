@@ -53,7 +53,8 @@ RUNTIME_ENV = ("OTPU_PROG_CACHE", "OTPU_PROG_CACHE_GB", "OTPU_IMAGE_CACHE", "OTP
                "OTPU_IMG_CACHE", "OTPU_IMG_CACHE_GB", "OTPU_IMG_CACHE_FREE_GB", "OTPU_BUILD_JOBS",
                "OTPU_QUIET", "OTPU_PREBUILD_CFG", "OTPU_PREBUILD_MIN_GB",
                "OTPU_PREBUILD_QUIET_WAIT", "OTPU_LOCK_HELD", "OTPU_LOCK_PID", "OTPU_LOCK_WAIT",
-               "OTPU_RUN_DIR", "OTPU_STOP_RUN", "OTPU_SIM_TMP", "OTPU_PARENT")
+               "OTPU_RUN_DIR", "OTPU_STOP_RUN", "OTPU_SIM_TMP", "OTPU_PARENT",
+               "OTPU_VISION_WARM")
 # the host modules the compiler, kernels and models import: opentpu/host/offload.py's LINE, TAG,
 # RUN, Layout and RowLayout place the mailboxes, slots and tags the programs address
 HOST_KEYED = ("host/offload.py",)

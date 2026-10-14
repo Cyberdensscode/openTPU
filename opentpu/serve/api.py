@@ -926,6 +926,8 @@ def main(argv=None):
 
 def _main(a):
     eng, tok, spec, path, defaults, weights = load(a)
+    from ..host import gen_warm as GW       # the decode loop's bucket programs ahead, in the
+    eng.gen_warm = GW.start(eng, defaults)  # background (opentpu/host/gen_warm.py)
     mk = ST.model_key(str(Path(path).resolve()), type(eng.image).__module__, eng.image.wformat,
                       eng.image.head_format, getattr(eng.image, "formats", None), eng.cap,
                       eng.block, eng.cfg.S, eng.cfg.D, eng.cfg.MCOLS, eng.cfg.PAIR)
