@@ -1470,6 +1470,20 @@ about 18.1 s: -5.1 s of its 90.4 s.
   - `tests/test_em_tile.py` test_a_tiles_moe_prologue_takes_its_rows_at_once: a tiny model at
     k = 4 (two need lines a tile): the router's and the shared expert's rows, the posts, and the
     prompt, blocks and decode steps against today's runs bit for bit, every need landed.
+  - On the card (session emprol, `tools/offload/sessions/emprol.sh`, 2026-10-14; opentpu
+    `~/otpu-build/emprol/run-1014-1320`): r2.1's m8 bitstream 039b34d5, production's host d57a3568
+    as A against these commits as B, a warm-up run in each arm, then A B B A, every run's tokens
+    the warm-up's (A's):
+
+    | request | A: TTFT (device) | B: TTFT (device) | B - A, mean |
+    |---|---|---|---|
+    | MiniCPM-V, doc.png at 9 slices (488 prompt rows) | 53.07 / 52.85 s (25.17 / 25.13) | 51.36 / 50.60 s (23.03 / 22.87) | TTFT -1.98 s (-3.7%), device -2.20 s (-8.7%) |
+    | qwen35-35b, a 260-token text prompt | 15.60 / 15.33 s (13.93 / 13.73) | 15.16 / 15.07 s (13.57 / 13.50) | TTFT -0.35 s (-2.2%), device -0.30 s (-2.1%) |
+
+    The device's -2.20 s on the image request is the co-simulation's -2.25 s. The host's share of
+    its TTFT moved +0.2 s, within the pairs' 0.5 s spread: the need lines' posts between the
+    shared expert's passes cost the card no more than that. Decode unchanged (4.28-4.37 and
+    4.42-4.50 tokens a second).
 
 ## 15. Chunked DeltaNet (proposal, parked, 2026-10-14)
 
