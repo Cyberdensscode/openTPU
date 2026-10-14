@@ -94,7 +94,8 @@ from . import moe as MO
 from .lfm2 import plan
 from ..host.offload import LINE, BackendDram, ExpertServer, Layout, RowLayout, RowServer
 from .qwen3 import (ATTN_BLOCK, ATTN_DEPTH, RunPos, _Bump, _lm_head, _lm_head_rows, _qdesc,
-                    _tdesc, amask_table, fill_logits, finite, step_descriptors)
+                    _tdesc, amask_bytes, amask_table, fill_logits, finite,
+                    step_descriptors)
 
 SLIDE, FULL = "sliding", "full"
 
@@ -955,7 +956,7 @@ class Image:
             # tiled.compile_layer_tile)
             from .prefill import layer_tile_flag
             if not spec.experts or (self.prefill_rows and layer_tile_flag(None)):
-                self.lookup.update(amask=b.alloc(2 * amask_table(block, cfg.MCOLS).nbytes),
+                self.lookup.update(amask=b.alloc(amask_bytes(block, cfg.MCOLS, 2)),
                                    amask_M=cfg.MCOLS)
         self.offload = None
         if mo:                      # path (a)'s words and expert slots (docs/offload.md)

@@ -402,10 +402,20 @@ def _lookup_alloc(b: "_Bump", spec, cap: int, block: int = None, D: int = 128,
     else:
         emb = {"embed": b.alloc(4 * V * H)}
     if masks or (getattr(spec, "moe", None) is None and not getattr(spec, "experts", 0)):
-        emb.update(amask=b.alloc(amask_table(block, M).nbytes), amask_M=M)
+        emb.update(amask=b.alloc(amask_bytes(block, M)), amask_M=M)
     return {**emb, "cos_t": b.alloc(4 * cap * half), "sin_t": b.alloc(4 * cap * half),
             "zmask": b.alloc(4 * (cap + block)), "half": half, "block": block, "D": D,
             "gen": G.alloc(b, spec, cap, block, imem, waitc)}
+
+
+def amask_bytes(block: int, M: int, tables: int = 1) -> int:
+    """The bytes of `tables` mask tables (amask_table's, one after the other) and AMASK_PAD
+    positions after them: a looped attention's last packed tile reads the next one's mask tiles,
+    at most MCOLS (M) rows past the table (tiled._heads_loop), from the image's own words."""
+    return (tables * block + AMASK_PAD * M) * M * (block + 1) * 4
+
+
+AMASK_PAD = 1       # amask_bytes' padding, in MCOLS positions
 
 
 def amask_table(block: int, M: int, start: bool = False) -> np.ndarray:

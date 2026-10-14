@@ -511,6 +511,9 @@ which is ISA-verified on these models.
 
 ## 10. Later: looped attention (parked)
 
+Built for tiled prompt runs (2026-10-14): docs/tiled_prefill.md 13 (A as a loop over KV heads
+and a part's packed tiles; B not built).
+
 A prompt run unrolls its attention entries (row r, KV head j, column group g), so its program
 grows with R x heads x blocks; past the middle of the cache IMEM caps the rows (R_max by bucket:
 Phi-4-mini's mix 3 3 3 2 2, then 1; LFM2-2.6B int8 4 3 2 2, then 1; E2B's mix 4 4 3 3, then 2),

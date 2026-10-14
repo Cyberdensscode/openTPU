@@ -44,12 +44,15 @@ MLP's weights once for the T rows, the experts left to the layer's expert run as
 """
 from __future__ import annotations
 
+import copy
 import math
+from types import SimpleNamespace
 
 from .. import isa as I
 from .. import language as ol
 from ..compiler import Affine, CompileError, Tensor, current, trace_fit
-from ..kernels.attention import RowMasks, RowTiles, TileSeq, _attend_heads
+from ..kernels.attention import (Additive, RowMasks, RowTiles, TileSeq, _attend_heads, _finish,
+                                 _scores)
 from ..kernels.lib import sigmoid, silu
 from ..kernels.mlp import _chunk
 from .qwen3 import (ATTN_BLOCK, ATTN_DEPTH, RunRows, RunWords, _amask, _inputs_rows, _layers,
@@ -58,6 +61,9 @@ from .qwen3 import (ATTN_BLOCK, ATTN_DEPTH, RunRows, RunWords, _amask, _inputs_r
 
 QPART = 8       # a query part's [T, heads d] at most TMEM / QPART words (fewer heads, more rows)
 SHALLOW = 2     # the attention pipeline's depth of a run over IMEM at ATTN_DEPTH
+LOOP = True     # a prompt run's attention in hardware loops over KV heads and packed tiles
+LOOPS = (2, 1, 0)   # their levels, tried in order (_first_fit): heads and tiles, tiles, none
+PEEL = False    # the last full tile after the loop (no prime of a tile past T: _heads_loop)
 
 
 def packing(mcols: int, G: int) -> int:
@@ -154,7 +160,7 @@ def _alloc_at(base: int, shape, rs: int):
 
 def _attention_tile(res: Res, lw, c, s_, pos, T: int, spec, block: int, parts: int,
                     gated: bool = False, depth: int = ATTN_DEPTH, whole: bool = True,
-                    oscr=None):
+                    oscr=None, loop: int = 0):
     """x += W_o . attention(x) for T rows of sequence 0 at positions pos .. pos + T - 1 (pos an
     int, or a prompt run's RunRows: run-time positions), their K / V appended first, each row
     attending causally over the cache: _attention_rows' arithmetic, one KV head's projections
@@ -192,6 +198,11 @@ def _attention_tile(res: Res, lw, c, s_, pos, T: int, spec, block: int, parts: i
         o_all, ost = None, None if whole else ol.stationary(T, nq * d)
     if oscr is not None:                       # (the scratch as [T, n_q d]: one load back)
         oscr = Tensor(oscr.base, (T, nq * d), (nq * d, 1))
+    looped = LOOP and loop and _loopable(pos, T, P, G, gs, kvc, heads, block, loop, whole
+                                         and not gated and oscr is not None)
+    if looped:                                 # (the outputs to the scratch, as below)
+        _attention_loop(lw, xs, qn, kn, c, s_, pos, T, spec, heads, G, gs, P, dk, block,
+                        depth, scale, oscr, loop >= 2)
     made, oh = {}, {}                          # (KV head, part) -> its queries, its outputs
     ent, qhs, kvh, seqs = [], [], [], []
 
@@ -267,7 +278,8 @@ def _attention_tile(res: Res, lw, c, s_, pos, T: int, spec, block: int, parts: i
                     ol.quantize_into(ost, oh.pop((j, g0)), h0)
         del o
 
-    _attend_heads(qhs, kvc, kvh, seqs, block, scale, depth=depth, emit=emit)
+    if not looped:
+        _attend_heads(qhs, kvc, kvh, seqs, block, scale, depth=depth, emit=emit)
     xs = qn = kn = None                        # (the norm gains too: placed after x's tiles,
     #                                            they split TMEM under the load back)
     if whole:                                  # (the scratch's rows back: the stores before)
@@ -276,6 +288,266 @@ def _attention_tile(res: Res, lw, c, s_, pos, T: int, spec, block: int, parts: i
         ost = ol.quantize(o_all, free=True)
         del o_all
     _add_parts(res.back(), [ost], [lw.wo], parts)              # x += W_o o, by output parts
+
+
+def _loopable(pos, T: int, P: int, G: int, gs: int, kvc, heads, block: int, level: int,
+              out: bool, tspan=None) -> bool:
+    """_attention_tile's heads attend in hardware loops (_attention_loop, _heads_loop): a
+    prompt run at a run-time position with the image's mask tiles (every packed tile's span the
+    bucket's, its last block whole; tspan(0): a tile's span, whole blocks), the outputs whole
+    through the I/O scratch (out), whole parts (G % gs), one slice, the KV heads' blocks evenly
+    apart (a loop over them: level 2), and loop depth to spare."""
+    if not (out and isinstance(pos, RunRows) and pos.amask is not None and G % gs == 0
+            and kvc.S == 1):
+        return False
+    if tspan is None:
+        if min(pos.block, kvc.cap - pos.t0) != block:
+            return False
+    else:
+        try:
+            if any(n != block for _, n in tspan(0)[0]):
+                return False
+        except CompileError:
+            return False
+    hl = level >= 2 and len(heads) > 1
+    if hl and _head_step(kvc, heads) is None:
+        return False
+    return len(current().loops) + hl + (T // P > 1) <= 4
+
+
+def _span_blocks(sq, block: int, cap: int):
+    """(blocks [(t0, n)], masks {t0: mask}) of a packed tile's span (pack_seq's: a TileSeq,
+    Blocks, or one row's Bucket with its mask tile)."""
+    from ..kernels.attention import Blocks, Bucket
+    if isinstance(sq, TileSeq):
+        items = list(sq.items)
+        return ([(i * block, block) for i in range(sq.full)] + [(t0, n) for t0, n, _ in items],
+                {t0: mk for t0, _, mk in items if mk is not None})
+    if isinstance(sq, Blocks):
+        return [(t0, n) for t0, n, _ in sq.items], {t0: mk for t0, _, mk in sq.items
+                                                    if mk is not None}
+    if isinstance(sq, Bucket) and sq.add is not None:
+        t0 = (sq.blocks - 1) * block
+        return [(i * block, block) for i in range(sq.blocks - 1)] + [(t0, min(block, cap - t0))], \
+            {t0: sq.add}
+    raise CompileError(f"no looped span of {type(sq).__name__}")
+
+
+def _head_step(kvc, heads):
+    """The bytes from one KV head's cache blocks to the next one's (the same for K, its scales,
+    V^T and V's scales, and for every head), or None."""
+    e = [{k: Affine.of(a) for k, a in kvc._h(h).items()} for h in heads]
+    diff = [{k: e[i][k] - e[0][k] for k in e[0]} for i in range(len(e))]
+    if any(x.terms for dd in diff for x in dd.values()):
+        return None
+    step = {x.const for x in diff[1].values()}
+    if len(step) != 1:
+        return None
+    step = step.pop()
+    if any(x.const != i * step for i, dd in enumerate(diff) for x in dd.values()):
+        return None
+    return step
+
+
+def _attention_loop(lw, xs, qn, kn, c, s_, pos, T: int, spec, heads, G: int, gs: int, P: int,
+                    dk: int, block: int, depth: int, scale: float, oscr,
+                    hloop: bool = True) -> None:
+    """_attention_tile's K / V appends and attention in hardware loops (_heads_loop), the
+    outputs to `oscr` ([T, n_q d], the I/O scratch): every KV head's K and V projected and
+    appended first (unrolled: their run-time rows), then the heads' queries and attention."""
+    d, eps = spec.head_dim, spec.eps
+    kvc = lw.kvs[0]
+    for j, hh in enumerate(heads):             # every head's K / V rows at their positions
+        k = ol.dot(xs, lw.wk[j * d:(j + 1) * d, :])
+        v = ol.dot(xs, lw.wv[j * d:(j + 1) * d, :])
+        kj = _rope_rows_padded(_norm_heads(k, kn, eps), c, s_)
+        vj = _padded(v)
+        for r in range(T):
+            ol.kv_append(kvc, hh, pos.pos + r, kj[r:r + 1, :], vj[r:r + 1, :])
+        del k, v, kj, vj
+
+    def query(hq, Qv):
+        """Query heads hq .. hq + gs of every row (W_q's rows: hq a loop's index), normed and
+        RoPE'd into Qv[0:T, g dk ..] (head g)."""
+        q = ol.dot(xs, lw.wq[hq * d:hq * d + gs * d, :])                # [T, gs d]
+        for g in range(gs):                             # head g of every row at once
+            _rope_rows_padded(_norm_heads(q[:, g * d:(g + 1) * d], qn, eps), c, s_,
+                              out=Qv[0:T, g * dk:g * dk + d])
+        del q
+
+    mbase, mstep = pos.amask
+    blocks = [(i * block, block) for i in range(pos.blocks - 1)] + [(pos.t0, block)]
+
+    def span(t, n=P):
+        """Tile t's blocks (the bucket's) and its masked block's row tiles (its n rows, row t P
+        + i: the image's mask tile at tpos + t P + i)."""
+        tl = [(i * gs, (i + 1) * gs, Additive(Affine(mbase + mstep * i) + Affine.of(t) * (
+            P * mstep) + pos.tpos * mstep, block)) for i in range(n)]
+        return blocks, {pos.t0: RowTiles(tl)}
+
+    _heads_loop(kvc, heads, T, G, gs, P, d, dk, block, depth, scale, oscr, hloop, query, span)
+
+
+def _heads_loop(kvc, heads, T: int, G: int, gs: int, P: int, d: int, dk: int, block: int,
+                depth: int, scale: float, oscr, hloop: bool, query, span) -> None:
+    """A tiled run's attention after its K / V appends (_attention_loop, _gemma_attention_loop):
+    a hardware loop over the KV heads `heads` of kvc (hloop; else each head in turn: fewer
+    address registers, a body a head) and in it its query group's parts of gs heads
+    (unrolled: query(hq, Qv) projects one into a TMEM buffer), each a hardware loop over its
+    packed tiles of P rows (span(t, n): tile t's blocks [(t0, n)], the same for every tile, and
+    the masks of its n rows), a partial last one after it (unrolled: T % P rows of its own
+    operand, state and score buffers). One packed tile's attention is the loop body
+    (docs/tiled_prefill.md 13), where the unrolled form (_attend_heads) has one a KV head, part
+    and tile (R x heads x blocks: what fills IMEM past the first buckets): the same
+    instructions a tile (_scores / _finish: its blocks, its masked blocks' row tiles; acc / l),
+    so the same bits, with their addresses affine in the loops' indices (the head's cache
+    blocks, W_q's rows, the tile's queries in TMEM: QACT's src register, its outputs over them:
+    VOP's dst, the same register; its mask tiles; then the part's outputs to their columns of
+    the scratch). The
+    pipeline runs across the tiles of a part: a tile's body ends with the next one's queries
+    quantized and its first blocks' scores in flight (in score buffers of their own: every
+    iteration addresses the same); the last tile's are a phantom's (the rows past T: the query
+    buffer's zeroed tile, the mask tiles of the table's padding, qwen3.AMASK_PAD), never used,
+    or with PEEL the last tile runs after the loop. Between parts and heads it drains."""
+    rows, ntiles, nh, tail = P * gs, T // P, len(heads), T % P
+    blocks, _ = span(0)
+    if any(n != block for _, n in blocks):
+        raise CompileError("a looped attention's blocks are whole")
+    Q = ol.empty([(T + P) * gs, dk], dense=True)       # a part's queries, row (r, g) = r gs + g
+    if dk > d:                                          # (heads padded to whole blocks)
+        Q.set(0.0)
+    else:                                               # (the phantom tile's rows)
+        Q[T * gs:(T + P) * gs, :].set(0.0)
+    Qv = Q.reshape(T + P, gs * dk)
+    sv = ol.full([dk], scale)                           # the softmax scale (QACT CSCALE)
+    qs = ol.stationary(rows, dk)                        # a tile's queries, quantized
+    dv = kvc.dv
+    m_, l_, acc = ol.empty([rows]), ol.empty([rows]), ol.empty([rows, dv])
+    nb = len(blocks)
+    npb = min(depth - 1, nb)                            # blocks in flight at a tile's start
+    PB = [ol.empty([rows, block]) for _ in range(npb)]
+    RB = [ol.empty([rows, block]) for _ in range(min(depth, nb - npb))]
+
+    def buf(f):
+        return PB[f] if f < npb else RB[(f - npb) % len(RB)]
+
+    if tail:                                            # the partial tile's
+        prow = tail * gs
+        qs2 = ol.stationary(prow, dk)
+        m2, l2, acc2 = ol.empty([prow]), ol.empty([prow]), ol.empty([prow, dv])
+        PB2 = [ol.empty([prow, block]) for _ in range(npb)]
+        RB2 = [ol.empty([prow, block]) for _ in range(min(depth, nb - npb))]
+
+        def buf2(f):
+            return PB2[f] if f < npb else RB2[(f - npb) % len(RB2)]
+
+    def state(kvh, h, t):
+        """Tile t's head state (_Head's fields for _scores / _finish)."""
+        return SimpleNamespace(G=rows, K=kvh.k(h), VT=kvh.vt(h), VS=kvh.vscale(h), qs=qs,
+                               m=m_, l=l_, acc=acc, rowmax={}, masked=None, masks=span(t)[1])
+
+    def quantize(t):
+        """Tile t's queries (rows t P gs .. of the part's buffer) into qs, times the scale."""
+        at = Affine.of(t) * (rows * dk)
+        ol.quantize_into(qs, Q[0:rows, :], 0, cscale=sv,
+                         at=None if at.is_static and at.const == 0 else at)
+
+    hloop = hloop and nh > 1
+    step = _head_step(kvc, heads) if hloop else 0
+    for j in (ol.range(nh) if hloop else range(nh)):
+        if hloop:                                       # head j's blocks: head 0's + j steps
+            h = heads[0]                                # (kvc's own kind: its K's layout)
+            kvh = copy.copy(kvc)
+            kvh.heads = {h: {k: Affine.of(a) + j * step for k, a in kvc._h(h).items()}}
+        else:
+            kvh, h = kvc, heads[j]
+        for g0 in range(0, G, gs):
+            hq = Affine.of(j) * G + g0                  # the part's first query head
+            query(hq, Qv)
+            if ntiles:                                  # tile 0's queries and first blocks
+                quantize(0)
+                st0 = state(kvh, h, 0)
+                for f in range(npb):
+                    _scores(st0, blocks[f][0], block, PB[f])
+                del st0
+            def tile(t, primes):
+                """Tile t's attention (and with `primes` the next tile's first blocks')."""
+                m_.set(-1e30)
+                l_.set(0.0)
+                acc.set(0.0)
+                cur = state(kvh, h, t)
+                nxt = state(kvh, h, Affine.of(t) + 1) if primes else None
+                _tile_blocks(cur, nxt, blocks, depth, buf, npb,
+                             lambda: quantize(Affine.of(t) + 1))
+                r = ol.recip(l_)                        # the tile's outputs over its queries
+                at = Affine.of(t) * (rows * dk)
+                current().vop(I.V_MUL, Q[0:rows, 0:d], acc, r[:, None],
+                              at=None if at.is_static and at.const == 0 else at)
+                del cur, nxt, r
+
+            nl = ntiles - 1 if PEEL else ntiles         # (PEEL: the last one after the loop)
+            for t in (ol.range(nl) if nl > 1 else range(nl)):
+                tile(t, PEEL or ntiles > 1)
+            if PEEL and ntiles:
+                tile(ntiles - 1, False)
+            if tail:                                    # the partial tile, unrolled
+                q0 = ntiles * rows
+                ol.quantize_into(qs2, Q[q0:q0 + prow, :], 0, cscale=sv)
+                m2.set(-1e30)
+                l2.set(0.0)
+                acc2.set(0.0)
+                st = SimpleNamespace(G=prow, K=kvh.k(h), VT=kvh.vt(h), VS=kvh.vscale(h),
+                                     qs=qs2, m=m2, l=l2, acc=acc2, rowmax={}, masked=None,
+                                     masks=span(ntiles, tail)[1])
+                for f in range(npb):
+                    _scores(st, blocks[f][0], block, PB2[f])
+                _tile_blocks(st, None, blocks, depth, buf2, npb, None)
+                r = ol.recip(l2)
+                Q[q0:q0 + prow, 0:d].set(acc2 * r[:, None])
+                del st, r
+            c0 = hq * d                                 # the part's outputs to the scratch
+            if dk == d:
+                ol.store(oscr[0:T, c0:c0 + gs * d], Qv[0:T, :])
+            else:
+                for r in range(T):
+                    for g in range(gs):
+                        ol.store(oscr[r:r + 1, c0 + g * d:c0 + (g + 1) * d],
+                                 Q[r * gs + g:r * gs + g + 1, 0:d])
+    Q = Qv = sv = qs = m_ = l_ = acc = PB = RB = None   # (free; the closures hold their names)
+    if tail:
+        del qs2, m2, l2, acc2
+        PB2 = RB2 = None
+
+
+def _tile_blocks(cur, nxt, blocks, depth: int, buf, npb: int, quantize_next) -> None:
+    """One packed tile's blocks (_attend_heads' pipeline for one entry): each block's scores
+    issued depth - 1 blocks ahead, in its buffer (buf(f)); once the tile's are all issued, the
+    next tile's queries quantized (nxt: its blocks follow in the stream) and its first npb
+    blocks' scores into the buffers this tile's first blocks have left; then the finishes."""
+    nb = len(blocks)
+    issued, primed, quantized = npb, 0, False
+    for b in range(nb):
+        ahead = b + depth - 1
+        while issued <= min(ahead, nb - 1):
+            t0, n = blocks[issued]
+            _scores(cur, t0, n, buf(issued))
+            issued += 1
+        if nxt is not None and issued == nb:
+            while primed < npb and nb + primed <= ahead and primed < b:
+                if not quantized:
+                    quantize_next()
+                    quantized = True
+                t0, n = blocks[primed]
+                _scores(nxt, t0, n, buf(primed))
+                primed += 1
+        t0, n = blocks[b]
+        _finish(cur, buf(b), t0, n)
+    if nxt is not None:
+        if not quantized:
+            quantize_next()
+        for f in range(primed, npb):
+            t0, n = blocks[f]
+            _scores(nxt, t0, n, buf(f))
 
 
 def _add_parts(x, acts, ws, parts: int, out=None) -> None:
@@ -473,13 +745,14 @@ def _rows_of(pos, T: int):
 
 @ol.jit
 def qwen3_tile(m, p0, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool = False,
-               depth: int = ATTN_DEPTH, whole: bool = True, oscr: bool = True):
+               depth: int = ATTN_DEPTH, whole: bool = True, oscr: bool = True, loop: int = 2):
     """T rows at positions p0 .. p0 + T - 1 of sequence 0 (p0 an int: their embedding and RoPE
     rows in the I/O area, as qwen3_rows'; a RunRows: a prompt run's tokens and positions), the
     logits of `logit_rows` (empty: none). spill: x in the I/O area's rows while each layer's
     heads attend (Res). depth: the attention's pipeline (_attend_heads: blocks in flight a
     head; fewer, a smaller program: compile_tile_run's forms). whole: W_o's operand quantized
-    at once (_attention_tile's; else a QACT range a part)."""
+    at once (_attention_tile's; else a QACT range a part). loop: the attention's loops
+    (_attention_loop's level: 2 heads and tiles, 1 tiles, 0 none)."""
     spec = m.spec
     x, c, s_ = _inputs_rows(m, _rows_of(p0, T))
     res = Res(x, m.xr[0:T, :] if spill else None)
@@ -487,7 +760,7 @@ def qwen3_tile(m, p0, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool =
     parts, sub = _widths(m, T)
     for lw in _layers(m):
         _attention_tile(res, lw, c, s_, p0, T, spec, block, parts, depth=depth, whole=whole,
-                        oscr=_oscr(m, oscr))
+                        oscr=_oscr(m, oscr), loop=loop)
         _mlp_tile(res.x, lw, spec, parts, sub(lw))
     _lm_head_rows(res.x, m, spec, logit_rows)
 
@@ -495,7 +768,7 @@ def qwen3_tile(m, p0, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool =
 @ol.jit
 def qwen35_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, hidden: bool = False,
                 spill: bool = False, drows: int = 0, depth: int = ATTN_DEPTH,
-                whole: bool = True, oscr: bool = True):
+                whole: bool = True, oscr: bool = True, loop: int = 2):
     """qwen35_rows tiled: T rows of a prompt run (pos a RunRows), its attention layers and
     MLPs tiled, its DeltaNet layers today's rows (_deltanet_rows over the T rows, or in runs
     of `drows` rows one after another: their pair buffers grow with the rows; each weight
@@ -541,7 +814,7 @@ def qwen35_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, hidden: boo
 
 @ol.jit
 def lfm2_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool = False,
-              depth: int = ATTN_DEPTH, whole: bool = True, oscr: bool = True):
+              depth: int = ATTN_DEPTH, whole: bool = True, oscr: bool = True, loop: int = 2):
     """lfm2_rows tiled: T rows of a prompt run (pos a RunRows), its attention layers, its
     convolution blocks and its MLPs tiled. spill, depth, whole: as qwen3_tile's. A stack the
     image lays out for it (m.stack) runs in one loop over its layers (_lfm2_stack, STACK);
@@ -562,7 +835,7 @@ def lfm2_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool =
             _conv_tile(res.x, lw, pos, spec, parts, conv_parts(n, spec.conv_k, D, T, W))
         else:
             _attention_tile(res, lw, c, s_, pos, T, spec, block, parts, depth=depth,
-                            whole=whole, oscr=_oscr(m, oscr))
+                            whole=whole, oscr=_oscr(m, oscr), loop=loop)
 
     def mlp(lw):
         _mlp_tile(res.x, lw, spec, parts, sub(lw))
@@ -586,11 +859,12 @@ def _lfm2_stack(m, mixer, mlp) -> None:
     """LFM2's layers in one hardware loop, whatever its kinds' pattern (docs/tiled_prefill.md
     12.3): a layer's kind from a TMEM table (a word per layer and kind, 1.0 where the layer is of
     that kind: FILLs at the start), RLD (bounded: 0 or 1) into the counts of loops of 0 or 1
-    iterations: the kind's mixer, then after the MLP (the blocks' common part, at the same
-    offsets in both kinds) the step of the layer's block Counter (compiler.Counter: the blocks
-    before it, lfm2.Image.stack) by the kind's block size. One copy of each kind's code, where
-    the plan's runs unroll every layer of an irregular stack (LFM2-2.6B's 30: 1 or 2 rows a run
-    in the card's IMEM)."""
+    iterations (a count register, its word read before each loop and free in its body: the
+    attention's loops take the address registers the counts would hold): the kind's mixer,
+    then after the MLP (the blocks' common part, at the same offsets in both kinds) the step of
+    the layer's block Counter (compiler.Counter: the blocks before it, lfm2.Image.stack) by the
+    kind's block size. One copy of each kind's code, where the plan's runs unroll every layer
+    of an irregular stack (LFM2-2.6B's 30: 1 or 2 rows a run in the card's IMEM)."""
     import itertools
     from .lfm2 import ATTN, CONV
     b = current()
@@ -605,25 +879,30 @@ def _lfm2_stack(m, mixer, mlp) -> None:
         i += n
     first = {kd: kinds.index(kd) for kd in (CONV, ATTN)}
     blk = b.counter("layer block")
-    r = {CONV: b.scratch(), ATTN: b.scratch()}
-    for it in ol.range(L):
+
+    def kind(it, kd):
+        """Begin layer it's loop of kind kd: its word of the table into a count register, free
+        again in the loop's body (LOOP reads it as it starts)."""
         b.check_live(tab)
-        for o, kd in ((0, CONV), (L, ATTN)):
-            ra, imm = b.addr(Affine(tab.base + o) + Affine.of(it))
-            b.emit(I.rld(r[kd], imm, ra=ra, bound=(0, 1), comment=f"a {kd} layer?"))
+        r = b.scratch()
+        ra, imm = b.addr(Affine(tab.base + (0 if kd == CONV else L)) + Affine.of(it))
+        b.emit(I.rld(r, imm, ra=ra, bound=(0, 1), comment=f"a {kd} layer?"))
+        lp = b.begin_loop(0, rcount=r)
+        b.unscratch(r)
+        return lp
+
+    for it in ol.range(L):
         for kd in (CONV, ATTN):
-            lp = b.begin_loop(0, rcount=r[kd])
+            lp = kind(it, kd)
             mixer(m.layer(first[kd], at=blk))
             b.end_loop(lp)
         mlp(m.layer(first[CONV], at=blk))      # (the common part: the same offsets)
         for kd in (CONV, ATTN):
-            lp = b.begin_loop(0, rcount=r[kd])
+            lp = kind(it, kd)
             b.step(blk, st.size[kd])
             b.end_loop(lp)
-    for x in r.values():
-        b.unscratch(x)
     b.end_counter(blk)
-    del tab
+    tab = None                                  # (free: kind's closure holds the name)
 
 
 def pack_seq(seqs, G: int, block: int, cap: int):
@@ -676,7 +955,7 @@ def _rope_rows_g(x, c, s, out):
 
 def _gemma_attention_tile(res: Res, lw, m, pos: RunRows, ropes, T: int, block: int,
                           parts: int, depth: int = ATTN_DEPTH, whole: bool = True,
-                          oscr=None):
+                          oscr=None, loop: int = 0):
     """gemma4._attention tiled for T rows of a prompt run: x += norm(W_o attention(norm(x))).
     Per KV head its K / V (own layers: projected for the T rows, normed, K RoPE'd, appended a
     row at a time to its slot: the sliding ring's or the cache's), then its query group in
@@ -687,7 +966,8 @@ def _gemma_attention_tile(res: Res, lw, m, pos: RunRows, ropes, T: int, block: i
     the part ends and loaded back whole into W_o's operand (without oscr gathered in a [T, n_q
     d] tile), or quantized as the part ends (a QACT range each, as _attention_tile's); then W_o
     by output parts into [T, H] and the post-norm. Each row's arithmetic is _attention's. x:
-    res.x, spilled while the heads attend (Res)."""
+    res.x, spilled while the heads attend (Res). loop: the heads' and tiles' hardware loops
+    (_gemma_attention_loop) at this level where they apply (_attention_tile's)."""
     from ..kernels.lib import rmsnorm
     from .gemma4 import SLIDE, _RowPos, _add_norm, _full_seq, _slide_seq, _slot
     spec = m.spec
@@ -717,6 +997,37 @@ def _gemma_attention_tile(res: Res, lw, m, pos: RunRows, ropes, T: int, block: i
         o_all, ost = None, None if whole else ol.stationary(T, spec.n_q * d)
     if oscr is not None:                       # (the scratch as [T, n_q d]: one load back)
         oscr = Tensor(oscr.base, (T, spec.n_q * d), (spec.n_q * d, 1))
+    heads = list(range(nkv))
+
+    def tspan(t, n=P):                         # tile t's span (its n rows t P ..: t a loop's
+        return _span_blocks(pack_seq([span(m, _RowPos(pos, Affine.of(t) * P + i), block)
+                                      for i in range(n)], gs, block, kv.cap), block, kv.cap)
+
+    looped = LOOP and loop and whole and oscr is not None and _loopable(
+        pos, T, P, G, gs, kv, heads, block, loop, True, tspan)
+    if looped:                                 # (the outputs to the scratch, as below)
+        if lw.own:                             # every head's K / V rows at their slots
+            for j in heads:
+                k = ol.dot(xs, lw.wk[j * d:(j + 1) * d, :])
+                v = k if lw.same else ol.dot(xs, lw.wv[j * d:(j + 1) * d, :])
+                kr = _rope_rows_g(rmsnorm(k, kn, eps), c, s_, ol.empty([T, d]))
+                vr = rmsnorm(v, None, eps)
+                for r in range(T):
+                    ol.kv_append(kv, j, _slot(m, lw.kind, rows[r]), kr[r:r + 1, :],
+                                 vr[r:r + 1, :])
+                del k, v, kr, vr
+
+        def lquery(hq, Qv):                    # heads hq .. hq + gs, normed and RoPE'd in place
+            q = Qv[0:T, :]
+            ol.dot(xs, lw.wq[hq * d:hq * d + gs * d, :], out=q)
+            for g in range(gs):
+                qg = q[:, g * d:(g + 1) * d]
+                _rope_rows_g(rmsnorm(qg, qn, eps), c, s_, qg)
+                del qg
+            del q
+
+        _heads_loop(kv, heads, T, G, gs, P, d, d, block, depth, ol.LOG2E, oscr, loop >= 2,
+                    lquery, tspan)
     made, ent, qhs, kvh, seqs = {}, [], [], [], []
 
     def part(j, g0, g1):
@@ -775,7 +1086,8 @@ def _gemma_attention_tile(res: Res, lw, m, pos: RunRows, ropes, T: int, block: i
                 ol.quantize_into(ost, made.pop((j, g0)), h0)
         del o
 
-    _attend_heads(qhs, kv, kvh, seqs, block, ol.LOG2E, depth=depth, emit=emit)
+    if not looped:
+        _attend_heads(qhs, kv, kvh, seqs, block, ol.LOG2E, depth=depth, emit=emit)
     xs = qn = kn = None                        # (the norm gains: _attention_tile's)
     if whole:                                  # (the scratch's rows back: the stores before)
         if o_all is None:
@@ -791,7 +1103,7 @@ def _gemma_attention_tile(res: Res, lw, m, pos: RunRows, ropes, T: int, block: i
 
 @ol.jit
 def gemma4_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool = False,
-                depth: int = ATTN_DEPTH, whole: bool = True, oscr: bool = True):
+                depth: int = ATTN_DEPTH, whole: bool = True, oscr: bool = True, loop: int = 2):
     """gemma4_step's rows tiled: T rows of a prompt run (pos a RunRows with the image's mask
     tiles), their tokens gathered from out[] and per-layer inputs as gemma4_step's; per layer
     the tiled attention, the dense MLP (GeGLU) tiled into [T, H] for its post-norm, the
@@ -816,7 +1128,7 @@ def gemma4_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, spill: bool
     def layer(li, it=None, jt=None):
         lw = m.layer(li, it, jt)
         _gemma_attention_tile(res, lw, m, pos, ropes, T, block, parts, depth, whole,
-                              _oscr(m, oscr))
+                              _oscr(m, oscr), loop)
         x = res.x
         y = ol.empty([T, spec.hidden])
         _mlp_tile(x, lw, spec, parts, sub(lw), act=gelu_tanh, g=lw.g_pre, out=y)
@@ -1032,10 +1344,10 @@ def compile_tile_run(img, blocks: int, T: int, kind: str, block: int = ATTN_BLOC
             "m": desc(s), "kernel": KERNELS[fam], "pos": pos, "T": T, "kind": kind,
             "block": block, "kw": kw}, fit=fit) for s in range(img.cfg.S)]
 
-    return _first_fit(trace, variants(fam, T, img.cfg.MCOLS), img.cfg)
+    return _first_fit(trace, variants(fam, T, img.cfg.MCOLS), img.cfg, levels=True)
 
 
-def _first_fit(trace, forms, cfg):
+def _first_fit(trace, forms, cfg, levels: bool = False):
     """(programs, run_args) of trace(form, fit) (its builders, one a slice) for the first of
     the forms that fits TMEM, ACT RAM and IMEM: each form at the attention's pipeline depth,
     then over IMEM at SHALLOW, then the next form, its tiles placed next-fit; then the same with
@@ -1043,26 +1355,33 @@ def _first_fit(trace, forms, cfg):
     reads; Qwen3-0.6B's 16 rows in co-simulation, MX, the card's configuration: 94.9K cycles
     a row placed best-fit, 87.4K next-fit); over IMEM at every one, the first (the caller's
     IMEM check: prefill.programs); none fitting, the last TMEM / ACT RAM error (or, where no
-    form applied, the range forms' QACT range error)."""
+    form applied, the range forms' QACT range error). levels: each form's attention at the
+    loop levels of LOOPS in turn where the one before runs out of address registers (a form
+    that names its level: that one)."""
     err = over = skip = None
     imem = cfg.IMEM_WORDS // 8
     for fit, v in [(fit, v) for fit in ("next", "best") for v in forms]:
-        for f in [v] + ([dict(v, depth=SHALLOW)] if "depth" not in v else []):
-            try:
-                bs = trace(f, fit)
-            except CompileError as e:
-                if "QACT range" in str(e):     # (a range form's part at an odd block of
-                    skip = e                   # 4-bit weights: the form does not apply)
+        for lv in ([v] if not levels or "loop" in v else [dict(v, loop=x) for x in LOOPS]):
+            short = False
+            for f in [lv] + ([dict(lv, depth=SHALLOW)] if "depth" not in lv else []):
+                try:
+                    bs = trace(f, fit)
+                except CompileError as e:
+                    if "QACT range" in str(e):     # (a range form's part at an odd block of
+                        skip = e                   # 4-bit weights: the form does not apply)
+                        break
+                    short = levels and "registers" in str(e)
+                    if not short and not any(w in str(e) for w in ("TMEM", "ACT RAM")):
+                        raise
+                    err = e
                     break
-                if not any(w in str(e) for w in ("TMEM", "ACT RAM")):
-                    raise
-                err = e
+                progs = [b.finish() for b in bs]
+                if max(map(len, progs)) <= imem:
+                    return progs, list(bs[0].run_args)
+                if over is None:
+                    over = progs, list(bs[0].run_args)
+            if not short:                          # (the next level: on a register shortage)
                 break
-            progs = [b.finish() for b in bs]
-            if max(map(len, progs)) <= imem:
-                return progs, list(bs[0].run_args)
-            if over is None:
-                over = progs, list(bs[0].run_args)
     if over is not None:
         return over
     raise err or skip

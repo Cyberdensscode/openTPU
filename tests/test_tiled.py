@@ -244,6 +244,107 @@ def test_tiled_prompt_runs_are_todays(tmp_path_factory, monkeypatch, case, mcols
                                                     _dram_but_scratch(b, P1 + P2)))
 
 
+@pytest.mark.parametrize("case, mcols, P1, P2, T, levels, peel", [
+    ("phi3", 4, 250, 20, 16, {2}, False),   # G = 3: a row a tile; a loop over its 2 KV heads,
+    ("qwen3", 4, 250, 20, 7, {2}, False),   # across the bucket's end; G = 2: 2 rows a tile, a
+    ("qwen3", 4, 250, 20, 8, {2}, True),    # partial 7th; the last tile peeled (tiled.PEEL)
+    ("smollm3", 4, 37, 30, 16, {2}, False),     # layers without RoPE (G = 4)
+    ("phi3", 8, 250, 20, 5, {2}, False),    # 2 rows of 3 heads a tile, a partial last one
+    ("lfm2", 4, 250, 20, 16, {2}, False),   # 64-wide heads (padded to D), the stack's loops
+    ("kh8", 4, 250, 20, 16, set(), False),  # Qwen3.5's gated attention: unrolled (its gates)
+])
+def test_looped_attention_is_the_unrolled_one(tmp_path_factory, monkeypatch, case, mcols, P1,
+                                              P2, T, levels, peel):
+    """A tiled prompt run's attention in hardware loops over the KV heads and each part's packed
+    tiles (tiled._heads_loop: the loop levels a form's trace takes, `levels`; with `peel` the
+    last tile after the loop) against the same runs unrolled (tiled.LOOP off): two prompts at T
+    rows a run, the last logits and every slice's DRAM bit for bit, shorter programs, the wait
+    counts checked against every run (OTPU_WAITS_CHECK) and every MM's drain keeping up with its
+    array."""
+    from conftest import assert_drains_keep_up, waits_programs
+    monkeypatch.setenv("OTPU_WAITS_CHECK", "1")
+    monkeypatch.setattr(tiled, "PEEL", peel)
+    W, spec, cfg, kw = _family(case, tmp_path_factory)
+    cfg = dataclasses.replace(cfg, MCOLS=mcols, ACT_ROWS=16)
+    r = np.random.default_rng(P1)
+    p1, p2 = ([int(t) for t in r.integers(0, 1000, n)] for n in (P1, P2))
+    seen = set()
+    loop = tiled._heads_loop
+
+    def spy(*a, **k):
+        seen.add(2 if a[12] and len(a[1]) > 1 else 1)
+        return loop(*a, **k)
+
+    def run(on):
+        monkeypatch.setattr(tiled, "LOOP", on)
+        e = Engine(spec, W, cap=512, cfg=cfg, rows=16, resident=True, prompt_runs=True, **kw)
+        e.tile_runs = True
+        e._prompt_tile = {b: T for b in (1, 2)}         # (the tile's rows, today's fewer)
+        e._prompt_rmax = {b: (1, True) for b in (0, 1, 2)}
+        progs = waits_programs(e)
+        return e, [e.prefill(p1), e.prefill(p2)], progs
+
+    monkeypatch.setattr(tiled, "_heads_loop", spy)
+    a, got, progs = run(True)
+    assert seen == levels
+    b, want, _ = run(False)
+    assert {s["rows"] for s in a.stats} == {s["rows"] for s in b.stats} >= {T}
+    for x, y in zip(got, want):
+        assert np.array_equal(x.view(np.uint32), y.view(np.uint32))
+    assert all(np.array_equal(x, y) for x, y in zip(_dram_but_scratch(a, P1 + P2),
+                                                    _dram_but_scratch(b, P1 + P2)))
+    n = {e: {k: max(map(len, v[0])) for k, v in e._prompt_progs.items() if k[0] == "prompt tile"}
+         for e in (a, b)}
+    assert n[a] and n[a].keys() == n[b].keys()
+    assert all(n[a][k] < n[b][k] for k in n[a]) if levels else n[a] == n[b]
+    assert_drains_keep_up(progs, cfg)
+
+
+@pytest.mark.parametrize("model, Ts", [("phi4mini", (12,) * 8), ("e4b", (4,) * 7 + (3,))])
+def test_looped_tiles_fit_the_cards_imem(model, Ts):
+    """At the real dims (layout only, no weights) on the card's configuration (m4: MCOLS 4,
+    ACT_ROWS 16, 4K-instruction IMEM; otpu-chat's formats; the image's rows grown to 16) the
+    looped attention (tiled._heads_loop) fits a tile of Ts[b - 1] rows in IMEM in bucket b of a
+    2K context, P and L, its heads and tiles in loops: Phi-4-mini 12 rows everywhere (16: TMEM;
+    unrolled, its whole-model program was 3,666 instructions at 4 rows in bucket 1 and 11,552 in
+    bucket 8: 1 to 3 rows on the card), Gemma 4 E4B 4, 3 in bucket 8 (at 4 rows its L program
+    is 4,114 instructions there, P 4,044; unrolled it took 1 to 3 rows; at 8 its layers' other
+    work is over 4K)."""
+    from opentpu.llm import generate as G
+    seen = set()
+    loop = tiled._heads_loop
+
+    def spy(*a, **k):
+        seen.add(a[12] and len(a[1]) > 1)
+        return loop(*a, **k)
+
+    if model == "phi4mini":
+        spec = Spec(3072, 32, 24, 8, 128, 8192, 200064, eps=1e-5, theta=1e4, bos=199999,
+                    eos=(200020, 199999), qk_norm=False, rotary=96, rope_div=(1.0,) * 48,
+                    rope_scale=1.1902380714238083, ctx=4096, embed="int8",
+                    mix="gateup@4-29=nvfp4,down@4-29=fp4")
+        wf = "mix"
+    else:
+        from opentpu.llm.gemma4 import Spec as SG
+        kinds = (("sliding",) * 5 + ("full",)) * 7
+        src = tuple(range(24)) + tuple(23 if k == "full" else 22 for k in kinds[24:])
+        spec = SG(2560, kinds, src, (10240,) * 42, 8, 2, 256, 512, 262144, 256,
+                  fit_formats="head=fp4,gateup@0-11=fp4")
+        wf = "int8"
+    cfg = board_config(PAIR=True, DSTEP=True, STREAM=True, SEQ_WC=True, DRAM_BYTES=1 << 33)
+    assert cfg.MCOLS == 4 and cfg.act_rows == 16 and cfg.IMEM_WORDS // 8 == 4096
+    img = spec.image(cfg, 2048, 1, 16, wformat=wf, lookup=True)
+    tiled._heads_loop = spy
+    try:
+        for blocks, T in enumerate(Ts, 1):
+            for kind in ("P", "L"):
+                progs, _ = tiled.compile_tile_run(img, blocks, T, kind)
+                assert G.fits(img, progs), (blocks, kind, max(map(len, progs)))
+    finally:
+        tiled._heads_loop = loop
+    assert seen == {True}
+
+
 @pytest.mark.parametrize("tile", [True, False], ids=["tile", "prompt"])
 def test_qwen35_nested_layers_are_the_unrolled_ones(tmp_path_factory, monkeypatch, tile):
     """Qwen3.5's prefill programs loop a unit's DeltaNet layers inside the unit's loop
@@ -503,8 +604,9 @@ def test_tiled_forms_placed_next_fit_first():
     ("qwen3", 4, 4, 300, 4, None),      # the card's ACT RAM (4 rows): a whole block, then the
     ("lfm2", 4, 16, 200, 16, None),     # masked one; 16 rows: replayed MMs, the convolution's
     ("kh8", 4, 16, 300, 16, None),      # channel parts; Qwen3.5: DeltaNet rows (DSTEP), gated
-    ("gemma4-1", 4, 16, 600, 4, None),  # Gemma 4: the sliding window's start-masked block (IMEM:
-    ("gemma4-2", 8, 16, 300, 8, None),  # 4 rows in bucket 3); E4B's groups of 4, two rows a tile
+    ("gemma4-1", 4, 16, 600, 16, None),     # Gemma 4: the sliding window's start-masked block;
+    ("gemma4-2", 8, 16, 300, 16, None),     # E4B's groups of 4, two rows a tile (the attention
+    #                                         looped: tiled._heads_loop, but Qwen3.5's gated one)
     ("kh8", 4, 16, 300, 16, {"spill": True, "drows": 5}),  # x stored and loaded back in place,
     #                                                         DeltaNet in runs of 4 x 4
     ("kh8", 4, 16, 300, 16, "ranges"),  # W_o's operand in QACT ranges: an MM a range (ACC)
@@ -563,19 +665,20 @@ def _gemma(tmp_path_factory, nkv: int):
 
 
 @pytest.mark.parametrize("mcols, nkv, wf, host, P1, P2, R, T, form", [
-    (4, 1, "int8", "0", 250, 20, 4, 8, None),   # two parts of 4 heads a row, across the
-    (8, 2, "int8", "0", 250, 20, 4, 8, None),   # bucket's end; groups of 4: two rows a tile
-    #                                             (bucket 1: 16 rows, bucket 2 8: IMEM)
-    (4, 1, "fp4", "1", 37, 30, 8, 12, None),    # 4-bit layers, the PLE table on the host
-    (8, 2, "int8", "0", 760, 20, 4, 8, None),   # the sliding ring's wrap (768 slots), packed
+    (4, 1, "int8", "0", 250, 20, 4, 16, None),  # two parts of 4 heads a row, across the
+    (8, 2, "int8", "0", 250, 20, 4, 16, None),  # bucket's end; groups of 4: two rows a tile
+    #                                             (the attention looped: 16 rows a bucket)
+    (4, 1, "fp4", "1", 37, 30, 8, 16, None),    # 4-bit layers, the PLE table on the host
+    (8, 2, "int8", "0", 760, 20, 4, 16, None),  # the sliding ring's wrap (768 slots), packed
     (8, 1, "int8", "0", 250, 20, 4, 8, "small"),    # x spilled; query parts of 2 heads (the
 ])                                                  # global layers' 1), 4 (8) rows a tile
 def test_tiled_gemma4_prompt_runs_are_todays(tmp_path_factory, monkeypatch, mcols, nkv, wf,
                                              host, P1, P2, R, T, form):
-    """Gemma 4's tiled prompt runs (T rows: 16 overflow IMEM or TMEM) against today's prompt
-    runs of R rows: the last logits, the layers' DRAM (weights, KV caches, the sliding rings)
-    and the next step's logits bit for bit. form "small": x spilled while the heads attend and
-    the query parts held to TMEM / 64 words (tiled.QPART)."""
+    """Gemma 4's tiled prompt runs (T rows, the fewest a bucket takes; the attention in hardware
+    loops, tiled._heads_loop) against today's prompt runs of R rows: the last logits, the
+    layers' DRAM (weights, KV caches, the sliding rings) and the next step's logits bit for bit.
+    form "small": x spilled while the heads attend and the query parts held to TMEM / 64 words
+    (tiled.QPART)."""
     monkeypatch.setenv("OTPU_PLE_HOST", host)
     if form == "small":
         monkeypatch.setattr(tiled, "variants", lambda fam, T, mc: [{"spill": True}])
