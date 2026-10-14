@@ -803,6 +803,85 @@ token's whole head row loads before its first step, so L2's statistic is ready: 
 operations in today's order), and the composite stages the tail lends the VPU today go with
 the fold: the engine can be pure stream.
 
+#### 4.9.1 The chunked delta rule on the MXU (2026-10-14: accuracy and cost, no kernel)
+
+The chunked form (Hugging Face's `torch_chunk_gated_delta_rule`, the WY representation) takes a
+chunk of C rows of a head in eight matmuls and a triangular solve, and reads and writes the
+state once a chunk instead of once a row. With gc the decays' cumulative sums in the chunk and
+Gamma[r, s] = exp(gc_r - gc_s):
+- M1 L = (beta k . k^T) * Gamma, strictly lower; T = (I + L)^-1 by forward substitution (VPU,
+  fp32, C^3 / 6 MACs);
+- M2 T . (beta v), M3 T . (beta k * exp(gc)); M5 U = M2 - M3 . S (S the state at the chunk's
+  start);
+- M4 A = (q . k^T) * Gamma, lower with the diagonal; M6 O = (q * exp(gc)) . S, M7 + A . U;
+- M8 S' = exp(gc_C) S + (k * exp(gc_C - gc))^T . U.
+
+**Accuracy.** `tools/dn_chunk.py` (tools/formats_scan.py's Qwen3.5 emulation with its
+recurrence replaced; `check`: the chunked form against the sequential one on random gates) on
+MiniCPM-V's card mix (delta@0-19=int8, attention and DeltaNet nvfp4,
+shared expert int8, fp4 experts, int8 head), 2000 tokens of docs/isa.md, every DeltaNet layer
+chunked over the whole text (an upper bound: decode stays DSTEP). int8: today's MXU operands
+(QACT rows against int8 ROW rows over d; over the chunk's tokens, one int8 scale a token folded
+into the other side, as P.V), with MM's window drops; "split": each operand its int8 part plus
+the int8 of its remainder, three MXU passes (hi.hi + hi.lo + lo.hi: ~16-bit operands on today's
+MXU). Values under fp32's normal range are flushed to zero before a quantization, and the decay
+matrix's upper triangle is zeroed before its exp, as Hugging Face's (it would overflow). KL
+against the float model:
+
+| recurrence | KL to float | dKL against int8 (SE) | against today's, paired (SE) |
+|---|---:|---:|---:|
+| today's: sequential, fp32 state (DSTEP) | 4.667% | +3.680 (0.141) | 0 |
+| chunked, C = 64, exact | 4.667% | +3.680 | +0.0000 |
+| C = 16 / 32 / 64, all eight int8 | 49.8 / 50.3 / 51.1% | +48.8 / +49.3 / +50.1 | +45.1 / +45.6 / +46.4 (2.0) |
+| C = 64, M1-M4 and M7 int8 (in the chunk) | 49.4% | +48.5 (2.0) | +44.8 (1.9) |
+| C = 64, M5, M6, M8 int8 (the state's) | 5.178% | +4.192 (0.147) | +0.512 (0.093) |
+| C = 16, the state's int8 | 5.375% | +4.388 (0.148) | +0.708 (0.117) |
+| C = 64, M1 int8 (L's k . k^T) | 4.731% | +3.745 (0.141) | +0.065 (0.068) |
+| C = 64, M2 and M3 int8 (T's products) | 48.3% | +47.3 (2.0) | +43.6 (2.0) |
+| C = 64, M4 and M7 int8 (the outputs') | 15.9% | +14.9 (0.79) | +11.2 (0.77) |
+| C = 64, the state's split | 4.634% | +3.648 (0.140) | -0.032 (0.060) |
+| C = 64, the chunk's split, the state's int8 | 5.300% | +4.313 (0.154) | +0.633 (0.102) |
+| C = 64, all eight split | 4.798% | +3.811 (0.147) | +0.131 (0.071) |
+| C = 16, all eight split | 4.785% | +3.798 (0.137) | +0.118 (0.066) |
+
+- The chunked form itself is exact (to float64's rounding).
+- What breaks in int8 is not the solve's input: L's k . k^T (M1) takes one int8 pass within its
+  SE. It is the products with the solve's output T = (I + L)^-1 (M2, M3: T . beta v and
+  T . beta k exp(gc)), which go on into U and the state, so their error adds up chunk after
+  chunk: +43.6 points. The output path (M4, M7: A = q . k^T * Gamma, signed and unnormalized,
+  against U) costs +11.2, without reaching the state. The state's matmuls take int8 for +0.5
+  (C = 64) to +0.7 (C = 16).
+- All eight split costs +0.13 at C = 64 (+0.12 at 16): the candidate, against a bar of about
+  +0.5. The chunk's split with the state's int8 misses it (+0.63).
+
+**Cost.** Issue cycles a row and head from the op sizes (d = 128; the card's MXU, MCOLS 4: a
+D-block a column a cycle; VPU 8 lanes, exp2 2), against DSTEP's 2,048 (its datapath: the state's
+16K words once through, 8 a cycle). "split": an operand as its int8 part plus the int8 of the
+remainder, three MXU passes (~16-bit operands on today's MXU). MiniCPM-V's 488-row image prompt
+(30 DeltaNet layers x 32 heads) takes 7.2 s of DSTEP (about 55% of it exposed).
+
+| C | matmuls | MXU | VPU | DRAM | x DSTEP (units overlapped) | the prompt's recurrence |
+|---:|---|---:|---:|---:|---:|---:|
+| 16 | all int8 | 424 | 382 | 64 | 4.8 | 1.5 s |
+| 64 | all int8 | 256 | 294 | 16 | 7.0 | 1.0 s |
+| 16 | the chunk's split, the state's int8 | 632 | 542 | 64 | 3.2 | 2.2 s |
+| 16 | all split | 1,272 | 974 | 64 | 1.6 | 4.5 s |
+| 64 | the chunk's split, the state's int8 | 512 | 454 | 16 | 4.0 | 1.8 s |
+| 64 | all split (the candidate: +0.13) | 768 | 598 | 16 | 2.7 | 2.7 s |
+| 16 | the chunk's on the VPU in fp32, the state's int8 | 320 | 1,022 | 64 | 2.0 | 3.6 s |
+| 64 | the chunk's on the VPU in fp32, the state's int8 | 128 | 2,854 | 16 | 0.7 | 10.0 s |
+
+**ASIC architecture item: a short-K MM, and the state's traffic.** MM contracts whole D-blocks,
+so a contraction over the chunk's C < D rows pads to D: M8 (Kd^T . U, d x d over C rows) takes
+4,096 cycles a chunk at MCOLS 4 whatever C is, and M2, M3 and M7 pad the same way. An MM mode
+that takes a short K at C / D of a block's cycles cuts the small chunks' MXU cost about 3x (C = 16,
+all int8: 424 -> 116 cycles a row and head; C = 32: 304 -> 136). The data movement is the case
+for the chunked form: MiniCPM-V's image prompt moves 61 GB of DeltaNet state with DSTEP (128 KB
+a row and head, read and written), ~1 GB at C = 64 (0.96 GB; 3.8 GB at C = 16), about 10% of the
+request's ~590 GB, where the card gains only ~1-1.5 s of its 90 s with the candidate (all split at
+C = 64: 2.7 s of the units' issue against DSTEP's 7.2 s, ~4 s of it exposed). Not built: no
+kernel until the arch decision.
+
 ### 4.10 ACT RAM reads gated to the MM's columns (done)
 
 `otpu_mxu`'s act_ren was 1: every column's ACT block RAMs (the D-byte pieces and the 8-byte scale
@@ -1254,6 +1333,11 @@ the fold and every proposal below are next-release items.
    over PUT / PUTADD; attention by KV head (by tokens where n_kv < S), MoE experts by F. Adopted
    (the lead, 2026-10-12).
 7. **k-major weight tiles** (4.11): recorded as a next-generation energy item.
+8. **The chunked delta rule and a short-K MM** (4.9.1, 2026-10-14): recorded as an ASIC
+   architecture item. The DeltaNet state once a chunk instead of once a row: MiniCPM-V's image
+   prompt's 61 GB of state traffic to ~1 GB at C = 64, for +0.13 points of dKL with every
+   matmul's operands split (three int8 passes); an MM mode for a contraction shorter than D cuts
+   the small chunks' MXU cost about 3x. The card gains ~1-1.5 s of a 90 s request; no kernel.
 
 ### 7.3 Staging
 
