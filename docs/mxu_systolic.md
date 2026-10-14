@@ -223,13 +223,31 @@ late, on the implemented netlist) LOCs the array as a grid at MCOLS 8 and up; be
 leaves the array to the placer (MCOLS 4 is better without it, below). It reads MCOLS and D from
 the netlist's PE names and takes the part's column table:
 - Array column j goes on one DSP column, positions 0..D-1 in order up it (the chains stay whole,
-  position i is level in every column), with its column end (`otpu_mxce`, a 9-DSP cascade) above.
-  At MCOLS 8 that is DSP48_X1..X8 (tile X 14 29 34 49 54 69 74 89), rows 10..146 of 160.
+  position i is level in every column), with its column end (`otpu_mxce`, a 9-DSP cascade) above
+  them and the column's scale RAM level with it. At MCOLS 8 that is DSP48_X1..X8 (tile X 14 29 34
+  49 54 69 74 89), rows 10..146 of 160. Each chain's last DSP feeds its own DSP of the column end
+  through fabric from its P register, so chain 0's end crosses 113 DSP rows (r2.1's m8 163ab46d:
+  0 levels, 5.3-5.8 ns of route, -0.005 ns before userclk1's reroute; 76 such endpoints under
+  +0.2 ns). `OTPU_MXU_CE=mid` puts the column end in the middle instead: chains 0..3 (positions
+  0..63), the column end on rows 74..82, chains 4..7, the longest chain-end hop 65 rows. It does
+  not pay: r2.1's m8 4f8be3d2 (mid) put the congestion on the column ends, three placer windows
+  at level 5 (101-103%, tile X 27-58, Y 200-238: u_mxu, u_mem, u_seq, u_ch1) against 163ab46d's
+  one, the weight feed's endpoints under +0.2 ns went from 88 to 455, and core_clk from -0.003 to
+  -0.156 ns, so the default stays above the array (`top`, the same LOCs as before `mid` existed).
 - The ACT RAM's memory of column j (`otpu_actram g_row[j]`: 4 pieces of 4 RAMB36, piece p = bytes
   32p..32p+31, and its scale RAM) goes in the block RAM column beside it, RAMB36_X1..X8 (tile X 17
   26 37 46 57 66 77 86). Each block RAM sits level with the 8 positions its bytes feed.
-- The weight RAMs (`g_fd`, `u_fs0`, `u_fs1`) go in RAMB36_X0 (tile X 6), beside column 0, spread
-  over the array's height.
+- The weight RAMs (`g_fd`, `u_fs0`, `u_fs1`) go in RAMB36_X0 (tile X 6), beside column 0. Through
+  `wsel` a `g_fd` RAM's bits reach two position ranges, an 8-bit format's and a 4-bit one's (the
+  high half's D/2 lower): `g_fd[1]`'s `mem_reg_5` reaches positions 58-62 and 117-125. Each goes
+  level with the middle of the rows of the positions its outputs reach (`OTPU_MXU_WRAM=loads`,
+  the default since r2.1: `all_fanout` from its outputs to the `g_wsk` skews), `u_fs0` / `u_fs1`
+  (the scale entries, no position) at their places of the linear spread. On 163ab46d's opt
+  checkpoint that leaves the farthest position 35 DSP rows from its RAM (65 for `g_fd[1]`'s
+  `mem_reg_6`, which reaches positions 0-6, 63-67 and 126-127) where the linear spread in name order
+  (`OTPU_MXU_WRAM=linear`, release r2 and r2.1's 163ab46d) left 75: in 163ab46d the weight feed's
+  endpoints (2-3 levels, 5.0-5.7 ns of route) were 88 under +0.2 ns (worst +0.009), in 4f8be3d2
+  (column ends in the middle) 455 (-0.156 ns, its worst).
 - DSP X0 and X9..X11 (640 sites) stay free for the VPU, QUANT and the epilogue lanes.
 
 It stops (an error, and `build.tcl` fails the build if its summary line is missing from the run's

@@ -4,3 +4,4 @@
 # e.g. STEPS.SYNTH_DESIGN.ARGS.RETIMING true, STEPS.PLACE_DESIGN.ARGS.DIRECTIVE ExtraTimingOpt,
 # STEPS.PHYS_OPT_DESIGN.ARGS.DIRECTIVE AggressiveExplore. Nothing else: no Tcl, no hooks, no
 # timing exceptions (tools/tourney/gates.py checks it). Empty: Vivado's defaults.
+set_property STRATEGY Performance_ExtraTimingOpt [get_runs impl_1]
