@@ -105,17 +105,30 @@ class DevVar(RunVar):
         self.reg, self.align = reg, align       # align: the value is a multiple of it
 
 
+class Counter(DevVar):
+    """A value the program steps itself (Builder.counter), in register `reg`: 0 where it is
+    taken (before the loops it counts in), and Builder.step adds to it where the program says,
+    e.g. in a loop of 0 or 1 iterations (tiled._lfm2_stack: an LFM2 stack's layers in one loop,
+    the counter the bytes of the blocks before the layer's, each its kind's size). An address
+    adds 1 * counter (its register as the base, as a DevVar's), and with it at most one run-time
+    value of the host's (a register of their sum, stepped with it: Builder._derived)."""
+
+
 ARG0 = 8                        # the run's arguments ARG0..7 are R8..R15 at the start
 
 
 class Program(list):
     """A program's instructions (Builder.finish), with the run-time arguments it reads
     (Builder.run_args: [(RunVar, c)], argument k in R15 - k): opentpu.waits bounds them by
-    their variables' bounds (an otpu_seq WAITC build's wait counts)."""
+    their variables' bounds (an otpu_seq WAITC build's wait counts); and run_seen, every
+    (RunVar, c) its addresses add (Builder.run_seen): with run words (a prompt run's state
+    words, qwen3.RunWords) also those read only into a register that a loop steps, which are
+    no argument, so the host writes every word the program reads (prefill._prepared)."""
 
-    def __init__(self, instrs=(), run_args=()):
+    def __init__(self, instrs=(), run_args=(), run_seen=()):
         super().__init__(instrs)
         self.run_args = list(run_args)
+        self.run_seen = list(run_seen)
 
 
 class Words(np.ndarray):
@@ -820,10 +833,21 @@ class Builder:
         for l in a.terms:
             if not isinstance(l, RunVar) and not any(lb.loop is l for lb in self.loops):
                 raise CompileError(f"address uses {l} outside its loop")
-        if len(run) > 1:
+        dev = None              # a Counter and a run-time value: the register of their sum
+        if len(run) == 2 and any(isinstance(v, Counter) for v, _ in run):
+            (k, kc), (v, c) = sorted(run, key=lambda t: not isinstance(t[0], Counter))
+            if kc != 1 or isinstance(v, DevVar):
+                raise CompileError(f"address {a}: a counter adds 1 * itself and one run-time "
+                                   f"value of the host's")
+            if (v, c) not in self.run_seen:
+                self.run_seen.append((v, c))
+            dev = arg = self._derived(k, v, c)
+            if len(a.terms) == 2:
+                return arg, a.const
+        elif len(run) > 1:
             raise CompileError(f"address {a} adds more than one run-time value")
         words = self.run_words
-        if run:
+        if run and dev is None:
             v, c = run[0]
             if isinstance(v, DevVar):               # the program's own register
                 if c != 1:
@@ -847,8 +871,8 @@ class Builder:
             if r is None:
                 r = self._free_for(key)
                 if r is not None and run:          # it starts at the run-time value
-                    (v, c), what = run[0], f"{run[0][1]}*{run[0][0]}"
-                    if words is None or isinstance(v, DevVar):
+                    (v, c), what = run[0], " + ".join(f"{c_}*{v_}" for v_, c_ in run)
+                    if dev is not None or words is None or isinstance(v, DevVar):
                         init = I.addi(r, arg, 0, comment=f"{what} (argument)")
                     elif v.name not in words:
                         raise CompileError(f"run-time value {v}: no TMEM word (run_words)")
@@ -1095,6 +1119,77 @@ class Builder:
             self.set_in[r] = g
         self.free_regs.append((r, frozenset(id(lb.loop) for lb in self.loops)))
 
+    # ---- counters (Counter: a count the program steps where it says)
+    def counter(self, name: str) -> Counter:
+        """A Counter at 0 in a scratch register, taken here (before the loops it counts in):
+        step() adds to it, end_counter() gives the register back (zeroed)."""
+        c = Counter(name, self.scratch())
+        c.depth, c.derived, c.steps = len(self.loops), {}, 0
+        return c
+
+    def _derived(self, k: Counter, v: RunVar, c: int) -> int:
+        """The register of k + c * v (an address adds both: an LFM2 attention layer's KV rows at
+        the token's position, a conv layer's ring row), stepped with k: it starts at c * v (an
+        RLD MUL of v's word under run_words, bounded by v's bound; else a copy of v's argument
+        register) before the outermost loop begun since k was taken. Taken on its first use,
+        before k's first step, from the registers free since k was taken (one used and freed
+        inside those loops would be clobbered)."""
+        r = k.derived.get((v, c))
+        if r is not None:
+            return r
+        if k.steps:
+            raise CompileError(f"{k.name} + {c}*{v}: first used after {k.name}'s step")
+        inner = {id(lb.loop) for lb in self.loops[k.depth:]}
+        i = next((i for i in builtins.range(len(self.free_regs) - 1, -1, -1)
+                  if not self.free_regs[i][1] & inner and self.free_regs[i][0] not in self.dirty),
+                 None)
+        if i is None:
+            raise CompileError(f"out of registers for {k.name} + {c}*{v}")
+        r, _ = self.free_regs.pop(i)
+        self.unset.discard(r)
+        self.used_regs.add(r)
+        what = f"{k.name} + {c}*{v}"
+        if self.run_words is None:
+            init = I.addi(r, self.arg_reg(v, c), 0, comment=f"{what} (argument)")
+        elif v.name not in self.run_words:
+            raise CompileError(f"run-time value {v}: no TMEM word (run_words)")
+        else:
+            bound = (0, int(c) * (int(v.bound) - 1)) if v.bound and c >= 0 else None
+            init = I.rld(r, self.run_words[v.name], mul=int(c), bound=bound, comment=what)
+        if len(self.loops) > k.depth:
+            lb, items = self.loops[k.depth], self.stack[k.depth]
+            items.insert(next(j for j, x in enumerate(items) if x is lb), init)
+        else:
+            self.emit(init)
+        k.derived[(v, c)] = r
+        return r
+
+    def step(self, c: Counter, by: int) -> None:
+        """c += by: ADDI (to c's register and each of c and a run-time value's). The address
+        registers that hold an address of its earlier value (spare ones: their loops have
+        ended) are free again, zeroed when taken; one of a live loop's could not follow the
+        step (the loop resets it to its init)."""
+        self._drop(c)
+        for r in (c.reg, *c.derived.values()):
+            self.emit(I.addi(r, r, int(by), comment=f"{c.name} + {by}"))
+        c.steps += 1
+
+    def end_counter(self, c: Counter) -> None:
+        """c's last use has been emitted: its registers (and those of addresses of it) free."""
+        self._drop(c)
+        for r in (c.reg, *c.derived.values()):
+            self.unscratch(r)
+
+    def _drop(self, c: Counter) -> None:
+        """Before c changes: the spare registers holding an address of it are free (unset)."""
+        if any(any(v is c for v, _ in key) for key in self.regs):
+            raise CompileError(f"{c.name} stepped while a loop's address adds it")
+        live = frozenset(id(lb.loop) for lb in self.loops)
+        for s in [s for s in self.spare_regs if any(v is c for v, _ in s[0])]:
+            self.spare_regs.remove(s)
+            self.free_regs.insert(0, (s[2], s[1] | live))
+            self.unset.add(s[2])
+
     def rld(self, r: int, t: "Tile", raw: bool = False, comment: str = "",
             bound: tuple | None = None) -> None:
         """R[r] = the one-word tile t as an int (RLD: f2i, or its bits with raw); bound: the
@@ -1231,8 +1326,10 @@ class Builder:
             return out
         raise CompileError(f"cannot use {x!r} as a tile")
 
-    def vop(self, func: int, dst: Tile, a: Tile | None, b) -> None:
-        """Emit dst = func(a, b) over dst's shape; b may be a Tile, Bcast or float."""
+    def vop(self, func: int, dst: Tile, a: Tile | None, b, at=None) -> None:
+        """Emit dst = func(a, b) over dst's shape; b may be a Tile, Bcast or float. at: a TMEM
+        word offset with loop terms added to dst's address (VOP's dst = R[ra] + w1: rows of a
+        buffer the loop walks, the looped attention's outputs, tiled._attention_loop)."""
         self.check_live(dst, a, b, b.t if isinstance(b, Bcast) else None)
         rows, cols = dst.rows, dst.cols
         a_base, ars = (a.base, a.rs if len(a.shape) == 2 else 0) if a is not None else (dst.base, 0)
@@ -1260,8 +1357,9 @@ class Builder:
         elif b is not None:
             raise CompileError(f"bad operand {b!r}")
         drs = dst.rs if len(dst.shape) == 2 else 0
-        self.emit(I.vop(func, dst.base, a_base, b_base, rows, cols, drs, ars, brs, bmode, imm,
-                        comment=I.VFUNCS[func]))
+        ra, d_base = (0, dst.base) if at is None else self.addr(Affine(dst.base) + Affine.of(at))
+        self.emit(I.vop(func, d_base, a_base, b_base, rows, cols, drs, ars, brs, bmode, imm,
+                        ra=ra, comment=I.VFUNCS[func]))
 
     def binop(self, func: int, x, y):
         swap = {I.V_ADD: I.V_ADD, I.V_MUL: I.V_MUL, I.V_MAX: I.V_MAX, I.V_MIN: I.V_MIN,
@@ -1506,23 +1604,32 @@ class Builder:
         st.loop = self.loops[-1].loop if self.loops else None
         return st
 
-    def quantize_into(self, st: Stationary, x: Tile, col: int) -> None:
+    def quantize_into(self, st: Stationary, x: Tile, col: int, cscale: Tile | None = None,
+                      at=None) -> None:
         """Quantize the rows of x into the blocks of `st` (from stationary()) from column
-        `col` on (QACT at the part's first block)."""
+        `col` on (QACT at the part's first block). cscale [cols]: x * cscale[None, :] (QACT
+        CSCALE, as quantize's). at: a TMEM word offset with loop terms added to x's address
+        (QACT's src = R[ra] + w1: x's rows in a buffer the loop walks, the looped attention's
+        query tiles, tiled._attend_loop); x is then those rows at offset 0."""
         x = self.materialize(x)
-        self.check_live(x)
+        self.check_live(x, cscale)
         D = self.cfg.D
         if not isinstance(st.src, _Parts):
             raise CompileError("quantize_into: a stationary from stationary()")
         if x.rows != st.src.rows or x.cols % D or col % D or col + x.cols > st.KB * D:
             raise CompileError(f"quantize_into: a {x.shape} tile at column {col} of a "
                                f"{st.src.shape} stationary")
+        if cscale is not None and cscale.shape != (x.cols,):
+            raise CompileError(f"quantize_into: a column scale of {cscale.shape} for {x.shape}")
         if not self.stationary_valid(st):
             raise CompileError("stationary operand was overwritten in ACT RAM")
         (ab, mc), = st.chunks
         rs = x.rs if len(x.shape) == 2 else x.cols
-        self.emit(I.qact(x.base, mc, ab + col // D, x.cols // D, rs, dup=st.pair,
-                         comment="quantize -> ACT (part)" + (" dup" if st.pair else "")))
+        ra, src = (0, x.base) if at is None else self.addr(Affine(x.base) + Affine.of(at))
+        self.emit(I.qact(src, mc, ab + col // D, x.cols // D, rs, dup=st.pair, ra=ra,
+                         cscale=None if cscale is None else cscale.base,
+                         comment="quantize -> ACT (part)" + (" dup" if st.pair else "")
+                         + (" x col scale" if cscale is not None else "")))
         st.add_qrange(col // D, (col + x.cols) // D)
 
     def fuse_cscale(self, x: Tile):
@@ -1871,7 +1978,7 @@ class Builder:
                 for r in sorted(self.used_regs - self.late_zero)]
         prog += self._flatten(self.root)
         prog.append(I.halt())
-        return Program(prog, self.run_args)
+        return Program(prog, self.run_args, self.run_seen)
 
     def _flatten(self, items: list) -> list[I.Instr]:
         out = []

@@ -5,7 +5,7 @@ words and tokens from DRAM) of R rows over the first L layers of a model.
     python3 tools/perf_prompt.py --model qwen3.5-0.8b [--layers 4] [--blocks 2]
         [--kernel prompt|tile] [--rows 4,8,16] [--mcols 4] [--act-rows 16] [--tmem 65536]
         [--wformat fp4] [--head-format int8] [--mem ldc|port] [--depth 2] [--ranges]
-        [--phases] [--compile-only]
+        [--imem 131072] [--phases] [--compile-only]
 
 --kernel prompt: today's prompt run (the image's compile_prompt_run, R rows); tile: the tiled
 prompt run (tiled.compile_tile_run, T rows). The run sits at the start of bucket --blocks
@@ -13,7 +13,8 @@ prompt run (tiled.compile_tile_run, T rows). The run sits at the start of bucket
 masked one). ACT_ROWS: --act-rows, at least MCOLS (0: MCOLS, the card's). --depth: the tile's
 attention pipeline depth (0: compile_tile_run's choice, at the virtual IMEM ATTN_DEPTH);
 --ranges: the tile's range forms (tiled.ranges: W_o's operand a QACT range a part). IMEM
-is virtual (1 << 17 words) so a run that would not fit still measures; "imem_fits" says
+is virtual (--imem words, default 1 << 17: 16K instructions; 1 << 19 holds every tile TMEM
+does) so a run that would not fit still measures; "imem_fits" says
 whether it fits the card's (4096 instructions). --layers: the model's first L layers (Gemma 4:
 Spec.truncated).
 
@@ -72,7 +73,7 @@ def compile_run(img, kernel, blocks, R, block=256, depth=0, ranges=False):
 
 def one(a, spec, R):
     act = max(a.act_rows or a.mcols, a.mcols)
-    kw = dict(MCOLS=a.mcols, ACT_ROWS=act, TMEM_WORDS=a.tmem, IMEM_WORDS=1 << 17, PAIR=True,
+    kw = dict(MCOLS=a.mcols, ACT_ROWS=act, TMEM_WORDS=a.tmem, IMEM_WORDS=a.imem, PAIR=True,
               DSTEP=True, STREAM=True)
     cap = 256 * (a.blocks + 1)
     rec = dict(model=a.model, layers=a.layers, blocks=a.blocks, R=R, mcols=a.mcols,
@@ -134,6 +135,7 @@ def main():
     ap.add_argument("--mem", choices=["ldc", "port"], default="ldc")
     ap.add_argument("--lat", type=int, default=40)
     ap.add_argument("--depth", type=int, default=0)
+    ap.add_argument("--imem", type=int, default=1 << 17, help="IMEM words (virtual)")
     ap.add_argument("--ranges", action="store_true")
     ap.add_argument("--phases", action="store_true")
     ap.add_argument("--compile-only", action="store_true")

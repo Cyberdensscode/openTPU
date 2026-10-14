@@ -157,13 +157,16 @@ def _prepared(eng, what, blocks: int, progs, ra):
     if not G.fits(img, progs):
         raise CompileError(f"prompt run {what}: {max(map(len, progs))} instructions, "
                            f"IMEM {img.cfg.IMEM_WORDS // 8}")
+    # the words the run reads: its arguments', and those its addresses add with a loop's
+    # step (Program.run_seen: a register loaded from the word before the loop, no argument)
+    names = {v.name for v, _ in ra or ()} | \
+        {v.name for p in progs for v, _ in getattr(p, "run_seen", ())}
     prep = getattr(eng.backend, "prepare", None)
     if getattr(eng.backend, "runs_words", False) and len(progs) == 1:   # (Words: run_args;
         from .qwen3 import worker_words                                 # WAITC: the entries)
         progs = worker_words(img, progs[0], ra or getattr(progs[0], "run_args", ()))
     elif prep is not None:
         prep(progs)
-    names = {v.name for v, _ in ra or ()}
     if blocks:                      # a run-time run: and the words its kernel reads itself
         names |= set(getattr(img, "prompt_words", ()))
     return progs, sorted(names)
@@ -183,11 +186,13 @@ def r_max(eng, blocks: int = 1) -> int:
 
 def tiled(eng, blocks: int) -> bool:
     """Bucket `blocks`'s P and L runs tiled: tiling on, a tile fits the bucket, and today's
-    prompt runs (which cover it) take no more rows there. Each run is a pass of the weights, so
-    the form with more rows a run streams them less often; tiled on a tie (release r2:
-    LFM2-2.6B's tile takes 1 row at MCOLS 4 and 2 at 8 where today's runs take 4, and its chat
-    prefill ran at half the speed of the untiled one). Where a tile takes as many rows as today's
-    runs could (Qwen3-0.6B's 16) nothing more is compiled to know it."""
+    prompt runs (which cover it) take fewer rows there. Each run is a pass of the weights, so
+    the form with more rows a run streams them less often (release r2: LFM2-2.6B's tile took 1
+    row at MCOLS 4 and 2 at 8 where today's runs take 4, and its chat prefill ran at half the
+    speed of the untiled one); on a tie today's runs, which were 0.4-1.2% faster at equal rows
+    and bytes on every production dense model (docs/tiled_prefill.md 12.4). Where a tile takes
+    as many rows as today's runs could (Qwen3-0.6B's 16) nothing more is compiled to know it:
+    no production model's today's runs reach those rows."""
     if not (blocks and tiling(eng)):
         return False
     T = _tile_fit(eng, blocks)
@@ -199,7 +204,7 @@ def tiled(eng, blocks: int) -> bool:
         R, covered = _fit(eng, blocks)
     except CompileError:                # (no prompt run of today's fits the bucket)
         return True
-    return not (covered and R > T)
+    return not (covered and R >= T)
 
 
 def _probe_top(eng, blocks: int) -> int:

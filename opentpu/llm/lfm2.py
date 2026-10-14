@@ -217,6 +217,15 @@ def plan(kinds) -> list:
         [(f + cov + a, unit, r) for a, unit, r in tail]
 
 
+def subs(runs, size) -> dict:
+    """Each run's unit planned again (plan over its keys): a repeated part of the unit (Qwen3.5's
+    three DeltaNet layers before each attention layer) loops again, inside the unit's loop, as
+    Gemma 4's do. {run's first layer: [(first element, part, repeats, the part's bytes)]};
+    size(key): a layer block's bytes (the part's blocks lie one after the other: _place)."""
+    return {first: [(e0, su, r, sum(size(k) for k in su)) for e0, su, r in plan(unit)]
+            for first, unit, _ in runs}
+
+
 # =============================================================================== reference
 def _norm(v, g, eps):
     return (v / np.sqrt(np.mean(v * v, axis=-1, keepdims=True) + eps)) * g
@@ -472,6 +481,13 @@ class Image(EmbedHost):
         self.plan = plan(self.keys)
         self.mlp_loop = sum(len(u) for _, u, _ in self.plan) > MLP_UNROLL_BODIES
         self.loc = _place(b, self.plan, lambda k: self.layouts[k[1]].size[_kind(k[0])])
+        # the stack in one loop (tiled._lfm2_stack): a dense model's layers of both kinds in
+        # one formats group, whose blocks lie one after the other in layer order (the runs'
+        # do, a block its kind's size) from base
+        self.stack = None
+        if mo is None and len(set(self.lf)) == 1 and set(spec.kinds) == {CONV, ATTN}:
+            g0 = self.layouts[self.lf[0]]
+            self.stack = SimpleNamespace(base=self._off(0).const, size=dict(g0.size))
         dk = self.dk
         n_attn = spec.kinds.count(ATTN)
         head = cap * dk + cap * k_scale_bytes(dk, D) + dk * cap + 4 * cap
@@ -734,16 +750,18 @@ class Image(EmbedHost):
         spec, cfg = self.spec, self.cfg
         D, d, H, K, n = cfg.D, spec.head_dim, spec.hidden, spec.conv_k, self.h_loc
 
-        def layer(li, it=None):
+        def layer(li, it=None, at=None):
             """Descriptors of layer `li` (static), or of element li of its run's unit at
             iteration `it` (a hardware-loop variable). Its kind (for a MoE model: kind, is a MoE
-            layer; Spec.lkinds) and formats group from self.keys."""
+            layer; Spec.lkinds) and formats group from self.keys. at (the stack in one loop,
+            self.stack): li's kind and group in the block at the stack's base + the Counter at
+            (compiler.Counter: the bytes of the blocks before it); `it` is not used."""
             kind, g = self.keys[li]
             moe = False
             if isinstance(kind, tuple):
                 kind, moe = kind
             g = self.layouts[g]
-            off = self._off(li, it)
+            off = self._off(li, it) if at is None else Affine(self.stack.base) + Affine.of(at)
             lofs, mf = g.lofs[kind], g.mf
             ns = SimpleNamespace(g_in=Tensor(off + lofs["g_in"], (H,), (1,)),
                                  g_post=Tensor(off + lofs["g_post"], (H,), (1,)), moe=moe,
@@ -793,7 +811,7 @@ class Image(EmbedHost):
                                   tag=L.tag, fmt=self.fmt, slots=L.slot_bounds,
                                   ids=L.layers * L.E)
         return SimpleNamespace(
-            spec=spec, layer=layer, plan=self.plan, moe_dev=dev,
+            spec=spec, layer=layer, plan=self.plan, moe_dev=dev, stack=self.stack,
             x=_tdesc(self.io["x"], (1, H)), cos=_tdesc(self.io["cos"], (d // 2,)),
             sin=_tdesc(self.io["sin"], (d // 2,)), g_final=_tdesc(self.io["gf"], (H,)),
             logits=_tdesc(self.io["logits"], (1, spec.vocab)),
@@ -971,15 +989,24 @@ def lfm2_prompt_run(m, pos, R: int, kind: str, block: int = ATTN_BLOCK):
                      None if run else OutTokens(0))
 
 
-def run_layers(runs, layer) -> None:
+def run_layers(runs, layer, nest: dict | None = None) -> None:
     """Emit the layers of a plan (runs of `plan`) as layer(index, it): a run with repeats is
     one hardware loop over its unit (the index is the element's layer in the first iteration,
-    `it` the loop variable), the others are unrolled (`it` None)."""
+    `it` the loop variable), the others are unrolled (`it` None). nest (subs' of the runs): a
+    unit's repeated part is a hardware loop inside it, its layers layer(index, it, jt) with
+    jt = (the inner loop variable, the part's layers, its bytes); one copy of the part's
+    layers in the program instead of one a repeat."""
     for first, unit, reps in runs:
-        if reps == 1:
-            for e in range(len(unit)):
-                layer(first + e, None)
-            continue
-        for i in ol.range(reps):
-            for e in range(len(unit)):
-                layer(first + e, i)
+        for it in ([None] if reps == 1 else ol.range(reps)):
+            if nest is None:
+                for e in range(len(unit)):
+                    layer(first + e, it)
+                continue
+            for e0, su, r, nb in nest[first]:
+                if r == 1:
+                    for e in range(len(su)):
+                        layer(first + e0 + e, it)
+                    continue
+                for jt in ol.range(r):
+                    for e in range(len(su)):
+                        layer(first + e0 + e, it, (jt, len(su), nb))

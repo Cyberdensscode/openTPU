@@ -5,20 +5,22 @@
                                          references for the runs (default all eight), in
                                          parallel as memory allows; exit 1 if any job failed or
                                          died
-    python3 tools/qual/refs.py card CFG.pkl MODEL WF HF NTOK [--long] [--resident [--card-loop]]
-                                         [--prompt-runs]
+    python3 tools/qual/refs.py card CFG.pkl MODEL WF HF NTOK [--long | --xl]
+                                         [--resident [--card-loop]] [--prompt-runs]
                                          the card's greedy tokens and logits against the cached
                                          reference (--card-loop: after the prompt's token, the
                                          decode loop on the card, Engine.generate_card, CAPS
                                          bit30; --prompt-runs: the prompt in prompt runs,
-                                         docs/prefill.md, resident; --long: the long prompt)
-    python3 tools/qual/refs.py key CFG.pkl MODEL WF HF NTOK [--long] [--prompt-runs]
+                                         docs/prefill.md, resident; --long: the long prompt;
+                                         --xl: the xl prompt)
+    python3 tools/qual/refs.py key CFG.pkl MODEL WF HF NTOK [--long | --xl] [--prompt-runs]
                                          the cache file of one reference
-    python3 tools/qual/refs.py one CFG.pkl MODEL WF HF NTOK [--long] [--prompt-runs]
+    python3 tools/qual/refs.py one CFG.pkl MODEL WF HF NTOK [--long | --xl] [--prompt-runs]
                                          (worker: one reference)
 
 Run from a host tree (the repo root; PYTHONPATH set). A run is MODEL:WF[:HF[:FLAGS]], HF '-' =
-the LM head in WF; FLAGS, comma-separated: long (the long prompt), pr (prompt runs).
+the LM head in WF; FLAGS, comma-separated: long (the long prompt) or xl (the xl prompt), pr
+(prompt runs).
 
 A reference is the ISA simulator's NTOK greedy tokens after the prompt, past EOS (no stop ids:
 a model's one-sentence answer ends after about 8 tokens, and the decode goes on), and a digest
@@ -29,7 +31,11 @@ decoding's logits bit for bit, tests/test_lfm2.py), the prefill's on the card's 
 (whose logits stay on the device). The prompts:
 - short: otpu-selftest's model check ("What is the capital of France?"), about 22 tokens;
 - long: LONG_TEXT cut to at most LONG_TOKENS tokens, so that NTOK = 32 tokens decode across
-  position 256, the attention bucket's end (a run per bucket, the decode loop's HALT CHAIN).
+  position 256, the attention bucket's end (a run per bucket, the decode loop's HALT CHAIN);
+- xl: LONG_TEXT repeated (XL_TEXT), cut to at most XL_TOKENS tokens, at a KV capacity of CAP_XL:
+  the prompt fills buckets 1 to XL_BUCKET and the decode stays in its last, so that with pr the
+  prefill takes the prompt runs of every bucket up to it (docs/tiled_prefill.md 13: the looped
+  attention's tiles, Phi-4-mini's 12 rows a run from bucket 6 where it took 1).
 With pr (--prompt-runs) the reference prefills in prompt runs too (resident, at run-time
 positions: their split can round a 4-bit MM's sums in another order than compile_rows' runs).
 
@@ -102,6 +108,10 @@ LONG_TEXT = (
     "many millions of years. Today satellites carry such clocks, and a phone finds its place on "
     "Earth by comparing the times at which their signals arrive.")
 LONG_TOKENS = 240                             # the long prompt's tokens, at most
+XL_TEXT = "\n\n".join([LONG_TEXT] * 4)        # (about 2,200 tokens before the cut)
+XL_TOKENS = 1400                              # the xl prompt's tokens, at most
+XL_BUCKET = 6                                 # the bucket the xl prompt ends in (from 1281)
+CAP_XL = 2048                                 # an xl run's KV positions
 ATTN_BLOCK = 256                              # the attention bucket (opentpu.llm.qwen3's)
 DATE = datetime.date(2026, 9, 29)             # "today" for chat templates that state it
 EXCLUDE = ("host/", "serve/", "lens.py", "lens_app.html", "rtlsim.py", "hwtrace.py")
@@ -168,33 +178,41 @@ def model_fingerprint(path: Path) -> str:
 
 
 def parse_run(r: str) -> tuple:
-    """MODEL:WF[:HF[:FLAGS]] -> (model, wf, hf, long, pr)."""
+    """MODEL:WF[:HF[:FLAGS]] -> (model, wf, hf, long, pr, xl)."""
     f = r.split(":")
     if not 2 <= len(f) <= 4:
         raise ValueError(f"{r}: a run is MODEL:WF[:HF[:FLAGS]]")
     flags = set(filter(None, f[3].split(","))) if len(f) > 3 else set()
-    if flags - {"long", "pr"}:
-        raise ValueError(f"{r}: the flags are long and pr")
-    return f[0], f[1], f[2] if len(f) > 2 else "-", "long" in flags, "pr" in flags
+    if flags - {"long", "xl", "pr"} or {"long", "xl"} <= flags:
+        raise ValueError(f"{r}: the flags are long or xl, and pr")
+    return (f[0], f[1], f[2] if len(f) > 2 else "-", "long" in flags, "pr" in flags,
+            "xl" in flags)
+
+
+def cap(xl: bool = False) -> int:
+    """A reference's KV positions (the card check's too): CAP_XL for the xl prompt, else CAP."""
+    return CAP_XL if xl else CAP
 
 
 def key(cfg, model: str, wf: str, hf: str, n: int, long: bool = False,
-        pr: bool = False) -> tuple[Path, dict]:
+        pr: bool = False, xl: bool = False) -> tuple[Path, dict]:
     from opentpu.host.board import sim_config
     from opentpu.llm import load_spec, model_dir
     path = model_dir(model)
     spec = load_spec(path)
     from transformers import AutoTokenizer
-    ids = prompt_ids(AutoTokenizer.from_pretrained(path), long)
+    ids = prompt_ids(AutoTokenizer.from_pretrained(path), long, xl)
     fmt = {"wformat": wf, "head_format": None if hf == "-" else hf}
+    prompt = f"{XL_TOKENS}: {XL_TEXT}" if xl else f"{LONG_TOKENS}: {LONG_TEXT}" if long \
+        else PROMPT
     parts = {"v": VERSION, "src": source_hash(),
-             "sim_cfg": repr(sim_config(spec, CAP, cfg, lookup=pr, **fmt)),
+             "sim_cfg": repr(sim_config(spec, cap(xl), cfg, lookup=pr, **fmt)),
              "model": path.name, "ckpt": model_fingerprint(path), "wf": wf, "hf": hf,
-             "ntok": n, "cap": CAP, "prompt": f"{LONG_TOKENS}: {LONG_TEXT}" if long else PROMPT,
+             "ntok": n, "cap": cap(xl), "prompt": prompt,
              "ids": hashlib.sha256(json.dumps(ids).encode()).hexdigest()[:16], "pr": pr,
              "env": env_key()}
     k = hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()[:20]
-    tag = ("_long" if long else "") + ("_pr" if pr else "")
+    tag = ("_long" if long else "") + ("_xl" if xl else "") + ("_pr" if pr else "")
     return cache_root() / f"{model}_{wf}_{hf}_{n}{tag}_{k}.pkl", parts
 
 
@@ -210,20 +228,28 @@ def _chat(tok, text: str) -> list:
     return list(ids["input_ids"] if hasattr(ids, "keys") else ids)
 
 
-def prompt_ids(tok, long: bool = False) -> list:
+def prompt_ids(tok, long: bool = False, xl: bool = False) -> list:
     """The prompt's token ids: PROMPT's, or (long) those of the most words of LONG_TEXT that
-    make a prompt of at most LONG_TOKENS tokens."""
-    if not long:
+    make a prompt of at most LONG_TOKENS tokens, or (xl) of XL_TEXT, at most XL_TOKENS."""
+    if not (long or xl):
         return _chat(tok, PROMPT)
-    words = LONG_TEXT.split(" ")
+    text, most = (XL_TEXT, XL_TOKENS) if xl else (LONG_TEXT, LONG_TOKENS)
+    words = text.split(" ")
     lo, hi = 1, len(words)
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        if len(_chat(tok, " ".join(words[:mid]))) <= LONG_TOKENS:
+        if len(_chat(tok, " ".join(words[:mid]))) <= most:
             lo = mid
         else:
             hi = mid - 1
     return _chat(tok, " ".join(words[:lo]))
+
+
+def xl_fits(prompt: int, n: int) -> bool:
+    """An xl prompt of `prompt` tokens reaches bucket XL_BUCKET and its n tokens' decode
+    (positions prompt .. prompt + n - 2) ends in it, within CAP_XL."""
+    return (XL_BUCKET - 1) * ATTN_BLOCK < prompt and \
+        prompt + n - 2 < min(XL_BUCKET * ATTN_BLOCK, CAP_XL)
 
 
 def load(model):
@@ -272,8 +298,8 @@ def prompt_runs_taken(eng, ids) -> bool:
 
 
 # ---- one reference (the worker)
-def one(cfg, model, wf, hf, n, long: bool = False, pr: bool = False) -> int:
-    kp, parts = key(cfg, model, wf, hf, n, long, pr)
+def one(cfg, model, wf, hf, n, long: bool = False, pr: bool = False, xl: bool = False) -> int:
+    kp, parts = key(cfg, model, wf, hf, n, long, pr, xl)
     pend = side(kp, ".pending")
     if kp.exists():
         pend.unlink(missing_ok=True)            # (compute's mark of a queued job)
@@ -296,10 +322,11 @@ def one(cfg, model, wf, hf, n, long: bool = False, pr: bool = False) -> int:
         path, spec, W, tok = load(model)
         t0 = time.time()
         hf_ = None if hf == "-" else hf
-        ref = Engine(spec, W, cap=CAP, cfg=sim_config(spec, CAP, cfg, lookup=pr, wformat=wf,
-                                                     head_format=hf_),
+        c = cap(xl)
+        ref = Engine(spec, W, cap=c, cfg=sim_config(spec, c, cfg, lookup=pr, wformat=wf,
+                                                   head_format=hf_),
                      wformat=wf, head_format=hf_, resident=pr, prompt_runs=pr)
-        ids = prompt_ids(tok, long)
+        ids = prompt_ids(tok, long, xl)
         if pr and not (ref.resident and prompt_runs_taken(ref, ids)):
             raise RuntimeError(f"{model} {wf}/{hf}: the ISA simulator's engine takes no prompt "
                                "runs (prefill.supported, covers)")
@@ -368,8 +395,8 @@ def mem_db() -> dict:
 
 
 def run_key(cfg, r: str, n: int) -> Path:
-    m, wf, hf, long, pr = parse_run(r)
-    return key(cfg, m, wf, hf, n, long, pr)[0]
+    m, wf, hf, long, pr, xl = parse_run(r)
+    return key(cfg, m, wf, hf, n, long, pr, xl)[0]
 
 
 def compute(cfgf: Path, runs: list[str], jobs: int | None, n: int) -> int:
@@ -426,12 +453,12 @@ def compute(cfgf: Path, runs: list[str], jobs: int | None, n: int) -> int:
                 if running and avail is not None and avail - RESERVE < need:
                     break                               # wait for memory (always start one)
                 todo.pop(0)
-                m, wf, hf, long, pr = parse_run(r)
+                m, wf, hf, long, pr, xl = parse_run(r)
                 kp.parent.mkdir(parents=True, exist_ok=True)
                 log = open(kp.with_suffix(".log"), "w")
                 p = subprocess.Popen(
                     ["nice", "-n", "5", sys.executable, __file__, "one", str(cfgf), m, wf, hf,
-                     str(n)] + ["--long"] * long + ["--prompt-runs"] * pr,
+                     str(n)] + ["--long"] * long + ["--xl"] * xl + ["--prompt-runs"] * pr,
                     stdout=log, stderr=subprocess.STDOUT, env=env, cwd=ROOT)
                 running[p.pid] = (r, p, kp, time.time(), 0)
                 mem = "" if avail is None else (f", MemAvailable {avail / 2**30:.1f} GiB, "
@@ -511,15 +538,15 @@ def compare(toks: list, digs: list, want, tok=None) -> str | None:
 
 
 def card(cfgf: Path, model, wf, hf, n, resident: bool, loop: bool = False,
-         prompt_runs: bool = False, long: bool = False) -> int:
+         prompt_runs: bool = False, long: bool = False, xl: bool = False) -> int:
     import numpy as np
 
     from opentpu.host.board import BoardBackend, XdmaTransport
     from opentpu.llm.qwen3 import Engine
     resident = resident or loop or prompt_runs
     cfg = pickle.loads(cfgf.read_bytes())
-    kp, _ = key(cfg, model, wf, hf, n, long, prompt_runs)
-    label = f"model {model} {wf}/{hf}" + (" long" if long else "") + \
+    kp, _ = key(cfg, model, wf, hf, n, long, prompt_runs, xl)
+    label = f"model {model} {wf}/{hf}" + (" long" if long else "") + (" xl" if xl else "") + \
         (" resident" if resident else "") + (" card loop" if loop else "") + \
         (" prompt runs" if prompt_runs else "")
     early = None if side(kp, ".pending").exists() else wait_ref(kp)
@@ -527,10 +554,10 @@ def card(cfgf: Path, model, wf, hf, n, resident: bool, loop: bool = False,
         print(f"  [FAIL] {label}: {early}")
         return 1
     path, spec, W, tok = load(model)
-    ids = prompt_ids(tok, long)
+    ids = prompt_ids(tok, long, xl)
     tr = XdmaTransport("/dev/xdma0")
     hf_ = None if hf == "-" else hf
-    dev = Engine(spec, W, cap=CAP, cfg=cfg, wformat=wf, head_format=hf_, resident=resident,
+    dev = Engine(spec, W, cap=cap(xl), cfg=cfg, wformat=wf, head_format=hf_, resident=resident,
                  backend=lambda c, imgs: BoardBackend(c, imgs, transport=tr, model=path.name),
                  prompt_runs=prompt_runs)
     why = None                          # a check that would not test what it says: a FAIL
@@ -543,6 +570,9 @@ def card(cfgf: Path, model, wf, hf, n, resident: bool, loop: bool = False,
     elif long and not len(ids) < ATTN_BLOCK <= len(ids) + n - 2:
         why = (f"the decode, positions {len(ids)} .. {len(ids) + n - 2}, does not cross "
                f"position {ATTN_BLOCK}")
+    elif xl and not xl_fits(len(ids), n):
+        why = (f"the xl prompt ({len(ids)} tokens) and its decode do not end in bucket "
+               f"{XL_BUCKET}")
     if why:
         print(f"  [FAIL] {label}: {why}")
         dev.backend.close()
@@ -586,6 +616,7 @@ def main():
     ap.add_argument("--card-loop", action="store_true")
     ap.add_argument("--prompt-runs", action="store_true")
     ap.add_argument("--long", action="store_true", help="the long prompt")
+    ap.add_argument("--xl", action="store_true", help="the xl prompt")
     a = ap.parse_args()
     cfgf = Path(a.cfg)
     if a.mode == "cfg":
@@ -604,13 +635,13 @@ def main():
     model, wf, hf, n = a.rest[0], a.rest[1], a.rest[2], int(a.rest[3])
     cfg = pickle.loads(cfgf.read_bytes())
     if a.mode == "key":
-        kp, parts = key(cfg, model, wf, hf, n, a.long, a.prompt_runs)
+        kp, parts = key(cfg, model, wf, hf, n, a.long, a.prompt_runs, a.xl)
         print(kp)
         print(json.dumps(parts, indent=1))
         return 0
     if a.mode == "one":
-        return one(cfg, model, wf, hf, n, a.long, a.prompt_runs)
-    return card(cfgf, model, wf, hf, n, a.resident, a.card_loop, a.prompt_runs, a.long)
+        return one(cfg, model, wf, hf, n, a.long, a.prompt_runs, a.xl)
+    return card(cfgf, model, wf, hf, n, a.resident, a.card_loop, a.prompt_runs, a.long, a.xl)
 
 
 if __name__ == "__main__":

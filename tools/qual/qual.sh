@@ -14,10 +14,12 @@
 # link back on a hot rescan after a reload), RUNS (the model runs MODEL:WF:HF, default the six
 # of Qwen3, LFM2.5 and Qwen3.5 in int8 and 4-bit; e.g. RUNS="lfm2-2.6b:int8:- lfm2-2.6b:fp4:int8"
 # for the other models of opentpu.llm.MODELS), LONG (the long prompt's run, MODEL:WF:HF, default
-# lfm2:int8:-; empty: none), NTOK (the token-exact runs' tokens, default 32), ECC_EACH=1 (both
-# channels' ECC counters after every step, into $OUT/ecc.tsv, and a NOTE line in checks.txt when
-# they changed: a corrected word placed to the step that read it; r2.1's m8 2343d61e counted 2 on
-# channel 0 somewhere in qual fast's 20 minutes between its first selftest and the turnarounds).
+# lfm2:int8:-; empty: none), XL (the xl prompt's runs, MODEL:WF:HF ..., default none: ~1,400
+# tokens in prompt runs, buckets 1-6; refs.py's MODEL:WF:HF:xl,pr), NTOK (the token-exact runs'
+# tokens, default 32), ECC_EACH=1 (both channels' ECC counters after every step, into
+# $OUT/ecc.tsv, and a NOTE line in checks.txt when they changed: a corrected word placed to the
+# step that read it; r2.1's m8 2343d61e counted 2 on channel 0 somewhere in qual fast's 20
+# minutes between its first selftest and the turnarounds).
 #
 # The card must run the candidate: its BUILD_ID (Board.info) must be EXPECT, else the last 8
 # hex digits of the deploy's name (deploy_fpfix_e776703a -> e776703a), checked after the JTAG
@@ -32,9 +34,11 @@
 #   quick memory test, then after the soak token-exact against the ISA simulator: for all six,
 #   per-position and resident, NTOK greedy tokens past EOS with every logits vector bit for bit,
 #   and LONG's long prompt (240 tokens, the decode across position 256: a run per attention
-#   bucket) per-position, resident and resident in prompt runs (docs/prefill.md); then a final
-#   selftest. A bitstream with the decode loop (CAPS bit30) also runs it for all six and LONG's
-#   two (plain and in prompt runs), token-exact against the same references, and
+#   bucket) per-position, resident and resident in prompt runs (docs/prefill.md), and each XL
+#   run's xl prompt resident in prompt runs (docs/tiled_prefill.md 13); then a final
+#   selftest. A bitstream with the decode loop (CAPS bit30) also runs it for all six, LONG's
+#   two (plain and in prompt runs) and the XL runs (in prompt runs), token-exact against the
+#   same references, and
 #   decode_profile --card-loop, greedy and sampled, for the 4-bit ones (wall against device
 #   tok/s); GEN=0 / 1 overrides the bitstream's bit. A bitstream with WAITW (CAPS bit31;
 #   WAITW=0 / 1 overrides it) runs tools/qual/waitw.py after the warm diag: 200 rounds of the
@@ -65,14 +69,14 @@ H=$(cd "$(dirname "$0")/../.." && pwd); P=${PYTHON:-~/otpu-venv/bin/python}
 REST=${REST:-$BIT}; OUT=${OUT:-/tmp/qual-$NAME}; mkdir -p "$OUT"
 cd "$H" || exit 1; export PYTHONPATH=$H
 RUNS=${RUNS:-"qwen3:int8:- lfm2:int8:- qwen35:int8:- qwen3:fp4:int8 lfm2:fp4:int8 qwen35:fp4:int8"}
-LONG=${LONG-lfm2:int8:-}; NTOK=${NTOK:-32}
+LONG=${LONG-lfm2:int8:-}; XL=${XL-}; NTOK=${NTOK:-32}
 # Started without the card lock: first the 4-bit runs' weights into the image cache
 # (opentpu.host.prebuild at nice 19, outside the lock; opentpu/qcache.py), so the session
 # quantizes nothing under the lock; then this script again, under it. PREBUILD=0: no prebuild.
 if [ -z "${OTPU_LOCK_HELD:-}" ]; then
   PB=""
   if [ "${PREBUILD:-1}" != 0 ]; then
-    for r in $RUNS $LONG; do case ":${r#*:}:" in *:fp4:*|*:int4:*) PB="$PB --prebuild $r" ;; esac; done
+    for r in $RUNS $LONG $XL; do case ":${r#*:}:" in *:fp4:*|*:int4:*|*:mix:*) PB="$PB --prebuild $r" ;; esac; done
     kept=${REFCACHE:-$HOME/otpu-build/refcache}/configs/$NAME.pkl
     [ -n "$PB" ] && [ -f "$kept" ] && PB="$PB --prebuild-cfg $kept"
   fi
@@ -216,7 +220,7 @@ refs_wait() {
 # the model phases' checkpoints, where the tools look for them (opentpu.llm.model_dir)
 models_ok() {
   local m d bad=""
-  for m in $(for r in $RUNS $LONG; do echo "${r%%:*}"; done | sort -u); do
+  for m in $(for r in $RUNS $LONG $XL; do echo "${r%%:*}"; done | sort -u); do
     d=$($P -c "from opentpu.llm import model_dir; print(model_dir('$m'))" 2>/dev/null)
     [ -n "$d" ] && [ -f "$d/config.json" ] || bad="$bad $m (${d:-model_dir failed})"
   done
@@ -260,11 +264,12 @@ MODELS=1; models_ok || MODELS=0
 GEN=${GEN:-$GENC}; WAITW=${WAITW:-$WAITWC}
 echo "decode loop on the card (CAPS bit30): $([ "$GEN" = 1 ] && echo yes || echo no)," \
      "WAITW (CAPS bit31): $([ "$WAITW" = 1 ] && echo yes || echo no)"
-NRUNS=$(set -- $RUNS; echo $#); NLONG=$(set -- $LONG; echo $#)
+NRUNS=$(set -- $RUNS; echo $#); NLONG=$(set -- $LONG; echo $#); NXL=$(set -- $XL; echo $#)
+XLR=""; for r in $XL; do XLR="$XLR $r:xl,pr"; done     # (refs.py's runs: the keys it computes)
 
 if [ $MODELS = 1 ]; then phase "references (background)"
   $P tools/qual/refs.py compute "$OUT/cfg.pkl" --ntok "$NTOK" --runs $RUNS \
-    ${LONG:+$LONG:long $LONG:long,pr} > "$OUT/refs.log" 2>&1 &
+    ${LONG:+$LONG:long $LONG:long,pr} $XLR > "$OUT/refs.log" 2>&1 &
   REFS=$!
   sleep 3; head -8 "$OUT/refs.log"
 fi
@@ -308,7 +313,7 @@ if [ "$WAITW" = 1 ]; then phase "WAITW on the host's writes"
 fi
 
 if [ $MODELS = 1 ]; then
-phase "token-exact after the soak ($NRUNS x per-position + resident${LONG:+, the long prompt x 3})"
+phase "token-exact after the soak ($NRUNS x per-position + resident${LONG:+, the long prompt x 3}${XL:+, the xl prompt x $NXL})"
 grep -E "FAILED" "$OUT/refs.log"
 p0=$(npass)
 for r in $RUNS; do IFS=: read -r m w h <<< "$r"
@@ -318,10 +323,14 @@ if [ -n "$LONG" ]; then IFS=: read -r m w h <<< "$LONG"
   for res in "" --resident "--resident --prompt-runs"; do
     exact "token-exact long $m $w $h${res:+ $res}" "$m" "$w" "$h" --long $res; done
 fi
-want=$(( NRUNS * 2 + NLONG * 3 )); got=$(( $(npass) - p0 ))
+for r in $XL; do IFS=: read -r m w h <<< "$r"
+  exact "token-exact xl $m $w $h --resident --prompt-runs" "$m" "$w" "$h" --xl --resident \
+    --prompt-runs
+done
+want=$(( NRUNS * 2 + NLONG * 3 + NXL )); got=$(( $(npass) - p0 ))
 [ "$got" -eq "$want" ] || fail "$got of $want token-exact runs passed"
 if [ "$GEN" = 1 ]; then
-phase "decode loop on the card ($NRUNS${LONG:+ + 2 long} token-exact + $(set -- $DP_RUNS; echo $#) x 2 decode_profile)"
+phase "decode loop on the card ($NRUNS${LONG:+ + 2 long}${XL:+ + $NXL xl} token-exact + $(set -- $DP_RUNS; echo $#) x 2 decode_profile)"
 p0=$(npass)
 for r in $RUNS; do IFS=: read -r m w h <<< "$r"
   exact "card loop $m $w $h" "$m" "$w" "$h" --card-loop
@@ -330,7 +339,10 @@ if [ -n "$LONG" ]; then IFS=: read -r m w h <<< "$LONG"
   for pr in "" --prompt-runs; do
     exact "card loop long $m $w $h${pr:+ $pr}" "$m" "$w" "$h" --long --card-loop $pr; done
 fi
-want=$(( NRUNS + NLONG * 2 )); got=$(( $(npass) - p0 ))
+for r in $XL; do IFS=: read -r m w h <<< "$r"
+  exact "card loop xl $m $w $h --prompt-runs" "$m" "$w" "$h" --xl --card-loop --prompt-runs
+done
+want=$(( NRUNS + NLONG * 2 + NXL )); got=$(( $(npass) - p0 ))
 [ "$got" -eq "$want" ] || fail "$got of $want card-loop token-exact runs passed"
 for r in $DP_RUNS; do IFS=: read -r m w h <<< "$r"; args="--wformat $w"; [ "$h" != "-" ] && args="$args --head-format $h"
   for mode in greedy sampled; do         # sampled: the model's chat defaults (chat.SAMPLING)
