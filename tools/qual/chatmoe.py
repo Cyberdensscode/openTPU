@@ -211,8 +211,8 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
                     **({} if tile_rows is None else {"tile_rows": tile_rows, "tile_runs": True}))
     load_s = time.time() - t
     if tile_rows is not None and not getattr(eng, "layer_tile", False):
-        raise SystemExit("--tile-rows: no tiled expert-major runs on this engine (an image "
-                         "built with OTPU_TILE=1 has their mask tiles; expert-major prefill)")
+        raise SystemExit("--tile-rows: no tiled expert-major runs on this engine (their mask "
+                         "tiles: an image built without OTPU_TILE=0; expert-major prefill)")
     pf, total = _pool(eng)
     if pf is not None and pf.io is None:        # (the reads by where they came from)
         pf.io = {}
@@ -318,7 +318,8 @@ def main(argv=None) -> int:
                          "moe.em_pass_rows)")
     ap.add_argument("--tile-rows", type=int, metavar="T",
                     help="expert-major runs tiled, T rows a run (Engine.tile_rows: the layer's "
-                         "weights once for T rows; OTPU_TILE=1 for the image's mask tiles)")
+                         "weights once for T rows; default 8 for Qwen3.5-MoE, off with "
+                         "OTPU_TILE=0)")
     ap.add_argument("--trace", help="each turn's calls' runs and the server's timeline, JSON")
     ap.add_argument("--mtp", action="store_true",
                     help="Qwen3.5-MoE: decode with the MTP drafter, the loop on the device "
