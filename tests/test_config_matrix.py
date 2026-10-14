@@ -1,9 +1,9 @@
 """The compiler, the kernels and the models across architectures (docs/targets.md): every
-target's in targets/ (opentpu.target.config, the hardware's truth: ypcb-00338 and nangate45 share
-one, bcu1525's two slices, nangate45-small's D = 32 / 2 columns / 4 lanes / 16K-word TMEM /
-1K-instruction IMEM), the simulators' design point, and two grown versions of the small one
-(D = 64 and 128, 16K-word IMEM, DSTEP / STREAM / PAIR), which reach the paths the small
-target refuses earlier: the one-hot gathers in parts, a decode step placed best-fit, DeltaNet
+target's in targets/ (opentpu.target.config, the hardware's truth: ypcb-00338, nangate45 (the
+card's at 8 ACT RAM rows), bcu1525's two slices, nangate45-small's D = 32 / 2 columns / 4 lanes /
+16K-word TMEM / 1K-instruction IMEM), the simulators' design point, and two grown versions of
+the small one (D = 64 and 128, 16K-word IMEM, DSTEP / STREAM / PAIR), which reach the paths the
+small target refuses earlier: the one-hot gathers in parts, a decode step placed best-fit, DeltaNet
 heads several D wide. On the ISA simulator; nothing here is tied to the card's sizes.
 
 Where a model does not map onto an architecture its image refuses it naming the limit."""

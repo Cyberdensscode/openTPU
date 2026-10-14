@@ -1,6 +1,7 @@
 """tools/asic/flow.py and paths.py without OpenROAD: the design points come from the targets and
 name only otpu_asic_top's parameters; the constraints; native ORFS or Docker, and prep's yosys; the
 paths' units, stages and kinds."""
+import dataclasses
 import os
 import re
 import subprocess
@@ -32,16 +33,17 @@ def test_points_are_the_asic_targets():
         assert abs(flow.clock_ns(p) * t.platform["core_mhz"] - 1000) < 0.01
     # the small point keeps the banked TMEM (its reference results); the card's is r2's one copy
     # in its ASIC form (two-port macros at the core clock, no pump) with the card's
-    # configuration: the same CFG_HASH, WAITC, MX E 4, the BAR-only collective unit
+    # configuration but 8 ACT RAM rows: WAITC, MX E 4, the BAR-only collective unit
     small = flow.params("small")
     assert (small["TMEM_IMPL"], small["RPB"], small["WPB"]) == (1, 1, 1)
     assert not {"SEQ_WC", "COLL_GATHER", "MXU_E"} & set(small)
     card = flow.params("card")
-    assert T.arch_hash(T.config("nangate45")) == T.arch_hash(T.config("ypcb-00338"))
+    assert T.arch_hash(T.config("nangate45")) == \
+        T.arch_hash(dataclasses.replace(T.config("ypcb-00338"), ACT_ROWS=8))
     assert {k: card[k] for k in ("MCOLS", "ACT_ROWS", "MXU_E", "SEQ_WC", "TMEM_IMPL", "TMEM_NSB",
                                  "TMEM_RPL", "TMEM_TDP", "TMEM_GST", "TMEM_PMP", "RPB",
                                  "COLL_GATHER")} == \
-        dict(MCOLS=4, ACT_ROWS=16, MXU_E=4, SEQ_WC=1, TMEM_IMPL=3, TMEM_NSB=2, TMEM_RPL=1,
+        dict(MCOLS=4, ACT_ROWS=8, MXU_E=4, SEQ_WC=1, TMEM_IMPL=3, TMEM_NSB=2, TMEM_RPL=1,
              TMEM_TDP=1, TMEM_GST=1, TMEM_PMP=0, RPB=64, COLL_GATHER=0)
 
 
@@ -65,6 +67,15 @@ def test_sram_map_has_the_two_port_leaf():
     assert "module otpu_sram_1rw1r" in v and "fakeram45_1rw1r_4096x32 u_m (.clk, .ce_in(ena)" in v
     assert ".ce1_in(enb), .addr1_in(ab), .rd1_out(rdb)" in v
     assert "module otpu_sram_1rw1r" not in flow.sram_map(ms[:1])
+
+
+def test_card_places_the_mxu_macros_by_column():
+    """The card's ORFS design places the MXU's macros with asic/nangate45/mxu_macros.tcl (the
+    macro placer the rest); the small point leaves them all to the macro placer."""
+    card = flow.config_mk("card", [])
+    m = re.search(r"^export MACRO_PLACEMENT_TCL = (\S+)$", card, re.M)
+    assert m and Path(m.group(1)).name == "mxu_macros.tcl" and Path(m.group(1)).exists()
+    assert "MACRO_PLACEMENT_TCL" not in flow.config_mk("small", [])
 
 
 def test_sdc_asks_the_targets_clock():

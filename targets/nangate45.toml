@@ -1,7 +1,8 @@
 # openTPU as an ASIC in NanGate45 (FreePDK45; not manufacturable: PPA numbers and a rehearsal
-# for a tapeout; docs/asic.md). The card's architecture (release r2's m4: targets/ypcb-00338.toml),
-# so it runs the card's programs: the same token-exact tests apply to its RTL. ASIC
-# micro-architecture: TMEM one copy of two-port 1RW1R macros at the core clock (no pump, no
+# for a tapeout; docs/asic.md). The card's architecture (release r2's m4: targets/ypcb-00338.toml)
+# with an ACT RAM of 8 rows, not 16 (docs/asic.md "ACT_ROWS": on the FPGA 16 rows cost no block
+# RAM, here 16 are 2.06 mm2 of macros against 1.16; results do not depend on it, the token-exact
+# tests apply to its RTL). ASIC micro-architecture: TMEM one copy of two-port 1RW1R macros at the core clock (no pump, no
 # per-port copies: docs/tmem_nocopy.md 6.4 and 9, the ASIC form), the MXU's cells generic
 # (rtl/tech/generic).
 
@@ -9,14 +10,14 @@
 name = "nangate45"
 kind = "asic"
 platform_id = 256
-description = "NanGate45 ASIC, the YPCB card's architecture (OpenROAD)"
+description = "NanGate45 ASIC, the YPCB card's architecture at ACT_ROWS 8 (OpenROAD)"
 
 [arch]
 S = 1
 D = 128
 MCOLS = 4
 ACT_BLOCKS = 128
-ACT_ROWS = 16                   # the card's (r2 m4): MMs of up to 16 rows (replay)
+ACT_ROWS = 8                    # MMs of up to 8 rows (replay; the card's 16: docs/asic.md)
 TMEM_WORDS = 65536
 IMEM_WORDS = 32768
 DRAM_BYTES = 4294967296
