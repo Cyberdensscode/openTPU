@@ -38,6 +38,26 @@ ecc() {   # $1 = label: selftest's ECC counts since the last scrub; any error = 
   grep -qE "\[PASS\] ecc .*channel 0: 0 corrected, 0 uncorrectable, channel 1: 0 corrected, 0 uncorrectable" $D/selftest_ecc_$1.log \
     && echo "ECC CLEAN ($1)" || echo "ECC NOT CLEAN ($1): $(grep -E " ecc " $D/selftest_ecc_$1.log | cut -c1-200)"
 }
+tree() { local x; for x in "$@"; do echo $x; tree $(pgrep -P $x); done; }    # these PIDs and all under them
+live() { local x; for x in "$@"; do kill -0 $x 2> /dev/null && echo $x; done; }  # those of them alive
+stop_tree() {   # $1: a background job's PID, timeout's (exec'd), the leader of the server's process group: TERM to the
+  local p=$1 g w all left   # group (uutils' timeout passes a TERM to its child only, not to the child's children: a
+  g=$(ps -o pgid= -p $p | tr -d ' ')   # compile worker would outlive it), up to 30 s for all of it; then KILL
+  [ "$g" = "$p" ] || g=""              # (not its own group's leader: its tree instead)
+  all=$(tree $p | tr '\n' ' ')
+  if [ -n "$g" ]; then kill -- -$g 2> /dev/null; else kill $all 2> /dev/null; fi
+  for w in $(seq 1 30); do
+    left=$( { [ -n "$g" ] && pgrep -g $g; live $all; } | sort -u | tr '\n' ' ')
+    [ -z "${left// }" ] && break; sleep 1; done
+  if [ -n "${left// }" ]; then echo "  stop_tree: $left still alive after 30 s: KILL"
+    [ -n "$g" ] && kill -9 -- -$g 2> /dev/null; kill -9 $left 2> /dev/null; sleep 2; fi
+  wait $p 2> /dev/null
+}
+xdma_free() {   # the card's device files closed by every process of this user (60 s at most)
+  local w u
+  for w in $(seq 1 60); do u=$(lsof -t /dev/xdma0_* 2> /dev/null | tr '\n' ' '); [ -z "$u" ] && return 0; sleep 1; done
+  echo "  /dev/xdma0 still open by pids $u: FAIL"; return 1
+}
 echo "HOSTR21 SESSION START $(date +%T) PART $PART host $(cat $H/COMMIT) up since $(uptime -s)"
 for f in $D/otpu.bit $H/models $RC/configs/$(basename $D).pkl $D/chatmoe/chatmoe-qwen35-35b.json; do
   [ -e $f ] || { echo "STOP: no $f"; exit 2; }; done
@@ -81,8 +101,10 @@ p, n = sys.argv[1], os.path.getsize(sys.argv[1] + ".packed")
 print(f"  pool: {PoolFile(p, os.path.getsize(p) // n, True, False).resident(range(n)) / 1e9:.2f} of "
       f"{os.path.getsize(p) / 1e9:.2f} GB in the page cache")
 PY
-  cd /tmp && env PYTHONPATH=$H timeout 2400 $P -m opentpu.serve.api --model $C2/Qwen3.5-35B-A3B --backend board \
-    --pool $POOL --port 8019 --kv-ram-gb 2 --kv-dir $D/kv > $D/serve.log 2>&1 &
+  # (exec: $! is timeout's own PID, the leader of the server's process group; `cd ... && env ... &` gave a subshell's,
+  # and killing it left the server holding /dev/xdma0: session hostr21, 2026-10-14)
+  (cd /tmp && exec env PYTHONPATH=$H timeout 2400 $P -m opentpu.serve.api --model $C2/Qwen3.5-35B-A3B --backend board \
+    --pool $POOL --port 8019 --kv-ram-gb 2 --kv-dir $D/kv) > $D/serve.log 2>&1 &
   sp=$!
   env PYTHONPATH=$H $P - <<'PY' > $D/serve-health.log 2>&1
 import http.client, json, time
@@ -108,9 +130,9 @@ PY
   cd $H && env PYTHONPATH=$H timeout 1800 $P tools/serve_bench.py --port 8019 --skip throughput,conversation,users,arrivals \
     --check-prompts 2 --check-tokens 16 --out $D/serve-bench.json > $D/serve-bench.log 2>&1
   rb=$?; echo "SERVE_BENCH EXIT $rb $(date +%T)"; grep -E "warming|check:|did not come up" $D/serve-bench.log | cut -c1-200
-  sleep 1; kill $sp 2>/dev/null; wait $sp 2>/dev/null
+  sleep 1; stop_tree $sp; xdma_free || ok_dev=0
   grep -E "^pool warm|^otpu-serve|Error|Traceback" $D/serve.log | cut -c1-220
-  ok=1
+  ok=${ok_dev:-1}
   grep -q ' 503 .*warming' $D/serve-health.log || { ok=0; echo "  warm gate: no 503 warming seen"; }
   grep -q ' 200 ' $D/serve-health.log || { ok=0; echo "  warm gate: no 200 after it"; }
   grep -q '^pool warm: done' $D/serve.log || { ok=0; echo "  warm gate: the warm did not end done"; }
