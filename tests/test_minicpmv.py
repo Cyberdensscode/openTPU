@@ -538,6 +538,48 @@ def test_a_pool_takes_the_vision_entries_past_its_experts(tmp_path):
         opened({**key, "format": "int8", "vision": vk2}, 2)
 
 
+def test_pack_pool_keys_the_experts_alone(tiny, tmp_path, monkeypatch):
+    """pack_pool.py on MiniCPM-V (whose image stages its vision by default: pool_key's "vision"
+    and pool_extra): init writes the experts' key alone, as the file holds the experts alone;
+    the first staged open appends the vision entries (open_pool's extra) and keeps the experts
+    packed since. With the vision key on an experts-only file, pool_entries would count the
+    entries in it, and open_pool would take the file for a new pool and truncate it."""
+    import importlib.util
+    import sys
+    from pathlib import Path
+    from opentpu.isasim import board_config
+    from opentpu.llm import moe as MO
+    _, d = tiny
+    pool = tmp_path / "pool.bin"
+    tool = Path(__file__).resolve().parents[1] / "tools" / "offload" / "pack_pool.py"
+    PP = importlib.util.module_from_spec(importlib.util.spec_from_file_location("pp", tool))
+    PP.__spec__.loader.exec_module(PP)
+    # (pack_pool's image, the tiny tower's patches cut so that its pieces fit the slots)
+    spec = replace(load_spec(d), vision_patches=128, vision_rows=64)
+    img = spec.image(replace(board_config(), DRAM_BYTES=1 << 40), 1024, 1, 1, "int8", "int8",
+                     lookup=True, experts=spec.moe.k)
+    monkeypatch.setattr(PP, "image", lambda model, wformat: img)
+    monkeypatch.setattr(sys, "argv", ["pack_pool.py", str(d), str(pool), "init"])
+    PP.main()
+    lay, (extra, vk) = img.offload, img.pool_extra
+    n = lay.layers * lay.E
+    key = json.loads((tmp_path / "pool.bin.key").read_text())
+    assert "vision" not in key and MO.pool_entries(pool, n) == n
+    assert key == {k: v for k, v in MO.pool_key(img, str(d)).items() if k != "vision"}
+    pf = MO.open_pool(lay, pool, key=key)              # a pack worker's expert
+    pf.warm_t.join()
+    pf.arr[3] = 9
+    pf.packed[3] = 1
+    pf.arr.flush()
+    pf.packed.flush()
+    del pf
+    pf = MO.open_pool(lay, pool, key=MO.pool_key(img, str(d)), extra=extra)
+    pf.warm_t.join()
+    assert pool.stat().st_size == (n + extra) * lay.slot_bytes
+    assert pf.packed[3] == 1 and (pf.arr[3] == 9).all() and not pf.packed[n:].any()
+    assert json.loads((tmp_path / "pool.bin.key").read_text())["vision"] == vk
+
+
 def test_the_card_order_puts_each_window_in_consecutive_rows():
     """card_order: each 4 x 4 block of the grid row-major, its 2 x 2 windows row-major, their
     4 patches row-major. Windows are consecutive rows (windows()' rows, in their order), and
