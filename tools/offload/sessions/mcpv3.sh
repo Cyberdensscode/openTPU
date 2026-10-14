@@ -170,6 +170,21 @@ PY
     *) warm; chat $m ;;
   esac
 done
+echo "=== MiniCPM-V's pool and checkpoint out of the page cache $(date +%T)"   # (the card host's 31 GB hold
+python - $O/$POOL $O/$MD <<'PY'           # one 35B pool: after session hostr21 this one's 18 GB stayed, and the next
+import os, sys                            # session's warm held 63% of production's 35B pool)
+gb = n = 0
+for a in sys.argv[1:]:
+    fs = [os.path.join(r, f) for r, _, fl in os.walk(a) for f in fl] if os.path.isdir(a) else [a]
+    for f in fs:
+        if os.path.isfile(f):
+            fd = os.open(f, os.O_RDONLY)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            os.close(fd)
+            gb, n = gb + os.path.getsize(f) / 1e9, n + 1
+print(f"  dropped from the page cache: {n} files of {gb:.1f} GB")
+PY
+echo "  mem $(mem) GB, cached $(awk '/^Cached:/ {print int($2/1048576)}' /proc/meminfo) GB"
 echo "=== final selftest $(date +%T)"
 st=$(timeout 600 python -m opentpu.host.selftest 2>&1)
 echo "$st" | grep -E "\[(PASS|FAIL)\]|ALL|stopped" | tail -14

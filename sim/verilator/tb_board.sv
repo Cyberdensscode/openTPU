@@ -174,6 +174,20 @@ module tb_board;
   longint cyc = 0;
   always @(posedge clk) cyc <= cyc + 1;
 
+  // A write in a slice's SW port register (otpu_slice) is in neither its units nor its adapter:
+  // the control block (STATUS WR_IDLE, go_ok) must not see the slice's writes all taken then
+  for (genvar s = 0; s < S; s++) begin : g_swchk
+    if (s == 0) begin : g_0
+      always @(posedge clk)
+        if (!rst && dut.q_wr_idle[0] && dut.u_slice.sw_v)
+          $fatal(1, "tb_board: slice 0 write idle with a write in its SW register");
+    end else begin : g_s
+      always @(posedge clk)
+        if (!rst && dut.q_wr_idle[s] && dut.g_slice[s].u_slice.sw_v)
+          $fatal(1, "tb_board: slice %0d write idle with a write in its SW register", s);
+    end
+  end
+
   // Handshakes are driven and sampled on the falling edge (race-free): a ready seen there
   // means the transfer happens at the next rising edge. The write's ready depends on its valid
   // (combinationally), so it is sampled a little after the valid is driven -- otherwise the

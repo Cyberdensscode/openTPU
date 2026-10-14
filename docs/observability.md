@@ -23,7 +23,7 @@ DDR3 speed as unknown.
 | 0x000 | ID | RO | 0x4F545055 ("OTPU") |
 | 0x004 | VERSION | RO | {D[15:0], MCOLS[7:0], LANES[7:0]} |
 | 0x008 | CTRL | RW | bit0 RUN, bit1 LOAD, bit2 CLEAR (per-run counters only). RUN rises and LOAD starts only while both channels are calibrated (CALIB0 and CALIB1; otherwise RUN stays 0). RUN 1 -> 0 stops a run at once (an abort; see below) |
-| 0x00C | STATUS | RO | bit0 HALTED, bit1 ERROR, bit2 LOADING, bit3 WR_IDLE (every write the slice gave the memory taken by the DDR3 controllers), bit4 AXI_ERR (sticky: a DDR3 controller broke its port contract, `otpu_mem_ch` n_err), bit5 CALIB0, bit6 CALIB1, bit7 RUN, bit8 WAIT_TO (with ERROR: a WAITW timed out), bit9 ECC_DED (a channel's ECC counted an uncorrectable 64-bit word since the LiteDRAM ECC counters' last clear, `ecc_clear` / `ecc1_clear`, which `Board.scrub` does; `memcal.ecc` reads the counts. The word read wrong; a partial write merged into its beat wrote it back with good check bits. Bitstreams before fix-board: 0) |
+| 0x00C | STATUS | RO | bit0 HALTED, bit1 ERROR, bit2 LOADING, bit3 WR_IDLE (every write the slice gave the memory taken by the DDR3 controllers, and none waiting in its SW port register), bit4 AXI_ERR (sticky: a DDR3 controller broke its port contract, `otpu_mem_ch` n_err), bit5 CALIB0, bit6 CALIB1, bit7 RUN, bit8 WAIT_TO (with ERROR: a WAITW timed out), bit9 ECC_DED (a channel's ECC counted an uncorrectable 64-bit word since the LiteDRAM ECC counters' last clear, `ecc_clear` / `ecc1_clear`, which `Board.scrub` does; `memcal.ecc` reads the counts. The word read wrong; a partial write merged into its beat wrote it back with good check bits. Bitstreams before fix-board: 0) |
 | 0x010 | PROG_ADDR | RW | program byte address |
 | 0x014 | PROG_N | RW | program length (instructions) |
 | 0x018, 0x01C | CYCLES lo, hi | RO | cycles of the current or last run (cleared by CLEAR) |
@@ -108,7 +108,7 @@ transition may see it in the next snapshot).
 | 0x138 | TMEM_DENY | some unit with a TMEM request was not granted (any of the P line's fm fq fv fc) |
 | 0x140 | DRAM_RD | events: 64-byte beats read from DRAM (R handshakes, both channels; a port B read is 2 beats, a port A read 1, an A read that reuses the previous beat 0) |
 | 0x148 | DRAM_WR | events: 64-byte beats written to DRAM (W handshakes, both channels; a port B write is 1 beat per channel its word mask touches, a QST word write 1) |
-| 0x150 | DRAM_WAIT | a slice DRAM request (port A, B or the QST port) was not accepted. Request backpressure only: the DRAM adapter queues up to RD reads per channel, so this stays near 0 even when the MXU starves for read data (then MXU_BUSY - MXU_MAC is large; measured on the card: 94% vs 21% for Qwen3) |
+| 0x150 | DRAM_WAIT | a slice DRAM request (port A, B or the QST port) was not accepted (the QST port: its output register holds a write the adapter cannot take, its SW queues full; release r2 and before had no register: the quantizer's grant was withheld instead, and the QST port never counted). Request backpressure only: the DRAM adapter queues up to RD reads per channel, so this stays near 0 even when the MXU starves for read data (then MXU_BUSY - MXU_MAC is large; measured on the card: 94% vs 21% for Qwen3) |
 | 0x158 | INSTR | events: instructions retired (as ICOUNT: over one run the difference equals ICOUNT) |
 | 0x160 | MXU_STARVE | (version 3) the MXU is streaming a command's weight chunks and none has arrived: its chunk FIFO is empty (the Q line's ms). It excludes the MXU's compute-only and drain cycles |
 

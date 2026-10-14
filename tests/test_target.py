@@ -391,24 +391,16 @@ def test_tech_families_define_the_same_cells():
 
 def _slice_sw_uses(txt: str) -> list:
     """otpu_slice's reads of the DRAM's raw sw_rdy / wr_idle (comments out), as (line, text),
-    outside its port list and the SW port's register block (if (SW_REG) begin : g_swr ... else
-    ... end); a unit's port of that name (.wr_idle(x)) is not one, its implicit connection
-    (.wr_idle,) is."""
+    outside its port list and the SW port's register (from its input, wire sw_req_c, to the end
+    of its block, end : sw_reg); a unit's port of that name (.wr_idle(x)) is not one, its implicit
+    connection (.wr_idle,) is."""
     code = re.sub(r"//.*", "", txt)
     head = re.search(r"module\s+otpu_slice\b.*?#\(.*?\)\s*\((.*?)\)\s*;", code, re.S)
-    start = code.index("if (SW_REG) begin : g_swr")
-    depth, pos, end = 0, start, None
-    for m in re.finditer(r"\b(begin|end)\b", code[start:]):
-        depth += 1 if m.group(1) == "begin" else -1
-        if depth == 0:
-            pos = start + m.end()
-            if not re.match(r"\s*else\b", code[pos:]):
-                end = pos
-                break
-    assert head and end, "otpu_slice: no port list or no SW register block"
+    reg = re.search(r"\bwire\s+sw_req_c\b.*?\bend\s*:\s*sw_reg\b", code, re.S)
+    assert head and reg, "otpu_slice: no port list or no SW register block"
     out = []
     for m in re.finditer(r"\b(sw_rdy|wr_idle)\b", code):
-        if head.start(1) <= m.start() < head.end(1) or start <= m.start() < end:
+        if head.start(1) <= m.start() < head.end(1) or reg.start() <= m.start() < reg.end():
             continue
         if code[m.start() - 1] == "." and re.match(r"\s*\(", code[m.end():]):
             continue                            # (a unit's port of that name: .wr_idle(wr_idle_i))
@@ -418,11 +410,10 @@ def _slice_sw_uses(txt: str) -> list:
 
 
 def test_the_slice_reads_dram_writes_through_the_sw_register():
-    """With SW_REG a QST write can sit a cycle in the SW port's register, in neither the
+    """A QST write can sit a cycle in the SW port's register (every target's), in neither the
     quantizer nor the DRAM: the slice's units and arbiters see the port as sw_rdy_i and wr_idle_i
-    (the register's), never the DRAM's sw_rdy / wr_idle, which only the register block reads. A
-    raw wr_idle would end a QST, a HALT CHAIN or a WAITW timeout before the DRAM has the write on
-    the ASIC targets only (SW_REG 0: the two are the same), where no FPGA test sees it."""
+    (the register's), never the DRAM's sw_rdy / wr_idle, which only the register reads. A raw
+    wr_idle would end a QST, a HALT CHAIN or a WAITW timeout before the DRAM has the write."""
     txt = (ROOT / "rtl/top/otpu_slice.sv").read_text()
     assert _slice_sw_uses(txt) == []
     # the check sees one: the quantizer's grant on the raw ready
@@ -430,9 +421,20 @@ def test_the_slice_reads_dram_writes_through_the_sw_register():
                       "if (g == G_Q && q_awant && !sw_rdy) aok[g] = 1'b0;")
     assert bad != txt and [t for _, t in _slice_sw_uses(bad)] == \
         ["if (g == G_Q && q_awant && !sw_rdy) aok[g] = 1'b0;"]
-    # and a unit connected to the raw one implicitly (.wr_idle, as before SW_REG)
+    # and a unit connected to the raw one implicitly (.wr_idle, as before the register)
     bad = txt.replace(".a_want(q_awant), .wr_idle(wr_idle_i),", ".a_want(q_awant), .wr_idle,")
     assert bad != txt and [t for _, t in _slice_sw_uses(bad)] == [".a_want(q_awant), .wr_idle,"]
+
+
+def test_the_board_counts_the_sw_register_as_a_write_pending():
+    """otpu_board's STATUS WR_IDLE and go_ok see a slice's writes all taken (q_wr_idle) once its
+    adapter has none pending and its SW port register is empty (sw_req, the register's valid
+    bit): the adapter's wr_idle (m_wr_idle) goes to the slice alone, for slice 0 and the others.
+    sim/verilator/tb_board.sv checks the same in every board simulation."""
+    code = re.sub(r"//.*", "", (ROOT / "rtl/shell/otpu_board.sv").read_text())
+    assert re.findall(r"\.wr_idle\(([^)]*)\)", code) == ["m_wr_idle"] * 4
+    assert re.findall(r"assign\s+q_wr_idle\[(\w+)\]\s*=\s*([^;]*);", code) == \
+        [("0", "m_wr_idle && !sw_req"), ("s", "m_wr_idle && !sw_req")]
 
 
 def test_config_summary_names_the_target(no_env):

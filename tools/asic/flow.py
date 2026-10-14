@@ -100,7 +100,7 @@ def params(point: str) -> dict:
                 FIFO_DEPTH=u["FIFO_DEPTH"], LANES=a["LANES"], WIN=u["WIN"],
                 MXU_IMPL=u["MXU_IMPL"], MXU_CL=u["MXU_CL"], VPU_CL=u["VPU_CL"],
                 ULANES=u["ULANES"], HAS_DSTEP=int(a["DSTEP"]), TMEM_IMPL=u["TMEM_IMPL"],
-                RPB=u["RPB"], WPB=u["WPB"], SW_REG=int(u.get("SW_REG", 0)))
+                RPB=u["RPB"], WPB=u["WPB"])
 
 
 def clock_ns(point: str) -> float:
