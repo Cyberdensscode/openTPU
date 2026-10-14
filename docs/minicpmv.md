@@ -858,6 +858,23 @@ Sessions (the lead runs them; scripts on this branch):
        file's extents (filefrag) and its mount, 2 x 200 random experts dropped and read back
        (one at a time, then 8 queued at once), 512 MB in order. hwe-bench's NVMe, a 2 GB test
        pool: 0.61 ms an expert one at a time, 0.52 queued.
+     - **pool_reads on the card host** (2026-10-13 21:29 opentpu, host idle, under the lock;
+       q35's size, mtime and sums unchanged):
+
+       | pool | file | one at a time | 8 queued | 512 MB in order |
+       |:--|:--|:--|:--|:--|
+       | MiniCPM-V, HDD (ext4) | 16 extents | 20.2 ms (85 MB/s) | 18.0 ms (95 MB/s) | 145 MB/s |
+       | qwen35-35b, SSD (btrfs compress=zstd:3 on dm-crypt) | 2,214 extents, mean 7.7 MB; 1,156 compressed | 7.3 ms (235 MB/s) | 4.7 ms (364 MB/s) | 467 MB/s |
+
+     - So the file is not the cause: one extent boundary every 7.7 MB, and the compressed
+       extents (btrfs's at most 128 KB each, ~150 MB in all) are under 1% of it. The idle SSD
+       reads an expert in 7.3 / 4.7 ms, 1.4-1.7x 2026-10-01's, against the session's 13-14.5;
+       the HDD in 18-20 ms against the session's 28-29.
+     - The rest is the session's: in both, a read in the engine took ~1.4x (HDD) to ~2-3x
+       (SSD) the idle disk's. Candidates: the image's write just before (the SSD only), and the
+       engine's reads (a miss in ~2.9 parts, a request's misses queued at once, the DMA thread
+       beside them). Telling them apart needs the card: pooldisk's q35 arms again with the
+       image already in the image cache.
    - **For serving: never serve from a cold pool.** The disk then sets only how long the wait
      is.
      - The engine already reads every packed expert into the page cache at each open
