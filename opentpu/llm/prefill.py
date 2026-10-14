@@ -186,11 +186,13 @@ def r_max(eng, blocks: int = 1) -> int:
 
 def tiled(eng, blocks: int) -> bool:
     """Bucket `blocks`'s P and L runs tiled: tiling on, a tile fits the bucket, and today's
-    prompt runs (which cover it) take no more rows there. Each run is a pass of the weights, so
-    the form with more rows a run streams them less often; tiled on a tie (release r2:
-    LFM2-2.6B's tile takes 1 row at MCOLS 4 and 2 at 8 where today's runs take 4, and its chat
-    prefill ran at half the speed of the untiled one). Where a tile takes as many rows as today's
-    runs could (Qwen3-0.6B's 16) nothing more is compiled to know it."""
+    prompt runs (which cover it) take fewer rows there. Each run is a pass of the weights, so
+    the form with more rows a run streams them less often (release r2: LFM2-2.6B's tile took 1
+    row at MCOLS 4 and 2 at 8 where today's runs take 4, and its chat prefill ran at half the
+    speed of the untiled one); on a tie today's runs, which were 0.4-1.2% faster at equal rows
+    and bytes on every production dense model (docs/tiled_prefill.md 12.4). Where a tile takes
+    as many rows as today's runs could (Qwen3-0.6B's 16) nothing more is compiled to know it:
+    no production model's today's runs reach those rows."""
     if not (blocks and tiling(eng)):
         return False
     T = _tile_fit(eng, blocks)
@@ -202,7 +204,7 @@ def tiled(eng, blocks: int) -> bool:
         R, covered = _fit(eng, blocks)
     except CompileError:                # (no prompt run of today's fits the bucket)
         return True
-    return not (covered and R > T)
+    return not (covered and R >= T)
 
 
 def _probe_top(eng, blocks: int) -> int:

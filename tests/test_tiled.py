@@ -505,8 +505,8 @@ def test_tiled_forms_placed_next_fit_first():
     ("kh8", 4, 16, 300, 16, None),      # channel parts; Qwen3.5: DeltaNet rows (DSTEP), gated
     ("gemma4-1", 4, 16, 600, 4, None),  # Gemma 4: the sliding window's start-masked block (IMEM:
     ("gemma4-2", 8, 16, 300, 8, None),  # 4 rows in bucket 3); E4B's groups of 4, two rows a tile
-    ("kh8", 4, 16, 300, 12, {"spill": True, "drows": 5}),  # x stored and loaded back in place,
-    #                                                         DeltaNet in runs of 4 x 3
+    ("kh8", 4, 16, 300, 16, {"spill": True, "drows": 5}),  # x stored and loaded back in place,
+    #                                                         DeltaNet in runs of 4 x 4
     ("kh8", 4, 16, 300, 16, "ranges"),  # W_o's operand in QACT ranges: an MM a range (ACC)
     ("kh8", 4, 16, 300, 12, {"spill": True, "drows": 4, "oscr": False}),  # outputs in TMEM
 ])

@@ -1176,15 +1176,24 @@ Rows a run on the card now (prefill_routes; before, in parentheses):
 
 ### 12.4 Ties
 
-prefill.tiled takes the tile where its T equals today's R. At equal rows the tile was slower on
-every production dense model under the card's formats (co-sim, as 12.1; tile against today's):
-Qwen3.5-0.8B 4 rows +0.50% (bucket 2) / +0.48% (5), Qwen3.5-4B 2 rows +0.36% (5), Gemma 4 E2B 4
-rows +1.24% / +1.08%, SmolLM3-3B 4 rows +0.63% (5), Phi-4-mini 3 rows +0.83% (2), 2 rows +0.96%
-(4), 1 row +0.59% (7), Gemma 4 E4B 2 rows +0.60% (3), 1 row +0.53% (8); port B's bytes equal
-within 0.2%. With 12.2 Qwen3.5's ties are gone (the tile takes more rows); E2B (buckets 1-6),
-SmolLM3 (3-6), Phi-4-mini (2, 4, 6-8) and E4B (2-4, 8) keep theirs. The rule this asks for,
-today's runs on a tie (prefill.tiled: covered and R >= T), is not made yet; a tile of the probe's
-largest rows would still be taken unprobed (no production model's today's runs reach it).
+prefill.tiled took the tile where its T equals today's R. At equal rows the tile was the slower
+on every production dense model under the card's formats (co-sim as 12.1, cycles a row, tile
+against today's prompt runs; port B's bytes equal within 0.2%):
+
+| model | rows | bucket | tile against today's |
+|---|---|---|---|
+| Qwen3.5-0.8B | 4 | 2 / 5 | +0.50% / +0.48% |
+| Qwen3.5-4B | 2 | 5 | +0.36% |
+| Gemma 4 E2B | 4 | 2 / 5 | +1.24% / +1.08% |
+| SmolLM3-3B | 4 | 5 | +0.63% |
+| Phi-4-mini | 3 / 2 / 1 | 2 / 4 / 7 | +0.83% / +0.96% / +0.59% |
+| Gemma 4 E4B | 2 / 1 | 3 / 8 | +0.60% / +0.53% |
+
+So a tie takes today's prompt runs (prefill.tiled: tiled unless today's runs cover the bucket
+with R >= T; test_a_bucket_takes_the_form_with_more_rows_a_run). With 12.2 Qwen3.5's ties are
+gone (the tile takes more rows); E2B (buckets 1-6), SmolLM3 (3-6), Phi-4-mini (2, 4, 6-8) and E4B
+(2-4, 8) now run today's runs there, at the same rows. A tile of the probe's largest rows is
+still taken unprobed (no production model's today's runs reach it).
 
 ### 12.5 Next
 
