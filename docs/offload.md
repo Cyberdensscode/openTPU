@@ -5005,7 +5005,12 @@ with these (`--slots 38 --slots-plain 41 --dmix 0.4175 --dhead 0.05 --cdraft 9.4
 
 The card check is session mtp1 (tools/offload/sessions/mtp1.sh): production's host, plain,
 against les-mtp's with --mtp on production's bitstream, the 35B's five les1 turns in ABBA order,
-each run's tokens les's reference, each pool wholly in the page cache before its run.
+each run's tokens les's reference, each pool wholly in the page cache before its run. The two
+pools (17.5 GB, the MTP one 18.0) do not fit the card host's page cache (31 GB) together, so
+each switch of arm reads the next arm's from the SSD again (~130 s), and before each read every
+other file of 100 MB or more under ~/openTPU, ~/otpu-build and /data/otpu leaves the page cache:
+mtp1's second run (mtp1b) stopped before its first run with production's pool 63% in the page
+cache, beside MiniCPM-V's pool on /data/otpu, cached since session hostr21.
 
 **mtp1's first run hung** (2026-10-14, B's warm-up): the card ran and never halted (STATUS RUN,
 no error), and the host's wait for HALTED timed out after RUN_TIMEOUT; the card itself was fine

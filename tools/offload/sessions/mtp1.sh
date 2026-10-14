@@ -21,7 +21,11 @@
 #    token, hits, MB a token), B's MTP acceptance and decode speedup (A's ms a token / B's), and MTP's share beyond S
 #    (les1's -4.09 ms a token, the 35B's turns 1-2).
 # A build other than EXPECT, a failed selftest, another configuration, a failed or timed-out run or a token mismatch
-# stops it (then the final selftest). About 35 min (10 runs of 70-120 s, each after a pool read of ~40 s; W builds).
+# stops it (then the final selftest). About 45 min: 10 runs of 70-120 s, W's builds, and the pools' reads. The two
+# pools (17.5 GB, the MTP one 18.0) do not fit the card host's page cache (31 GB) together: each switch of arm reads
+# the next arm's from the SSD again (~130 s; 7 of the 10 runs), the others' read is from the page cache. Before each
+# read every other file of 100 MB or more under ~/openTPU, ~/otpu-build and /data/otpu leaves the page cache (the
+# image cache's entries too: each run reads its image from the SSD).
 # Stage (from the Mac, before the session, with the lead's go; no host work while a session runs):
 #   git archive <les-mtp sha> | ssh opentpu 'D=~/otpu-build/les/mtp1/host; mkdir -p $D && tar -x -C $D'
 #   ssh opentpu 'echo <les-mtp sha, full> > ~/otpu-build/les/mtp1/host/COMMIT'
@@ -56,7 +60,8 @@ MD=Qwen3.5-35B-A3B
 MDB=${MDB:-$LS/$MD-mtp}                         # (B's checkpoint: card2's files linked, and mtp.safetensors)
 QA=${QA:-pool-q35-mx.split.bin}                 # (in O)
 QM=${QM:?the MTP pool (the lead chooses its disk: beside QA on /home, or on /data and kept warm)}
-DROPOTHER=$HOME/openTPU/models:$O:$HOME/otpu-build/offload/g26it:$(dirname $QM)
+DROPOTHER=${DROPOTHER:-$HOME/openTPU:$HOME/otpu-build:/data/otpu}   # (all of ours: mtp1b, 2026-10-14, stopped
+                                # before its first run, MiniCPM-V's pool on /data/otpu cached since session hostr21)
 T1="What is the capital of France? Answer in one sentence."
 T2="And what is it famous for? Two sentences."
 T3="Which three museums in Paris should a first-time visitor see, and how long does each take?"
