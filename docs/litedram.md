@@ -850,6 +850,17 @@ is this PHY.
 - **On the card:** ldcpu's isolated test image (`ld_test --selfcal`) is the first card run with
   `rd_reg`. Both channels had 0 BIST errors and a 300 s soak each with 0 errors, at 58 C
   (**measured**, as ldcpu reported it).
+- **The host and the read latency:** the latency (8, or 9 with `rd_reg`) lives in the
+  bitstream only. The controller's crossbar and `rddata_valid` follow it. `sdram_init.py`
+  records it (the generator writes it with the core), but no host code reads it, and neither
+  does the calibration firmware. So one host tree serves a core with `rd_reg` and one without:
+  r2.1's m8 core has it, r2's m4 doesn't, and a production swap between them changes no host
+  file.
+  - `tests/test_selfcal.py` `test_read_latency_is_the_bitstreams` checks this. With the other
+    latency, the firmware header is the same and `ddrcal` writes the same CSRs. It also fails
+    on any module under `opentpu/` other than `sdram_init.py` that mentions `read_latency`.
+  - The one place outside the bitstream that has to match the latency is the co-simulation's
+    controller model, `gen_ldc.py`'s `sim/verilator/otpu_ldc_ch.v`.
 
 **Reading the ldtest3e numbers:**
 - **Window width:** the scans step the common CK phase in 16.7 ps steps. A lane fails only

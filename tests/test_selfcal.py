@@ -5,6 +5,7 @@ write), and the firmware's mailbox, decoded by opentpu/host/selfcal.py, must equ
 ddrcal.calibrate_channel's result. The firmware is built for this machine (SELFCAL_HOST, every
 CSR access a ctypes callback); tools/litedram/selfcal_sim.py runs the RV32I image on the CPU."""
 import random
+import re
 import shutil
 from pathlib import Path
 
@@ -179,6 +180,31 @@ def test_without_per_bit_csr(fws, tmp_path):
     ref, dec, _ = compare(H.Firmware(tmp_path, tmp_path / "fw"), tmp_path, ldtest3e(1, tmp_path),
                           stride=8)
     assert isinstance(ref[1], C.CalError)
+
+
+def test_read_latency_is_the_bitstreams(tmp_path):
+    # sdram_init.py's read_latency (8; 9 with gen_core.py --rd-reg, r2.1's m8 core) is built into
+    # the bitstream: the controller's crossbar and rddata_valid follow it. Neither the host nor the
+    # calibration firmware reads it, so one host serves either core (m4 and m8 alike): with 9 the
+    # firmware's header is the same, ddrcal writes the same CSRs, and the firmware still matches it
+    # (and the other way round once the host's copy says 9)
+    host = Path(C.__file__).parent / "litedram"
+    for d in (host, CORE):
+        (tmp_path / d.name).mkdir()
+        for f in ("csr.csv", "sdram_init.py"):
+            text = (d / f).read_text()
+            if f == "sdram_init.py":
+                text, n = re.subn(r'"read_latency": ([89]),',
+                                  lambda m: f'"read_latency": {17 - int(m[1])},', text)
+                assert n == 1, d
+            (tmp_path / d.name / f).write_text(text)
+        assert H.fw.header(tmp_path / d.name) == H.fw.header(d), d
+    other = tmp_path / CORE.name
+    assert H.reference(other, C.FakeBoard(other), 4) == H.reference(CORE, C.FakeBoard(CORE), 4)
+    compare(H.Firmware(other, tmp_path / "fw"), other, lambda: C.FakeBoard(other), stride=4)
+    root = Path(C.__file__).parents[1]
+    assert [str(p.relative_to(root)) for p in root.rglob("*.py")
+            if p.name != "sdram_init.py" and "read_latency" in p.read_text()] == []
 
 
 @pytest.mark.slow
