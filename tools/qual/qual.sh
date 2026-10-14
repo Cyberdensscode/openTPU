@@ -14,7 +14,10 @@
 # link back on a hot rescan after a reload), RUNS (the model runs MODEL:WF:HF, default the six
 # of Qwen3, LFM2.5 and Qwen3.5 in int8 and 4-bit; e.g. RUNS="lfm2-2.6b:int8:- lfm2-2.6b:fp4:int8"
 # for the other models of opentpu.llm.MODELS), LONG (the long prompt's run, MODEL:WF:HF, default
-# lfm2:int8:-; empty: none), NTOK (the token-exact runs' tokens, default 32).
+# lfm2:int8:-; empty: none), NTOK (the token-exact runs' tokens, default 32), ECC_EACH=1 (both
+# channels' ECC counters after every step, into $OUT/ecc.tsv, and a NOTE line in checks.txt when
+# they changed: a corrected word placed to the step that read it; r2.1's m8 2343d61e counted 2 on
+# channel 0 somewhere in qual fast's 20 minutes between its first selftest and the turnarounds).
 #
 # The card must run the candidate: its BUILD_ID (Board.info) must be EXPECT, else the last 8
 # hex digits of the deploy's name (deploy_fpfix_e776703a -> e776703a), checked after the JTAG
@@ -121,11 +124,28 @@ stop() { [ $# -gt 0 ] && fail "$*"; STOPPED=1; echo "the qual stops here"; exit 
 # for the caller's filter. A non-zero exit (timeout's 124 too) or a Python exception is a FAIL
 # line: a crash never passes silently through the filters below. Returns 1 when it is one.
 EXC='^Traceback \(most recent call last\)|^([A-Za-z_][A-Za-z0-9_]*\.)*[A-Za-z_][A-Za-z0-9_]*(Error|Exception)(: |$)'
+# ecc_each STEP (ECC_EACH=1): the ECC counters now (memcal.ecc: corrected / uncorrectable words
+# per channel since the last scrub, not cleared) as a line of $OUT/ecc.tsv; a NOTE when they differ
+# from the line before (the file, not a variable: run may be in a subshell)
+ecc_each() {
+  [ "${ECC_EACH:-0}" = 1 ] || return 0
+  local c prev
+  c=$(timeout 60 $P -c "from opentpu.host.board import XdmaTransport
+from opentpu.host import memcal
+e = memcal.ecc(XdmaTransport('/dev/xdma0', dma=False))
+print('ECC', 'none' if e is None else ' '.join('%d/%d' % x for x in e))" 2>/dev/null | sed -n 's/^ECC //p' | tail -1)
+  prev=$(awk -F'\t' '$3 != "?" {v = $3} END {print v}' "$OUT/ecc.tsv" 2>/dev/null)   # (the last read)
+  printf '%s\t%s\t%s\n' "$(date +%T)" "$1" "${c:-?}" >> "$OUT/ecc.tsv"
+  if [ -n "$prev" ] && [ -n "$c" ] && [ "$c" != "$prev" ]; then
+    echo "  [NOTE] ECC (ch0 ch1, corrected/uncorrectable) $prev -> $c after $1" | tee -a "$OUT/checks.txt" >&2
+  fi
+}
 run() {
   local label=$1; shift
   local n; n=$(( $(ls "$OUT/logs" | wc -l) + 1 ))        # counted: run may be in a subshell
   local log; log="$OUT/logs/$(printf %03d $n)-$(printf %s "$label" | tr -c 'A-Za-z0-9_.-' _).txt"
   "$@" > "$log" 2>&1; local rc=$?
+  ecc_each "$(basename "$log" .txt)"
   local exc; exc=$(grep -E "$EXC" "$log" | grep -v '^Traceback' | tail -1 | cut -c1-200)
   local bad=0
   if [ $rc -ne 0 ] || grep -qE "$EXC" "$log"; then
