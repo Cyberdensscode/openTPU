@@ -48,7 +48,9 @@ module otpu_asic_top
   input  logic                sw_rdy,
   input  logic                wr_idle,
   input  logic                rd_idle,
-  output logic                a_req,
+  output logic                a_req,        // port A's outputs come from a register (otpu_slice): a
+                                            // read waits in it while a_req is high (reads only: a_we
+                                            // is 0; the reads all back: see b_req)
   output logic                a_we,
   output logic [31:0]         a_addr,
   output logic [31:0]         a_wdata,
@@ -66,8 +68,9 @@ module otpu_asic_top
                                             // in it while b_req is high, read data is the block's a
                                             // cycle after its b_rvalid; every write the block gave
                                             // is taken once wr_idle && !sw_req && !(b_req && b_we),
-                                            // no read is in flight once rd_idle && !(b_req &&
-                                            // !b_we) and there was no b_rvalid the cycle before
+                                            // no read is in flight once rd_idle && !a_req &&
+                                            // !(b_req && !b_we) and there was no b_rvalid the
+                                            // cycle before
   output logic                b_tag,
   output logic                b_we,
   output logic [D/4-1:0]      b_wmask,

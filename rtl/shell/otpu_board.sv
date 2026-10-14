@@ -183,7 +183,7 @@ module otpu_board #(
   logic [3:0]  a_be, sw_be;
   logic        sw_req, sw_rdy;
   logic        m_wr_idle, m_rd_idle;   // slice 0's adapter's wr_idle and rd_idle (q_wr_idle[0],
-  logic        m_rv;                   //   q_rd_idle[0]: with its SW and port B registers, below);
+  logic        m_rv;                   //   q_rd_idle[0]: with its SW and port registers, below);
                                        //   m_rv: a b_rvalid the cycle before
   logic [31:0] sw_addr, sw_wdata;
   logic [D/4-1:0] b_wmask;
@@ -348,11 +348,11 @@ module otpu_board #(
   // Every write the slice gave is taken (STATUS WR_IDLE, go_ok) once the adapter has none
   // pending and neither the slice's SW register nor its port B output register holds one (sw_req,
   // b_req: the registers' valid bits); no read of the slice's is in flight (go_ok) once the
-  // adapter has none, port B's output register holds none and its input register holds no data
-  // (a b_rvalid the cycle before, m_rv). A request or data there is in neither the slice's units
-  // nor the adapter (otpu_slice)
+  // adapter has none, neither port A's nor port B's output register holds one (a_req: port A
+  // reads only) and port B's input register holds no data (a b_rvalid the cycle before, m_rv). A
+  // request or data there is in neither the slice's units nor the adapter (otpu_slice)
   assign q_wr_idle[0] = m_wr_idle && !sw_req && !(b_req && b_we);
-  assign q_rd_idle[0] = m_rd_idle && !(b_req && !b_we) && !m_rv;
+  assign q_rd_idle[0] = m_rd_idle && !a_req && !(b_req && !b_we) && !m_rv;
   always_ff @(posedge clk) m_rv <= !x_srst[0] && b_rvalid;
   otpu_native_dram #(.D(D), .CHASH(CHASH)) u_mem (
     .clk, .rst(x_srst[0]), .a_flush(x_rst[0] || x_ld_start[0] || a_inval),
@@ -412,7 +412,7 @@ module otpu_board #(
       .n_wready(n_wready[2*s +: 2]), .n_wdata(n_wdata[2*s +: 2]), .n_wmask(n_wmask[2*s +: 2]),
       .n_rvalid(n_rvalid[2*s +: 2]), .n_rdata(n_rdata[2*s +: 2]), .n_wdone(n_wdone[2*s +: 2]));
     assign q_wr_idle[s] = m_wr_idle && !sw_req && !(b_req && b_we);     // as slice 0's
-    assign q_rd_idle[s] = m_rd_idle && !(b_req && !b_we) && !m_rv;
+    assign q_rd_idle[s] = m_rd_idle && !a_req && !(b_req && !b_we) && !m_rv;
     always_ff @(posedge clk) m_rv <= !x_srst[s] && b_rvalid;
   end
 

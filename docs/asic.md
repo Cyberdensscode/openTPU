@@ -189,7 +189,7 @@ clock on the operator) pays once those are fixed, from about 540 MHz.
 - **The ports.** The SW and port B requests (`sw_req`, `sw_addr`, `sw_wdata`, `b_wmask`, ...) left
   the block combinationally from the DMA's and quantizer's state through the slice's arbitration
   (12-27 levels): with 20% of the period outside, 339 MHz. A register stage at the boundary (as the
-  platform's adapter would add) frees them, and both ports have one now, on every target (the
+  platform's adapter would add) frees them, and every port has one now, on every target (the
   card's too: one design):
   - The SW port's register took the small block at 3.0 ns from 21 routed port violators to none
     ([asic_timing_loop.md](asic_timing_loop.md)).
@@ -204,15 +204,24 @@ clock on the operator) pays once those are fixed, from about 540 MHz.
     +0.09 worst): port B is a card-size problem. The a8 point's global routing overflowed only at
     the DMA's line-buffer macros on the top edge, where 967 `b_wdata` pins and the buffers' read
     data meet; the register also lets the pins' drivers sit by the pins, away from the DMA.
+  - Port A's output register (`a_req`, `a_addr`: the MXU's scale reads), the register the card's
+    DRAM adapter (`otpu_native_dram`) took them into, moved into the slice: the card has one
+    register between the MXU and the adapter's queues as before. At the card point `a_req` was
+    -1.62 ns against the ideal I/O clock (+0.25 credited), from the DMA's request through port
+    B's grant and the MXU's issue, `a_addr` -0.93 (+0.94), and `a_rdy` and `b_rdy` crossed the
+    block to `a_req` (input to output, +0.11 and -0.02); the routed small block met (+0.15). Its
+    read data needs no register: the MXU registers `a_rdata` at the port (`a_rvalid` +0.41,
+    `a_rdata` +1.73, credited).
   - The registers' valid bits are the contract: a request waits in a register while `sw_req` /
-    `b_req` is high, and port B's read data is the block's a cycle after its `b_rvalid`. So a
-    platform's "every write the block gave is taken" is `wr_idle && !sw_req && !(b_req && b_we)`,
-    and "no read of the block's in flight" is `rd_idle && !(b_req && !b_we)` with no `b_rvalid`
-    the cycle before (as `otpu_board`'s STATUS WR_IDLE and run start).
-  - `b_rdy` still reaches the slice's grant logic combinationally (`b_rdy` -> the MXU's tag
-    count, -0.30 ns with the insertion delay credited): a registered ready (a credit: the
-    memory's ready a cycle ahead, or a two-entry skid buffer) waits for the card's routed
-    timing with the TMEM placed by script. Port A's requests are still combinational.
+    `a_req` / `b_req` is high, and port B's read data is the block's a cycle after its
+    `b_rvalid`. So a platform's "every write the block gave is taken" is `wr_idle && !sw_req &&
+    !(b_req && b_we)`, and "no read of the block's in flight" is `rd_idle && !a_req && !(b_req &&
+    !b_we)` with no `b_rvalid` the cycle before (as `otpu_board`'s STATUS WR_IDLE and run start;
+    port A's requests are reads).
+  - `a_rdy` and `b_rdy` still reach the slice's grant logic combinationally (-> the MXU's tag
+    count: `b_rdy` -0.30 ns, `a_rdy` -0.18, with the insertion delay credited): a registered
+    ready (a credit: the memory's ready a cycle ahead, or a two-entry skid buffer) waits for the
+    card's routed timing with the TMEM placed by script.
 - **Sequencer dispatch.** `q_pr -> c_fp` (the footprint of the queued command, 50 levels) is the
   worst register-to-register path; `fp_ranges` and `fp_seg` in two cycles would give it a full one.
 - **Grant fanout.** The DMA's stream state -> the arbitration -> the quantizer's and the VPU's

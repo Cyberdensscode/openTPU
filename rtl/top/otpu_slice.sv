@@ -4,16 +4,18 @@
 //          the priority order DMA, COLL, VPU, MXU drain, QUANT (a unit that is not granted holds)
 //   DRAM B DMA first, then the MXU stream (read responses are routed back by tag); its outputs
 //          come from a register (b_req its valid bit) and its read data enters through one
-//   DRAM A the MXU scale stream (reads); QST writes have their own scalar write port (SW), whose
-//          outputs come from a register (sw_req its valid bit)
+//   DRAM A the MXU scale stream (reads), its outputs from a register (a_req its valid bit); QST
+//          writes have their own scalar write port (SW), whose outputs come from a register
+//          (sw_req its valid bit)
 // The slice's DRAM sits outside (otpu_top) so that board wrappers can swap it. The DRAM may
 // refuse requests (a_rdy/b_rdy, which must not depend on this cycle's requests), return reads
 // after any latency (in order per port), and acknowledge writes late (wr_idle: none pending);
 // rd_idle: no read of the slice's in flight (a run stopped by the host, rst, leaves its reads
-// to come back after it). A request in the SW or port B register is in neither the units nor
-// the DRAM, and port B's read data is the slice's a cycle after its b_rvalid: every write the
+// to come back after it). A request in the SW, port A or port B register is in neither the units
+// nor the DRAM, and port B's read data is the slice's a cycle after its b_rvalid: every write the
 // slice gave is taken once wr_idle && !sw_req && !(b_req && b_we), and no read of the slice's is
-// in flight once rd_idle && !(b_req && !b_we) and there was no b_rvalid the cycle before.
+// in flight once rd_idle && !a_req && !(b_req && !b_we) and there was no b_rvalid the cycle
+// before (port A's requests are reads: a_we is 0).
 //
 // Loader: while the slice is held in reset (rst), ld_start copies ld_n instructions from DRAM
 // byte address ld_addr (chunk aligned) into IMEM, one chunk (D/32 instructions) per cycle.
@@ -147,6 +149,8 @@ module otpu_slice
   // registers"
   logic b_rdy_i, rd_idle_i, b_rvalid_i, b_rtag_i;
   logic [D*8-1:0] b_rdata_i;
+  // port A's ready as the MXU sees it: through its output register (see "port A's register")
+  logic a_rdy_i;
   // the stream engine (docs/stream.md): the DMA moves a stream (DSTEP, STREAM) through SE in
   // the VPU; streams need 8 lanes on both sides (otpu_dma W = 8: D >= 32). Without it DSTEP and
   // STREAM are illegal instructions (otpu_seq STREAMS: the slice stops with ERROR)
@@ -911,19 +915,18 @@ module otpu_slice
       $fatal(1, "otpu_slice: a QST write the SW port cannot take");
 `endif
 
-  // ---- DRAM ports: port A, and port B's requests (b_*_c) into its output register (below)
+  // ---- DRAM ports: the MXU's port A reads, and port B's requests (b_*_c), into their output
+  // registers (below)
   logic           b_req_c, b_tag_c, b_we_c, b_par_c;
   logic [D/4-1:0] b_wmask_c;
   logic [D*8-1:0] b_wdata_c;
   logic [31:0]    b_addr_c;
   assign mxu_bgnt = !dma_breq && b_rdy_i;
-  assign mxu_agnt = a_rdy;
+  assign mxu_agnt = a_rdy_i;
+  assign a_we    = 1'b0;               // port A carries the MXU's scale reads only
+  assign a_wdata = '0;
+  assign a_be    = '0;
   always_comb begin
-    a_req    = mxu_areq;
-    a_we     = 1'b0;
-    a_addr   = mxu_aaddr;
-    a_wdata  = '0;
-    a_be     = '0;
     b_req_c   = dma_breq | mxu_breq;
     b_tag_c   = dma_breq;
     b_we_c    = dma_bwe;
@@ -949,14 +952,15 @@ module otpu_slice
   // The output register takes a request when it is empty or drains this cycle (b_rdy_i, what
   // the DMA, the MXU and the loader see: b_rdy does not depend on b_req), b_req its valid bit.
   // A write in it is one the DRAM has not taken (wr_idle_i, with the SW register's), a read in it
-  // or its data in the input register one not back (rd_idle_i: the loader's start). Only the
+  // or its data in the input register one not back (rd_idle_i, with port A's: the loader's
+  // start). Only the
   // loader's reset clears them: a request given before a run's reset (rst) still goes out, and
   // its data comes back, as one in the DRAM's queues. The units, the loader and the arbiters read
   // the DRAM's b_rdy, rd_idle, b_rvalid, b_rtag and b_rdata only through them
   // (tests/test_target.py). One cycle more each way costs nothing measurable (co-simulated:
   // within +-0.07% at m4 on decode, a tiled prompt run and a MoE step, signs mixed)
   assign b_rdy_i   = !b_req || b_rdy;
-  assign rd_idle_i = rd_idle && !(b_req && !b_we) && !b_rvalid_i;
+  assign rd_idle_i = rd_idle && !a_req && !(b_req && !b_we) && !b_rvalid_i;
   always_ff @(posedge clk) begin : pb_reg
     if (sys_rst) b_req <= 1'b0;
     else if (b_rdy_i) b_req <= b_req_c;
@@ -970,15 +974,31 @@ module otpu_slice
     end
   end : pb_reg
 
+  // ---- port A's register (docs/asic.md "The ports"): the MXU's scale reads (a_req, a_addr) leave
+  // the slice from flip-flops, so the MXU's issue (the DMA's request -> port B's grant -> the
+  // MXU's issue -> a_req: the ASIC card point's a_req, -1.62 ns against the ideal I/O clock), and
+  // a_rdy and b_rdy through it, do not reach the boundary. It is the register the card's DRAM
+  // adapter took port A's requests into (otpu_native_dram), moved here: one register between the
+  // MXU and the adapter's queues on the card as before, so the same cycles. It takes a request
+  // when it is empty or drains this cycle (a_rdy_i, the MXU's grant: a_rdy does not depend on
+  // a_req), a_req its valid bit; a read in it is one not back (rd_idle_i). Only the loader's
+  // reset clears it. The read data needs none: the MXU registers a_rdata at the port (ln1)
+  assign a_rdy_i = !a_req || a_rdy;
+  always_ff @(posedge clk) begin : pa_reg
+    if (sys_rst) a_req <= 1'b0;
+    else if (a_rdy_i) a_req <= mxu_areq;
+    if (a_rdy_i && mxu_areq) a_addr <= mxu_aaddr;
+  end : pa_reg
+
   // a unit's DRAM request waiting for its port, a cycle late (pf: the board's B_STALL and
   // DRAM_WAIT): port B's (the DMA, the MXU stream, the loader, which runs in reset), port A's (the
-  // MXU's scales), the quantizer's QST write. A request parked in the SW or port B register while
-  // the DRAM refuses it is not one: the unit that gave it has moved on (an MXU at its stream's
+  // MXU's scales), the quantizer's QST write. A request parked in the SW, port A or port B register
+  // while the DRAM refuses it is not one: the unit that gave it has moved on (an MXU at its stream's
   // tag limit waits for its data, not for the port)
   logic bw_r, dw_r;
   always_ff @(posedge clk) begin
     bw_r <= !sys_rst && b_req_c && !b_rdy_i;
-    dw_r <= !sys_rst && ((b_req_c && !b_rdy_i) || (a_req && !a_rdy) || (q_awant && !sw_rdy_i));
+    dw_r <= !sys_rst && ((b_req_c && !b_rdy_i) || (mxu_areq && !a_rdy_i) || (q_awant && !sw_rdy_i));
   end
 
   // ---- activity and trace events (pf; docs/observability.md). The sequencer's events come
@@ -987,7 +1007,8 @@ module otpu_slice
   //   P  per window of `win` cycles: DRAM port B requests (MXU bm, DMA bd), port A requests
   //      (MXU am, QST aq), MXU compute (mx), and cycles the MXU drain, QUANT, VPU and collective
   //      lost to TMEM bank arbitration (fm fq fv fc)
-  //   Q  the same window: a port B / A request waited for the memory (bs, as), the MXU had work
+  //   Q  the same window: a unit's port B / port A or QST request waited for its port (bs, as;
+  //      as dwait above: not one parked in a port's register), the MXU had work
   //      but no chunk (ms) or chunks but did not consume (mb), the summed MXU chunk-FIFO level
   //      (ff; average = ff / n), the program loader used port B (ld)
   //   H  at the halt: the port requests since reset (bmxu bdma amxu aq)
@@ -1151,8 +1172,8 @@ module otpu_slice
   logic [FW-1:0] af_r;
   assign ap = {lose_col, lose_vpu, lose_q, lose_mxu, mxu_pop, q_areq, mxu_areq, dma_breq,
                mxu_breq};
-  assign aq = {ld_busy && ld_req, mxu_block, mxu_starve, (a_req || q_awant) && !a_rdy,
-               b_req_c && !b_rdy_i};
+  assign aq = {ld_busy && ld_req, mxu_block, mxu_starve,
+               (mxu_areq && !a_rdy_i) || (q_awant && !sw_rdy_i), b_req_c && !b_rdy_i};
   logic [31:0] w_n, n_r;             // cycles of the current window before this one; last n
   logic        h_d, we_r, h_ev;      // halted a cycle ago; a window ended / the halt, last cycle
   logic [NP-1:0][31:0] sp;           // window sums, a cycle behind
