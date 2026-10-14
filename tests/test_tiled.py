@@ -881,7 +881,7 @@ def test_tiled_qwen35_expert_major_layer_runs(monkeypatch, wf, T, R):
                         PAIR=True, DSTEP=True, STREAM=True)
     kw = dict(cap=256, cfg=dataclasses.replace(cfg, ACT_ROWS=16), rows=1, resident=True,
               experts=6, wformat=wf)
-    a = Engine(spec, W, layer_major=T, expert_major=True, **kw)
+    a = Engine(spec, W, layer_major=T, expert_major=True, tile_rows=T, **kw)
     b = Engine(spec, W, tile_runs=False, **(dict(kw, layer_major=R, expert_major=True)
                                             if R else kw))
     assert a.layer_tile and "amask" in b.image.lookup and a.image.embed_host

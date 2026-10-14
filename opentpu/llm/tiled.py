@@ -37,9 +37,10 @@ today's: they already stream each weight once a run, pair of heads by pair) and 
 Prompt runs (opentpu/llm/prefill.py, docs/prefill.md) take this kernel by default (not with the
 engine's tile_runs False or OTPU_TILE=0: prefill.tile_flag): compile_tile_run's programs at a
 run-time position of a bucket, their tokens from out[], as compile_prompt_run's. A MoE model's
-expert-major layer runs (docs/offload.md 13.11) take it when asked for (tile_runs True or
-OTPU_TILE=1: prefill.layer_tile_flag; Engine.layer_tile: gemma4_layer_tile, T rows of a
-chunk through one layer from their records; compile_layer_tile), the mixer's and the dense
+expert-major layer runs (docs/offload.md 13.11) take it, Qwen3.5-MoE's by default (not with
+OTPU_TILE=0), Gemma 4's when asked for (tile_runs True or OTPU_TILE=1: prefill.layer_tile_flag,
+LAYER_ROWS; Engine.layer_tile: qwen35_layer_tile / gemma4_layer_tile, T rows of a chunk through
+one layer from their records; compile_layer_tile), the mixer's and the dense
 MLP's weights once for the T rows, the experts left to the layer's expert run as today.
 """
 from __future__ import annotations
@@ -1417,14 +1418,21 @@ def ranges(forms: list) -> list:
 
 
 LAYER_KERNELS = {"gemma4": gemma4_layer_tile, "qwen35": qwen35_layer_tile}
+# the families whose tiled layer runs are on by default (prefill.layer_tile_flag: unless
+# OTPU_TILE=0) and their rows a run (Engine.tile_rows; at most ACT_ROWS): the most rows whose
+# forms are whole (today's bits) on every Qwen3.5-MoE layer kind and bucket of the card's
+# configuration (docs/tiled_prefill.md 14); the others opt-in, of the engine's layer_major rows
+LAYER_ROWS = {"qwen35": 8}
 
 
 def layer_family(img) -> str | None:
-    """The image's family when a tiled expert-major layer run serves it (LAYER_KERNELS: a MoE
-    image with prefill rows, the expert server's words and the mask tiles, which a MoE model's
-    image holds when OTPU_TILE=1 as it is built: prefill.layer_tile_flag), else None."""
-    name = type(img).__module__.rsplit(".", 1)[-1]
-    ok = name in LAYER_KERNELS and getattr(img, "prefill_rows", 0) and \
+    """The image's family when a tiled expert-major layer run serves it (LAYER_KERNELS, its
+    class's module or a base class's: MiniCPM-V's Image is Qwen3.5's; a MoE image with prefill
+    rows, the expert server's words and the mask tiles, which a MoE model's image holds when
+    OTPU_TILE=1 as it is built: prefill.layer_tile_flag), else None."""
+    name = next((n for n in (t.__module__.rsplit(".", 1)[-1] for t in type(img).__mro__)
+                 if n in LAYER_KERNELS), None)
+    ok = name is not None and getattr(img, "prefill_rows", 0) and \
         getattr(img, "offload", None) is not None and "amask" in (img.lookup or {})
     return name if ok else None
 

@@ -83,8 +83,9 @@ def test_hints_are_off_by_default(tiny, tmp_path):
 
 
 def _engine(spec, W, experts=None, **kw):
-    cfg = device_config(spec, 256, S=1, experts=experts, **kw)
-    return Engine(spec, W, cap=256, cfg=cfg, experts=experts, **kw)
+    from opentpu.llm.qwen3 import PREFILL_ROWS
+    cfg = device_config(spec, 256, S=1, rows=PREFILL_ROWS, experts=experts, **kw)   # (the
+    return Engine(spec, W, cap=256, cfg=cfg, experts=experts, **kw)     # Engine's rows)
 
 
 def test_reference_matches_hf(tiny):
@@ -1132,7 +1133,8 @@ def test_expert_major_prefill_is_bit_exact(tiny, R, skew, wformat, b, C, monkeyp
     pass's rows one MM's). C: the passes' entries (Engine.em_pass; None: the configuration's,
     docs/offload.md 13.18: 4 with b's MCOLS 4 and PAIR, a short pass of 2; 8 for int8 at the
     default MCOLS 8): each row's math the same, only grouped otherwise, so every C equals token
-    by token's."""
+    by token's. Today's runs of R rows (tile_runs False; the tiles, Qwen3.5-MoE's default:
+    tests/test_em_tile.py)."""
     from opentpu.llm import qwen35 as Q35
     from opentpu.llm.moe import em_pass_rows, em_record, em_slots
     monkeypatch.setattr(Q35, "PREFILL_CHUNK", 24)
@@ -1146,7 +1148,7 @@ def test_expert_major_prefill_is_bit_exact(tiny, R, skew, wformat, b, C, monkeyp
     cfg = device_config(spec, 256, rows=1, lookup=True, S=1, experts=6, wformat=wformat, **kw)
     a, ref = (Engine(spec, W, cap=256, cfg=cfg, rows=1, resident=True, experts=6,
                      wformat=wformat, **kw)
-              for kw in ({"layer_major": R, "expert_major": True}, {}))
+              for kw in ({"layer_major": R, "expert_major": True, "tile_runs": False}, {}))
     assert em_pass_rows(cfg, wformat) == (4 if b else 8)
     a.em_pass = C
     sc = _scratch(a.server, monkeypatch)

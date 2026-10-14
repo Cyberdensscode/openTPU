@@ -182,7 +182,8 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
         seed: int = 0, create: bool = False, tok=None, em_rows: int | None = None,
         trace: list | None = None, em_pass: int | None = None, mtp: bool = False,
         mtp_from: str | None = None, images=(), max_slices: int | None = None,
-        vision_staged: bool | None = None, pool_calls: bool = False) -> dict:
+        vision_staged: bool | None = None, pool_calls: bool = False,
+        tile_rows: int | None = None) -> dict:
     from opentpu.host import chat as C
     from opentpu.host import streamed as ST
     from opentpu.isasim import board_config
@@ -206,8 +207,12 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
                     vision_staged=vision_staged,              # (MiniCPM-V: None, the Spec's)
                     **({} if em_rows is None else {"em_rows": em_rows}),    # (13.16)
                     **({} if em_pass is None else {"em_pass": em_pass}),    # (13.18)
-                    **({"mtp": True, "mtp_from": mtp_from} if mtp else {}))    # (15.6)
+                    **({"mtp": True, "mtp_from": mtp_from} if mtp else {}),    # (15.6)
+                    **({} if tile_rows is None else {"tile_rows": tile_rows, "tile_runs": True}))
     load_s = time.time() - t
+    if tile_rows is not None and not getattr(eng, "layer_tile", False):
+        raise SystemExit("--tile-rows: no tiled expert-major runs on this engine (an image "
+                         "built with OTPU_TILE=1 has their mask tiles; expert-major prefill)")
     pf, total = _pool(eng)
     if pf is not None and pf.io is None:        # (the reads by where they came from)
         pf.io = {}
@@ -225,7 +230,8 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
                experts=ST.describe(eng, eng.pool_path), layer_major=eng.layer_major,
                expert_major=eng.expert_major, em_rows=getattr(eng, "em_rows", 0),
                em_pass=getattr(eng, "em_pass", None),
-               on_card=chat.on_card, load_s=round(load_s, 1), max_slices=max_slices,
+               tile_rows=getattr(eng, "tile_rows", None) if getattr(eng, "layer_tile", False)
+               else None, on_card=chat.on_card, load_s=round(load_s, 1), max_slices=max_slices,
                vision_staged=getattr(getattr(eng.image, "vision", None), "resident", True) is False,
                images=[dict(turn=i, path=str(f), sha256=hashlib.sha256(
                    Path(f).read_bytes()).hexdigest()) for i, f in images],
@@ -310,6 +316,9 @@ def main(argv=None) -> int:
     ap.add_argument("--em-pass", type=int, metavar="C",
                     help="expert-major's entries a pass (default: the configuration's, "
                          "moe.em_pass_rows)")
+    ap.add_argument("--tile-rows", type=int, metavar="T",
+                    help="expert-major runs tiled, T rows a run (Engine.tile_rows: the layer's "
+                         "weights once for T rows; OTPU_TILE=1 for the image's mask tiles)")
     ap.add_argument("--trace", help="each turn's calls' runs and the server's timeline, JSON")
     ap.add_argument("--mtp", action="store_true",
                     help="Qwen3.5-MoE: decode with the MTP drafter, the loop on the device "
@@ -347,7 +356,7 @@ def main(argv=None) -> int:
             trace=tr, em_pass=a.em_pass, mtp=a.mtp or a.mtp_from is not None,
             mtp_from=a.mtp_from, images=images, max_slices=a.max_slices,
             vision_staged=True if a.vision_staged else False if a.vision_resident else None,
-            pool_calls=a.pool_calls)
+            pool_calls=a.pool_calls, tile_rows=a.tile_rows)
     for i, t in enumerate(r["turns"]):
         print(f"turn {i + 1}: {t['reply']!r}\n  {t['line']}", flush=True)
         print(f"  pool: {_pct(t['pool_before'])} -> {_pct(t['pool_after'])} of its "
