@@ -818,6 +818,66 @@ Sessions (the lead runs them; scripts on this branch):
      - Checked on a Linux host, with a mapped, touched PoolFile of 512 MB: plain DONTNEED
        left all 537 MB cached; the fix left 0.
      - For the next session: the pool on /data and an SSD pool, the same arms.
+4. **pooldisk** (`tools/offload/sessions/pooldisk.sh`, tree c20e4ea6): what the pool's disk
+   costs a warm process.
+   - MiniCPM-V's pool on /data (sdb: the 7,200 rpm WD10EZEX, ext4), and qwen35-35b's on /home
+     (sda: a Crucial BX500 SATA SSD, btrfs on dm-crypt). The latter is production's file, read
+     only: its size, mtime and its .packed's and .key's sums are checked before and after.
+   - Per pool: a warm-up process, then pool_disk.py's arms cached, dropped, dropped, cached.
+     Each arm asks the same text turn, 26 prompt tokens and 32 reply tokens, greedy.
+
+   PASSED 2026-10-13 20:20 (opentpu). Every arm valid by mincore; q35's files unchanged;
+   selftest all pass before and after.
+
+   | pool | arm | prefill tok/s (device) | decode tok/s | misses | ms of reads a miss | disk reads |
+   |:--|:--|:--|:--|:--|:--|:--|
+   | MiniCPM-V, HDD | cached | 5.27 (6.17) / 5.24 (6.16) | 5.06 / 5.10 | 2,605 / 2,523 | 0.52 / 0.56 | none |
+   | | dropped | 0.39 (0.40) / 0.39 (0.40) | 0.99 / 0.99 | 2,544 / 2,529 | 31.9 / 32.5 | 2,785 at 28.1 ms / 2,737 at 29.0 |
+   | qwen35-35b, SSD | cached | 5.32 (6.15) / 5.26 (6.10) | 5.60 / 5.63 | 2,511 / 2,429 | 0.57 / 0.63 | none |
+   | | dropped | 0.68 (0.73) / 0.69 (0.74) | 1.82 / 1.50 | 2,456 / 2,442 | 14.6 / 16.8 | 2,489 at 13.0 ms / 2,626 at 14.5 |
+
+   - **Warm, the disk does not matter.** A miss takes 0.52-0.63 ms of reads on both: about 2.9
+     reads of 0.18-0.20 ms each, from the page cache. MiniCPM-V decodes ~10% slower than
+     qwen35-35b because of its formats and slots (mcpv2), not the disk.
+   - **Cold, a miss reads its expert (1.71 MB) from the disk:** ~32 ms on the HDD (54 MB/s),
+     15-17 ms on the SSD (100-120 MB/s).
+     - Prefill is 13.5x slower on the HDD and 7.7x on the SSD; decode 5.1x and 3.1-3.7x.
+     - The turn took ~99 s cold against ~11 s warm on the HDD, ~57 s against ~11 s on the SSD.
+   - **Reading the whole pool in order costs about one cold turn.** The last cached arm read it
+     in with 16 MB reads: 79.5 s on the HDD (230 MB/s), 36.7 s on the SSD (478 MB/s). A cold
+     turn's reads took about as long, 81-82 s and 36-41 s, for about a quarter of the pool
+     (~2,500 of its 10,240 experts).
+   - **The SSD read 3-4x slower than on 2026-10-01** (docs/offload.md 10.6: 4.2 ms an expert
+     one at a time, 3.4-3.6 queued). Not explained yet. Candidates:
+     - q35's warm-up had just rebuilt the 35B's image under this tree's keys (load 97.4 s)
+       and written it to the image cache on the same SSD, a DRAM-less SATA drive: its
+       writeback, and btrfs discarding the cache's evicted files.
+     - The MX pool's extents: written 2026-10-12 onto a btrfs 84% full.
+     - The in-order read after the dropped arms still ran at 478 MB/s.
+     - `tools/offload/pool_reads.py` tells them apart, on the host alone and read only: the
+       file's extents (filefrag) and its mount, 2 x 200 random experts dropped and read back
+       (one at a time, then 8 queued at once), 512 MB in order. hwe-bench's NVMe, a 2 GB test
+       pool: 0.61 ms an expert one at a time, 0.52 queued.
+   - **For serving: never serve from a cold pool.** The disk then sets only how long the wait
+     is.
+     - The engine already reads every packed expert into the page cache at each open
+       (open_pool's PoolFile.warm: in file order, in a thread, from before the image build).
+     - A 35B image's build (a 28-30 GB peak of the host's 31 GB) takes the pool back out of
+       the page cache (mcpv1, mcpv3b). An open from the image cache (6-8 s) leaves the warm
+       running: the first turn's misses go to the disk, competing with it.
+     - Waiting for the warm costs ~80 s on the HDD or ~37 s on the SSD, once, and every turn
+       after it is warm. For the turn above: 91 s against 99 s served cold on the HDD, 47 s
+       against 57 s on the SSD; the cold turn also leaves three quarters of the pool on the
+       disk.
+     - Not there yet: otpu-serve's /health says ok and the server takes requests as soon as
+       the engine opens; the warm's own seconds are not logged; nothing warms the pool again
+       after a build that evicted it.
+     - The pool must stay in RAM. One 35B pool fits in the host's 31 GB (18.3 or 17.5 GB,
+       beside otpu-serve's 4 GB KV store and the process); both together (35.8 GB) do not.
+       Alternating MiniCPM-V and qwen35-35b reads a pool again at every switch.
+     - So moving MiniCPM-V's pool to the SSD shortens the wait of an open with a cold pool
+       (a reboot, a build, a switch from the other 35B) from ~80 to ~37 s. It stays with the
+       production rotation, as decided; it would count per switch if the two alternated.
 
 ## 7. Decisions
 
