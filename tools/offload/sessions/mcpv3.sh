@@ -25,6 +25,7 @@
 # Card: production deploy_r2m4_b10245f5 as loaded (EXPECT b10245f5, register map 5); its
 # qual/cfg.pkl. O (/data/otpu/minicpmv): the slim checkpoint, the pool (its 446 vision entries
 # packed by mcpv2), img/, refs/ (minicpmv-text/thumb/sliced.json), pylib/.
+# POOL_CALLS=1: chatmoe.py --pool-calls (the pool's page cache around each call too).
 # One otpu-lock: selftest (the configuration must be production's), the runs, selftest. A build
 # other than EXPECT, a failed selftest, another configuration or a missing file stops it; a failed
 # run or a token mismatch is reported and the next run goes on. The last line: MCPV3 PASS or
@@ -131,7 +132,8 @@ PY
 }
 chat() {      # chatmoe.py run $1 (RUN's options), checked against REFOF's reference
   eval "timeout 3600 python tools/qual/chatmoe.py $O/$MD --pool $O/$POOL --backend board --cfg $R/cfg-dev.pkl \
-    --check $RF/minicpmv-${REFOF[$1]}.json --out $R/minicpmv-$1.json ${RUN[$1]}" > $R/minicpmv-$1.log 2>&1
+    --check $RF/minicpmv-${REFOF[$1]}.json --out $R/minicpmv-$1.json ${POOL_CALLS:+--pool-calls} ${RUN[$1]}" \
+    > $R/minicpmv-$1.log 2>&1
   local rc=$?
   echo "  exit $rc $(date +%T)"; grep -E "\[(PASS|FAIL)\]|Error|Traceback" $R/minicpmv-$1.log | tail -3
   [ $rc = 0 ] && grep -q "\[PASS\]" $R/minicpmv-$1.log || fail=1
