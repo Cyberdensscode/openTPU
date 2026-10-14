@@ -51,7 +51,8 @@ FAMILIES = ("generic", "xilinx7", "xilinxus", "asic")
 UARCH_KEYS = ("MXU_IMPL", "MXU_CL", "VPU_CL", "ULANES", "TMEM_IMPL", "RPB", "WPB", "WIN",
               "FIFO_DEPTH", "TRACE_DEPTH", "PQ_WIN", "CHASH")
 # and the optional ones (absent: the RTL's default): MXU_E, the MXU's epilogue lanes (0: MCOLS / 2;
-# above MCOLS: MCOLS); with TMEM_IMPL 3 the one copy's knobs (otpu_slice TMEM_<K>,
+# above MCOLS: MCOLS); SW_REG, the slice's SW port (QST writes) from a register (otpu_slice);
+# with TMEM_IMPL 3 the one copy's knobs (otpu_slice TMEM_<K>,
 # docs/tmem_nocopy.md; vivado/tmem_knobs.tcl's TMEM_X)
 TMEM3_KEYS = ("TMEM_NSB", "TMEM_SBP", "TMEM_SBH", "TMEM_RPL", "TMEM_TDP", "TMEM_GST", "TMEM_PMP",
               "TMEM_PRK", "TMEM_SDM")
@@ -266,6 +267,8 @@ def sim_uarch(t: Target | str | None = None) -> dict:
         d["MXU_E"] = u["MXU_E"]
     if t.arch["SEQ_WC"]:
         d["SEQ_WC"] = 1
+    if u.get("SW_REG"):
+        d["SW_REG"] = int(u["SW_REG"])
     return d
 
 

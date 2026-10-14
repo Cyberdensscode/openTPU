@@ -32,7 +32,8 @@ module otpu_asic_top
   parameter bit HAS_DSTEP  = 1'b1,
   parameter int TMEM_IMPL  = 1,         // the banked TMEM (otpu_tmem IMPL 1) and its limits
   parameter int RPB        = 1,
-  parameter int WPB        = 1
+  parameter int WPB        = 1,
+  parameter bit SW_REG     = 1'b0     // the SW port's outputs (QST writes) from a register
 ) (
   input  logic                clk,
   input  logic                sys_rst,      // the loader's reset
@@ -90,7 +91,7 @@ module otpu_asic_top
                .ACT_ROWS(ACT_ROWS), .TMEM_WORDS(TMEM_WORDS), .IMEM_WORDS(IMEM_WORDS),
                .FIFO_DEPTH(FIFO_DEPTH), .LANES(LANES), .WIN(WIN), .RPB(RPB), .WPB(WPB),
                .MXU_IMPL(MXU_IMPL), .MXU_CL(MXU_CL), .VPU_CL(VPU_CL), .ULANES(ULANES),
-               .HAS_DSTEP(HAS_DSTEP), .TMEM_IMPL(TMEM_IMPL)) u_slice (
+               .HAS_DSTEP(HAS_DSTEP), .TMEM_IMPL(TMEM_IMPL), .SW_REG(SW_REG)) u_slice (
     // clk_f: an ASIC does not pump its SRAM (TMEM_PMP 0: the one copy's two-port macros run at
     // the core clock, docs/tmem_nocopy.md), so there is no 2x clock
     .clk, .clk_f(1'b0), .sys_rst, .rst, .rinit(rinit_a), .ld_start, .ld_addr, .ld_n, .ld_busy,
