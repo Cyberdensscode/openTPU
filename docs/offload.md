@@ -5071,3 +5071,17 @@ accept, replayed as the k = 1 loop) the head the card has (fp4, the 32K lowest i
 20 there (the card 11 of 20) and 56 of 75 over the five turns (the card 55 of 76), the full fp32
 head 13 of 18; 13% of turn 3's targets (a markdown list with an en dash, numbers and French names)
 are outside the 32K ids.
+
+Another 32K-id set does not pay (2026-10-14). Ranked by frequency on 10M tokens of UltraChat's
+replies (MIT; none of mtp_accept.py's prompts), the 32K most frequent ids cover fewer reply
+targets than the lowest 32K on gen-base (0.902 against 0.927: chat +2.1 points, summaries +6.0,
+code -14.5, UltraChat having little code); the lowest 16K and then the most frequent above them
+cover the most (0.953, code -0.9; the card's five turns 0.900 -> 0.954). On the fp32 reference
+(mtp_transplant accept's drafts, the fp4 head, int8 activations) that set gains per position
++1.8 points on gen-base (0.782 -> 0.800), +1.5 on gen-mcpv (MiniCPM-V's replies, its embedding and
+head: 0.796 -> 0.811) and +4.6 on the five turns (130 targets), but the k = 1 loop's acceptance,
+which the decode follows, only +0.6 / +0.4 (0.775 -> 0.781, 0.791 -> 0.795; the five turns +6.1),
+with code -1.2: ~+0.2-0.4% decode. The device's side would be cheap: the draft index's id from a
+table in DRAM (an RLD MUL into a register and a one-word load, as qwen3._embed_word) costs D +372
+cycles (+0.056%) and D1 +46 in co-sim (the prototype: branch draft-ids, e7c58f75), but not worth a
+table and its mechanism in every MTP image: the draft head stays the lowest 32K ids.
