@@ -217,6 +217,15 @@ def plan(kinds) -> list:
         [(f + cov + a, unit, r) for a, unit, r in tail]
 
 
+def subs(runs, size) -> dict:
+    """Each run's unit planned again (plan over its keys): a repeated part of the unit (Qwen3.5's
+    three DeltaNet layers before each attention layer) loops again, inside the unit's loop, as
+    Gemma 4's do. {run's first layer: [(first element, part, repeats, the part's bytes)]};
+    size(key): a layer block's bytes (the part's blocks lie one after the other: _place)."""
+    return {first: [(e0, su, r, sum(size(k) for k in su)) for e0, su, r in plan(unit)]
+            for first, unit, _ in runs}
+
+
 # =============================================================================== reference
 def _norm(v, g, eps):
     return (v / np.sqrt(np.mean(v * v, axis=-1, keepdims=True) + eps)) * g
@@ -971,15 +980,24 @@ def lfm2_prompt_run(m, pos, R: int, kind: str, block: int = ATTN_BLOCK):
                      None if run else OutTokens(0))
 
 
-def run_layers(runs, layer) -> None:
+def run_layers(runs, layer, nest: dict | None = None) -> None:
     """Emit the layers of a plan (runs of `plan`) as layer(index, it): a run with repeats is
     one hardware loop over its unit (the index is the element's layer in the first iteration,
-    `it` the loop variable), the others are unrolled (`it` None)."""
+    `it` the loop variable), the others are unrolled (`it` None). nest (subs' of the runs): a
+    unit's repeated part is a hardware loop inside it, its layers layer(index, it, jt) with
+    jt = (the inner loop variable, the part's layers, its bytes); one copy of the part's
+    layers in the program instead of one a repeat."""
     for first, unit, reps in runs:
-        if reps == 1:
-            for e in range(len(unit)):
-                layer(first + e, None)
-            continue
-        for i in ol.range(reps):
-            for e in range(len(unit)):
-                layer(first + e, i)
+        for it in ([None] if reps == 1 else ol.range(reps)):
+            if nest is None:
+                for e in range(len(unit)):
+                    layer(first + e, it)
+                continue
+            for e0, su, r, nb in nest[first]:
+                if r == 1:
+                    for e in range(len(su)):
+                        layer(first + e0 + e, it)
+                    continue
+                for jt in ol.range(r):
+                    for e in range(len(su)):
+                        layer(first + e0 + e, it, (jt, len(su), nb))

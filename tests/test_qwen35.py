@@ -11,7 +11,7 @@ import pytest
 
 from opentpu.isasim import board_config
 from opentpu.llm import load_spec
-from opentpu.llm.lfm2 import plan
+from opentpu.llm.lfm2 import plan, subs
 from opentpu.llm.qwen3 import ATTN_BLOCK, Engine, load_weights
 from opentpu.llm.qwen35 import Spec, emulated_logits, reference_logits
 
@@ -87,6 +87,17 @@ def test_plan_loops_the_repeated_unit():
     assert plan(("linear", "linear", "linear", "attn") * 6) == [
         (0, ("linear", "linear", "linear", "attn"), 6)]
     assert plan(KINDS) == [(0, ("linear", "linear", "attn"), 2)]
+
+
+def test_subs_loop_the_units_repeated_part():
+    """lfm2.subs: a unit's DeltaNet layers before its attention layer are a loop of their own
+    inside the unit's (the prefill programs' NEST), its part's bytes the stride."""
+    size = {"linear": 3, "attn": 5}.get
+    assert subs(plan(("linear", "linear", "linear", "attn") * 8), size) == {
+        0: [(0, ("linear",), 3, 3), (3, ("attn",), 1, 5)]}
+    assert subs(plan(KINDS), size) == {0: [(0, ("linear",), 2, 3), (2, ("attn",), 1, 5)]}
+    assert subs(plan(("attn", "linear")), size) == {0: [(0, ("attn",), 1, 5)],
+                                                    1: [(0, ("linear",), 1, 3)]}
 
 
 @pytest.mark.parametrize("config", ["design", "board"])

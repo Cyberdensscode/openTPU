@@ -113,7 +113,7 @@ class MTPDecoder:
         rows = [(0, p + j) for j in range(len(toks))]
         t0 = time.perf_counter()
         progs = self.img.compile_rows(rows, logit_rows, self.eng.block, tokens=toks,
-                                      slot=self.slot, fork=fork, hidden=True)
+                                      slot=self.slot, fork=fork, hidden=True, nest=False)
         st.compile_s += time.perf_counter() - t0
         if fork:
             st.slots.append(self.slot)
@@ -488,7 +488,7 @@ def _verify_gen(m, pos, block: int, c: int, R: int, samp: G.Sampling | None = No
             m.lm_sinks.append(G.Sampler(b, m, g, samp, st, pos, consts,
                                         lg=a["lg"] if r else None, u_at=pos.pos + 1 + r,
                                         pen_from=m.lm_sinks[0] if r else None))
-    qwen35_rows.fn(m, pos, R, list(range(R)), block, None, R > 1, True)
+    qwen35_rows.fn(m, pos, R, list(range(R)), block, None, R > 1, True, False)  # (not nested)
     if samp is not None and samp.pen and R > 1:
         _penalize_draft(b, g, st, m.lm_sinks[1])
     toks = [sk.token() for sk in m.lm_sinks]

@@ -502,6 +502,7 @@ def qwen35_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, hidden: boo
     streamed once a run, pair of heads by pair). hidden: MTP's rows (each row's final-normed
     hidden to m.hid, as qwen35_rows'). spill, depth, whole: as qwen3_tile's."""
     from ..kernels.lib import rmsnorm
+    from . import qwen35 as Q35
     from .qwen35 import LIN, _deltanet_rows, run_layers
     spec = m.spec
     if not isinstance(pos, RunRows) or pos.lo < spec.conv_k - 1:
@@ -512,8 +513,8 @@ def qwen35_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, hidden: boo
     parts, sub = _widths(m, T)
     dr = drows or T
 
-    def layer(li, it):
-        lw = m.layer(li, it)
+    def layer(li, it, jt=None):
+        lw = m.layer(li, it, jt)
         x = res.x
         if lw.kind == LIN:
             for r0, n in _pieces(T, dr):
@@ -528,7 +529,7 @@ def qwen35_tile(m, pos, T: int, logit_rows, block: int = ATTN_BLOCK, hidden: boo
                             depth=depth, whole=whole, oscr=_oscr(m, oscr))
         _mlp_tile(res.x, lw, spec, parts, sub(lw))
 
-    run_layers(m.plan, layer)
+    run_layers(m.plan, layer, m.subs if Q35.NEST else None)   # (the DeltaNet layers' loop)
     x = res.x
     if hidden:
         g = ol.load(m.g_final)

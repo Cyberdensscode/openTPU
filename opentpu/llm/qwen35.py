@@ -73,7 +73,7 @@ from ..kernels.layouts import head_parallel_attention_weights
 from ..kernels.deltanet import gates, l2norm_rows
 from ..kernels.lib import rmsnorm, silu
 from ..kernels.mlp import _chunk, down_chunk
-from .lfm2 import _place, plan, run_layers
+from .lfm2 import _place, plan, run_layers, subs
 from . import formats as FM
 from . import generate as G
 from . import moe as MO
@@ -95,6 +95,7 @@ EMBED_F32_MAX = 2 << 30     # bytes: a larger fp32 embedding table (over half th
 #                             Qwen3.5-4B and up) is int8, gathered from the head (Spec.embed)
 PREFILL_CHUNK = 512 # a MoE model's layer-major prefill: prompt rows a chunk (Image's xbuf)
 RUN_ROWS = 4        # and at most rows a run (_deltanet_rows' gr / on; moe_ffn_rows: R k ids)
+NEST = True         # prefill programs loop a unit's DeltaNet layers inside the unit's loop (subs)
 
 
 # =============================================================================== model spec
@@ -765,6 +766,9 @@ class Image(EmbedHost):
         self.keys = tuple(zip(spec.kinds, self.lf))
         self.plan = plan(self.keys)
         self.loc = _place(b, self.plan, lambda k: self.layouts[k[1]].size[k[0]])
+        # a unit's repeated part (the DeltaNet layers before each attention layer) loops again
+        # inside the unit's loop in the prefill programs (NEST: qwen35_rows, tiled.qwen35_tile)
+        self.subs = subs(self.plan, lambda k: self.layouts[k[1]].size[k[0]])
         if spec.mtp:                # an attention block after the model's (the formats without a
             gm = tuple(fmt(k, spec.layers) for k in ("delta", "attn", "gateup", "down"))  # range)
             if gm not in self.layouts:
@@ -1103,9 +1107,11 @@ class Image(EmbedHost):
                 for s in range(self.cfg.S)]
 
     def compile_rows(self, rows, logit_rows, block: int = ATTN_BLOCK, tokens=None,
-                     slot: int = 0, fork: bool = False, hidden: bool = False) -> list:
+                     slot: int = 0, fork: bool = False, hidden: bool = False,
+                     nest: bool = True) -> list:
         """One program per slice: consecutive positions of the sequence at once
-        (qwen35_rows); slot, fork, hidden: MTP decoding's (qwen35_rows, docs/mtp.md 9)."""
+        (qwen35_rows); slot, fork, hidden: MTP decoding's (qwen35_rows, docs/mtp.md 9); nest
+        False: the unit's DeltaNet layers unrolled (MTP's verify rows)."""
         if self.spec.moe is not None:
             raise ValueError("a MoE model runs its prompt through the decode step (its MoE "
                              "block routes one token): rows=1")
@@ -1118,6 +1124,8 @@ class Image(EmbedHost):
         mtp = {"fork": True} if fork else {}
         if hidden:
             mtp["hidden"] = True
+        if not nest:
+            mtp["nest"] = False
         return [qwen35_rows.trace(self.cfg, s, {"m": self.descriptors(s, slot), "p0": rows[0][1],
                                                 "R": len(rows), "logit_rows": list(logit_rows),
                                                 "block": block, **mtp,
@@ -1285,13 +1293,17 @@ class Image(EmbedHost):
         sl = dict(tp=K * self.CP, wwords=(K - 1) * self.CP, slot=slot,
                   sbytes=self.sbytes if self.slots > 1 else 0)
 
-        def layer(li, it=None):
+        def layer(li, it=None, jt=None):
             """Descriptors of layer `li` (static), or of element li of its run's unit at
-            iteration `it` (a hardware-loop variable). Its kind and formats group from
-            self.keys (the MTP layer's: li = spec.layers)."""
+            iteration `it` (a hardware-loop variable) and, jt = (loop variable, layers, bytes):
+            at iteration jt of the unit's inner loop over its repeated part (lfm2.run_layers'
+            nest). Its kind and formats group from self.keys (the MTP layer's: li =
+            spec.layers)."""
             kind, g = self.keys[li]
             lay = self.layouts[g]
             off = self._off(li, it)
+            if jt is not None:
+                off = off + Affine.of(jt[0]) * jt[2]
             lofs, mf = lay.lofs[kind], lay.mf
             ns = SimpleNamespace(g_in=Tensor(off + lofs["g_in"], (H,), (1,)),
                                  g_post=Tensor(off + lofs["g_post"], (H,), (1,)),
@@ -1364,7 +1376,7 @@ class Image(EmbedHost):
                            dh=_qdesc(*mo["dh"], self.nd, H, D, "fp4")),
                        mtpgen=self.lookup.get("mtpgen"))
         return SimpleNamespace(
-            spec=spec, layer=layer, plan=self.plan, moe_dev=dev, **mtp,
+            spec=spec, layer=layer, plan=self.plan, subs=self.subs, moe_dev=dev, **mtp,
             x=_tdesc(self.io["x"], (1, H)), cos=_tdesc(self.io["cos"], (spec.rope_dim // 2,)),
             sin=_tdesc(self.io["sin"], (spec.rope_dim // 2,)), g_final=_tdesc(self.io["gf"], (H,)),
             logits=_tdesc(self.io["logits"], (1, spec.vocab)),
@@ -2244,7 +2256,7 @@ def _deltanet_rows(x, lw, p0: int, spec: Spec, gr, on, fork: bool = False, xs=No
 
 @ol.jit
 def qwen35_rows(m, p0: int, R: int, logit_rows, block: int = ATTN_BLOCK, tokens=None,
-                fork: bool = False, hidden: bool = False):
+                fork: bool = False, hidden: bool = False, nest: bool = True):
     """R prompt tokens at positions p0 .. p0+R-1 at once: their embeddings m.xr and RoPE
     tables m.cosr / m.sinr, or those of `tokens` from the image's tables (qwen3._inputs_rows) ->
     logits of the rows in `logit_rows` (a contiguous range, or empty). Bit-identical to R
@@ -2269,15 +2281,17 @@ def qwen35_rows(m, p0: int, R: int, logit_rows, block: int = ATTN_BLOCK, tokens=
         raise CompileError(f"a run-time rows run: {p0.R} rows from position {pd}")
     x, c, s_ = _inputs_rows(m, rows, tokens)
 
-    def layer(li, it):
-        lw = m.layer(li, it)
+    def layer(li, it, jt=None):
+        lw = m.layer(li, it, jt)
         if lw.kind == LIN:
             x.set(_deltanet_rows(x, lw, pd, spec, m.gr[0:R, :], m.on[0:R, :], fork))
         else:
             x.set(_attention_rows(x, lw, c, s_, rows, spec, block, gated=True))
         x.set(_mlp(x, lw, spec))
 
-    run_layers(m.plan, layer)
+    # prefill loops a unit's DeltaNet layers inside the unit's loop (NEST); MTP's verify rows
+    # (nest False: decode-time programs) keep a copy of each layer of the unit
+    run_layers(m.plan, layer, m.subs if NEST and nest else None)
     if hidden:                  # row by row: one row of TMEM (a prompt run's R rows fit)
         g = ol.load(m.g_final)
         for r in range(R):

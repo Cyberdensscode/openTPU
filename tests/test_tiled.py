@@ -217,7 +217,7 @@ def _dram_but_scratch(eng, P):
     ("kh16", 4, 37, 30, 4, 16, None),       # 2 heads (QPART), DeltaNet rows; 16 DeltaNet heads
     ("qwen3", 4, 250, 20, 8, 16, {"spill": True}),     # x spilled while the heads attend
     ("lfm2", 4, 37, 30, 8, 16, {"spill": True}),
-    ("kh8", 4, 250, 20, 4, 12, {"spill": True, "drows": 5}),   # DeltaNet: 3 x 4 rows
+    ("kh8", 4, 250, 20, 4, 16, {"spill": True, "drows": 5}),   # DeltaNet: runs of 5 rows
     ("kh8", 4, 250, 20, 4, 12, {"spill": True, "drows": 5, "oscr": False}),  # the outputs
 ])                                          # gathered in TMEM (its [16, n_q d]: 12 rows)
 def test_tiled_prompt_runs_are_todays(tmp_path_factory, monkeypatch, case, mcols, P1, P2, R, T,
@@ -242,6 +242,60 @@ def test_tiled_prompt_runs_are_todays(tmp_path_factory, monkeypatch, case, mcols
         assert np.array_equal(x.view(np.uint32), y.view(np.uint32))
     assert all(np.array_equal(x, y) for x, y in zip(_dram_but_scratch(a, P1 + P2),
                                                     _dram_but_scratch(b, P1 + P2)))
+
+
+@pytest.mark.parametrize("tile", [True, False], ids=["tile", "prompt"])
+def test_qwen35_nested_layers_are_the_unrolled_ones(tmp_path_factory, monkeypatch, tile):
+    """Qwen3.5's prefill programs loop a unit's DeltaNet layers inside the unit's loop
+    (qwen35.NEST, lfm2.subs: the tiny model's (lin, lin, attn) x 2 runs its two DeltaNet layers
+    as a loop of 2, one copy of the layer in the program): two prompts' last logits and every
+    slice's DRAM bit for bit as with the layers unrolled, tiled runs and today's prompt runs
+    alike, in shorter programs of the same rows."""
+    from opentpu.llm import qwen35 as Q35
+    r = np.random.default_rng(7)
+    p1, p2 = ([int(t) for t in r.integers(0, 1000, n)] for n in (250, 20))
+    W, spec, cfg, kw = _family("kh8", tmp_path_factory)
+    cfg = dataclasses.replace(cfg, MCOLS=4, ACT_ROWS=16)
+
+    def run():
+        e = Engine(spec, W, cap=512, cfg=cfg, rows=16, resident=True, prompt_runs=True, **kw)
+        e.tile_runs = tile
+        return e, [e.prefill(p1), e.prefill(p2)]
+
+    (a, got) = run()
+    monkeypatch.setattr(Q35, "NEST", False)
+    (b, want) = run()
+    assert [s["rows"] for s in a.stats] == [s["rows"] for s in b.stats]
+    assert ("prompt tile" if tile else "prompt") in {k[0] for k in a._prompt_progs}
+    for x, y in zip(got, want):
+        assert np.array_equal(x.view(np.uint32), y.view(np.uint32))
+    assert all(np.array_equal(x, y) for x, y in zip(_dram_but_scratch(a, 270),
+                                                    _dram_but_scratch(b, 270)))
+    n = {e: {k: max(map(len, v[0])) for k, v in e._prompt_progs.items()} for e in (a, b)}
+    assert n[a].keys() == n[b].keys() and all(n[a][k] < n[b][k] for k in n[a])
+
+
+@pytest.mark.parametrize("dims, T", [("4B", 4), ("0.8B", 12)])
+def test_qwen35_tiles_fit_the_cards_imem(dims, T):
+    """At the real dims (layout only, no weights) on the card's configuration (m4: MCOLS 4,
+    ACT_ROWS 16, 4K-instruction IMEM; otpu-chat's formats: the 4B's mix, the 0.8B's int8; the
+    image's rows grown to 16) the nested DeltaNet layers (qwen35.NEST) fit the tile the TMEM
+    holds in IMEM at every bucket of a 2K context, P and L: Qwen3.5-4B 4 rows (unrolled, its
+    whole-model program was 4,210 instructions at bucket 5, so 2 rows from there), Qwen3.5-0.8B
+    12 (unrolled: 4)."""
+    from opentpu.llm import generate as G
+    from opentpu.llm.qwen35 import Spec as S35
+    kinds = ("linear", "linear", "linear", "attn") * (8 if dims == "4B" else 6)
+    spec = S35(2560, kinds, 16, 4, 256, 64, 32, 128, 128, 9216, 248320, lin_kheads=16,
+               embed="int8", mix="delta=fp4,mlp=nvfp4") if dims == "4B" else \
+        S35(1024, kinds, 8, 2, 256, 64, 16, 128, 128, 3584, 248320, lin_kheads=16)
+    cfg = board_config(PAIR=True, DSTEP=True, STREAM=True, SEQ_WC=True, DRAM_BYTES=1 << 33)
+    assert cfg.MCOLS == 4 and cfg.act_rows == 16 and cfg.IMEM_WORDS // 8 == 4096
+    img = spec.image(cfg, 2048, 1, 16, wformat="mix" if dims == "4B" else "int8", lookup=True)
+    for blocks in range(1, 9):
+        for kind in ("P", "L"):
+            progs, _ = tiled.compile_tile_run(img, blocks, T, kind)
+            assert G.fits(img, progs), (blocks, kind, max(map(len, progs)))
 
 
 @pytest.mark.parametrize("P1, P2", [(36, 24), (250, 20)])
@@ -392,8 +446,8 @@ def test_tiled_forms_placed_next_fit_first():
     ("kh8", 4, 16, 300, 16, None),      # channel parts; Qwen3.5: DeltaNet rows (DSTEP), gated
     ("gemma4-1", 4, 16, 600, 4, None),  # Gemma 4: the sliding window's start-masked block (IMEM:
     ("gemma4-2", 8, 16, 300, 8, None),  # 4 rows in bucket 3); E4B's groups of 4, two rows a tile
-    ("kh8", 4, 16, 300, 12, {"spill": True, "drows": 5}),  # x stored and loaded back in place,
-    #                                                         DeltaNet in runs of 4 x 3
+    ("kh8", 4, 16, 300, 16, {"spill": True, "drows": 5}),  # x stored and loaded back in place,
+    #                                                         DeltaNet in runs of 5 rows
     ("kh8", 4, 16, 300, 16, "ranges"),  # W_o's operand in QACT ranges: an MM a range (ACC)
     ("kh8", 4, 16, 300, 12, {"spill": True, "drows": 4, "oscr": False}),  # outputs in TMEM
 ])
