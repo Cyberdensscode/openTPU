@@ -2146,7 +2146,9 @@ class Engine:
     rows a run, the image's I/O rows at least ACT_ROWS; False: today's. With expert_major a
     MoE model's layer runs of more than one row, opt-in: tile_runs True or OTPU_TILE=1
     (prefill.layer_tile_flag; layer_tile: tiled.compile_layer_tile, on an image built with
-    OTPU_TILE=1: its mask tiles).
+    OTPU_TILE=1: its mask tiles), of `tile_rows` rows (None: layer_major's), at most ACT_ROWS;
+    the calls that run layer-major (gate_expert_major's short ones) keep layer_major's rows,
+    untiled.
 
     rollback(k) takes the context back to its first k tokens (a chat's next turn, whose
     template renders the last reply differently from what was fed: opentpu/llm/snapshot.py).
@@ -2166,7 +2168,8 @@ class Engine:
                  restore: str = "lazy", embed_runs: bool = False, release_weights: bool = True,
                  pool_map: bool = True, prog_cache: bool | None = None,
                  prompt_runs: bool = False, layer_ahead=None, expert_major: bool = False,
-                 snapshots: int = 0, batch_area: bool = False, tile_runs: bool | None = None):
+                 snapshots: int = 0, batch_area: bool = False, tile_runs: bool | None = None,
+                 tile_rows: int | None = None):
         from . import prefill as PF
         self.spec, self.cap, self.block = spec, cap, block
         self.prog_cache = PC.enabled() if prog_cache is None else bool(prog_cache)
@@ -2305,9 +2308,10 @@ class Engine:
         from . import tiled as TL
         self.layer_tile = bool(self.expert_major and PF.layer_tile_flag(tile_runs)
                                and TL.layer_family(self.image))
-        if self.layer_tile and self.layer_major > self.cfg.act_rows:
-            raise ValueError(f"tiled layer runs of {self.layer_major} rows: one MM over them "
-                             f"needs ACT_ROWS >= {self.layer_major} ({self.cfg.act_rows})")
+        self.tile_rows = int(tile_rows or self.layer_major)     # (a tiled run's rows)
+        if self.layer_tile and self.tile_rows > self.cfg.act_rows:
+            raise ValueError(f"tiled layer runs of {self.tile_rows} rows: one MM over them "
+                             f"needs ACT_ROWS >= {self.tile_rows} ({self.cfg.act_rows})")
         self._gens: dict = {}               # the generate loop: (blocks, mode) -> programs
                                             # (a list, or split: (first parts, second parts))
         self.gen_split = None               # split generate programs: None when a bucket's
@@ -2847,6 +2851,8 @@ class Engine:
             if not tokens:
                 return lg if logits else None
         em = self.expert_major
+        tile = em and self.layer_tile   # (expert-major runs tiled, of T rows: layer 0's from the
+        T = self.tile_rows if tile else R               # host's slot or from vis untiled, R)
         mo = getattr(self.spec, "moe", None)
         chunks, p0 = [], self.pos       # each chunk's runs: (key, run arguments, the host's rows
         for c0 in range(0, len(tokens), img.prefill_rows):  # written before it, or None)
@@ -2866,7 +2872,7 @@ class Engine:
                         n = min(R, low - i)
                         runs.append(((li, None, n, True, p), {"row": i}, None))
                     else:
-                        n = min(R, len(part) - i, B - p % B)
+                        n = min(T, len(part) - i, B - p % B)
                         if li == 0 and vp is not None:      # a run of text or of image rows
                             j, im = i + 1, vp[i] >= 0
                             while j < i + n and (vp[j] >= 0) == im and \
@@ -2874,16 +2880,17 @@ class Engine:
                                 j += 1
                             n = j - i
                             if im:                          # (the rows from vis, then layer 0
-                                runs.append((("v", n), {"row": i, "src": vp[i]}, None))  # on them)
+                                n = min(n, R)               # on them, untiled)
+                                runs.append((("v", n), {"row": i, "src": vp[i]}, None))
                                 runs.append(((0, p // B + 1, n, True),
                                              dict(RunPos.values(part[i], p, K, B), row=i), None))
                                 i += n
                                 continue
                         gather = li == 0 and (R == 1 or host)   # (the run gathers its rows:
-                        if gather and self.layer_tile:          # the host's; untiled)
-                            n = min(n, TL.untiled_rows(img))
+                        if gather and tile:                     # the host's; untiled)
+                            n = min(n, R, TL.untiled_rows(img))
                         key = (li, p // B + 1, n, R > 1 and not gather)
-                        if self.layer_tile and n > 1 and not gather:
+                        if tile and n > 1 and not gather:
                             key += ("tile",)                    # (tiled.compile_layer_tile)
                         runs.append((key, dict(RunPos.values(part[i], p, K, B), row=i),
                                      part[i:i + n] if gather else None))
