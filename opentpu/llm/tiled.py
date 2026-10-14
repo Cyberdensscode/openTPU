@@ -1101,11 +1101,13 @@ LAYER_KERNELS = {"gemma4": gemma4_layer_tile, "qwen35": qwen35_layer_tile}
 
 
 def layer_family(img) -> str | None:
-    """The image's family when a tiled expert-major layer run serves it (LAYER_KERNELS: a MoE
-    image with prefill rows, the expert server's words and the mask tiles, which a MoE model's
-    image holds when OTPU_TILE=1 as it is built: prefill.layer_tile_flag), else None."""
-    name = type(img).__module__.rsplit(".", 1)[-1]
-    ok = name in LAYER_KERNELS and getattr(img, "prefill_rows", 0) and \
+    """The image's family when a tiled expert-major layer run serves it (LAYER_KERNELS, its
+    class's module or a base class's: MiniCPM-V's Image is Qwen3.5's; a MoE image with prefill
+    rows, the expert server's words and the mask tiles, which a MoE model's image holds when
+    OTPU_TILE=1 as it is built: prefill.layer_tile_flag), else None."""
+    name = next((n for n in (t.__module__.rsplit(".", 1)[-1] for t in type(img).__mro__)
+                 if n in LAYER_KERNELS), None)
+    ok = name is not None and getattr(img, "prefill_rows", 0) and \
         getattr(img, "offload", None) is not None and "amask" in (img.lookup or {})
     return name if ok else None
 
