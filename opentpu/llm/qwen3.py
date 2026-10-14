@@ -2144,11 +2144,12 @@ class Engine:
     (prefill.warm). tile_runs (docs/tiled_prefill.md; None: OTPU_TILE's choice, on unless it
     is 0: prefill.tile_flag): the prompt runs tiled (opentpu/llm/tiled.py), up to ACT_ROWS
     rows a run, the image's I/O rows at least ACT_ROWS; False: today's. With expert_major a
-    MoE model's layer runs of more than one row, opt-in: tile_runs True or OTPU_TILE=1
-    (prefill.layer_tile_flag; layer_tile: tiled.compile_layer_tile, on an image built with
-    OTPU_TILE=1: its mask tiles), of `tile_rows` rows (None: layer_major's), at most ACT_ROWS;
-    the calls that run layer-major (gate_expert_major's short ones) keep layer_major's rows,
-    untiled.
+    MoE model's layer runs of more than one row (prefill.layer_tile_flag; layer_tile:
+    tiled.compile_layer_tile, on an image with the mask tiles): Qwen3.5-MoE's by default (not
+    with OTPU_TILE=0 as the image is built), Gemma 4's opt-in (tile_runs True or OTPU_TILE=1),
+    of `tile_rows` rows (None: tiled.LAYER_ROWS' 8 for Qwen3.5-MoE, else layer_major's), at
+    most ACT_ROWS; the calls that run layer-major (gate_expert_major's short ones) keep
+    layer_major's rows, untiled.
 
     rollback(k) takes the context back to its first k tokens (a chat's next turn, whose
     template renders the last reply differently from what was fed: opentpu/llm/snapshot.py).
@@ -2301,14 +2302,17 @@ class Engine:
                                       and not self.layer_hint):
             raise ValueError("expert-major MoE needs layer-major prefill, the expert server "
                              "with pooled slots, and no layer hints (its runs post needs)")
-        # expert-major runs of more than one row tiled, opt-in (tile_runs True, None: OTPU_TILE
-        # set and not 0: prefill.layer_tile_flag; tiled.py's compile_layer_tile: the layer's
-        # weights once for the run's rows, up to ACT_ROWS of them; the image's mask tiles,
-        # which OTPU_TILE=1 gives a MoE image as it is built)
+        # expert-major runs of more than one row tiled (tiled.py's compile_layer_tile: the
+        # layer's weights once for the run's rows, up to ACT_ROWS of them; the image's mask
+        # tiles): Qwen3.5-MoE's by default, tiled.LAYER_ROWS rows a run, unless tile_runs is
+        # False or (None) OTPU_TILE=0 as the image is built; Gemma 4's opt-in (tile_runs True,
+        # or OTPU_TILE=1), layer_major's rows a run: prefill.layer_tile_flag
         from . import tiled as TL
-        self.layer_tile = bool(self.expert_major and PF.layer_tile_flag(tile_runs)
-                               and TL.layer_family(self.image))
-        self.tile_rows = int(tile_rows or self.layer_major)     # (a tiled run's rows)
+        fam = TL.layer_family(self.image)
+        self.layer_tile = bool(self.expert_major and fam
+                               and PF.layer_tile_flag(tile_runs, fam in TL.LAYER_ROWS))
+        self.tile_rows = int(tile_rows or (min(TL.LAYER_ROWS[fam], self.cfg.act_rows)
+                                           if fam in TL.LAYER_ROWS else self.layer_major))
         if self.layer_tile and self.tile_rows > self.cfg.act_rows:
             raise ValueError(f"tiled layer runs of {self.tile_rows} rows: one MM over them "
                              f"needs ACT_ROWS >= {self.tile_rows} ({self.cfg.act_rows})")

@@ -732,7 +732,8 @@ class Image(EmbedHost):
                    "gr": b.alloc(4 * 2 * self.nl * self.grows),    # chunked prefill, per row:
                    "on": b.alloc(4 * 4 * spec.lin_dv * self.grows)}    # decays, betas; a head
         from .prefill import tile_scratch   # a tiled run's attention outputs, a part at a time
-        if tile_scratch(spec, layer_runs=True):     # (tiled.py; a MoE image's: opt-in)
+        if tile_scratch(spec, layer_runs=True, default=True):   # (tiled.py; a MoE image's: on
+            #                                   unless OTPU_TILE=0, tiled.LAYER_ROWS)
             self.io["o"] = b.alloc(4 * cfg.act_rows * self.nq_loc * spec.head_dim)
         if spec.mtp:                # the final norm's rows (the MTP's input), the draft ids
             self.io.update(hid=b.alloc(4 * H * rows), draft=b.alloc(4 * rows))   # group's outputs
@@ -798,13 +799,13 @@ class Image(EmbedHost):
                           and getattr(spec, "embed", "f32") == "int8" and spec.moe is not None)
         if embed_host and not lookup:
             raise ValueError("embed_host needs the image's lookup tables (lookup=True)")
-        # (a MoE model's mask tiles: its tiled layer runs, opt-in: OTPU_TILE=1 as it is built)
+        # (a MoE model's mask tiles: its tiled layer runs, on unless OTPU_TILE=0 as it is built)
         from .prefill import layer_tile_flag
         self.lookup = _lookup_alloc(b, spec, cap, D=D, head=self.head if shared else None,
                                     M=cfg.MCOLS, embed_host=bool(embed_host),
                                     rows=self.grows,                # (layer 0's R rows)
                                     imem=cfg.IMEM_WORDS,
-                                    masks=bool(self.prefill_rows) and layer_tile_flag(None),
+                                    masks=bool(self.prefill_rows) and layer_tile_flag(None, True),
                                     waitc=cfg.SEQ_WC) \
             if lookup else {}
         if lookup and spec.mtp:     # the MTP loop's chain area (opentpu/llm/mtp.py)

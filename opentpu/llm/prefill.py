@@ -84,24 +84,27 @@ def tile_flag(t) -> bool:
     return bool(t)
 
 
-def layer_tile_flag(t) -> bool:
+def layer_tile_flag(t, default: bool = False) -> bool:
     """A MoE model's tiled expert-major layer runs asked for (Engine.layer_tile, with
-    expert_major), and so its image's mask tiles as it is built: opt-in, not the prompt runs'
-    default. t (an engine's tile_runs) True, or where it is None OTPU_TILE set and not 0. They
-    go with the expert-major switch (docs/offload.md 13.11), which ships on its own."""
+    expert_major), and so its image's mask tiles as it is built. t (an engine's tile_runs) True,
+    or where it is None OTPU_TILE: for a family whose tiles are on by default (`default`:
+    Qwen3.5-MoE's, tiled.LAYER_ROWS: their whole forms are today's bits, docs/tiled_prefill.md
+    14) on unless it is 0, as the prompt runs' tile_flag; for the others (Gemma 4's: opt-in)
+    set and not 0."""
     if t is None:
-        t = os.environ.get("OTPU_TILE", "").strip() not in ("", "0")
+        v = os.environ.get("OTPU_TILE", "").strip()
+        t = v != "0" if default else v not in ("", "0")
     return bool(t)
 
 
-def tile_scratch(spec, layer_runs: bool) -> bool:
+def tile_scratch(spec, layer_runs: bool, default: bool = False) -> bool:
     """An image holds the tiled runs' I/O scratch (io "o": the attention's outputs a part at a
     time, loaded back whole: tiled.py): a dense model's (its tiled prompt runs, the default);
     a MoE model's only where its family has tiled layer runs (layer_runs) and they are asked for
-    as the image is built (layer_tile_flag), so a MoE image's layout and expert slots stay as
-    they were without them."""
+    as the image is built (layer_tile_flag, the family's `default`), so a MoE image's layout and
+    expert slots without them stay as they were."""
     moe = getattr(spec, "moe", None) is not None or bool(getattr(spec, "experts", 0))
-    return not moe or (layer_runs and layer_tile_flag(None))
+    return not moe or (layer_runs and layer_tile_flag(None, default))
 
 
 def tiling(eng) -> bool:
