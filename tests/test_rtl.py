@@ -775,6 +775,59 @@ def test_ldc_memory_path(have_verilator, prog, seed, ldc, mhz):
     assert all(r > 0 for r, _ in st["axi_reads"]), st["axi_reads"]
 
 
+H2C_SPAN = 32 << 10             # each channel's bytes the host load writes: the image's top 2x
+
+
+def _stream_program(n_ld: int, words: int = 8192, region: int = 768 << 10):
+    """Loads alone, one after another through `region` bytes of DRAM, each `words` words into
+    TMEM's two halves in turn: the core reading as fast as its DMA moves (decode's weights)."""
+    prog = [I.ld((k * 4 * words) % region, (k % 2) * words, words) for k in range(n_ld)]
+    return prog + [I.halt()]
+
+
+def _h2c_cosim(rate: float, mhz: float = 400, n_ld: int = 48):
+    """The stream program on the card's channels at `mhz`, alone and beside a host load of `rate`
+    GB/s over both channels (otpu_ldc_mem's +h2c_*: 256-byte bursts on XDMA's side of each bridge,
+    into the H2C_SPAN bytes below each channel's half of the image, the image's top, which the
+    program never touches; zeros over 0x5A). The program goes above the image (rtlsim's boot: the
+    simulated DRAM doubles). Returns (ISA DRAM and TMEM, then per run: DRAM, TMEM, stats)."""
+    rng = np.random.default_rng(6300)
+    cfg = Config(S=1, D=128, ACT_BLOCKS=16)
+    p = _stream_program(n_ld)
+    img = rng.integers(0, 256, cfg.DRAM_BYTES, dtype=np.uint8)
+    img[-2 * H2C_SPAN:] = 0x5A
+    m = Machine(cfg, [p], [img.copy()]).run()
+    xhz = 1.25 * mhz * 1e6                          # otpu_ldc_mem's xclk: 1.25x the core's
+    load = [f"+h2c_bpk={round(1000 * rate / 2 * 1e9 / xhz)}", "+h2c_burst=256",
+            f"+h2c_span={H2C_SPAN}", f"+h2c_base={cfg.DRAM_BYTES // 2 - H2C_SPAN}"]
+    out = []
+    for plus in ([], load):
+        drams, tmems, st = rtlsim.run(cfg, [p], [img.copy()], axi=True, boot=True, ldc=1066,
+                                      uarch=rtlsim.BOARD_UARCH,
+                                      plusargs=rtlsim.ldc_plusargs(1066, mhz) + plus)
+        out.append((drams[0], tmems[0], st))
+    return (m.slices[0].dram, m.slices[0].tmem), out
+
+
+# XDMA's writes beside the core's on the card's channels (docs/offload.md 13.19, the write
+# contention): the core's results stay bit-exact, every host burst lands (the image's top ends all
+# zeros) and is answered (but those in flight at the end), and otpu_mem_ch's batches (XT, XB: a
+# host turn carries a batch, so the controller turns its bus and changes rows once a batch) keep
+# the run's extra time per GB written under 0.015 s: 0.006 here (1.3% slower), against 0.034
+# without them (XT 0: 7.2% slower).
+def test_ldc_host_writes(have_verilator):
+    (dram, tmem), ((d0, t0, s0), (d1, t1, s1)) = _h2c_cosim(2.0)
+    want = dram.copy()
+    want[-2 * H2C_SPAN:] = 0
+    assert np.array_equal(t0, tmem) and np.array_equal(d0, dram)
+    assert np.array_equal(t1, tmem) and np.array_equal(d1, want)
+    h = s1["h2c"]
+    assert len(h) == 2 and all(0 <= x["bursts"] - x["bresp"] <= 4 and x["bytes"] >= H2C_SPAN
+                               and x["bytes"] == 256 * x["bursts"] for x in h), h
+    ct = (s1["cycles"] - s0["cycles"]) / 400e6 / (sum(x["bytes"] for x in h) / 1e9)
+    assert ct < 0.015, (ct, s0["cycles"], s1["cycles"], h)
+
+
 def _dma_program(rng, cfg: Config, n_ops=70):
     """LD / ST only: every alignment within a chunk, lengths around the segment and chunk sizes
     and past the DMA's chunk buffer (32 chunks), stores that share chunks, and loads of what
