@@ -365,15 +365,20 @@ def test_mtp_continues_its_context(sampled):
                zip(_mtp_kv(dec.eng, dec.eng.pos), _mtp_kv(fresh.eng, fresh.eng.pos)))
 
 
-def test_mtp_loop_on_rtl(have_verilator):
+@pytest.mark.parametrize("split", [False, True])
+def test_mtp_loop_on_rtl(have_verilator, split):
     """The MTP loop on the Verilator RTL (the board's memory path): from the same DRAM state (a
     251-token prefill on the ISA simulator), one run of the loop across the first bucket's end (V, E, D, D1 and the next
     bucket's V through HALT CHAIN, both parities, drafts from the host's table, every third
-    wrong): the tokens and the image's DRAM equal the ISA simulator's."""
+    wrong): the tokens and the image's DRAM equal the ISA simulator's. split: layers 0-2's MLP
+    in fp4 (more than one run of layers), each V and E in two parts (MTPDecoder.split: part 0's
+    HALT CHAIN to part 1 through the split table, the rows' residual through DRAM)."""
     from opentpu import rtlsim
     from opentpu.llm.rtl_backend import RtlBackend
     _, W, spec = _tiny_model(8)
     W = _mtp_weights(W, spec)
+    if split:
+        spec = dataclasses.replace(spec, formats="mlp@0-2=fp4")
     P, N = 251, 9
     prompt = [int(t) for t in np.random.default_rng(P).integers(0, 1000, P)]
     want = _plain(spec, W, prompt, N, {})
@@ -382,12 +387,14 @@ def test_mtp_loop_on_rtl(have_verilator):
     drafts = np.where(np.arange(514) % 3, right, (right + 7) % 1000)
     eng = mtp_engine(spec, W, cap=512, cfg=CFG)
     dec = MTPDecoder(eng)
+    dec.split = split or None
     a0, d = dec.prefill(prompt, MTPStats())
     isa, n = eng.backend, eng.image.nbytes
     rtl = RtlBackend(eng.cfg, [isa.machine.slices[0].dram[:n]], uarch=rtlsim.BOARD_UARCH,
                      axi=True, boot=True)
     st = dec.loop_card(a0, d, N, drafts=drafts)
     assert st.tokens == want and 0 < sum(st.accepted) < st.iterations
+    assert any(len(k) == 3 for k in eng._mtp_gen) == split
     eng.backend, eng.pos, dec.slot = rtl, P, 0
     eng.__dict__.pop("_mtp_gen")            # the chain area: written again, to the RTL's DRAM
     got = dec.loop_card(a0, d, N, drafts=drafts)

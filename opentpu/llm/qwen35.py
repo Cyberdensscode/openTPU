@@ -2292,9 +2292,23 @@ def _moe_or_mlp(x, lw, m, spec):
     return MO.moe_ffn_rows(x, lw, spec.moe, m.moe_dev, spec.eps)
 
 
+def plan_span(runs, lo: int, hi: int) -> list:
+    """The runs of a plan (lfm2.plan's) over layers lo .. hi - 1, which must be whole runs (a
+    run's layers address its blocks from the run's first, _place)."""
+    out = []
+    for first, unit, reps in runs:
+        end = first + len(unit) * reps
+        if lo < end and first < hi:
+            if first < lo or hi < end:
+                raise CompileError(f"layers {lo} .. {hi - 1} cut the run of layers {first} .. "
+                                   f"{end - 1}")
+            out.append((first, unit, reps))
+    return out
+
+
 @ol.jit
 def qwen35_rows(m, p0: int, R: int, logit_rows, block: int = ATTN_BLOCK, tokens=None,
-                fork: bool = False, hidden: bool = False):
+                fork: bool = False, hidden: bool = False, span=None, xs=None):
     """R prompt tokens at positions p0 .. p0+R-1 at once: their embeddings m.xr and RoPE
     tables m.cosr / m.sinr, or those of `tokens` from the image's tables (qwen3._inputs_rows) ->
     logits of the rows in `logit_rows` (a contiguous range, or empty). Bit-identical to R
@@ -2310,14 +2324,27 @@ def qwen35_rows(m, p0: int, R: int, logit_rows, block: int = ATTN_BLOCK, tokens=
     DeltaNet states and windows after row R-2 in the committed slot and those after row R-1
     in the other (_deltanet_rows). p0 a RunRows (R its rows): the run at a run-time position,
     its tokens run-time values (docs/mtp.md 10); the DeltaNet rows do not depend on the
-    position from K - 1 on, so they take the bucket's first position."""
+    position from K - 1 on, so they take the bucket's first position.
+
+    span (lo, hi), a run-time rows run's: the layers lo .. hi - 1 alone, whole runs of the
+    plan (a program over IMEM in two parts, mtp.py's split verify): from lo > 0 the rows'
+    residual from xs (R rows in DRAM) instead of their embedding rows; below the last layer
+    the residual to xs, and no hidden and no head."""
     spec = m.spec
     run = isinstance(p0, RunRows)
     rows = p0 if run else [(0, p0 + r) for r in range(R)]
     pd = p0.lo if run else p0
     if run and (R != p0.R or pd < spec.conv_k - 1):
         raise CompileError(f"a run-time rows run: {p0.R} rows from position {pd}")
-    x, c, s_ = _inputs_rows(m, rows, tokens)
+    lo, hi = (0, spec.layers) if span is None else span
+    if (lo or hi < spec.layers) and (not run or xs is None):
+        raise CompileError("a span of the layers: a run-time rows run, its residual in xs")
+    if lo:
+        _, c, s_ = _inputs_rows(m, rows, tokens, embed=False)
+        x = ol.empty([R, m.xr.shape[1]], dense=True)
+        ol.load(xs[0:R, :], out=x)
+    else:
+        x, c, s_ = _inputs_rows(m, rows, tokens)
 
     def layer(li, it):
         lw = m.layer(li, it)
@@ -2327,7 +2354,10 @@ def qwen35_rows(m, p0: int, R: int, logit_rows, block: int = ATTN_BLOCK, tokens=
             x.set(_attention_rows(x, lw, c, s_, rows, spec, block, gated=True))
         x.set(_moe_or_mlp(x, lw, m, spec))
 
-    run_layers(m.plan, layer)
+    run_layers(m.plan if span is None else plan_span(m.plan, lo, hi), layer)
+    if hi < spec.layers:
+        ol.store(xs[0:R, :], x)
+        return
     if hidden:                  # row by row: one row of TMEM (a prompt run's R rows fit)
         g = ol.load(m.g_final)
         for r in range(R):

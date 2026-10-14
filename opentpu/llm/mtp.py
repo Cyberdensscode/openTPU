@@ -39,7 +39,7 @@ import numpy as np
 
 from .. import isa as I
 from .. import language as ol
-from ..compiler import CompileError, current
+from ..compiler import CompileError, Tensor, current
 from . import generate as G
 from . import prefill as PF
 from ..host.offload import LINE
@@ -101,6 +101,8 @@ class MTPDecoder:
         self.eng, self.img = engine, img
         self.slot = 0
         self.draft = None           # the draft after the token at Engine.pos (prefill, the loop)
+        self.split = None           # the loop's V and E in two parts: None when over IMEM (tests:
+                                    # True always, False never; _gen_programs)
         # the MTP layer's rows a prefill run (a MoE's: its experts' request names R k ids)
         self.mtp_rows = MTP_ROWS if mo is None else max(1, min(MTP_ROWS, LINE // 4 // mo.k))
 
@@ -310,7 +312,10 @@ class MTPDecoder:
                       forced: bool = False, samp: G.Sampling | None = None) -> dict:
         """Buckets b0 .. b1's programs of the MTP loop in the chain area and their table
         entries (each compiled and written once per engine, `forced` and sampler); returns
-        {(bucket, kind): programs}."""
+        {(bucket, kind): programs} (a split kind's first part; its second at (bucket, kind,
+        1)). A V or E over IMEM (or any, self.split True) goes in two parts (compile_gen's
+        split form, cut at the first of plan_cuts whose parts fit): the first in its slot and
+        table entry, the second in the slot's second half and its ptab2 entry."""
         eng, img = self.eng, self.img
         a = img.lookup["mtpgen"]
         mode = (forced, None if samp is None else samp.key)
@@ -318,29 +323,56 @@ class MTPDecoder:
             eng.__dict__.pop("_mtp_gen", None)      # the chain area holds another kind
         eng._mtp_forced = mode
         done = eng.__dict__.setdefault("_mtp_gen", {})
+
+        def over(k, progs):
+            return CompileError(f"MTP loop program {KINDS[k]} of bucket {blk}: "
+                                f"{max(map(len, progs))} instructions, IMEM "
+                                f"{img.cfg.IMEM_WORDS // 8}")
         for blk in range(b0, b1 + 1):
             if (blk, V0) in done:
                 continue
             t0 = time.perf_counter()
-            tab = np.zeros(2 * NK, np.uint32)
+            tab, tab2 = np.zeros(2 * NK, np.uint32), np.zeros(2 * NK, np.uint32)
             for k in range(NK):
                 sk = samp if KINDS[k][0] in "VE" else None      # (D, D1: either mode's)
-                progs = eng.cached(("mtpgen", blk, k, eng.block, forced,
-                                    None if sk is None else sk.key),
-                                   lambda: (compile_gen(img, blk, k, eng.block, forced, sk),
-                                            None))[0]
-                if progs is None:
-                    continue
-                if not G.fits(img, progs):
-                    raise CompileError(f"MTP loop program {KINDS[k]} of bucket {blk}: "
-                                       f"{max(map(len, progs))} instructions, IMEM "
-                                       f"{img.cfg.IMEM_WORDS // 8}")
+                what = ("mtpgen", blk, k, eng.block, forced, None if sk is None else sk.key)
+                splits = KINDS[k][0] in "VE" and self.split is not False
+                progs = None
+                if not (splits and self.split):
+                    progs = eng.cached(what, lambda: (compile_gen(img, blk, k, eng.block,
+                                                                  forced, sk), None))[0]
+                    if progs is None:
+                        continue
+                    if not G.fits(img, progs):
+                        if not splits:
+                            raise over(k, progs)
+                        progs = None
+                parts = None
+                if progs is None:           # the split form
+                    for cut in plan_cuts(img):
+                        parts = [eng.cached(what + ("part", j, cut), lambda j=j: (
+                            compile_gen(img, blk, k, eng.block, forced, sk, j, cut), None))[0]
+                            for j in (0, 1)]
+                        if parts[0] is None or all(G.fits(img, p) for p in parts):
+                            break
+                    else:
+                        raise over(k, parts[1] if parts else [[]])
+                    if parts[0] is None:
+                        continue
+                    progs, p2 = parts[0], prog_addr(a, blk, k) + a["slot"] // 2
+                    for s_, prog in enumerate(parts[1]):
+                        eng.backend.write(s_, p2, G.slot_words(eng.backend, prog))
+                    tab2[2 * k], tab2[2 * k + 1] = p2, len(I.assemble(parts[1][0])) // 8
                 for s_, prog in enumerate(progs):     # (with its wait entries: chained)
                     eng.backend.write(s_, prog_addr(a, blk, k), G.slot_words(eng.backend, prog))
                 tab[2 * k], tab[2 * k + 1] = prog_addr(a, blk, k), len(I.assemble(progs[0])) // 8
-                done[(blk, k)] = progs
+                done[(blk, k)] = progs              # (a split kind's first part: the entry)
+                if parts is not None:
+                    done[(blk, k, 1)] = parts[1]
             for s_ in range(img.cfg.S):
                 eng.backend.write(s_, ptab_addr(a, blk), tab)
+                if tab2.any():
+                    eng.backend.write(s_, ptab2_addr(a, blk, 0), tab2)
             if st is not None:
                 st.compile_s += time.perf_counter() - t0
         return done
@@ -472,14 +504,17 @@ V0, E0, D2, D1 = 0, 2, 4, 5
 def gen_alloc(b, cap: int, spec, block: int = ATTN_BLOCK,
               imem_words: int = 1 << 15, waitc: bool = False) -> dict:
     """DRAM of the MTP loop: a program slot per bucket and kind (with its wait entries on a
-    WAITC device: generate.prog_bytes), and the chain table ([address, instructions] per bucket
-    and kind); the sampled verify's row 1 logits (the generate loop's lg holds row 0's:
-    generate.Sampler)."""
+    WAITC device: generate.prog_bytes; a split V's or E's second part in its second half), and
+    the chain table ([address, instructions] per bucket and kind); the sampled verify's row 1
+    logits (the generate loop's lg holds row 0's: generate.Sampler); the split parts' table
+    (ptab2: a split kind's second part at its kind's entry) and the two rows' residual between
+    the parts (xs)."""
     nb, slot = G.buckets(cap, block), G.prog_bytes(imem_words, waitc)
     return {"progs": b.alloc(slot * NK * nb), "ptab": b.alloc(8 * NK * nb), "nb": nb,
             "slot": slot,
             "dtab": b.alloc(4 * (cap + 2)),     # tests: the draft of each position
-            "lg": b.alloc(4 * G._vpad(spec))}
+            "lg": b.alloc(4 * G._vpad(spec)),
+            "ptab2": b.alloc(8 * NK * nb), "xs": b.alloc(4 * 2 * spec.hidden)}
 
 
 def gen_build(put, s: int, S: int, spec, a: dict) -> None:
@@ -495,6 +530,19 @@ def prog_addr(a: dict, blocks: int, kind: int) -> int:
 
 def ptab_addr(a: dict, blocks: int, kind: int = 0) -> int:
     return a["ptab"] + 8 * (NK * (blocks - 1) + kind)
+
+
+def ptab2_addr(a: dict, blocks: int, kind: int) -> int:
+    """A split kind's second part's [address, instructions] (its first part's HALT CHAIN)."""
+    return a["ptab2"] + 8 * (NK * (blocks - 1) + kind)
+
+
+def plan_cuts(image) -> list:
+    """The layers at which a split V or E may cut (the first layer of each run of the plan but
+    the first: qwen35.plan_span), the most even first (by the runs' count on either side)."""
+    firsts = [f for f, _, _ in image.plan[1:]]
+    n = len(image.plan)
+    return [f for _, f in sorted((abs(2 * (i + 1) - n), f) for i, f in enumerate(firsts))]
 
 
 def _flag(x):
@@ -548,7 +596,8 @@ def _store_state(g, st) -> None:
     ol.store(g.state[S_DRAFT:S_END + 1], st[S_DRAFT:S_END + 1])
 
 
-def _verify_gen(m, pos, block: int, c: int, R: int, samp: G.Sampling | None = None):
+def _verify_gen(m, pos, block: int, c: int, R: int, samp: G.Sampling | None = None,
+                part: int | None = None, cut: int = 0):
     """V (R = 2: rows t, d at p, p + 1) or E (R = 1: t at the bucket's last position) of
     parity c: the rows kernel (fork, hidden) with an ARGMAX per row, or with samp the sampled
     loop's pick (generate.Sampler: row r with the uniform of position p + 1 + r, row 1's
@@ -557,13 +606,30 @@ def _verify_gen(m, pos, block: int, c: int, R: int, samp: G.Sampling | None = No
     penalty's context gets the emitted ids); S_END at a stop id, the host's stop word or no
     tokens left; then HALT CHAIN to the bucket's D or D1 (which halts at S_END). Sampled,
     accepting d iff the pick a0 equals it is speculative sampling for the one-hot draft
-    (docs/mtp.md 11.1)."""
+    (docs/mtp.md 11.1).
+
+    part 0 / 1 (a V or E over IMEM: compile_gen's split form): part 0 the layers before `cut`
+    (the rows' embedding rows gathered), their residual to the MTP area's xs, then HALT CHAIN
+    to part 1 through the bucket's ptab2 entry of its kind; part 1 the layers from `cut` on
+    (the residual from xs), the head and the rest as above. The same operations: the
+    residual's fp32 rows only pass through DRAM."""
     from .qwen35 import qwen35_rows
     b = current()
     g, a = m.gen, m.mtpgen
     st, at = _load_state(b, g)
     words = {"tok": st.base + G.S_TOK, "tok1": st.base + S_DRAFT, "tpos": st.base + G.S_TPOS}
     b.run_words = words
+    span = xs = None
+    if part is not None:
+        H = m.spec.hidden
+        span = (0, cut) if part == 0 else (cut, m.spec.layers)
+        xs = Tensor(a["xs"], (2, H), (H, 1))
+    if part == 0:
+        qwen35_rows.fn(m, pos, R, [], block, None, R > 1, False, span, xs)
+        _args(b, at, words)
+        G._chain(b, ptab2_addr(a, pos.blocks, (V0 if R > 1 else E0) + c),
+                 what="the verify's second part")
+        return
     if samp is None:
         m.lm_sinks = [G.Greedy(b, m.v_loc, head_rows_chunk(R)) for _ in range(R)]
     else:
@@ -575,7 +641,7 @@ def _verify_gen(m, pos, block: int, c: int, R: int, samp: G.Sampling | None = No
             m.lm_sinks.append(G.Sampler(b, m, g, samp, st, pos, consts,
                                         lg=a["lg"] if r else None, u_at=pos.pos + 1 + r,
                                         pen_from=m.lm_sinks[0] if r else None))
-    qwen35_rows.fn(m, pos, R, list(range(R)), block, None, R > 1, True)
+    qwen35_rows.fn(m, pos, R, list(range(R)), block, None, R > 1, True, span, xs)
     if samp is not None and samp.pen and R > 1:
         _penalize_draft(b, g, st, m.lm_sinks[1])
     toks = [sk.token() for sk in m.lm_sinks]
@@ -688,12 +754,16 @@ def _draft_gen(m, pos, block: int, R: int, forced: bool = False):
 
 
 def compile_gen(image, blocks: int, kind: int, block: int = ATTN_BLOCK,
-                forced: bool = False, samp: G.Sampling | None = None) -> list | None:
+                forced: bool = False, samp: G.Sampling | None = None,
+                part: int | None = None, cut: int = 0) -> list | None:
     """Program KINDS[kind] of bucket `blocks` of the MTP loop (docs/mtp.md 10), one per slice;
     None when the bucket has no such position (E and D1 past the KV cache's end). forced
     (tests): D and D1 take the drafts from the host's table (_draft_gen). samp: V and E
-    sample (docs/mtp.md 11), D and D1 are the same either way."""
+    sample (docs/mtp.md 11), D and D1 are the same either way. part 0 / 1: a V's or E's
+    split form, cut at layer `cut` (a run's first: plan_cuts)."""
     name = KINDS[kind]
+    if part is not None and (name[0] not in "VE" or cut not in plan_cuts(image)):
+        raise ValueError(f"a split {name}: a V or E cut at a run of the plan")
     R = 1 if name in ("E0", "E1", "D1") else 2
     t0 = (blocks - 1) * block
     lo = t0 + block - 1 if R == 1 else max(t0, image.spec.conv_k - 1)
@@ -703,8 +773,8 @@ def compile_gen(image, blocks: int, kind: int, block: int = ATTN_BLOCK,
         return None
     rp = RunRows(blocks, block, lo, image.lookup["zmask"], image.cap, R)
     c = int(name[1]) if name[0] in "VE" else 0
-    fn, kw = ((_verify_gen, {"c": c, "R": R, "samp": samp}) if name[0] in "VE" else
-              (_draft_gen, {"R": R, "forced": forced}))
+    fn, kw = ((_verify_gen, {"c": c, "R": R, "samp": samp, "part": part, "cut": cut})
+              if name[0] in "VE" else (_draft_gen, {"R": R, "forced": forced}))
     return [ol.jit(fn).trace(image.cfg, s, {"m": image.descriptors(s, c), "pos": rp,
                                             "block": block, **kw}).finish()
             for s in range(image.cfg.S)]

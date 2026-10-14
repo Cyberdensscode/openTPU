@@ -168,6 +168,42 @@ def test_moe_mtp_loop_on_the_device_is_plain_greedy(tiny_moe_mtp, P, drafter, fm
                zip(_states(eng, spec, dec.slot), _states(ref, spec, 0)))
 
 
+@pytest.mark.parametrize("P, drafter, N", [(249, "mixed", 15), (250, "mtp", 12)])
+def test_moe_mtp_loop_in_two_parts_is_plain_greedy(tiny_moe_mtp, P, drafter, N):
+    """A V or E over IMEM goes in two parts (MTPDecoder._gen_programs; MiniCPM-V's formats give
+    its layers two runs, and its V 6173 instructions against the card's 4096): part 0 the
+    layers before a run's first (plan_cuts), the rows' residual to DRAM, HALT CHAIN to part 1
+    (the rest, the head, the token). Layers 0-2 with int8 DeltaNet weights, 3-5 fp4 (two runs),
+    every V and E split (split True): the loop's tokens are plain greedy decode's of the same
+    formats across a bucket's end (an E), whatever the drafts, and the committed states plain
+    decode's. The cut: layer 3, the runs' middle."""
+    from opentpu.llm.mtp import plan_cuts
+    from test_mtp import _states
+    W, spec = tiny_moe_mtp
+    spec = dataclasses.replace(spec, formats="delta@0-2=int8")
+    prompt = [int(t) for t in np.random.default_rng(P).integers(0, 1000, P)]
+    want = _plain(spec, W, prompt, N, **FP4)
+    right = np.zeros(514, np.float32)
+    right[P:P + len(want)] = want
+    drafts = {"mtp": None, "mixed": np.where(np.arange(514) % 3, right, (right + 7) % 1000)}[
+        drafter]
+    eng = mtp_engine(spec, W, cap=512, cfg=CFG, rows=2, experts=SLOTS, **FP4)
+    assert plan_cuts(eng.image)[0] == 3            # (runs: layers 0-1, 2, 3-4, 5)
+    dec = MTPDecoder(eng)
+    dec.split = True
+    st = dec.generate_card(prompt, max_new=N, stop=[], drafts=drafts)
+    assert st.tokens == want
+    ve = {k for k in eng._mtp_gen if len(k) == 2 and k[1] < 4}    # (V0, V1, E0, E1)
+    assert ve and {k[:2] for k in eng._mtp_gen if len(k) == 3} == ve    # each in two parts
+    ref = Engine(spec, W, cap=512, cfg=CFG, rows=1, resident=True, experts=SLOTS, **FP4)
+    ref.prefill(prompt)
+    for t in want[:-1]:
+        ref.step(t)
+    assert eng.pos == ref.pos == P + len(want) - 1
+    assert all(np.array_equal(a, b) for a, b in
+               zip(_states(eng, spec, dec.slot), _states(ref, spec, 0)))
+
+
 @pytest.mark.parametrize("P, drafter, sp", [
     (250, "right", (0.8, 5, 0.9, 1.1)),     # penalty: row 1's counts the draft
     (251, "mixed", (1.5, 20, 1.0, 1.0)),    # E at 255; no penalty, top-k 20

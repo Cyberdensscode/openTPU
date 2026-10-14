@@ -1578,11 +1578,22 @@ def _embed_word(m, t):
     return row
 
 
-def _inputs_rows(m, rows, tokens=None):
+def _inputs_rows(m, rows, tokens=None, embed: bool = True):
     """_inputs for token rows (rows[r] = (sequence, position)): from the I/O area, or with
     `tokens` (their ids, compile-time values) from the image's tables, the embedding row of
     each token and the RoPE rows of each run of consecutive positions. rows a RunRows: its
-    tokens' rows (run-time ids) and its positions' RoPE rows from the tables."""
+    tokens' rows (run-time ids) and its positions' RoPE rows from the tables; without `embed`
+    the RoPE rows alone (x None: a split run's later part, its x from DRAM)."""
+    if isinstance(rows, RunRows) and not embed:
+        c = ol.empty([rows.R, m.cosr.shape[1]], dense=True)
+        s_ = ol.empty([rows.R, m.sinr.shape[1]], dense=True)
+        ol.load(m.cos_t[rows.pos:rows.pos + rows.R, :], out=c)
+        ol.load(m.sin_t[rows.pos:rows.pos + rows.R, :], out=s_)
+        for t in rows.toks:                 # (the tokens: the first part's)
+            ol.release(t)
+        return None, c, s_
+    if not embed:
+        raise CompileError("RoPE rows alone: a run-time rows run's")
     if isinstance(rows, RunRows):
         R = rows.R
         x = ol.empty([R, m.xr.shape[1]], dense=True)
