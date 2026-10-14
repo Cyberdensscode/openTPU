@@ -803,9 +803,16 @@ def load(a):
     t0 = time.perf_counter()
     if streams:
         from ..isasim import board_config
+        mtp = {"mtp": True, "mtp_from": a.mtp_from} if getattr(a, "mtp", False) else {}
         eng = STR.engine(path, cfg or board_config(), backend, a.cap, a.pool or STR.DEFAULT,
                          experts=a.experts, wformat=wformat, head_format=a.head_format,
-                         formats=formats, prog_cache=not a.no_prog_cache, snapshots=0)
+                         formats=formats, prog_cache=not a.no_prog_cache, snapshots=0, **mtp)
+    elif getattr(a, "mtp", False):          # (a dense Qwen3.5 with its own mtp.* layer)
+        from ..llm.mtp import mtp_engine
+        eng = mtp_engine(spec, load_weights(path, mtp=True), cap=a.cap, cfg=cfg, backend=backend,
+                         wformat=wformat, head_format=a.head_format,
+                         prog_cache=not a.no_prog_cache, prompt_runs=not a.no_prompt_runs,
+                         snapshots=0)
     else:
         B = a.slots if batchable(spec) else 1
         if B > 1 and cfg is None:           # the simulator: room for the slots and their area, one
@@ -908,7 +915,15 @@ def main(argv=None):
                     help="require 'Authorization: Bearer <key>' (default $OTPU_API_KEY)")
     ap.add_argument("--no-prog-cache", action="store_true")
     ap.add_argument("--no-prompt-runs", action="store_true")
-    ap.add_argument("--pool", help="a streamed MoE's expert pool file")
+    ap.add_argument("--pool", help="a streamed MoE's expert pool file (with --mtp the -mtp "
+                                   "one: tools/offload/pack_pool.py extend)")
+    ap.add_argument("--mtp", action="store_true",
+                    help="Qwen3.5 (a streamed MoE with the -mtp pool, or dense): every request "
+                         "decodes with the MTP drafter, the loop on the device "
+                         "(opentpu/serve/scheduler.py; sampling the device's loop takes only)")
+    ap.add_argument("--mtp-from", metavar="DIR",
+                    help="with --mtp: the MTP drafter's checkpoint when the model has none "
+                         "(MiniCPM-V 4.7: its base Qwen3.5-35B-A3B's)")
     ap.add_argument("--experts", type=int, default=0)
     ap.add_argument("--max-slices", type=int,
                     help="images (MiniCPM-V): an image's slices at most besides its thumbnail, "
@@ -927,10 +942,12 @@ def main(argv=None):
 def _main(a):
     eng, tok, spec, path, defaults, weights = load(a)
     from ..host import gen_warm as GW       # the decode loop's bucket programs ahead, in the
-    eng.gen_warm = GW.start(eng, defaults)  # background (opentpu/host/gen_warm.py)
+    eng.gen_warm = None if a.mtp else GW.start(eng, defaults)   # background (gen_warm.py; the
+    #                                         MTP loop's: compiled at their first use)
     mk = ST.model_key(str(Path(path).resolve()), type(eng.image).__module__, eng.image.wformat,
                       eng.image.head_format, getattr(eng.image, "formats", None), eng.cap,
-                      eng.block, eng.cfg.S, eng.cfg.D, eng.cfg.MCOLS, eng.cfg.PAIR)
+                      eng.block, eng.cfg.S, eng.cfg.D, eng.cfg.MCOLS, eng.cfg.PAIR,
+                      *(("mtp", str(a.mtp_from)) if a.mtp else ()))
     store = ST.BlobStore(int(a.kv_ram_gb * 2**30), int(a.kv_disk_gb * 2**30),
                          a.kv_dir + f"/{mk}" if a.kv_disk_gb > 0 else None)
     from .batching import BatchWorker, batches
@@ -939,7 +956,7 @@ def _main(a):
                         prefill_budget=a.chunked_prefill_size, mixed=a.mixed).start()
     else:
         w = SC.Worker(eng, tok, store=store, model_key=mk, max_running=a.max_running,
-                      quantum=a.quantum).start()
+                      quantum=a.quantum, mtp=a.mtp).start()
     name = a.served_model_name or Path(path).name
     srv = Server(w, tok, spec, name, defaults, think=a.think, reasoning=a.reasoning_parser,
                  aliases=(a.model,), api_key=a.api_key, max_queue=a.max_queue,

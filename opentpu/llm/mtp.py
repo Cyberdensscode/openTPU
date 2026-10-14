@@ -293,16 +293,25 @@ class MTPDecoder:
         (q, a0), self.pending = self.pending, None
         self.draft = self._draft(q, [a0], MTPStats() if st is None else st, "mtp prefill")[0]
 
+    def kept_row(self) -> np.ndarray | None:
+        """The residual row before Engine.pos, when the last prefill kept it (holds: a part
+        before a snapshot, Engine.kept), read back; else None."""
+        eng = self.eng
+        kept = getattr(eng, "kept", None)
+        if not self.holds or kept is None or kept[0] != eng.pos - 1:
+            return None
+        H = self.img.spec.hidden
+        return eng.backend.read(0, self.img.io["xbuf"] + 4 * H * kept[1],
+                                4 * H).view(np.float32).copy()
+
     def snapshot(self) -> bool:
         """Engine.snapshot of the committed slot's states and windows; with the residual row
-        before its position, read back (holds: the last prefill kept it, Engine.kept)."""
+        before its position, read back (holds: the last prefill kept it, kept_row)."""
         eng = self.eng
         ok = eng.snapshot(self.slot)
-        kept = getattr(eng, "kept", None)
-        if ok and self.holds and kept is not None and kept[0] == eng.pos - 1:
-            H = self.img.spec.hidden
-            self.held[eng.pos] = eng.backend.read(0, self.img.io["xbuf"] + 4 * H * kept[1],
-                                                  4 * H).view(np.float32).copy()
+        h = self.kept_row() if ok else None
+        if h is not None:
+            self.held[eng.pos] = h
         at = set(eng._snaps.at.values()) if getattr(eng, "_snaps", None) is not None else set()
         self.held = {t: h for t, h in self.held.items() if t in at}
         return ok

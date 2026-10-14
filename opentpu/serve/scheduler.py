@@ -20,6 +20,16 @@ in turns:
 New requests come first (their prefill), then the running ones in turn. While one request runs
 alone, it runs to its end; the card's loop is halted after the token in flight as soon as
 another request arrives (stop(), polled while the card runs).
+
+With mtp (an MTP engine, opentpu/llm/mtp.py; otpu-serve --mtp) every request decodes with the
+MTP drafter, its loop on the device (MTPDecoder.loop_card): the prompt goes through the
+decoder's prefill (the MTP layer's K / V rows with it; the first token picked on the host from
+the last row's logits as the device would, its draft left to the loop's first run), and a
+context's bytes hold the MTP layer's KV cache and the committed slot's state (kvio). A context
+saved for its request to come back to keeps its draft (Request.draft); one saved before the
+reply's start (Request.at) keeps the residual row before it, so that a prompt going on there with
+another token appends the MTP layer's row again (MTPDecoder.refill; store.PrefixCache's
+follow and held). Only sampling the device's loop takes is served.
 """
 from __future__ import annotations
 
@@ -34,6 +44,7 @@ import numpy as np
 
 from ..host.chat import Detok, sampler as host_sampler
 from ..llm import generate as G
+from ..llm.mtp import MTPStats
 from . import kvio as KV
 from . import store as ST
 
@@ -90,6 +101,9 @@ class Request:
     next: int | None = None           # its next token: picked, not fed
     entry: object = None              # its saved context while it is off the device (pinned)
     slot: int | None = None           # its KV slot (batching.BatchWorker)
+    draft: int | None = None          # MTP: the draft after `next` while it is off the device
+    mtp_iters: int = 0                # MTP: its loop's iterations and accepted drafts
+    mtp_accepted: int = 0
     _bset: bool = False               # its slot's sampling words written (BatchWorker)
     _shown: int = 0                   # chars of text sent
     _detok: object = None
@@ -120,12 +134,20 @@ class Worker:
 
     def __init__(self, eng, tok, store=None, model_key: str = "model",
                  max_running: int = 8, quantum: int = QUANTUM, ram_bytes: int = 4 << 30,
-                 area=False):
+                 area=False, mtp: bool = False):
         self.eng, self.tok = eng, tok
         self.tok_lock = threading.Lock()
         self.io = KV.ContextIO(eng, area=area)      # (False: kvio.staging_area's)
         self.store = store if store is not None else ST.BlobStore(ram_bytes)
-        self.cache = ST.PrefixCache(self.store, self.io.layout, model_key)
+        self.dec = None                   # the MTP decoder (mtp=True)
+        if mtp:
+            from ..llm.mtp import MTPDecoder
+            if not getattr(eng, "can_generate", False):
+                raise ValueError("MTP decoding runs the device's loop: an engine that has it")
+            self.dec = MTPDecoder(eng)
+        self.follow: int | None = None    # MTP: the token the device context's last MTP row
+        #                                   took (None: not known)
+        self.cache = ST.PrefixCache(self.store, self.io.layout, model_key, mtp=mtp)
         self.max_running, self.quantum = max_running, quantum
         self.stateful = self.io.layout.stateful
         self.softcap = getattr(eng.spec, "softcap", None)
@@ -143,7 +165,10 @@ class Worker:
         self.stats = {"requests": 0, "finished": 0, "aborted": 0, "errors": 0,
                       "prompt_tokens": 0, "cached_tokens": 0, "prefill_tokens": 0,
                       "generated": 0, "decode_s": 0.0, "prefill_s": 0.0, "switch_s": 0.0,
-                      "saves": 0, "restores": 0, "device_reuses": 0, "turns": 0}
+                      "saves": 0, "restores": 0, "device_reuses": 0, "turns": 0,
+                      "restore_s": 0.0, "save_s": 0.0}
+        if mtp:
+            self.stats.update(mtp_iters=0, mtp_accepted=0, refills=0)
 
     # ---- the clients' side
     def start(self) -> "Worker":
@@ -182,6 +207,9 @@ class Worker:
         if len(r.stop_ids) > G.N_STOP:
             raise ValueError(f"{len(r.stop_ids)} stop token ids: the card's loop takes "
                              f"{G.N_STOP}")
+        if self.dec is not None and not self._card_picks(r):
+            raise ValueError("this server decodes with MTP on the device: sampling with top_k "
+                             f"1 .. {G.K_MAX} (or greedy) and repetition_penalty >= 1 only")
         r.t_submit = time.perf_counter()
         r.max_new = max(0, min(r.max_new, self.eng.cap - len(r.prompt)))
         with self.cv:
@@ -233,6 +261,7 @@ class Worker:
                 self.owner, self.dev, self.dirty = None, [], False
                 try:
                     self.eng.reset()
+                    self._mtp_reset()
                 except BaseException:
                     pass
                 self._end(r, "error")
@@ -281,14 +310,20 @@ class Worker:
         return n if eq.all() else int(np.argmin(eq))
 
     def _save_device(self, pin_for: Request | None = None) -> None:
-        """The device's context into the store (what the store lacks of it)."""
+        """The device's context into the store (what the store lacks of it). MTP: a pending
+        draft settled first (the MTP layer's last row), the request's draft kept with it."""
         if not self.dev or (not self.dirty and pin_for is None):
             return
-        e = self.cache.save(self.io, list(self.dev), pin=pin_for is not None)
+        t0 = time.perf_counter()
+        self._settle()
+        e = self.cache.save(self.io, list(self.dev), pin=pin_for is not None, follow=self.follow)
         self.stats["saves"] += 1
+        self.stats["save_s"] += time.perf_counter() - t0
         self.dirty = False
         if pin_for is not None:
             pin_for.entry = e
+            if self.dec is not None:
+                pin_for.draft = self.dec.draft
 
     def _switch_to(self, r: Request) -> None:
         """Make the device's context r's: a running request's own (as it left it), or for a new
@@ -320,14 +355,22 @@ class Worker:
             self.eng.adopt(dev_k)
             k = dev_k
             self.stats["device_reuses"] += 1
+            if self.dec is not None and r.fed and r.draft is not None:
+                self.dec.draft = r.draft
         else:
             self._save_device()
+            t0 = time.perf_counter()
+            if self.dec is not None:            # (the state into slot 0)
+                self.io.slot = 0
             k = self.cache.restore(self.io, m, have=c) if m.k else 0
             if k:
                 self.eng.adopt(k)
                 self.stats["restores"] += 1
+                self.stats["restore_s"] += time.perf_counter() - t0
+                self._mtp_restored(r, m.entry, want, k)
             else:
                 self.eng.reset()
+                self._mtp_reset()
         if r.fed:
             if r.entry is not None:
                 self.cache.unpin(r.entry)
@@ -335,6 +378,7 @@ class Worker:
             if k != len(r.fed):                 # its saved context is gone (dropped): again
                 r.fed, r.next = [], None
                 self.eng.reset()
+                self._mtp_reset()
                 k = 0
         else:
             r.fed = list(want[:k])
@@ -346,6 +390,45 @@ class Worker:
         self._rope(r)
         if self.eng.pos != len(r.fed):
             raise RuntimeError(f"the device is at {self.eng.pos}, the context has {len(r.fed)}")
+
+    # ---- the MTP decoder's state (mtp)
+    def _mtp_reset(self) -> None:
+        """A new context: the decoder's committed slot 0, nothing pending."""
+        d = self.dec
+        if d is not None:
+            d.slot, d.draft, d.pending, d.refill, d.held = 0, None, None, None, {}
+            self.follow = None
+
+    def _mtp_restored(self, r: Request, e, want, k: int) -> None:
+        """The device's context restored from entry e (its state in slot 0): r's own (its
+        draft back), or the first k tokens of r's prompt: the MTP layer's row at k - 1 took
+        e.follow; a prompt going on with another token appends it again from the held residual
+        row (MTPDecoder.refill), where the entry keeps one."""
+        d = self.dec
+        if d is None:
+            return
+        d.slot, d.pending, d.refill, d.held = 0, None, None, {}
+        if r.fed:
+            d.draft, self.follow = r.draft, r.next
+            return
+        d.draft, self.follow = None, e.follow
+        if e.follow != int(self._real(r, list(want[k:k + 1]))[0]):
+            h = self.cache.held_row(e)
+            if h is not None and d.holds:
+                d.refill = (k - 1, h)
+                self.stats["refills"] += 1
+
+    def _settle(self) -> None:
+        """MTP: a lazy prefill's pending draft run (the MTP layer's row at the prompt's last
+        position, the first token's), so the device's context is whole; the state's slot for
+        kvio."""
+        d = self.dec
+        if d is None:
+            return
+        if d.pending is not None:
+            self.follow = d.pending[1]
+            d._settle()
+        self.io.slot = d.slot
 
     # ---- images (MiniCPM-V)
     def _real(self, r: Request, keys) -> list:
@@ -388,6 +471,8 @@ class Worker:
         """Feed r's prompt from r.fed on. When the device's loop picks r's tokens, all but its
         last token, which becomes r.next: the decode loop feeds it and picks the first token
         on the device (no logits to the host); else the host picks it from the logits."""
+        if self.dec is not None:
+            return self._prefill_mtp(r)
         t0 = time.perf_counter()
         ids = r.prompt                          # (its key: with images, their keys)
         real = self._real(r, ids)
@@ -426,6 +511,63 @@ class Worker:
         t = int(np.argmax(logits)) if r.sampling.greedy else \
             int(self._sampler(r)(logits, self._real(r, r.fed)))
         self._emit(r, t)
+
+    def _prefill_mtp(self, r: Request) -> None:
+        """_prefill with the MTP decoder: the whole prompt through MTPDecoder.prefill (lazy:
+        the last row's draft is the loop's first run), the first token picked on the host from
+        the last row's logits as the device's loop would (greedy: the argmax; sampled:
+        generate.reference_pick with the request's first uniform), and r.next. Up to the
+        reply's start (r.at; a decoder that does not hold the row before it: a token earlier)
+        a part of its own, saved with the token after it and that row."""
+        t0 = time.perf_counter()
+        d, ids = self.dec, r.prompt
+        real = self._real(r, ids)
+        n = len(r.fed)
+        vis = self.vision.prompt(real, r.images, n) if r.images else None
+        at = r.at if self.stateful and r.at is not None else None
+        if at is not None and not d.holds:
+            at -= 1
+        if at is not None and not n < at < len(ids):
+            at = None
+        self.stats["prompt_tokens"] += len(ids)
+        st = MTPStats()
+        k = [n]
+
+        def on_run(part) -> bool:
+            r.fed += ids[k[0]:k[0] + len(part)]
+            k[0] += len(part)
+            r.prefill_tokens += len(part)
+            self.stats["prefill_tokens"] += len(part)
+            return r.cancelled.is_set()
+
+        def rows(a: int, b: int) -> dict:
+            return {} if vis is None else {"vis": vis[a - n:b - n]}
+        samp = None if r.sampling.greedy else G.Sampling(**self._sampler(r).params)
+        if at is not None:
+            d.prefill(real[n:at], st, on_run=on_run, follow=int(real[at]), **rows(n, at))
+            if r.cancelled.is_set():
+                r.finish = "abort"
+                self.stats["prefill_s"] += time.perf_counter() - t0
+                return
+            self.follow = int(real[at])
+            self.io.slot = d.slot
+            self.cache.save(self.io, list(r.fed), follow=self.follow, held=d.kept_row())
+            self.stats["saves"] += 1
+
+        def pick(lg) -> int:            # (the device loop's pick of the first token)
+            if samp is None:
+                return int(np.argmax(lg))
+            u = np.minimum(np.float32(self._sampler(r).rng.random()), np.float32(1 - 2.0 ** -24))
+            return int(G.reference_pick(lg, samp, list(real), u, self.eng.cfg.S, self.softcap))
+        a = len(r.fed)
+        a0, _ = d.prefill(real[a:], st, pick=pick, on_run=on_run, lazy=True,
+                          **rows(a, len(ids)))
+        self.stats["prefill_s"] += time.perf_counter() - t0
+        if a0 is None:                          # (cancelled)
+            r.finish = "abort"
+            return
+        self.follow = None if d.pending is not None else a0     # (lazy: the loop's first run)
+        self._emit(r, a0)
 
     def _emit(self, r: Request, t: int) -> None:
         """Token t generated: the request's output and its text, its end when it stops."""
@@ -468,6 +610,8 @@ class Worker:
     def _decode(self, r: Request) -> None:
         """Up to the request's end, or a quantum when others wait. Invariant: the device has
         fed r.fed (eng.pos == len(r.fed)); r.next is picked, not fed."""
+        if self.dec is not None:
+            return self._decode_mtp(r)
         t0 = time.perf_counter()
         eng = self.eng
         k0 = len(r.out)
@@ -514,6 +658,59 @@ class Worker:
                     self._emit(r, t)
                     if r.finish is not None or len(r.fed) >= eng.cap:
                         break
+            if eng.pos != len(r.fed):
+                raise RuntimeError(f"the device is at {eng.pos}, the context has {len(r.fed)}")
+            if self._yield(r, k0):
+                break
+        self.stats["decode_s"] += time.perf_counter() - t0
+
+    def _decode_mtp(self, r: Request) -> None:
+        """_decode with the MTP loop on the device (MTPDecoder.loop_card from r.next and the
+        decoder's draft: after a lazy prefill none, its first run drafts it): its tokens as they
+        land, halted after the token in flight when r's turn ends (stop()). The decoder leaves
+        the draft after the last token and the state in its committed slot."""
+        t0 = time.perf_counter()
+        eng, d = self.eng, self.dec
+        k0 = len(r.out)
+        while r.finish is None and r.next is not None:
+            if r.cancelled.is_set():
+                r.finish = "abort"
+                break
+            left = r.max_new - len(r.out)
+            n = left if not self._others(r) else min(left, self.quantum)
+            if not getattr(eng.backend, "run_generate", None):
+                n = min(n, CHUNK)               # (no stop() mid-run: a cancel waits for it)
+            pick = self._sampler(r)
+            samp = None if r.sampling.greedy else G.Sampling(**pick.params)
+            t = r.next
+            first = [True]
+
+            def took(x: int) -> None:           # (the loop emits t first: r's already)
+                if not first[0]:
+                    self._emit(r, x)
+                first[0] = False
+
+            def stop() -> bool:
+                return r.finish is not None or r.cancelled.is_set() or self._yield(r, k0)
+            r.fed.append(t)
+            st = d.loop_card(t, d.draft, n + 1, stop=sorted(r.stop_ids), on_token=took,
+                             samp=samp, context=list(self._real(r, r.fed)),
+                             rng=pick.rng if samp is not None else None, halt=stop)
+            got = st.tokens[1:]
+            r.mtp_iters += st.iterations
+            r.mtp_accepted += sum(st.accepted)
+            self.stats["mtp_iters"] += st.iterations
+            self.stats["mtp_accepted"] += sum(st.accepted)
+            if not got:                         # (no room: the draft ran on its own)
+                r.fed.pop()
+                self.follow = t
+                r.finish = r.finish or "length"
+                break
+            r.fed += got[:-1]
+            self.follow = got[-1]
+            if got[-1] in r.stop_ids:
+                r.next = None
+                r.finish = r.finish or "stop"
             if eng.pos != len(r.fed):
                 raise RuntimeError(f"the device is at {eng.pos}, the context has {len(r.fed)}")
             if self._yield(r, k0):

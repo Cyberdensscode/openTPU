@@ -12,7 +12,7 @@
 # greedy loop is plain decode's bit for bit), and with REF (a five-turn chatmoe JSON on this configuration, e.g. mtp1's
 # refs/chatmoe5-qwen35-35b.json on production's m4) each arm's equal to it. A build other than EXPECT, a failed
 # selftest, a pool not this image's, a failed run or another token stops it (then the final selftest).
-# On a tree whose tiled expert-major runs take the states' slot 0 only (before mtp-slot-fix 45bed813: MTP's slot 1 raises
+# On a tree whose tiled expert-major runs take the states' slot 0 only (before mtp-slot-fix: MTP's slot 1 raises
 # at the first expert-major prompt after a loop that ended there), both arms run untiled (OTPU_TILE=0).
 # Output: R/q{WA,AT,WB,BT}.{log,json}, R/q{AT,BT}.trace.json, and per turn A's and B's TTFT, the calls, each phase's
 # seconds and the rest of the TTFT outside them, B - A; the last line MTPT EXIT <fails>.

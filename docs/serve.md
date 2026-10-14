@@ -191,6 +191,33 @@ restores the incoming one. A request running alone runs to its end. The prompt i
 last token, which the card's decode loop feeds and picks from (when the loop takes the request's
 sampling; else the host picks the first token from the logits).
 
+**With the MTP drafter** (`--mtp`, opt-in: a streamed Qwen3.5-MoE from its -mtp pool,
+`--mtp-from` for MiniCPM-V 4.7, or a dense Qwen3.5; docs/mtp.md, docs/offload.md 15.6). Every
+request decodes on the card's MTP loop (`MTPDecoder.loop_card`), halted after the token in flight
+as plain decode's is. Only sampling the loop takes is served (greedy, top-k 1 .. 64, repetition
+penalty >= 1; else 400). What changes against plain decode:
+
+- The whole prompt goes through the decoder's prefill, which appends the MTP layer's K / V rows
+  with it. The first token is picked on the host from the last row's logits as the loop would
+  pick it (greedy: the argmax; sampled: the device sampler's arithmetic with the request's first
+  uniform). Its draft is left to the loop's first run.
+- A context's bytes hold the MTP layer's KV cache (kvio's pages: one more attention layer, the
+  35B's +1,048 bytes a position, +0.6 / 1.4 / 2.4% of a context of 300 / 1,000 / 2,000 tokens)
+  and the DeltaNet states of the decoder's committed slot, restored into slot 0.
+- The MTP layer's row at q takes the token at q + 1, which the context does not hold. A page's
+  key holds one token more, and an entry the token its last row took (`follow`). A context
+  saved for its request to come back to keeps the draft after its next token. A draft still
+  pending (a reply that ended right after its prompt) is run before the context is saved.
+- The part of a prompt before the reply's start (`at`) is saved with the residual row before it
+  (`held`; the streamed MoE's decoder holds it). A prompt that goes on there with another token
+  (a chat's next turn) restores that context, and its prefill first appends the MTP layer's row
+  at `at` - 1 again from the held row (`MTPDecoder.refill`), bit for bit a fresh decoder's. A
+  dense model's decoder holds no row, so its part ends a token earlier, at a token both turns
+  share. A context restored without its row only drafts worse there: the verify keeps the
+  tokens plain decode's.
+- `/v1/stats` adds `mtp_iters`, `mtp_accepted` and `refills`, and both workers report
+  `restore_s` and `save_s` (the context switches' host time).
+
 ## Measured on the card
 
 Run on 2026-10-09 on opentpu with build 1025907f (133.33 MHz, Gen2 x8), Qwen3-0.6B int8, cap
@@ -307,6 +334,12 @@ All on the ISA simulator with tiny models.
   requests packed into a block of slots.
 - `test_serve_api.py`: the HTTP API end to end with concurrent clients, 64 connections at
   once, SGLang's `/generate`.
+- `test_serve_mtp.py`: `--mtp` on the tiny streamed MoE with its MTP layer: requests in turns
+  equal plain decode's, each switch back the same MTP context (the MTP layer's KV cache, the
+  state, the draft), a pending draft run before the save; a prompt from a held reply start
+  appends the MTP layer's row again, bit for bit a fresh decoder's (without the held row, it
+  differs there and the tokens do not); a loop halted on the device mid-run continues (the
+  host's stop word written at a WAITW while the ISA simulator runs it); a dense Qwen3.5.
 - `test_minicpmv.py`: the worker with images (requests in turns equal their fresh runs, a
   context reused past an image only for the same image, a text-only request after them), the
   API's image_url parts (placeholders, keys, refusals).
