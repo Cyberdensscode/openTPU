@@ -76,19 +76,20 @@ utilisation; the same run with a native ORFS of the same date (f395e4b6, OpenROA
 26Q4-110-g91e5f5ff2f) gives the same within the tools' noise (422 / 341 MHz, 0.79 W, 0 DRC), and
 its reports are in `asic/nangate45/results/small/`. The card is release r2's arch at ACT_ROWS 8
 (`targets/nangate45.toml`) through that native ORFS on hwe-bench, at 45% with the MXU's macros by
-its columns and the TMEM's by its readers (below); "before" is the previous card point (2026-10-11: the card's arch before r2,
+its columns and the TMEM's by its readers, with the ports' boundary registers and the VPU's grant
+copies (main 1aad9195, r4 below); "before" is the previous card point (2026-10-11: the card's arch before r2,
 ACT_ROWS 4 and three TMEM copies, at 35% on the macro placer's floorplan).
 
-| | nangate45-small | card: r2, ACT_ROWS 8, the TMEM by its readers | card before (2026-10-11) |
+| | nangate45-small | card: r2, ACT_ROWS 8, the TMEM by its readers (r4) | card before (2026-10-11) |
 |---|---|---|---|
 | stage | routed, final report (signoff extraction) | CTS; global routing (clean at metal4-6's 7%), timed on its parasitics before its repair | CTS; global routing ends congested |
 | die | 2.65 x 2.65 mm = 7.02 mm² | 4.52 x 4.52 mm = 20.4 mm² | 5.53 x 5.53 mm = 30.6 mm² |
-| standard cells | 1.18 mm², 590 K instances (20.8% of the core): 94 K flip-flops 0.43 mm², 373 K gates 0.66 mm² | 4.48 mm², 2.00 M instances (29.1% of the core outside the macros; 1.78 M after synthesis) | 4.36 mm², 2.02 M instances (18.3% of the core; 1.76 M after synthesis) |
+| standard cells | 1.18 mm², 590 K instances (20.8% of the core): 94 K flip-flops 0.43 mm², 373 K gates 0.66 mm² | 4.59 mm², 2.07 M instances (29.7% of the core outside the macros; 1.83 M after synthesis) | 4.36 mm², 2.02 M instances (18.3% of the core; 1.76 M after synthesis) |
 | macros | 27, 233 KiB, 1.31 mm² | 90, 758 KiB, 4.98 mm² | 113, 1126 KiB, 6.62 mm² |
-| register to register | 2.39 ns: **419 MHz** (no violation at 2.5 ns) | 2.59 ns: **386 MHz** on the global route, before its repair (2.69 ns, 372 MHz, after CTS on the placement's estimate; clock skew 0.26 ns; the VPU's grant fanout the worst path) | 5.60 ns: 178 MHz (clock skew 2.7 ns) |
-| with the ports | 2.95 ns: 339 MHz (one endpoint: `sw_req`) | 2.75 ns: 364 MHz, the ports latency-neutral (port B's write data -0.25 ns; 4.69 ns against the ideal virtual clock) | 6.40 ns: 156 MHz |
-| power at 400 MHz | 0.79 W: sequential 0.28, clock 0.20, combinational 0.15, macros 0.16; leakage 21 mW | 4.87 W: combinational 1.75, sequential 1.24, clock 1.10, macros 0.78; leakage 81 mW | 3.34 W: sequential 1.09, clock 0.93, macros 0.87, combinational 0.46; leakage 82 mW |
-| route | 16.2 m of wire, 0 DRC violations, 0 antenna violations | global: 112.2 m, no overflow (30.9% of the tracks); not detail-routed | not routed |
+| register to register | 2.39 ns: **419 MHz** (no violation at 2.5 ns) | 2.67 ns: **375 MHz** on the global route, before its repair (2.65 ns, 377 MHz, after CTS on the placement's estimate; clock skew 0.52 ns; the worst path one unrepaired flip-flop of the MXU's decoded weight scale, 2.55 ns without it; tm100, before the boundary registers and the grant copies, 2.59 ns) | 5.60 ns: 178 MHz (clock skew 2.7 ns) |
+| with the ports | 2.95 ns: 339 MHz (one endpoint: `sw_req`) | 2.67 ns: 375 MHz, the ports latency-neutral and met (out +1.24 ns, in +0.08 ns) | 6.40 ns: 156 MHz |
+| power at 400 MHz | 0.79 W: sequential 0.28, clock 0.20, combinational 0.15, macros 0.16; leakage 21 mW | 4.38 W: clock 1.75, sequential 1.22, macros 0.78, combinational 0.63; leakage 83 mW (vectorless; tm100 4.87 W, the difference the estimate's: r4 below) | 3.34 W: sequential 1.09, clock 0.93, macros 0.87, combinational 0.46; leakage 82 mW |
+| route | 16.2 m of wire, 0 DRC violations, 0 antenna violations | global: 109.4 m, no overflow (29.9% of the tracks); not detail-routed | not routed |
 
 ### The card: release r2
 
@@ -275,6 +276,86 @@ left for the repair (1506 and 126). The macro placer then put port B's write-dat
 right edge (830, beside the sequencer's IMEM macros) and the bottom edge (194), the line buffer
 in the bottom-right corner, and none of it congests.
 
+### The card's boundary registers and the grant copies (r3, r4)
+
+Two RTL changes, each a run of the card point from main through global routing (the same recipe:
+the TMEM by its readers, metal4 and up at 7%, the ports latency-neutral from CTS; global routing
+without ORFS's repair, timed on its parasitics: `estimate_parasitics -global_routing` from the
+route's guides, every endpoint's worst path; tm100 is the card point above, its virtual clock at
+its own CTS latency, 1.872 ns): r3 (main 7e42a626) registers port A's and port B's outputs and
+port B's inputs at the block's boundary ("The ports", Open problems), r4 (main 1aad9195) gives
+the VPU's stream grant per-lane copies ("Grant fanout"; its 24 `otpu_delay` copies come out of
+synthesis as 24 instances). The same night's host-write batches (`otpu_mem_ch`) are the FPGA's
+only: the ASIC block's sources leave out `rtl/shell`. Main since adds r2.2's two cycle-exact cuts
+from the FPGA's m8 near-critical paths (`otpu_dma`: TMEM's read request straight from flip-flops,
+the advance predicted a cycle ahead; `otpu_mxu`: `mx_go` a register of its own), not through this
+flow.
+
+| | tm100 (06c4be2d) | r3: the boundary registers | r4: and the grant copies |
+|---|---|---|---|
+| after synthesis | 1,784,512 cells, 9.17 mm² | 1,835,617 cells, 9.27 mm² | 1,834,493 cells, 9.27 mm² |
+| after CTS | 2.00 M instances, 4.48 mm² of cells | 2.01 M instances, 4.48 mm² of cells | 2.07 M instances, 4.59 mm² of cells |
+| wire after detailed placement | 83.7 m | 82.9 m | 78.2 m |
+| register to register, ideal clocks (placement) | 2.66 ns | 2.43 ns | 2.69 ns |
+| register to register after CTS | 2.69 ns (372 MHz) | 2.40 ns (416 MHz) | 2.65 ns (377 MHz) |
+| global route | 112.2 m, no overflow | 112.0 m, no overflow | 109.4 m, no overflow |
+| register to register on it | 2.59 ns (**386 MHz**) | 2.73 ns (367 MHz) | 2.67 ns (375 MHz) |
+| reg2reg: worst, TNS, failing endpoints | -0.091 ns, -0.48 ns, 14 | -0.227 ns, -0.31 ns, 4 | -0.166 ns, -2.43 ns, 33 |
+| in2reg: worst | +0.217 ns | +0.201 ns | +0.075 ns |
+| reg2out: worst, TNS, failing | -0.322 ns, -71.09 ns, 634 | +1.173 ns, 0, 0 | +1.244 ns, 0, 0 |
+| with the ports | 2.82 ns (port B's write data) | 2.73 ns (the ports meet) | 2.67 ns (the ports meet) |
+| power at 400 MHz | 4.87 W | 4.98 W | 4.38 W |
+
+The boundary registers (r3) took the ports off the clock: reg2out went from -0.322 ns (634
+failing endpoints, port B's write data from the DMA's rotator) to +1.17 ns, in2reg stayed at
++0.2 ns, and with its ports the block runs at its register-to-register clock (2.82 -> 2.73 ns),
+for 51 K cells and 0.10 mm². The grant copies (r4) took the VPU's stream grant off the critical
+list: its worst path (from `ss_act` or a copy) went from -0.091 ns (tm100) and +0.268 (r3) to
++0.447 ns (a copy's complement into the tail's Q multiplier operands), and the VPU's worst register
+path is now +0.410 ns (the tail's U buffer macro into U's operand registers). Neither moves the
+register-to-register clock, which each run sets by a path its change did not touch:
+
+- r3's 2.73 ns is the TMEM's replay freeze (`frz[0]`) into the VPU's read enable, -0.227 ns, 0.755 ns
+  of it one AND4_X1 on a long net; r4's 2.67 ns is the MXU's decoded weight-block scale (`dhi1`,
+  one flip-flop of it) into every column's aligned scale (`bm2`: the weight scale less the column's
+  activation scale), -0.166 ns, 1.01 ns of it the DFF_X1's clock-to-Q into its load (32 of r4's 33
+  failing endpoints). Each is a weak driver on a long net, what `repair_design` sizes or buffers
+  (r4 leaves it 2,388 nets over their maximum capacitance and 179 pins over their maximum slew; r3
+  2,248 and 111).
+- Past those, r3's next is the MXU's `lo` -> `dal` at +0.233 ns (2.27 ns) and r4's the DMA's
+  write-data rotator into port B's output register (`b_wdata[960]`, nine MUX2 levels from one
+  select) at -0.053 ns (2.55 ns; +0.279 on r3), then port B's ready into the same registers
+  (`b_rdy`, +0.075 ns; +0.201 on r3) and the TMEM's read ports into the VPU (+0.096 ns).
+- The difference is placement. r4 runs on r3's floorplan, every macro where r3's are (for r4's
+  netlist the macro placer had put the IMEM 0.95 mm to the left: 3.11 ns on ideal clocks), but
+  global placement places the standard cells anew for each netlist: 5.7% less wire after detailed
+  placement (78.2 against 82.9 m), CTS adding 228 K instances against 154 K (the tree one buffer
+  level deeper), and the untouched paths 0.2-0.3 ns apart between the two runs (the rotator above;
+  `b_rvalid` into the line buffer's macros +0.381 / +0.172 ns).
+
+So the card's clock is now set by the flow, not by the arch: 2.67-2.73 ns before a repair, from
+one weak driver in each run, and 2.27-2.55 ns past it, the spread placement's. What the RTL can
+still take: the rotator in two stages, a registered `b_rdy` ("The ports", Open problems), and
+the decoded weight scale copied per column as the grant was.
+
+Power (vectorless: OpenSTA's default activities) reads 4.38 W against r3's 4.98, and neither
+part of the difference is the RTL's. The clock tree takes 0.57 W more (1.75 W: CTS added 228 K
+instances to r4 against 154 K), and the combinational logic 1.15 W less (0.63 against 1.78), all
+of it in the VPU (1.91 -> 0.79 W already at placement: the SE tail 0.98 -> 0.31, the lanes' RDOT
+multipliers 0.53 -> 0.14), the logic behind the grant's selects. The copies equal the one
+flip-flop every cycle (the change is cycle-exact), and under the default activities the grant
+never switches (its propagated activity is 0 in both runs): what moved is the estimate's
+propagation through the new selects, not what the logic does. A VCD from a workload (Open
+problems) would measure it.
+
+ORFS's own repair after global routing (`repair_design` then `repair_timing` on the route's
+parasitics, single-threaded) does not fit this block's size: on r3 `repair_design` went through
+1.52 M of its 2.53 M nets in 25 minutes and then slowed to about 2,000 a minute (2,233 buffers,
+46 resizes by then), more than 8 hours to go before `repair_timing` began; it was stopped. The
+numbers here are before that repair (2,248 nets over their maximum capacitance and 111 pins over
+their maximum slew left on r3), and a routed card point needs a faster repair: by region, or
+limited to the failing paths' nets.
+
 ### Before: the previous card point (2026-10-11)
 
 The card's arch before r2 (113 macros, three TMEM copies, ACT_ROWS 4), 35%, the macro placer's
@@ -440,11 +521,17 @@ clock on the operator) pays once those are fixed, from about 540 MHz.
   so each equals it in the same cycle (`otpu_vpu` `g_sar`: `sa_r` for the lane's RDOT term,
   `cm_u` / `cm_q` for the tail's U and Q operands; each a kept instance, since identical
   flip-flops merge, and ORFS's slang import keeps the attribute): the word-level selects on the
-  one flip-flop go from 2181 to the control's 133, and each copy carries one lane's 64-96. Not
-  yet through the flow.
+  one flip-flop go from 2181 to the control's 133, and each copy carries one lane's 64-96. On the
+  card's global route (r4, above) the grant's worst path is +0.447 ns (-0.091 as one flip-flop),
+  off the critical list.
 - The macros are CACTI-fitted estimates (`tools/asic/fakeram.py`), not a compiler's; a real PDK's
   1R1W macros (IHP SG13G2, commercial) replace them through `rtl/tech/asic`'s leaves.
 - Power is vectorless; a VCD from the Verilator RTL (a decode token) would give real activities.
+- The TMEM's unpumped true dual-port RAMs (TDP without PMP, the card's) go through
+  `otpu_ram_1rw1r` under synthesis (the ASIC's macros); on an FPGA that costs 703 LUTs (+4.9%:
+  Vivado out of context, `otpu_tmem` 14,410 -> 15,113, with the same 64 RAMB36, flip-flops and
+  READ_FIRST port A) against inferring them in the TMEM, the logic inside the RAMs' instances. No
+  FPGA target uses that mode (theirs are pumped), so it is a note, not a fix.
 - **The weight chunk's layout** (a data-movement fix, not made). The MXU's FIFO holds the D-byte
   chunk as DRAM brings it, and array position i takes byte i in int8 but nibble i of the chunk's
   low half and nibble i of its high half in the 4-bit formats (`otpu_mxu` `wsel` / `dec4`: int4,
