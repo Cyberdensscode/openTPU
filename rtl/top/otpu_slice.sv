@@ -982,7 +982,10 @@ module otpu_slice
   // MXU and the adapter's queues on the card as before, so the same cycles. It takes a request
   // when it is empty or drains this cycle (a_rdy_i, the MXU's grant: a_rdy does not depend on
   // a_req), a_req its valid bit; a read in it is one not back (rd_idle_i). Only the loader's
-  // reset clears it. The read data needs none: the MXU registers a_rdata at the port (ln1)
+  // reset clears it, as the adapter's did: it holds a request, not data, and the adapter's
+  // a_flush (a run's reset, a load, a WAITW's word holding) drops the beats it holds (its
+  // reused beat and runs), so a read that leaves after a flush reads the memory as the host left
+  // it. The read data needs none: the MXU registers a_rdata at the port (ln1)
   assign a_rdy_i = !a_req || a_rdy;
   always_ff @(posedge clk) begin : pa_reg
     if (sys_rst) a_req <= 1'b0;

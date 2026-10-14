@@ -214,6 +214,27 @@ module tb_board;
       end
   end
 
+  // port A's held beats (otpu_native_dram: the reused beat al_v, the runs pv) do not outlive a
+  // flush (a_flush: a run's reset, a program load, a WAITW's word holding, where the host may have
+  // written): the cycle after one, none is held (a read taken in it is decided with the old
+  // state, its beat dropped with the rest)
+  for (genvar s = 0; s < S; s++) begin : g_pachk
+    logic fl, fl_q, al_v;
+    logic [1:0] pv;
+    if (s == 0) begin : g_0
+      assign fl = dut.x_rst[0] || dut.x_ld_start[0] || dut.a_inval;
+      assign al_v = dut.u_mem.al_v; assign pv = dut.u_mem.pv;
+    end else begin : g_s
+      assign fl = dut.x_rst[s] || dut.x_ld_start[s] || dut.g_slice[s].a_inval;
+      assign al_v = dut.g_slice[s].u_mem.al_v; assign pv = dut.g_slice[s].u_mem.pv;
+    end
+    always @(posedge clk) begin
+      if (!rst && fl_q && (al_v || pv != '0))
+        $fatal(1, "tb_board: slice %0d's port A beats outlived a flush", s);
+      fl_q <= !rst && fl;
+    end
+  end
+
   // Handshakes are driven and sampled on the falling edge (race-free): a ready seen there
   // means the transfer happens at the next rising edge. The write's ready depends on its valid
   // (combinationally), so it is sampled a little after the valid is driven -- otherwise the
