@@ -70,7 +70,8 @@ else:
         print("config")
     elif tool == "refs.py" and a[1] == "card":
         res = {"--resident", "--card-loop", "--prompt-runs"} & set(a)     # as refs.py's label
-        what = "".join(f" {w}" for w, on in (("long", "--long" in a), ("resident", res),
+        what = "".join(f" {w}" for w, on in (("long", "--long" in a), ("xl", "--xl" in a),
+                                              ("resident", res),
                                               ("card loop", "--card-loop" in a),
                                               ("prompt runs", "--prompt-runs" in a)) if on)
         print(f"  [PASS] model {a[3]} {a[4]}/{a[5]}{what}: 32 tokens and the logits bit-exact")
@@ -272,6 +273,27 @@ def test_runs_picks_the_models(qual, tmp_path):
     text, checks, rc = qual(RUNS="lfm2:int8:-", LONG="", NTOK="8")
     assert summary(text) == ("0", "8") and "long" not in checks, text[-2000:]
     assert "compute --ntok 8 --runs lfm2:int8:-\n" in (tmp_path / "out/refs.log").read_text()
+
+
+def test_xl_runs(qual, tmp_path):
+    """XL: each run's xl prompt (refs.py MODEL:WF:HF:xl,pr: ~1,400 tokens, buckets 1-6) resident
+    in prompt runs, and on the card's decode loop with CAPS bit30; its references are computed
+    with the others, under the keys the card check asks for; a mix run is prebuilt."""
+    text, checks, rc = qual(XL="qwen3:int8:- phi4-mini:mix:-", OTPU_LOCK_HELD="")
+    # the clean run's 21, and the 2 xl runs
+    assert summary(text) == ("0", "23"), text[-2000:]
+    assert "[PASS] model qwen3 int8/- xl resident prompt runs" in checks
+    assert "[PASS] model phi4-mini mix/- xl resident prompt runs" in checks
+    assert "lfm2:int8:-:long lfm2:int8:-:long,pr qwen3:int8:-:xl,pr phi4-mini:mix:-:xl,pr" in \
+        (tmp_path / "out/refs.log").read_text()
+    assert "prebuilt qwen3:fp4:int8 lfm2:fp4:int8 qwen35:fp4:int8 phi4-mini:mix:-" in text
+    text, checks, rc = qual(XL="phi4-mini:mix:-", QUAL_CAPS="1 0")
+    assert summary(text) == ("0", "31"), text[-2000:]
+    assert "decode loop on the card (6 + 2 long + 1 xl token-exact" in text
+    assert "[PASS] model phi4-mini mix/- xl resident card loop prompt runs" in checks
+    text, checks, rc = qual(XL="phi4-mini:mix:-", QUAL_CRASH="phi4-mini mix - 32 --xl")
+    assert "token-exact xl phi4-mini mix - --resident --prompt-runs: exit 1" in checks
+    assert "15 of 16 token-exact runs passed" in checks and rc == 1
 
 
 def test_without_models_the_model_phases_are_skipped(qual):
