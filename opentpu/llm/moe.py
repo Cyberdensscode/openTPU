@@ -11,7 +11,9 @@ A MoE layer on the device (`moe_ffn`), one token:
    expert bias, renormalized and scaled; Qwen's softmax of the k largest logits;
 3. the fence, WAITW served >= seq (the host has finished every earlier request: none of this
    layer's slots is being replaced, and the one request row and answer are free), then the
-   ids and seq + 1 to the mailbox;
+   ids and seq + 1 to the mailbox; then what needs no routed expert, while the host streams
+   the missing ones: a shared expert (a dense SwiGLU of the layer block, times sigmoid of its
+   gate's logit; docs/offload.md 15) and beside()'s work;
 4. the directory: each id's present flag;
 5. the experts present (a LOOP over the k ids, a LOOP R[present] inside), then the others
    (LOOP R[1 - present]). A present one takes its slot address from its directory entry, a
@@ -24,8 +26,8 @@ A MoE layer on the device (`moe_ffn`), one token:
    then the answer's words are zeroed (the host writes the next request's answer only after
    its post);
 6. the rows summed in the router's order (the result does not depend on what the cache held),
-   then a shared expert (a dense SwiGLU of the layer block, times sigmoid of its gate's
-   logit), and added to the residual.
+   then the shared expert's output added (last, as before it was computed early: bit for bit
+   the same sum), and the whole to the residual.
 
 It holds one register (the resident decode's run arguments and the layer loops hold the
 rest): the per-expert values are the columns of a small tile that each loop rotates, so
@@ -556,8 +558,10 @@ def moe_ffn(x, lw, mo: MoESpec, dev: SimpleNamespace, eps: float, beside=None,
 
     beside(): emits work that needs no expert (Gemma 4's dense MLP) right after the request is
     posted, so that it runs while the host streams the missing experts (docs/offload.md 5.3);
-    moe_ffn's register is free during it. residual=False: the FFN's output without x (Gemma 4
-    norms the experts' sum before its residual). y_first: the experts' [k, H] outputs take
+    moe_ffn's register is free during it. A shared expert runs there too, before beside()'s
+    work (docs/offload.md 15: the card waits for its misses in most MoE layers, and a shared
+    expert computed after them lengthened every wait by its time). residual=False: the FFN's
+    output without x (Gemma 4 norms the experts' sum before its residual). y_first: the experts' [k, H] outputs take
     their TMEM before the router's input does (Gemma 4 26B-A4B: 22,544 words, which only the
     free space before the step's later tiles holds)."""
     b = current()
@@ -637,9 +641,14 @@ def moe_ffn(x, lw, mo: MoESpec, dev: SimpleNamespace, eps: float, beside=None,
     ol.store(Tensor(Affine(dev.mbox + 4), (1,), (1,)), ol.full((1,), float(k)))  # (its count)
     seq.set(seq + 1.0)
     ol.store(Tensor(Affine(dev.mbox), (1,), (1,)), seq)
-    if beside is not None:                              # while the host streams
-        b.unscratch(r)
-        beside()
+    sh = None
+    if mo.shared or beside is not None:                 # while the host streams: the work
+        b.unscratch(r)                                  # that needs no routed expert
+        if mo.shared:                                   # (the shared expert, added last)
+            sh = swiglu_down(xs, lw.wg, lw.wu, lw.wd) * gate[:, None]
+            del gate
+        if beside is not None:
+            beside()
         r = b.scratch()
     # the directory: each entry's present flag
     col = lambda row: pe.base + row * pe.rs                       # noqa: E731 (column 0)
@@ -674,8 +683,8 @@ def moe_ffn(x, lw, mo: MoESpec, dev: SimpleNamespace, eps: float, beside=None,
     acc = y[0:1, :]
     for i in range(1, k):
         acc = acc + y[i:i + 1, :]
-    if mo.shared:
-        acc = acc + swiglu_down(xs, lw.wg, lw.wu, lw.wd) * gate[:, None]
+    if sh is not None:
+        acc = acc + sh
     return x + acc if residual else acc
 
 
@@ -789,9 +798,18 @@ def moe_ffn_rows(x, lw, mo: MoESpec, dev: SimpleNamespace, eps: float, beside=No
     ol.store(Tensor(Affine(dev.mbox + 4), (1,), (1,)), ol.full((1,), float(N)))
     seq.set(seq + 1.0)
     ol.store(Tensor(Affine(dev.mbox), (1,), (1,)), seq)
-    if beside is not None:                              # while the host streams
-        b.unscratch(r)
-        beside()
+    sh = None
+    if mo.shared or beside is not None:                 # while the host streams: the work
+        b.unscratch(r)                                  # that needs no routed expert
+        if mo.shared:                                   # (the shared expert, added last)
+            g = ol.empty((R,))
+            g.column().set(lg[:, E:E + 1])
+            gate = sigmoid(g)
+            del g
+            sh = swiglu_down(xs, lw.wg, lw.wu, lw.wd) * gate[:, None]
+            del gate, lg
+        if beside is not None:
+            beside()
         r = b.scratch()
     col = lambda row: pe.base + row * pe.rs                       # noqa: E731 (column 0)
     lp = b.begin_loop(N)                                # the directory: present flags
@@ -834,11 +852,8 @@ def moe_ffn_rows(x, lw, mo: MoESpec, dev: SimpleNamespace, eps: float, beside=No
             acc = y if acc is None else acc + y
         out[q:q + 1, :].set(acc)
         del acc, y
-    if mo.shared:
-        g = ol.empty((R,))
-        g.column().set(lg[:, E:E + 1])
-        gate = sigmoid(g)
-        out = out + swiglu_down(xs, lw.wg, lw.wu, lw.wd) * gate[:, None]
+    if sh is not None:
+        out = out + sh
     return x + out if residual else out
 
 
