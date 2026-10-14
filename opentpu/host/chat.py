@@ -532,7 +532,8 @@ class Chat:
 
     def _rollback(self, k: int) -> int:
         """Take the context back to (at most) the first k fed tokens: Engine.rollback (the MTP
-        decoder's: its committed slot, and one token more). Returns the tokens kept."""
+        decoder's: its committed slot, and one token more unless it holds the row before a
+        snapshot at k). Returns the tokens kept."""
         t = self.mtp.rollback(k) if self.use_mtp else self.eng.rollback(k)
         if t == 0:
             self.eng.reset()
@@ -585,16 +586,17 @@ class Chat:
         n = turn.reused = len(self.fed)
         turn.prefill_total = len(ids) - n
         # the snapshot of the state for the next turn's rollback: at the reply's start (MTP: a
-        # token before, rollback's), within this turn's prompt
+        # token before, rollback's, unless the decoder holds the row before it), within this
+        # turn's prompt
         at = self.reply_start(ids) if getattr(self.eng, "stateful", False) else None
-        if at is not None and self.use_mtp:
+        if at is not None and self.use_mtp and not self.mtp.holds:
             at -= 1
         if at is not None and not n < at <= len(ids):
             at = None
         logits = None
         vis = self._image_rows(ids, n, turn)
         if self.use_mtp:
-            logits = self._prefill_mtp(ids, n, turn, t0, on_update, stop, at)
+            logits = self._prefill_mtp(ids, n, turn, t0, on_update, stop, at, vis)
         else:
             cut = [at] if at is not None and at < len(ids) else []
             for a, b in zip([n] + cut, cut + [len(ids)]):
@@ -652,11 +654,14 @@ class Chat:
         return self.mtp is not None and self.on_card
 
     def _prefill_mtp(self, ids, n: int, turn: Turn, t0: float, on_update, stop,
-                     at: int | None = None):
+                     at: int | None = None, vis=None):
         """ids[n:] through the MTP decoder's prefill (each run's rows' hidden, then the MTP
         layer over them): the first token is picked from the last row's logits inside it (the
-        draft after it needs it), so this returns it, _Picked; None when stopped. at: the
-        snapshot's position (the prefill parts there, the token after it the MTP's input)."""
+        draft after it needs it), so this returns it, _Picked; None when stopped. Lazy: on a
+        layer-by-layer prompt the draft after the first token is the loop's first run (the
+        token is shown before it, MTPDecoder.loop_card). at: the
+        snapshot's position (the prefill parts there, the token after it the MTP's input).
+        vis: ids[n:]'s image rows (_image_rows) or None."""
         from opentpu.llm.mtp import MTPStats
         st, k = MTPStats(), [0]
 
@@ -672,14 +677,19 @@ class Chat:
                 turn.end = "stopped"
                 return True
             return False
+        n0 = n
+
+        def rows(a: int, b: int) -> dict:   # (ids[a:b]'s image rows)
+            return {} if vis is None else {"vis": vis[a - n0:b - n0]}
         if at is not None and at < len(ids):
-            self.mtp.prefill(ids[n:at], st, on_run=on_run, follow=ids[at])
+            self.mtp.prefill(ids[n:at], st, on_run=on_run, follow=ids[at], **rows(n, at))
             if turn.end:
                 return None
             n = at
         if at is not None and self.eng.pos == at:
             self.mtp.snapshot()
-        a0, _ = self.mtp.prefill(ids[n:], st, pick=lambda lg: self.pick(lg, ids), on_run=on_run)
+        a0, _ = self.mtp.prefill(ids[n:], st, pick=lambda lg: self.pick(lg, ids), on_run=on_run,
+                                 lazy=True, **rows(n, len(ids)))
         return None if a0 is None else _Picked(a0)
 
     def _mtp_run(self, t: int, left: int, take, stop, samp, turn: Turn) -> tuple[list, int]:
@@ -1047,8 +1057,12 @@ def main(argv=None):
         "gemma4-26b): its experts stream from a pool file into slots in the card's DRAM "
         "(docs/offload.md 14); --wformat auto takes the formats it ran with on the card")
     moe.add_argument("--pool", help="the expert pool file (default: pool-mx1-<the experts' "
-                                    "format>.bin in the checkpoint's directory; "
-                                    "tools/offload/pack_pool.py packs it)")
+                                    "format>.bin in the checkpoint's directory, with --mtp "
+                                    "pool-mx1-<format>-mtp.bin; tools/offload/pack_pool.py "
+                                    "packs it, extend makes the -mtp one from it)")
+    moe.add_argument("--mtp-from", metavar="DIR",
+                     help="with --mtp: the MTP drafter's checkpoint when the model has none "
+                          "(MiniCPM-V 4.7: its base Qwen3.5-35B-A3B's, docs/offload.md 15.6)")
     moe.add_argument("--experts", type=int, default=0,
                      help="expert slots per MoE layer (default 0: as many as fit the DRAM)")
     moe.add_argument("--policy", choices=("lfu", "lru"), default="lfu",
@@ -1088,9 +1102,9 @@ def main(argv=None):
     wformat = FM.auto(spec, a.wformat)
     streams = ST.streams(spec)          # a MoE: its experts streamed (opentpu/host/streamed.py)
     if streams:
-        if a.backend not in ("isa", "board") or a.mtp or a.per_position:
+        if a.backend not in ("isa", "board") or a.per_position:
             raise SystemExit("otpu-chat: a streamed MoE runs on the ISA simulator or the card "
-                             "(--backend isa or board), resident, without --mtp")
+                             "(--backend isa or board), resident")
         formats = None
         if a.wformat == FM.AUTO:        # the formats it ran with on the card
             wformat, head, formats = ST.defaults(spec)
@@ -1110,8 +1124,8 @@ def main(argv=None):
         from opentpu.isasim import board_config
         cfg = sim_config(spec, a.cap, board_config(PAIR=True, DSTEP=True, STREAM=True),
                          lookup=not a.per_position, wformat=wformat, head_format=a.head_format)
-    if a.mtp and cfg is None:   # the simulators' default is the design's (two slices): the
-        from dataclasses import replace     # card's one-slice configuration instead
+    if a.mtp and cfg is None and not streams:   # the simulators' default is the design's
+        from dataclasses import replace     # (two slices): the card's one-slice configuration
 
         from opentpu.isasim import board_config
         from opentpu.llm.qwen3 import PREFILL_ROWS
@@ -1129,7 +1143,7 @@ def main(argv=None):
                             head_format=a.head_format, formats=formats,
                             embed_host=None if a.embed_table is None else a.embed_table == "host",
                             layer_major=a.layer_major, prog_cache=not a.no_prog_cache,
-                            snapshots=SNAPSHOTS)
+                            snapshots=SNAPSHOTS, mtp=a.mtp, mtp_from=a.mtp_from)
             ST.poll_idle(eng, a.poll_idle)
             print(f"experts: {ST.describe(eng, eng.pool_path)}", flush=True)
         elif a.mtp:

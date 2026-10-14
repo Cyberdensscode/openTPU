@@ -86,10 +86,10 @@ def em_rows_of(spec) -> int:
     return EM_ROWS.get(_family(spec), 0)
 
 
-def probe(spec, cfg, cap: int, experts: int | None = None, **kw):
+def probe(spec, cfg, cap: int, experts: int | None = None, rows: int = 1, **kw):
     """The image's layout alone (a DRAM too large to fill, no weights): its offload layout and
-    expert format, the pool's key, the slots that fit."""
-    return spec.image(replace(cfg, DRAM_BYTES=1 << 40), cap, 1, 1,
+    expert format, the pool's key, the slots that fit. rows: the image's (an MTP image's 2)."""
+    return spec.image(replace(cfg, DRAM_BYTES=1 << 40), cap, 1, rows,
                       experts=spec.moe.k if experts is None else experts, **kw)
 
 
@@ -113,14 +113,15 @@ def expert_major_fits(spec, image, experts: int) -> bool:
     return L.layers * experts - scratch >= 3 * L.E
 
 
-def default_pool(model_dir, efmt: str) -> Path:
+def default_pool(model_dir, efmt: str, mtp: bool = False) -> Path:
     """Where a checkpoint's pool goes by default: in its directory, pool-<the MXU's numerics>-
     <the experts' format>.bin (pool-mx1-fp4.bin, pool-mx1-nvfp4.bin; with its .packed, .format
     and .key beside it, or beside the file it links to). The numerics in the name keep a pool
     of the MXU before MX (pool-fp4.bin, key 1: refused) beside this tree's, for a qualification
-    and a rollback."""
+    and a rollback. mtp: an MTP image's, its MTP layer's experts after the model's
+    (pool-mx1-fp4-mtp.bin; pack_pool.py extend makes it from the model's pool)."""
     from opentpu.quant import MX_NUMERICS
-    return Path(model_dir) / f"pool-{MX_NUMERICS}-{efmt}.bin"
+    return Path(model_dir) / f"pool-{MX_NUMERICS}-{efmt}{'-mtp' if mtp else ''}.bin"
 
 
 def _pack_hint(model, pool, wformat: str, formats: str | None) -> str:
@@ -152,7 +153,8 @@ def check_pool(pool, image, W, wformat: str = "fp4", formats: str | None = None)
                         f"experts of {L.slot_bytes} bytes, {image.fmt.wformat}): another model "
                         f"or format (pack_pool.py MODEL {pool} info)")
     try:
-        MO.check_pool_key(path, MO.pool_key(image, getattr(W, "model_dir", None)))
+        MO.check_pool_key(path, MO.pool_key(image, getattr(W, "model_dir", None),
+                                            getattr(W, "mtp_from", None)))
     except ValueError as e:
         raise PoolError(str(e)) from None
     done = Path(str(path) + ".packed")
@@ -172,8 +174,8 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
            layer_ahead=None, expert_major: bool | None = None, em_rows: int | None = None,
            em_pass: int | None = None, ahead_part: int | None = None,
            idle_parts: str = "v2", willneed: bool = True, pool_map: bool = True,
-           release_weights: bool = True, create: bool = False, W=None,
-           vision_staged: bool | None = None, vision_warm: bool = True, **kw):
+           release_weights: bool = True, create: bool = False, W=None, mtp: bool = False,
+           mtp_from=None, vision_staged: bool | None = None, vision_warm: bool = True, **kw):
     """The Engine of the MoE checkpoint at `model` on `backend` ("isa", or a backend factory
     as Engine takes: the card's BoardBackend) with configuration `cfg` (the card's 4 GiB), its
     experts streamed from `pool` (a path; DEFAULT: the checkpoint's, default_pool; None: packed
@@ -196,10 +198,13 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
     idle_parts: ExpertServer's read ahead and halt-aware parts (IDLE_PARTS); willneed: a
     request's disk reads queued at once (PoolFile.willneed); pool_map, release_weights:
     Engine's. create: a missing pool is made and each expert packed on its first use (else
-    check_pool). W: the weights (default LazyWeights of `model`). vision_staged: MiniCPM-V's
-    Spec.vision_staged (None: the Spec's); vision_warm: its tower programs' wait entries
-    computed ahead in a background process (opentpu/host/vision_warm.py; the engine's
-    `vision_warm`, the process or None). kw: Engine's own."""
+    check_pool). W: the weights (default LazyWeights of `model`). mtp: an MTP image (Spec.mtp,
+    opentpu/llm/mtp.py; Qwen3.5's drafter, its MoE one more layer of the pool's: default_pool's
+    -mtp pool) of 2 rows, the mtp.* tensors from `mtp_from` when given (MiniCPM-V 4.7: its base
+    Qwen3.5-35B-A3B's, docs/offload.md 15.6). vision_staged: MiniCPM-V's Spec.vision_staged
+    (None: the Spec's); vision_warm: its tower programs' wait entries computed ahead in a
+    background process (opentpu/host/vision_warm.py; the engine's `vision_warm`, the process or
+    None). kw: Engine's own."""
     from opentpu.llm import load_spec
     from opentpu.llm.qwen3 import Engine, LazyWeights
     if idle_parts not in IDLE_PARTS:
@@ -213,15 +218,20 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
         spec = replace(spec, embed=embed)
     if hints is not None:                       # (default: the Spec's)
         spec = replace(spec, moe=replace(spec.moe, hint=hints))
+    if mtp:                                     # (the MTP loop's verify: 2 rows)
+        spec = replace(spec, mtp=True)
+        kw.setdefault("rows", 2)
     if vision_staged is not None:               # (MiniCPM-V: its tower through the slots)
         spec = replace(spec, vision_staged=vision_staged)
-    W = LazyWeights(model) if W is None else W
+    if W is None:
+        W = LazyWeights(model, mtp=True, mtp_from=mtp_from) if mtp else LazyWeights(model)
     ekw = {} if embed_host is None else {"embed_host": embed_host}   # (default: the image's)
-    img = probe(spec, cfg, cap, wformat=wformat, head_format=head_format, lookup=True, **ekw)
+    img = probe(spec, cfg, cap, rows=kw.get("rows", 1), wformat=wformat,
+                head_format=head_format, lookup=True, **ekw)
     if not experts:
         experts = fit_experts(spec, cfg, cap, img)
     if pool == DEFAULT:
-        pool = default_pool(model, img.fmt.wformat)
+        pool = default_pool(model, img.fmt.wformat, mtp)
     if pool is not None and not (create and not Path(pool).exists()):
         pool = check_pool(pool, img, W, wformat, formats)
     if layer_major is None:                     # (the layer runs: Qwen3.5-MoE's, Gemma 4's)
@@ -280,7 +290,7 @@ def gate_expert_major(eng, rows: int) -> None:
     runs = {True: (eng._layer_runs, eng._layer_next), False: ({}, {})}
     eng.em_rows, eng.em_last, eng.em_calls = rows, None, [0, 0]
 
-    def prefill_layers(tokens, logits: bool = True, **kw):
+    def prefill_layers(tokens, logits: bool = True, **kw):     # (kw: an MTP image's, vis)
         on = len(tokens) >= rows
         eng.expert_major = on
         eng._layer_runs, eng._layer_next = runs[on]

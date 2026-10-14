@@ -28,10 +28,14 @@ def wait_served(mbox: int, comment: str = "fence: served >= seq", timeout: int =
     return seq
 
 
-def post(mbox: int, ids) -> None:
+def post(mbox: int, ids, count: bool = False) -> None:
     """A request: after the fence (the host's row is free), the ids (fp32, a [k] tile) to the
-    row, then seq + 1."""
+    row, with `count` their number to the word after seq (a RowServer's request of k rows:
+    the MTP loop's, docs/mtp.md 12; without it the host reads one), then seq + 1."""
     seq = wait_served(mbox)
-    ol.store(Tensor(Affine(mbox + LINE), (ids.rows * ids.cols,), (1,)), ids)
+    n = ids.rows * ids.cols
+    ol.store(Tensor(Affine(mbox + LINE), (n,), (1,)), ids)
+    if count:
+        ol.store(Tensor(Affine(mbox + 4), (1,), (1,)), ol.full((1,), float(n)))
     seq.set(seq + 1.0)
     ol.store(Tensor(Affine(mbox), (1,), (1,)), seq)

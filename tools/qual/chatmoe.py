@@ -25,7 +25,12 @@ from (PoolFile.io: "cached", "disk"); a turn that read from the disk or began un
 marked "cold" (its prompt's misses waited on the disk: session r2m8's 35B, 2026-10-13, 2,966
 misses served in 40.2 s against production's 2.9 s, the same calls, read from the SSD at
 ~13.5 ms each).
-Exit 1 when --check finds another token.
+--mtp (Qwen3.5-MoE): the MTP drafter's image (streamed.engine(mtp=): its pool the -mtp one,
+pack_pool.py extend), each reply by the MTP loop on the device as otpu-chat --mtp decodes it
+(docs/offload.md 15.6), greedy or sampled: the same tokens as plain decode's (--check against a
+plain run's JSON), with each turn's iterations and accepted drafts; --mtp-from: the drafter's
+checkpoint when not the model's (MiniCPM-V 4.7: its base Qwen3.5-35B-A3B). Exit 1 when --check
+finds another token.
 
 Images (a model with a vision side: MiniCPM-V, docs/minicpmv.md): --image N:PATH attaches PATH
 to turn N (1-based; repeated), --max-slices bounds an image's slices; each turn reports its
@@ -138,7 +143,7 @@ def _calls(eng, calls: list, trace: list | None = None, pool_calls: bool = False
                 return st
             b.start, b.wait = started, waited
 
-    def prefill_layers(tokens, logits: bool = True, **kw):     # (kw: vis, an image's rows)
+    def prefill_layers(tokens, logits: bool = True, **kw):     # (kw: an MTP image's, vis)
         c0 = {k: getattr(srv, k, 0) for k in CALL_COUNTS}
         res0, io0 = res(), _io(pf)              # (the pool's page cache: outside the timing)
         k, t = len(eng.stats), time.perf_counter()
@@ -175,9 +180,9 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
         turns=TURNS, max_new: int = 16, cap: int = 2048, pool: str | None = None,
         experts: int = 0, layer_major: int | None = None, sample: bool = False,
         seed: int = 0, create: bool = False, tok=None, em_rows: int | None = None,
-        trace: list | None = None, em_pass: int | None = None, images=(),
-        max_slices: int | None = None, vision_staged: bool | None = None,
-        pool_calls: bool = False) -> dict:
+        trace: list | None = None, em_pass: int | None = None, mtp: bool = False,
+        mtp_from: str | None = None, images=(), max_slices: int | None = None,
+        vision_staged: bool | None = None, pool_calls: bool = False) -> dict:
     from opentpu.host import chat as C
     from opentpu.host import streamed as ST
     from opentpu.isasim import board_config
@@ -200,7 +205,8 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
                     create=create, snapshots=C.SNAPSHOTS,     # (otpu-chat's: its turns roll back)
                     vision_staged=vision_staged,              # (MiniCPM-V: None, the Spec's)
                     **({} if em_rows is None else {"em_rows": em_rows}),    # (13.16)
-                    **({} if em_pass is None else {"em_pass": em_pass}))    # (13.18)
+                    **({} if em_pass is None else {"em_pass": em_pass}),    # (13.18)
+                    **({"mtp": True, "mtp_from": mtp_from} if mtp else {}))    # (15.6)
     load_s = time.time() - t
     pf, total = _pool(eng)
     if pf is not None and pf.io is None:        # (the reads by where they came from)
@@ -224,6 +230,10 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
                images=[dict(turn=i, path=str(f), sha256=hashlib.sha256(
                    Path(f).read_bytes()).hexdigest()) for i, f in images],
                pool_gb=round(total / 1e9, 2), pool_at_load=_resident(pf, total), turns=[])
+    if mtp:
+        if not chat.use_mtp:
+            raise SystemExit("--mtp: these sampling settings stay on the host (no MTP loop)")
+        out.update(mtp=True, mtp_from=mtp_from)
     for k, text in enumerate(turns, 1):
         for i, f in images:
             if i == k:
@@ -248,7 +258,8 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
             pool_before=res0, pool_after=res1, reads=reads,
             cold=bool(reads.get("disk")) or any(c["pool_before"] is not None and
                                                 c["pool_before"] < 0.95 for c in calls[c0:])
-            or (res0 is not None and res0 < 0.95)))
+            or (res0 is not None and res0 < 0.95),
+            **({"mtp_iters": tr.mtp_iters, "mtp_accepted": tr.mtp_accepted} if mtp else {})))
     out["host_mem"] = ST.host_mem()
     return out
 
@@ -300,6 +311,11 @@ def main(argv=None) -> int:
                     help="expert-major's entries a pass (default: the configuration's, "
                          "moe.em_pass_rows)")
     ap.add_argument("--trace", help="each turn's calls' runs and the server's timeline, JSON")
+    ap.add_argument("--mtp", action="store_true",
+                    help="Qwen3.5-MoE: decode with the MTP drafter, the loop on the device "
+                         "(its pool: the -mtp one, pack_pool.py extend)")
+    ap.add_argument("--mtp-from", metavar="DIR",
+                    help="the MTP drafter's checkpoint when not the model's (--mtp)")
     ap.add_argument("--image", action="append", default=[], metavar="N:PATH",
                     help="an image for turn N (1-based; repeated): a model with a vision side")
     ap.add_argument("--max-slices", type=int, help="an image's slices at most (default the "
@@ -328,7 +344,8 @@ def main(argv=None) -> int:
         images.append((int(n), Path(f)))
     r = run(a.model, a.backend, a.cfg, a.dev, a.turn or TURNS, a.max_new, a.cap, a.pool,
             a.experts, a.layer_major, a.sample, a.seed, a.pool_create, em_rows=a.em_rows,
-            trace=tr, em_pass=a.em_pass, images=images, max_slices=a.max_slices,
+            trace=tr, em_pass=a.em_pass, mtp=a.mtp or a.mtp_from is not None,
+            mtp_from=a.mtp_from, images=images, max_slices=a.max_slices,
             vision_staged=True if a.vision_staged else False if a.vision_resident else None,
             pool_calls=a.pool_calls)
     for i, t in enumerate(r["turns"]):

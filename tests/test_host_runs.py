@@ -209,6 +209,40 @@ def test_an_interrupted_generate_run_halts_after_its_token(monkeypatch):
     be.close()
 
 
+def test_a_generate_run_is_served_until_it_halts():
+    """run_generate with the host's hook (a streamed MoE's expert and row servers) serves the
+    card until it halts, past its last token: the MTP loop's last D runs the MTP layer after
+    the verify that wrote the last token (its MoE request, the post of its two rows) and waits
+    for the host's answers. It was served up to the n-th token only and then waited for HALTED
+    (session mtp1, 2026-10-14: the card waited on that request until RUN_TIMEOUT). The fake
+    card writes a token at each serve, posts the last D's request 20 ms after its last token
+    and halts when it is served (else after 1 s)."""
+    from opentpu.llm import generate as G
+    t = FakeTransport(run_s=1.0, devname=None, gen=True)
+    be = BoardBackend(board_config(DRAM_BYTES=1 << 21), [np.zeros(1 << 16, np.uint8)],
+                      transport=t, status=False)
+    out, n, served, last = (1 << 16) + 4096, 6, [0], [None]
+    be.board.write(out, np.full(64, G.OUT_MARK, np.uint32))
+
+    def host():
+        i = served[0]
+        if i < n:                           # the iteration's token
+            be.board.write(out + 4 * i, np.full(1, 100 + i, np.float32))
+            last[0] = time.perf_counter()
+        elif i > n or time.perf_counter() - last[0] < 0.02:
+            return 0
+        else:                               # the last D's request: then it halts
+            t.run_s = 0.0
+        served[0] += 1
+        return 1
+    be.host = host
+    t0 = time.perf_counter()
+    st, got = be.run_generate(np.zeros(16, np.uint32), out, n)
+    assert got == [100 + i for i in range(n)] and served[0] == n + 1
+    assert time.perf_counter() - t0 < 0.5
+    be.close()
+
+
 # ------------------------------------------------------------------------------ the stop word
 def test_the_stop_write_leaves_the_cards_state_stores_alone():
     """The host's stop word mid-run: Board.write writes its beat only. Widened to its 128-byte

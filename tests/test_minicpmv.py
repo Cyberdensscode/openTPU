@@ -558,7 +558,7 @@ def test_pack_pool_keys_the_experts_alone(tiny, tmp_path, monkeypatch):
     spec = replace(load_spec(d), vision_patches=128, vision_rows=64)
     img = spec.image(replace(board_config(), DRAM_BYTES=1 << 40), 1024, 1, 1, "int8", "int8",
                      lookup=True, experts=spec.moe.k)
-    monkeypatch.setattr(PP, "image", lambda model, wformat: img)
+    monkeypatch.setattr(PP, "image", lambda model, wformat, mtp=False: img)
     monkeypatch.setattr(sys, "argv", ["pack_pool.py", str(d), str(pool), "init"])
     PP.main()
     lay, (extra, vk) = img.offload, img.pool_extra
@@ -768,6 +768,48 @@ def test_image_rows_are_layer_zeros_input(tiny, em, monkeypatch):
         ga, gb = a.step(t), b.step(t)
         assert np.array_equal(ga.view(np.uint32), gb.view(np.uint32))
         t = int(np.argmax(ga))
+
+
+
+def test_mtp_image_rows_decode_as_plain(tiny, monkeypatch):
+    """MiniCPM-V with the MTP drafter (its base Qwen3.5's mtp.* transplanted, docs/offload.md
+    15.6): a prompt's image rows through MTPDecoder.prefill's vis (the layer-by-layer prompt's
+    copy runs; the MTP layer's input of an image token is its placeholder's embedding row), then
+    the MTP loop on the device: the tokens are plain greedy decode's of the same prompt with
+    text ids whose embedding rows are the image rows (test_image_rows_are_layer_zeros_input's),
+    whatever the drafts. 20 image rows after 9 text rows, chunks of 24 rows."""
+    from opentpu.llm import qwen35 as Q35
+    from opentpu.llm.mtp import MTPDecoder, MTPStats, mtp_engine
+    from test_mtp_moe import _moe_mtp_weights
+    monkeypatch.setattr(Q35, "PREFILL_CHUNK", 24)
+    m, d = tiny
+    spec = replace(load_spec(d), vision_patches=128, vision_rows=64,
+                   vision_staged=False)         # (2 k slots a layer: too few to stage)
+    rng = np.random.default_rng(3)
+    W = dict(load_weights(d).items())
+    W.update(_tiny_vision_weights(spec.vision, rng))
+    n, at, v0, N = 20, 9, 5, 10
+    q = rng.integers(-127, 128, (n, spec.hidden))
+    q[:, ::128] = 127
+    rows = (q * 2.0 ** -7).astype(np.float32)
+    fake = list(range(V - 5 - n, V - 5))       # ids whose embedding rows are the image rows
+    W["model.embed_tokens.weight"] = W["model.embed_tokens.weight"].copy()
+    W["model.embed_tokens.weight"][fake] = rows
+    W = _moe_mtp_weights(W, spec)
+    toks = [int(t) for t in rng.integers(0, V - 40, 31)]
+    cfg = device_config(spec, 256, rows=1, lookup=True, S=1, experts=2 * K)
+    want = Engine(spec, W, cap=256, cfg=cfg, rows=1, resident=True,
+                  experts=2 * K).generate(toks[:at] + fake + toks[at:], max_new=N)
+    cfg = device_config(replace(spec, mtp=True), 256, rows=2, lookup=True, S=1, experts=6)
+    eng = mtp_engine(spec, W, cap=256, cfg=cfg, rows=2, experts=6, layer_major=2)
+    dec = MTPDecoder(eng)
+    assert dec.by_layers and eng.image.vision is not None
+    eng.backend.write(0, eng.image.vision.work["vis"] + 4 * v0 * spec.hidden, rows)
+    vis = [-1] * at + list(range(v0, v0 + n)) + [-1] * (len(toks) - at)
+    st = MTPStats()
+    a0, d0 = dec.prefill(toks[:at] + [0] * n + toks[at:], st, vis=vis)
+    assert ("v", 2) in eng._layer_runs and any(k[0] == "m" for k in eng._layer_runs)
+    assert dec.loop_card(a0, d0, N, stop=[], st=st).tokens == want
 
 
 def test_mrope_rows_gather_the_table():

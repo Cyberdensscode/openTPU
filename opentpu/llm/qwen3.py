@@ -249,18 +249,30 @@ class LazyWeights(dict):
     it is asked for and not kept: for a model whose fp32 weights would not fit host RAM (a
     MoE; its experts are packed one at a time, opentpu.llm.moe). release() gives the files'
     pages back once the image is built (a later read reopens its file). A tensor with a NaN or
-    an infinity is refused (finite)."""
+    an infinity is refused (finite). mtp: the multi-token prediction layers' tensors (mtp.*,
+    Qwen3.5's drafter) too, from `mtp_from` when given (another checkpoint's: MiniCPM-V 4.7
+    has none, its backbone's base Qwen3.5-35B-A3B's are transplanted, docs/offload.md 15.6)."""
 
-    def __init__(self, model_dir):
+    def __init__(self, model_dir, mtp: bool = False, mtp_from=None):
         super().__init__()
         from safetensors import safe_open
         self.model_dir = Path(model_dir)    # (moe.pool_key: the checkpoint's identity)
+        self.mtp_from = None if mtp_from is None else Path(mtp_from)
         self._at, self._h = {}, {}          # name -> (file, its name there); file -> handle
+        own = mtp and mtp_from is None
         for f in sorted(Path(model_dir).glob("*.safetensors")):
             h = self._h[str(f)] = safe_open(str(f), "pt")
             for k in h.keys():
-                if not k.startswith(VISION + ("mtp.",)):
+                if not k.startswith(VISION + (() if own else ("mtp.",))):
                     self._at[k.replace("model.language_model.", "model.", 1)] = (str(f), k)
+        for f in sorted(Path(mtp_from).glob("*.safetensors")) if mtp and mtp_from else ():
+            h = safe_open(str(f), "pt")
+            keys = [k for k in h.keys() if k.startswith("mtp.")]
+            if keys:
+                self._h[str(f)] = h
+                self._at.update((k, (str(f), k)) for k in keys)
+        if mtp and not any(k.startswith("mtp.") for k in self._at):
+            raise ValueError(f"{mtp_from or model_dir}: no mtp.* tensors (the MTP drafter)")
 
     def _open(self, k):
         from safetensors import safe_open
@@ -1566,11 +1578,22 @@ def _embed_word(m, t):
     return row
 
 
-def _inputs_rows(m, rows, tokens=None):
+def _inputs_rows(m, rows, tokens=None, embed: bool = True):
     """_inputs for token rows (rows[r] = (sequence, position)): from the I/O area, or with
     `tokens` (their ids, compile-time values) from the image's tables, the embedding row of
     each token and the RoPE rows of each run of consecutive positions. rows a RunRows: its
-    tokens' rows (run-time ids) and its positions' RoPE rows from the tables."""
+    tokens' rows (run-time ids) and its positions' RoPE rows from the tables; without `embed`
+    the RoPE rows alone (x None: a split run's later part, its x from DRAM)."""
+    if isinstance(rows, RunRows) and not embed:
+        c = ol.empty([rows.R, m.cosr.shape[1]], dense=True)
+        s_ = ol.empty([rows.R, m.sinr.shape[1]], dense=True)
+        ol.load(m.cos_t[rows.pos:rows.pos + rows.R, :], out=c)
+        ol.load(m.sin_t[rows.pos:rows.pos + rows.R, :], out=s_)
+        for t in rows.toks:                 # (the tokens: the first part's)
+            ol.release(t)
+        return None, c, s_
+    if not embed:
+        raise CompileError("RoPE rows alone: a run-time rows run's")
     if isinstance(rows, RunRows):
         R = rows.R
         x = ol.empty([R, m.xr.shape[1]], dense=True)
@@ -1584,6 +1607,14 @@ def _inputs_rows(m, rows, tokens=None):
             for r in range(R):
                 x[r:r + 1, :].set(_embed_word(m, tk[r:r + 1]))
             del tk
+        mbox = getattr(m, "embed_mbox", None)
+        if mbox is not None and rows.toks:  # embed_host: the slot's rows 0 .. R - 1, which the
+            MB.wait_served(mbox)            # host writes for the run's tokens (before it, or
+            for t in rows.toks:             # served for a post of the program before it in the
+                ol.release(t)               # chain: the MTP loop's, docs/mtp.md 12)
+            for r, g in enumerate(_gather(m, m.embed_q, range(R))):
+                x[r:r + 1, :].set(g)
+            return x, c, s_
         for r, t in enumerate(rows.toks):
             x[r:r + 1, :].set(_embed(m, t))
             ol.release(t)
@@ -1687,7 +1718,8 @@ def _rope_rows_padded(x, c, s_, out=None):
     return out
 
 
-def _attention_rows(x, lw, c, s_, rows, spec, block: int, gated: bool = False):
+def _attention_rows(x, lw, c, s_, rows, spec, block: int, gated: bool = False,
+                    kv_only: bool = False):
     """x + W_o . attention(x) for R token rows; row r is token position rows[r][1] of sequence
     rows[r][0] (its own KV cache), or rows is a RunRows (sequence 0, run-time positions; the
     V^T appends a row at a time, each row's mask its own). Every row's K/V is appended first,
@@ -1699,14 +1731,17 @@ def _attention_rows(x, lw, c, s_, rows, spec, block: int, gated: bool = False):
     results are bit-identical to R decode steps: heads narrower than D (LFM2) are padded, RoPE
     may cover part of a head (Qwen3.5), `gated` multiplies the output by sigmoid(W_gate x),
     and a query group wider than the MXU attends in parts of MCOLS heads. A row's position may
-    be a run-time one (RunPos.offset: a layer-major prefill run), its K / V appended row by row."""
+    be a run-time one (RunPos.offset: a layer-major prefill run), its K / V appended row by row.
+    kv_only: the rows' K / V appended, nothing else (no queries, no output: None; the MTP
+    layer's prompt rows in a layer-major prefill, qwen35.qwen35_mtp_kv_run)."""
     d, G, eps = spec.head_dim, spec.n_q // spec.n_kv, spec.eps
     R = rows.R if isinstance(rows, RunRows) else len(rows)
     xs = ol.quantize(rmsnorm(x, ol.load(lw.g_in), eps))
     k = ol.dot(xs, lw.wk)                       # [R, nkv_loc*d]
     v = ol.dot(xs, lw.wv)
-    q = ol.dot(xs, lw.wq)                       # [R, nq_loc*d]
-    qn, kn = _load_opt(lw.qn), _load_opt(lw.kn)
+    q = None if kv_only else ol.dot(xs, lw.wq)  # [R, nq_loc*d]
+    qn = None if kv_only else _load_opt(lw.qn)
+    kn = _load_opt(lw.kn)
     c, s_ = _rope_gate(lw, c, s_)
     scale = ol.LOG2E / math.sqrt(d)
     heads = list(lw.kv.owned_heads(spec.n_kv))
@@ -1727,6 +1762,8 @@ def _attention_rows(x, lw, c, s_, rows, spec, block: int, gated: bool = False):
                 ol.kv_append(lw.kvs[sq], hh, p0, kj[r0:r0 + n, :], vj[r0:r0 + n, :])
         del kj, vj
     del k, v
+    if kv_only:
+        return None
     # queries as [R * nq, dk]: (row r, KV head j) is the G contiguous rows r*nq + j*G ...
     dk = -(-d // ol.block_size()) * ol.block_size()
     Q = ol.zeros([R * nq, dk]) if dk > d else ol.empty([R * nq, d])
@@ -1919,37 +1956,49 @@ def _worker_decode(blocks: int, lo: int):
     return worker_words(image, progs[0], ra), ra
 
 
-def layer_programs(image, key, block: int, hint: bool = False, em: bool = False):
+def layer_programs(image, key, block: int, hint: bool = False, em: bool = False,
+                   slot: int = 0):
     """Engine.prefill_layers' run of `key`: (layer (-1: the embed run), blocks, rows,
     embedded), (layer, None, rows, True, compile-time position), (layer, blocks, rows, True,
     "tile") (an expert-major run tiled: Engine.layer_tile), ("x", layer) (an expert run; ("x",
-    layer, C): of passes of C entries, Engine.em_pass), ("v", rows) (image rows into the chunk:
+    layer, C): of passes of C entries, Engine.em_pass), ("m", blocks, rows) (an MTP image's
+    KV rows of the MTP layer: compile_mtp_kv_run; ("m", blocks, rows, "keep"): expert-major's,
+    their residual kept in the chunk's rows; ("m", blocks, rows, "xbuf"): from the chunk's rows
+    whatever em), ("v", rows) (image rows into the chunk:
     minicpmv.Image.compile_vis_run) or
     "head" -> (programs, run_args); hint: a layer's run ends with the next MoE layer's hint
-    (Engine's layer_ahead "hint"); em: expert-major (Engine's expert_major)."""
+    (Engine's layer_ahead "hint"); em: expert-major (Engine's expert_major); slot: the DeltaNet
+    states' and windows' slot of an MTP image (its committed one, mtp.MTPDecoder)."""
     if key == "head":
         return image.compile_prefill_head(**({"em": True} if em else {}))
     if key[0] == "x":                       # (("x", layer, C): passes of C entries)
         return image.compile_expert_run(*key[1:])
+    if key[0] == "m":
+        return image.compile_mtp_kv_run(key[1], block, R=key[2], em=em and key[3:] != ("xbuf",),
+                                        keep=key[3:] == ("keep",))
     if key[0] == "v":                       # (("v", rows): image rows, minicpmv.Image)
         return image.compile_vis_run(key[1], em=em)
     if key[-1] == "tile":
+        if slot:
+            raise ValueError("a tiled layer run takes the states' slot 0")
         from . import tiled as TL
         return TL.compile_layer_tile(image, key[0], key[1], key[2], block)
     kw = {"hint": True} if hint and key[0] >= 0 else {}
     if em:
         kw["em"] = True
+    if slot:
+        kw["slot"] = slot
     if key[1] is None:                      # (a compile-time position)
         return image.compile_layer_run(key[0], key[4] // block + 1, block, R=key[2],
                                        embedded=True, at=key[4], **kw)
     return image.compile_layer_run(key[0], key[1], block, R=key[2], embedded=key[3], **kw)
 
 
-def _worker_layer(key, hint: bool = False, em: bool = False):
+def _worker_layer(key, hint: bool = False, em: bool = False, slot: int = 0):
     """The worker process: layer_programs' program, assembled (one slice), and its
     run_args."""
     image, block = _WORKER
-    progs, ra = layer_programs(image, key, block, hint, em)
+    progs, ra = layer_programs(image, key, block, hint, em, slot)
     return worker_words(image, progs[0], ra), ra
 
 
@@ -2220,7 +2269,8 @@ class Engine:
         if pool_file is not None and getattr(self.image, "offload", None) is not None:
             from .moe import open_pool, pool_key    # its read into the page cache runs during
             pool_file = open_pool(self.image.offload, pool_file, mapped=pool_map,  # the build
-                                  key=pool_key(self.image, getattr(W, "model_dir", None)),
+                                  key=pool_key(self.image, getattr(W, "model_dir", None),
+                                               getattr(W, "mtp_from", None)),
                                   extra=(getattr(self.image, "pool_extra", None) or (0,))[0])
         images = IC.build(self.image, W, self.layout)     # (opentpu/imgcache.py)
         # rollback's snapshots of the state the KV caches do not hold (snapshot.py)
@@ -2289,6 +2339,8 @@ class Engine:
                                             # moe.em_pass_rows, docs/offload.md 13.18)
         self._layer_runs: dict = {}
         self._layer_next: dict = {}         # their compiles in the worker processes: Futures
+        self._layer_slot = 0                # (the DeltaNet states' slot of the runs: an MTP
+                                            # image's committed one, prefill_layers' slot)
         if self.layer_major and not (getattr(self.image, "prefill_rows", 0) and self.device_inputs
                                      and getattr(self.backend, "args", False) and batch == 1):
             raise ValueError("layer-major prefill needs an image with prefill rows and lookup "
@@ -2772,7 +2824,8 @@ class Engine:
             pass
         return logits
 
-    def prefill_layers(self, tokens, logits: bool = True, vis=None) -> np.ndarray | None:
+    def prefill_layers(self, tokens, logits: bool = True, vis=None, mtp=None,
+                       slot: int = 0, keep: bool = False, fix=None) -> np.ndarray | None:
         """A MoE model's prompt layer by layer (docs/offload.md, layer-major prefill): each
         chunk of the image's prefill rows passes a layer before the next, in runs of
         `layer_major` rows (the image's compile_layer_run: the first row's position and chunk
@@ -2813,7 +2866,40 @@ class Engine:
         minicpmv.Image), or -1 for a text token (None: all text). An image token's layer-0 input
         is that row: layer 0 takes a chunk's image tokens in runs of their own (consecutive vis
         rows), each a copy run (("v", n): vis_copy_run, the rows into the chunk's residual rows
-        or records) and an embedded layer run; text runs are as without images."""
+        or records) and an embedded layer run; text runs are as without images.
+
+        An MTP image's (Spec.mtp, mtp.MTPDecoder; docs/mtp.md 12): `mtp` the token after each
+        of `tokens` (None from the first row whose next token is not known: the last row's,
+        the head's pick), and after each chunk's last layer runs of its rows that have one
+        append the MTP layer's K / V (("m", blocks, rows): qwen35_mtp_kv_run, the host's slot
+        rows the next tokens' embedding rows: an image token's too, its placeholder's); the
+        head also stores the last row's hidden (m.hid[0]) for its draft. From conv_k - 1 on.
+        slot: the DeltaNet states' and windows' slot (the MTP decoder's committed one). keep:
+        the last row's residual stays in its chunk row after the prompt (expert-major: its K / V
+        run keeps it there, ("m", ..., "keep")), self.kept (its position, the row), for a
+        snapshot after it (mtp.MTPDecoder.snapshot). fix (q, its residual row): first the MTP
+        layer's K / V row at q = Engine.pos - 1 again, its next token tokens[0], from that row
+        (written to chunk row 0; ("m", blocks, 1[, "xbuf"])): a context rolled back to a snapshot
+        whose next token changed (mtp.MTPDecoder.rollback), bit for bit the row a run of q
+        through the model would append."""
+        if mtp is None and not slot:
+            return self._prefill_layers(tokens, logits, None, vis)
+        K = getattr(self.spec, "conv_k", 1)
+        if mtp is not None and (not getattr(self.spec, "mtp", False) or len(mtp) != len(tokens)
+                                or self.pos < K - 1):
+            raise ValueError("an MTP prefill: an MTP image, a next token (or None) per token, "
+                             "from conv_k - 1 on")
+        if fix is not None and (fix[0] != self.pos - 1 or fix[0] < K - 1 or mtp is None):
+            raise ValueError(f"fix: the MTP layer's row before Engine.pos {self.pos} from "
+                             f"conv_k - 1 on, in an MTP prefill (row {fix[0]})")
+        self._layer_slot = slot
+        try:
+            return self._prefill_layers(tokens, logits, mtp, vis, keep, fix)
+        finally:
+            self._layer_slot = 0
+
+    def _prefill_layers(self, tokens, logits: bool, mtp, vis=None, keep: bool = False,
+                        fix=None) -> np.ndarray | None:
         from . import tiled as TL
         img, K, B, R = self.image, getattr(self.spec, "conv_k", 1), self.block, self.layer_major
         self._drain()
@@ -2848,6 +2934,11 @@ class Engine:
                 return lg if logits else None
         em = self.expert_major
         mo = getattr(self.spec, "moe", None)
+        self.kept = None
+        if fix is not None:             # (the MTP layer's row before Engine.pos again)
+            q = fix[0]
+            fix = (("m", q // B + 1, 1) + (("xbuf",) if em else ()),
+                   dict(RunPos.values(tokens[0], q, K, B), row=0), fix[1])
         chunks, p0 = [], self.pos       # each chunk's runs: (key, run arguments, the host's rows
         for c0 in range(0, len(tokens), img.prefill_rows):  # written before it, or None)
             part, runs = tokens[c0:c0 + img.prefill_rows], []
@@ -2892,9 +2983,27 @@ class Engine:
                     runs.append((("x", li) + ((self.em_pass,) if self.em_pass else ()),
                                  {"rows": len(part), "entries": len(part) * mo.k},
                                  None))
+            nx = [] if mtp is None else mtp[c0:c0 + len(part)]
+            have = next((i for i, t in enumerate(nx) if t is None), len(nx))
+            i = 0
+            while i < have:                 # the MTP layer's K / V of the rows with their next
+                p = p0 + i                  # token (its embedding row the host's)
+                n = min(img.grows, have - i, B - p % B)
+                runs.append((("m", p // B + 1, n), dict(RunPos.values(part[i], p, K, B), row=i),
+                             [int(t) for t in nx[i:i + n]]))
+                i += n
             chunks.append((part, runs))
             p0 += len(part)
-        self._precompile_layers([k for _, runs in chunks for k, _, _ in runs] +
+        last = None if not (keep and mtp is not None and mtp[-1] is not None) else \
+            next((j for j, (k, _, _) in reversed(list(enumerate(chunks[-1][1]))) if k[0] == "m"),
+                 None)
+        if last is not None:            # (its rows end at the part's last)
+            k, vals, rows = chunks[-1][1][last]
+            if em:
+                chunks[-1][1][last] = (k + ("keep",), vals, rows)
+            self.kept = (p0 - 1, len(chunks[-1][0]) - 1)
+        self._precompile_layers(([fix[0]] if fix is not None else []) +
+                                [k for _, runs in chunks for k, _, _ in runs] +
                                 (["head"] if logits else []))
         srv = self.server if self.pooled else None
         send = getattr(srv, "ahead_layer", None) if self.layer_ahead else None
@@ -2906,14 +3015,19 @@ class Engine:
                 kw.update(expert_major=True, part=self.ahead_part, scratch=len(chunks[0][0]) *
                           em_record(self.spec.hidden, mo.k))
             srv.begin_prefill(**kw)
+        if fix is not None:             # its residual row into chunk row 0, the next token's
+            self.backend.write(0, img.io["xbuf"], np.asarray(fix[2], np.float32))   # row
+            self._write_host_rows(tokens[:1])
+            run(fix[0], fix[1])
         if send is not None:
             self._send_ahead(send, 0)
-            first, nm = self.spec.moe.first, img.offload.layers
+            first = self.spec.moe.first             # (the model's MoE layers: not an MTP
+            nm = img.offload.layers - bool(getattr(self.spec, "mtp", False))    # layer's)
         for c, (part, runs) in enumerate(chunks):
             cur = -1
             for key, vals, rows in runs:
-                if send is not None and key[0] not in ("x", "v") and \
-                        key[0] > cur:                   # a layer's first run:
+                if send is not None and isinstance(key[0], int) and key[0] > cur:   # a layer's
+                                                        # first run:
                     cur = key[0]                        # the next MoE layer's experts, or
                     j = cur + 1 - first                 # the first's for the next chunk
                     if cur + 1 == self.spec.layers and c + 1 < len(chunks):
@@ -2954,22 +3068,27 @@ class Engine:
     def _layer_run(self, key):
         """prefill_layers' programs, compiled once (layer_programs' key) -> (programs, run_args,
         the program assembled for a backend that runs words, else None); programs None when a
-        worker process compiled it (_precompile_layers)."""
-        if key not in self._layer_runs:
-            fut = self._layer_next.pop(key, None)
+        worker process compiled it (_precompile_layers). The runs of the states' slot 1 (an
+        MTP image's, _layer_slot) are kept under (key, "slot", 1)."""
+        ck = self._slot_key(key)
+        if ck not in self._layer_runs:
+            fut = self._layer_next.pop(ck, None)
             if fut is not None and not fut.done() and not self._ready.done():
                 fut.cancel()                # the workers still starting: compiled here
                 fut = None
             if fut is not None:             # (the words with their run_args: Words)
                 words, ra = fut.result()
-                self._layer_runs[key] = (None, ra, Words.of(words, ra))
+                self._layer_runs[ck] = (None, ra, Words.of(words, ra))
             else:
                 progs, ra = layer_programs(self.image, key, self.block, self.layer_hint,
-                                           self.expert_major)
+                                           self.expert_major, self._layer_slot)
                 words = Words.of(I.assemble(progs[0]), ra) \
                     if getattr(self.backend, "runs_words", False) else None
-                self._layer_runs[key] = (progs, ra, words)
-        return self._layer_runs[key]
+                self._layer_runs[ck] = (progs, ra, words)
+        return self._layer_runs[ck]
+
+    def _slot_key(self, key):
+        return key if not self._layer_slot else (key, "slot", self._layer_slot)
 
     def _precompile_layers(self, keys) -> None:
         """prefill_layers' runs not compiled yet, compiled by the worker processes in the order
@@ -2980,9 +3099,12 @@ class Engine:
         if not self._procs:
             return
         for k in dict.fromkeys(keys):
-            if k not in self._layer_runs and k not in self._layer_next:
-                self._layer_next[k] = self._pool.submit(_worker_layer, k, self.layer_hint,
-                                                        self.expert_major)
+            ck = self._slot_key(k)
+            if ck not in self._layer_runs and ck not in self._layer_next:
+                self._layer_next[ck] = self._pool.submit(_worker_layer, k, self.layer_hint,
+                                                         self.expert_major,
+                                                         *([self._layer_slot]
+                                                           if self._layer_slot else []))
 
     def step_batch(self, tokens) -> np.ndarray:
         """One token for each of the first len(tokens) sequences, each at its own next
