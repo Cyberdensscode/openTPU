@@ -1,6 +1,6 @@
 #!/bin/bash
 # Session les1 (docs/offload.md 15.4): what LES gives the card, production's host against les's on production's
-# bitstream. les = release-2 217cf13a + two host changes, both bit for bit:
+# bitstream. les = release-2's r2 (4ead4e53) + two host changes, both bit for bit:
 #   S  the shared expert beside the request (moe.moe_ffn / moe_ffn_rows): Qwen3.5-MoE only, its programs change;
 #   O  an expert-major need line counts as a request, and the finished layer's experts go to the pooled order's end
 #      by their last need line (docs/offload.md 13.18, ExpertServer.need / _at): the slots after an EM prompt.

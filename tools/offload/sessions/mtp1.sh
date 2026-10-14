@@ -1,6 +1,6 @@
 #!/bin/bash
 # Session mtp1 (docs/offload.md 15.6): the MoE MTP loop on the card, production's host against les-mtp's with --mtp on
-# production's bitstream. les-mtp = release-2 217cf13a + S (the shared expert beside the request, les1: -4.09 ms a
+# production's bitstream. les-mtp = release-2's r2 (4ead4e53) + S (the shared expert beside the request, les1: -4.09 ms a
 # token) + the MTP drafter on the streamed 35B: each decode iteration one verify run of the token and its draft
 # through every layer (both rows' experts one request a layer), then the MTP layer's draft (its MoE one more layer
 # of the pool's), the loop on the device (opentpu/llm/mtp.py); greedy, its tokens plain decode's bit for bit.

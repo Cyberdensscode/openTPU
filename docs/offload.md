@@ -4807,7 +4807,7 @@ operations on the same operands, bit for bit.
 - The model gives 178.4 -> 174.0 ms a token on the 35B (+2.5%, F less 0.136 ms).
 - A layer-major prompt's runs gain the same way, per request with misses.
 - Only Qwen3.5-MoE's programs change. LFM2 and Gemma 4 have no shared expert.
-- On the ISA simulator, the tiny Qwen3.5-MoE gives the same logits as 217cf13a: decode with
+- On the ISA simulator, the tiny Qwen3.5-MoE gives the same logits as r2 (4ead4e53): decode with
   misses, and a layer-major prefill of R = 2 with the decode after.
 - The 35B's chatmoe reference on les (five turns, r2's configuration, the MX pool) gives
   production's tokens in the turns production's reference has (its two layer-major prompts

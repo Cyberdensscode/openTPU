@@ -369,7 +369,7 @@ def _same_dram(eng, a, b) -> None:
     """The ISA simulator's DRAM a and the RTL's b after the same MTP loop run: equal but the
     loop's chain area, where the RTL's slots hold each program's WAITC wait entries after its
     words (RtlBackend.slot_words, the board uarch's SEQ_WC) and the ISA simulator's the words
-    alone (every difference there, release-2 217cf13a on: 12948 bytes, all after the programs'
+    alone (every difference there, r2 4ead4e53 on: 12948 bytes, all after the programs'
     words); there each written program's words are equal."""
     from opentpu.llm import mtp as MT
     g = eng.image.lookup["mtpgen"]

@@ -208,7 +208,7 @@ def test_a_loop_program_that_fits_is_not_split():
     """The split V / E (docs/mtp.md 10.3) changes neither an MTP image's layout nor a program
     of a model whose V and E fit IMEM: Qwen3.5-35B-A3B's loop programs of bucket 1 (its
     formats, the card's configuration, its 38 slots a layer) are byte for byte those of the
-    tree before the split (mcpv-mtp 71d9eb3a). A change of the programs themselves updates the
+    tree before the split (3af05a43). A change of the programs themselves updates the
     sum here."""
     import hashlib
     from pathlib import Path
