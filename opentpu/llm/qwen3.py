@@ -1962,7 +1962,9 @@ def layer_programs(image, key, block: int, hint: bool = False, em: bool = False,
     embedded), (layer, None, rows, True, compile-time position), (layer, blocks, rows, True,
     "tile") (an expert-major run tiled: Engine.layer_tile), ("x", layer) (an expert run; ("x",
     layer, C): of passes of C entries, Engine.em_pass), ("m", blocks, rows) (an MTP image's
-    KV rows of the MTP layer: compile_mtp_kv_run), ("v", rows) (image rows into the chunk:
+    KV rows of the MTP layer: compile_mtp_kv_run; ("m", blocks, rows, "keep"): expert-major's,
+    their residual kept in the chunk's rows; ("m", blocks, rows, "xbuf"): from the chunk's rows
+    whatever em), ("v", rows) (image rows into the chunk:
     minicpmv.Image.compile_vis_run) or
     "head" -> (programs, run_args); hint: a layer's run ends with the next MoE layer's hint
     (Engine's layer_ahead "hint"); em: expert-major (Engine's expert_major); slot: the DeltaNet
@@ -1972,7 +1974,8 @@ def layer_programs(image, key, block: int, hint: bool = False, em: bool = False,
     if key[0] == "x":                       # (("x", layer, C): passes of C entries)
         return image.compile_expert_run(*key[1:])
     if key[0] == "m":
-        return image.compile_mtp_kv_run(key[1], block, R=key[2], em=em)
+        return image.compile_mtp_kv_run(key[1], block, R=key[2], em=em and key[3:] != ("xbuf",),
+                                        keep=key[3:] == ("keep",))
     if key[0] == "v":                       # (("v", rows): image rows, minicpmv.Image)
         return image.compile_vis_run(key[1], em=em)
     if key[-1] == "tile":
@@ -2822,7 +2825,7 @@ class Engine:
         return logits
 
     def prefill_layers(self, tokens, logits: bool = True, vis=None, mtp=None,
-                       slot: int = 0) -> np.ndarray | None:
+                       slot: int = 0, keep: bool = False, fix=None) -> np.ndarray | None:
         """A MoE model's prompt layer by layer (docs/offload.md, layer-major prefill): each
         chunk of the image's prefill rows passes a layer before the next, in runs of
         `layer_major` rows (the image's compile_layer_run: the first row's position and chunk
@@ -2871,7 +2874,14 @@ class Engine:
         append the MTP layer's K / V (("m", blocks, rows): qwen35_mtp_kv_run, the host's slot
         rows the next tokens' embedding rows: an image token's too, its placeholder's); the
         head also stores the last row's hidden (m.hid[0]) for its draft. From conv_k - 1 on.
-        slot: the DeltaNet states' and windows' slot (the MTP decoder's committed one)."""
+        slot: the DeltaNet states' and windows' slot (the MTP decoder's committed one). keep:
+        the last row's residual stays in its chunk row after the prompt (expert-major: its K / V
+        run keeps it there, ("m", ..., "keep")), self.kept (its position, the row), for a
+        snapshot after it (mtp.MTPDecoder.snapshot). fix (q, its residual row): first the MTP
+        layer's K / V row at q = Engine.pos - 1 again, its next token tokens[0], from that row
+        (written to chunk row 0; ("m", blocks, 1[, "xbuf"])): a context rolled back to a snapshot
+        whose next token changed (mtp.MTPDecoder.rollback), bit for bit the row a run of q
+        through the model would append."""
         if mtp is None and not slot:
             return self._prefill_layers(tokens, logits, None, vis)
         K = getattr(self.spec, "conv_k", 1)
@@ -2879,13 +2889,17 @@ class Engine:
                                 or self.pos < K - 1):
             raise ValueError("an MTP prefill: an MTP image, a next token (or None) per token, "
                              "from conv_k - 1 on")
+        if fix is not None and (fix[0] != self.pos - 1 or fix[0] < K - 1 or mtp is None):
+            raise ValueError(f"fix: the MTP layer's row before Engine.pos {self.pos} from "
+                             f"conv_k - 1 on, in an MTP prefill (row {fix[0]})")
         self._layer_slot = slot
         try:
-            return self._prefill_layers(tokens, logits, mtp, vis)
+            return self._prefill_layers(tokens, logits, mtp, vis, keep, fix)
         finally:
             self._layer_slot = 0
 
-    def _prefill_layers(self, tokens, logits: bool, mtp, vis=None) -> np.ndarray | None:
+    def _prefill_layers(self, tokens, logits: bool, mtp, vis=None, keep: bool = False,
+                        fix=None) -> np.ndarray | None:
         from . import tiled as TL
         img, K, B, R = self.image, getattr(self.spec, "conv_k", 1), self.block, self.layer_major
         self._drain()
@@ -2920,6 +2934,11 @@ class Engine:
                 return lg if logits else None
         em = self.expert_major
         mo = getattr(self.spec, "moe", None)
+        self.kept = None
+        if fix is not None:             # (the MTP layer's row before Engine.pos again)
+            q = fix[0]
+            fix = (("m", q // B + 1, 1) + (("xbuf",) if em else ()),
+                   dict(RunPos.values(tokens[0], q, K, B), row=0), fix[1])
         chunks, p0 = [], self.pos       # each chunk's runs: (key, run arguments, the host's rows
         for c0 in range(0, len(tokens), img.prefill_rows):  # written before it, or None)
             part, runs = tokens[c0:c0 + img.prefill_rows], []
@@ -2975,7 +2994,16 @@ class Engine:
                 i += n
             chunks.append((part, runs))
             p0 += len(part)
-        self._precompile_layers([k for _, runs in chunks for k, _, _ in runs] +
+        last = None if not (keep and mtp is not None and mtp[-1] is not None) else \
+            next((j for j, (k, _, _) in reversed(list(enumerate(chunks[-1][1]))) if k[0] == "m"),
+                 None)
+        if last is not None:            # (its rows end at the part's last)
+            k, vals, rows = chunks[-1][1][last]
+            if em:
+                chunks[-1][1][last] = (k + ("keep",), vals, rows)
+            self.kept = (p0 - 1, len(chunks[-1][0]) - 1)
+        self._precompile_layers(([fix[0]] if fix is not None else []) +
+                                [k for _, runs in chunks for k, _, _ in runs] +
                                 (["head"] if logits else []))
         srv = self.server if self.pooled else None
         send = getattr(srv, "ahead_layer", None) if self.layer_ahead else None
@@ -2987,6 +3015,10 @@ class Engine:
                 kw.update(expert_major=True, part=self.ahead_part, scratch=len(chunks[0][0]) *
                           em_record(self.spec.hidden, mo.k))
             srv.begin_prefill(**kw)
+        if fix is not None:             # its residual row into chunk row 0, the next token's
+            self.backend.write(0, img.io["xbuf"], np.asarray(fix[2], np.float32))   # row
+            self._write_host_rows(tokens[:1])
+            run(fix[0], fix[1])
         if send is not None:
             self._send_ahead(send, 0)
             first = self.spec.moe.first             # (the model's MoE layers: not an MTP

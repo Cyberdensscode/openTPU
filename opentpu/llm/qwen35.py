@@ -1205,11 +1205,12 @@ class Image(EmbedHost):
         return [b.finish()], list(b.run_args)
 
     def compile_mtp_kv_run(self, blocks: int, block: int = ATTN_BLOCK, R: int = 1,
-                           em: bool = False):
+                           em: bool = False, keep: bool = False):
         """(programs, run_args): qwen35_mtp_kv_run, R rows at a run-time position of bucket
         `blocks` (from conv_k - 1) and a run-time row of the prefill chunk (RunPos.values and
-        "row"); em: expert-major's records. An MTP image's (Spec.mtp) with lookup tables, its
-        prefill rows and the embedding rows from the host's slot (embed_host)."""
+        "row"); em: expert-major's records (keep: their residual to the chunk's rows too). An
+        MTP image's (Spec.mtp) with lookup tables, its prefill rows and the embedding rows from
+        the host's slot (embed_host)."""
         from ..compiler import RunVar
         if not (self.spec.mtp and self.lookup and self.prefill_rows and self.embed_host):
             raise ValueError("an MTP prefill run needs an MTP image's lookup tables, its prefill "
@@ -1223,7 +1224,8 @@ class Image(EmbedHost):
         pos.tpos.bound -= R - 1     # the run's last row in the block too: tpos <= block - R
         b = qwen35_mtp_kv_run.trace(self.cfg, 0, {"m": self.descriptors(0), "pos": pos,
                                                   "row": RunVar("row", self.prefill_rows),
-                                                  "block": block, "R": R, "em": em})
+                                                  "block": block, "R": R, "em": em,
+                                                  **({"keep": True} if keep else {})})
         return [b.finish()], list(b.run_args)
 
     def compile_prefill_head(self, em: bool = False):
@@ -2536,7 +2538,8 @@ def qwen35_prefill_head(m, row, em: bool = False):
 
 
 @ol.jit
-def qwen35_mtp_kv_run(m, pos, row, block: int = ATTN_BLOCK, R: int = 1, em: bool = False):
+def qwen35_mtp_kv_run(m, pos, row, block: int = ATTN_BLOCK, R: int = 1, em: bool = False,
+                      keep: bool = False):
     """A layer-major prefill's MTP rows (Spec.mtp, docs/mtp.md 12): after a chunk's last layer,
     its R rows from `row` (a run-time value) at the positions pos .. pos + R - 1 (a RunPos, in
     one attention block) append the MTP layer's K / V as qwen35_mtp's rows do: row r's
@@ -2544,13 +2547,18 @@ def qwen35_mtp_kv_run(m, pos, row, block: int = ATTN_BLOCK, R: int = 1, em: bool
     layer's combine) and the embedding row of the token after it (the host's slot rows 0 .. R -
     1, embed_host) -> fc -> the MTP layer's K and V. Its queries, MoE and draft head are left
     out (nothing reads them: only the prompt's last row drafts, qwen35_mtp after the head, its
-    token the head's pick), so the run posts no expert request."""
+    token the head's pick), so the run posts no expert request. keep (em): the rows' residual,
+    the combine's, to m.xbuf[row:row + R] too (where a layer-major run keeps it), for the host
+    to keep with a snapshot after them (mtp.MTPDecoder.snapshot: a later turn's K / V row of the
+    last one again, the token after it changed, from that row alone)."""
     spec, mt = m.spec, m.mtp
     H, eps, p = spec.hidden, spec.eps, pos.pos
     if em:
         x = ol.load(MO.em_x(m.moe_dev, row, R, H))
         if m.layer(spec.layers - 1).moe:
             x.set(MO.moe_combine_rows(x, spec.moe, m.moe_dev, row))
+        if keep:
+            ol.store(m.xbuf[row:row + R, :], x)
     else:
         x = ol.load(m.xbuf[row:row + R, :])
     c, s_ = ol.load(m.cos_t[p:p + R, :]), ol.load(m.sin_t[p:p + R, :])

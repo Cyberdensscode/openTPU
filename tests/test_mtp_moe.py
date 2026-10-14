@@ -370,6 +370,45 @@ def test_moe_mtp_loop_drafts_the_prompts_last_row_first(tiny_moe_mtp, P, em, dra
                                                         _mtp_kv(eager.eng, P)))
 
 
+@pytest.mark.parametrize("em", [False, True])
+def test_moe_mtp_rollback_to_a_held_snapshot_is_a_rerun(tiny_moe_mtp, em, monkeypatch):
+    """A rollback to a snapshot whose next token changed (a chat's next turn): the snapshot
+    after a part (follow: the token after it) holds the part's last row's residual (the K / V
+    run of the expert-major prompt keeps it in its chunk row), the rollback goes back to the
+    snapshot itself, and the next prefill first appends the MTP layer's row before it from
+    that row and the new token (Engine.prefill_layers' fix), then feeds the rest. The MTP
+    layer's KV cache, the committed DeltaNet states, a0 and the first draft equal a fresh
+    decoder's over the new context bit for bit: the row as a run of that position through
+    the model would append it."""
+    from opentpu.llm import qwen35 as Q35
+    from opentpu.llm.mtp import MTPStats
+    from test_mtp import _mtp_kv, _states
+    monkeypatch.setattr(Q35, "PREFILL_CHUNK", 24)
+    W, spec = tiny_moe_mtp
+    r = np.random.default_rng(5)
+    ids1 = [int(t) for t in r.integers(0, 1000, 40)]
+    at = 30
+    ids2 = ids1[:at] + [int(t) for t in r.integers(0, 1000, 13)]
+    assert ids2[at] != ids1[at]
+    dec = MTPDecoder(_layered(spec, W, em, snapshots=1))
+    assert dec.holds
+    dec.prefill(ids1[:at], MTPStats(), follow=ids1[at])
+    assert dec.snapshot() and at in dec.held
+    dec.prefill(ids1[at:], MTPStats())
+    assert dec.rollback(at) == at == dec.eng.pos and dec.refill[0] == at - 1
+    n0 = len(dec.eng.stats)
+    got = dec.prefill(ids2[at:], MTPStats())
+    assert dec.refill is None and any(k[0] == "m" and k[3:] == (("xbuf",) if em else ())
+                                      and k[2] == 1 for k in dec.eng._layer_runs)
+    ref = MTPDecoder(_layered(spec, W, em))
+    assert got == ref.prefill(ids2, MTPStats())
+    L = len(ids2)
+    assert dec.eng.pos == ref.eng.pos == L and len(dec.eng.stats) > n0
+    assert all(np.array_equal(x, y) for x, y in zip(_mtp_kv(dec.eng, L), _mtp_kv(ref.eng, L)))
+    assert all(np.array_equal(x, y) for x, y in zip(_states(dec.eng, spec, dec.slot),
+                                                    _states(ref.eng, spec, ref.slot)))
+
+
 def test_moe_mtp_layer_major_continues_from_slot_1(tiny_moe_mtp, monkeypatch):
     """A chat's next turn on the layer-major path: the first turn's loop (drafts all right)
     leaves the states committed in slot 1, and the next prompt's layer runs read and write that
@@ -481,9 +520,10 @@ def test_streamed_mtp_engine_from_a_checkpoint_and_an_extended_pool(tiny_moe_mtp
 
 def test_moe_mtp_chat_turns_roll_back_to_the_reply(tiny_moe_mtp, monkeypatch):
     """otpu-chat's turns with MTP on the streamed MoE (Chat over an MTP engine whose prompt goes
-    layer by layer): from the second turn on the context rolls back a token before the last
-    reply's start (the snapshot the turn took there) and feeds the reply and the new message,
-    not the whole conversation (restarted False). Chat.fed holds every token fed, the first
+    layer by layer): from the second turn on the context rolls back to the last reply's start
+    (the snapshot the turn took there, with the residual row before it: the MTP layer's row
+    before it appended again from that row and the new token, MTPDecoder.holds) and feeds the
+    reply and the new message, not the whole conversation (restarted False). Chat.fed holds every token fed, the first
     prompt's conv_k - 1 rows of the rows kernel too (without them the next turn found no common
     part and started over). Each turn's reply equals plain greedy decode's of its rendering."""
     from opentpu.host.chat import Chat, sampler
@@ -500,7 +540,7 @@ def test_moe_mtp_chat_turns_roll_back_to_the_reply(tiny_moe_mtp, monkeypatch):
         ids = tok.apply_chat_template(chat.history[:-1], True, False, True)
         assert not turn.restarted, i
         assert chat.fed[:len(ids)] == ids, i
-        assert turn.reused == (start - 1 if i else 0), i
+        assert turn.reused == (start if i else 0), i
         want = Engine(spec, W, cap=512, cfg=CFG, rows=1, resident=True,
                       experts=SLOTS).generate(ids, max_new=6)
         assert chat._reply == [x for x in want if x not in spec.eos], i

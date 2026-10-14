@@ -532,7 +532,8 @@ class Chat:
 
     def _rollback(self, k: int) -> int:
         """Take the context back to (at most) the first k fed tokens: Engine.rollback (the MTP
-        decoder's: its committed slot, and one token more). Returns the tokens kept."""
+        decoder's: its committed slot, and one token more unless it holds the row before a
+        snapshot at k). Returns the tokens kept."""
         t = self.mtp.rollback(k) if self.use_mtp else self.eng.rollback(k)
         if t == 0:
             self.eng.reset()
@@ -585,9 +586,10 @@ class Chat:
         n = turn.reused = len(self.fed)
         turn.prefill_total = len(ids) - n
         # the snapshot of the state for the next turn's rollback: at the reply's start (MTP: a
-        # token before, rollback's), within this turn's prompt
+        # token before, rollback's, unless the decoder holds the row before it), within this
+        # turn's prompt
         at = self.reply_start(ids) if getattr(self.eng, "stateful", False) else None
-        if at is not None and self.use_mtp:
+        if at is not None and self.use_mtp and not self.mtp.holds:
             at -= 1
         if at is not None and not n < at <= len(ids):
             at = None

@@ -103,6 +103,8 @@ class MTPDecoder:
         self.draft = None           # the draft after the token at Engine.pos (prefill, the loop)
         self.pending = None         # (p, a0): a lazy prefill's last row, its draft not run yet
                                     # (the loop's first run drafts it: loop_card; else _settle)
+        self.held = {}              # a snapshot's position t -> the residual row of t - 1 (holds)
+        self.refill = None          # (t - 1, that row): the next prefill's first K / V row again
         self.split = None           # the loop's V and E in two parts: None when over IMEM (tests:
                                     # True always, False never; _gen_programs)
         # the MTP layer's rows a prefill run (a MoE's: its experts' request names R k ids)
@@ -238,6 +240,15 @@ class MTPDecoder:
         return (getattr(self.img.spec, "moe", None) is not None and bool(self.eng.layer_major)
                 and bool(getattr(self.img, "embed_host", False)))
 
+    @property
+    def holds(self) -> bool:
+        """A snapshot keeps the residual row before it (by_layers: Engine.prefill_layers'
+        keep), so a rollback to it takes the context back to the snapshot itself, and the next
+        prefill appends the MTP layer's row before it from that row with the new token
+        (Engine.prefill_layers' fix) instead of running that position through the model again.
+        Without, a rollback goes a token further back (rollback)."""
+        return self.by_layers
+
     def _prefill_layers(self, toks, st: MTPStats, pick, on_run, follow, vis=None,
                         lazy: bool = False):
         """prefill on a streamed MoE whose Engine runs the prompt layer by layer
@@ -247,12 +258,17 @@ class MTPDecoder:
         `follow`); then, the slots back to decode's, the last row's draft: qwen35_mtp over the
         head's hidden row and a0 (its MoE a request in the MTP layer's slots; lazy: left to
         the loop, self.pending). The states in the committed slot. on_run(tokens) once, after
-        it. vis: the tokens' image rows."""
+        it. vis: the tokens' image rows. A part before a snapshot (follow) keeps its last
+        row's residual (holds); after a rollback to one, the MTP layer's row before it comes
+        first (self.refill)."""
         eng = self.eng
         head = follow is None
         P, n0 = eng.pos + len(toks), len(eng.stats)
+        kw = {} if vis is None else {"vis": vis}
+        if self.refill is not None:
+            kw["fix"], self.refill = self.refill, None
         lg = eng.prefill_layers(toks, logits=head, mtp=toks[1:] + [follow], slot=self.slot,
-                                **({} if vis is None else {"vis": vis}))
+                                keep=not head, **kw)
         st.runs.append(("prefill", len(toks),
                         {"cycles": sum((s or {}).get("cycles", 0) for s in eng.stats[n0:])}))
         if on_run is not None:
@@ -278,18 +294,34 @@ class MTPDecoder:
         self.draft = self._draft(q, [a0], MTPStats() if st is None else st, "mtp prefill")[0]
 
     def snapshot(self) -> bool:
-        """Engine.snapshot of the committed slot's states and windows."""
-        return self.eng.snapshot(self.slot)
+        """Engine.snapshot of the committed slot's states and windows; with the residual row
+        before its position, read back (holds: the last prefill kept it, Engine.kept)."""
+        eng = self.eng
+        ok = eng.snapshot(self.slot)
+        kept = getattr(eng, "kept", None)
+        if ok and self.holds and kept is not None and kept[0] == eng.pos - 1:
+            H = self.img.spec.hidden
+            self.held[eng.pos] = eng.backend.read(0, self.img.io["xbuf"] + 4 * H * kept[1],
+                                                  4 * H).view(np.float32).copy()
+        at = set(eng._snaps.at.values()) if getattr(eng, "_snaps", None) is not None else set()
+        self.held = {t: h for t, h in self.held.items() if t in at}
+        return ok
 
     def rollback(self, k: int) -> int:
         """Engine.rollback for this decoder's context (into the committed slot): the MTP
         layer's row at q took the token at q + 1 (h_q, x_(q + 1)), so a context going back
-        because the token at k changes goes back to k - 1 at most, where the next prefill's
-        first row computes that row again with the new token. Returns the position."""
+        because the token at k changes must append the row at k - 1 again with the new token.
+        With a snapshot at k that holds the residual row of k - 1 (holds), the context goes
+        back to k and the next prefill appends that row from it first (self.refill); else it
+        goes back to k - 1 at most, where the next prefill's first row computes that row
+        again. Returns the position."""
         if k >= self.eng.pos:
             return self.eng.pos
-        t = self.eng.rollback(max(0, k - 1), self.slot)
+        h = self.held.get(k)
+        t = self.eng.rollback(k if h is not None else max(0, k - 1), self.slot)
         self.draft = self.pending = None    # (the next prefill computes the rows from t on)
+        self.refill = (t - 1, h) if h is not None and t == k else None
+        self.held = {p: v for p, v in self.held.items() if p <= t}
         if t == 0:
             self.slot = 0
         return t
