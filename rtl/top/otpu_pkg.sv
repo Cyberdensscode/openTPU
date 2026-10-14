@@ -414,6 +414,8 @@ package otpu_pkg;
     logic                    mac;       // the MXU consumed a weight chunk
     logic                    starve;    // the MXU had chunks to consume but none had arrived
     logic                    deny;      // a unit with TMEM requests was not granted
+    logic                    bwait;     // a unit's port B request waited for the port
+    logic                    dwait;     // a unit's DRAM request (port B, port A, QST) waited
     logic                    u_mxu;     // MXU instruction ended: starve, bp, frz, deny
     logic [3:0][31:0]        u_mxu_v;   // [0] starve ... [3] deny
     logic                    u_q;       // QACT ended: frz
