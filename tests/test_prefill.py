@@ -142,6 +142,53 @@ def test_prompt_runs_are_compile_time_runs(case, P1, P2):
 
 
 
+def _lfm2(kinds):
+    """A tiny LFM2 of these layer kinds (test_autodecode._tiny's dims and weights' spread)."""
+    import torch
+    import transformers
+    from opentpu.llm.lfm2 import Spec
+    torch.manual_seed(0)
+    hc = transformers.Lfm2Config(
+        hidden_size=256, num_hidden_layers=len(kinds), num_attention_heads=4,
+        num_key_value_heads=2, intermediate_size=512, vocab_size=1000, norm_eps=1e-5,
+        layer_types=["full_attention" if k == "attn" else "conv" for k in kinds],
+        conv_L_cache=3, conv_bias=False, block_auto_adjust_ff_dim=False,
+        tie_word_embeddings=True, max_position_embeddings=4096, initializer_range=0.2,
+        rope_parameters={"rope_type": "default", "rope_theta": 1e6})
+    m = transformers.Lfm2ForCausalLM(hc).float().eval()
+    with torch.no_grad():
+        for n, p in m.named_parameters():
+            if "norm" in n:
+                p.copy_(1.0 + 0.1 * torch.randn_like(p))
+    spec = Spec(256, tuple(kinds), 4, 2, 64, 512, 1000)
+    W = {k: v.float().numpy() for k, v in m.state_dict().items()}
+    return W, spec, device_config(spec, 512, rows=PREFILL_ROWS, lookup=True, S=1)
+
+
+def test_a_run_word_read_only_through_a_loop_register():
+    """LFM2 (conv, attn) x 2: every convolution in the layers' hardware loop, so a prompt run
+    reads its ring word (the state ring's row of position p - K + 1, (p + 1) mod K) only into a
+    register the loop steps ({ring, the loop}: loaded from the word before the loop, no run-time
+    argument of Builder.run_args). The program names it (Program.run_seen) and prefill.run
+    writes it before each run; when only the arguments' words were written, a run read the ring
+    word an earlier run left. Two prompts (a chat's turns) against compile-time runs of the
+    same split, as test_prompt_runs_are_compile_time_runs: the logits and every slice's DRAM."""
+    W, spec, cfg = _lfm2(("conv", "attn", "conv", "attn"))
+    r = np.random.default_rng(5)
+    p1, p2 = ([int(t) for t in r.integers(0, 1000, n)] for n in (37, 30))
+    a = Engine(spec, W, cap=512, cfg=cfg, resident=True, prompt_runs=True)
+    got = [a.prefill(p1), a.prefill(p2)]
+    progs, names = PF.programs(a, 40, a._prompt_rmax[1][0], "P")
+    assert "ring" in {v.name for v, _ in progs[0].run_seen} - \
+        {v.name for v, _ in progs[0].run_args} and "ring" in names
+    R_max = lambda blocks: a._prompt_rmax[blocks][0]                # noqa: E731
+    b = Engine(spec, W, cap=512, cfg=cfg, resident=True)
+    want = [_static(b, p1, R_max), _static(b, p2, R_max)]
+    assert [s["rows"] for s in a.stats] == [s["rows"] for s in b.stats]
+    assert all(np.array_equal(x, y) for x, y in zip(got, want))
+    assert all(np.array_equal(x, y) for x, y in zip(_drams(a, 67), _drams(b, 67)))
+
+
 def test_todays_route_where_it_fits_more_rows(monkeypatch):
     """prefill.covers: where today's prefill (compile_rows) fits more rows in a bucket than its
     prompt run (here bucket 2's prompt programs held to 2 rows), a prompt that reaches the

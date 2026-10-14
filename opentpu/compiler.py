@@ -111,11 +111,15 @@ ARG0 = 8                        # the run's arguments ARG0..7 are R8..R15 at the
 class Program(list):
     """A program's instructions (Builder.finish), with the run-time arguments it reads
     (Builder.run_args: [(RunVar, c)], argument k in R15 - k): opentpu.waits bounds them by
-    their variables' bounds (an otpu_seq WAITC build's wait counts)."""
+    their variables' bounds (an otpu_seq WAITC build's wait counts); and run_seen, every
+    (RunVar, c) its addresses add (Builder.run_seen): with run words (a prompt run's state
+    words, qwen3.RunWords) also those read only into a register that a loop steps, which are
+    no argument, so the host writes every word the program reads (prefill._prepared)."""
 
-    def __init__(self, instrs=(), run_args=()):
+    def __init__(self, instrs=(), run_args=(), run_seen=()):
         super().__init__(instrs)
         self.run_args = list(run_args)
+        self.run_seen = list(run_seen)
 
 
 class Words(np.ndarray):
@@ -1868,7 +1872,7 @@ class Builder:
                 for r in sorted(self.used_regs - self.late_zero)]
         prog += self._flatten(self.root)
         prog.append(I.halt())
-        return Program(prog, self.run_args)
+        return Program(prog, self.run_args, self.run_seen)
 
     def _flatten(self, items: list) -> list[I.Instr]:
         out = []

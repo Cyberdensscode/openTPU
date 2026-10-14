@@ -157,13 +157,16 @@ def _prepared(eng, what, blocks: int, progs, ra):
     if not G.fits(img, progs):
         raise CompileError(f"prompt run {what}: {max(map(len, progs))} instructions, "
                            f"IMEM {img.cfg.IMEM_WORDS // 8}")
+    # the words the run reads: its arguments', and those its addresses add with a loop's
+    # step (Program.run_seen: a register loaded from the word before the loop, no argument)
+    names = {v.name for v, _ in ra or ()} | \
+        {v.name for p in progs for v, _ in getattr(p, "run_seen", ())}
     prep = getattr(eng.backend, "prepare", None)
     if getattr(eng.backend, "runs_words", False) and len(progs) == 1:   # (Words: run_args;
         from .qwen3 import worker_words                                 # WAITC: the entries)
         progs = worker_words(img, progs[0], ra or getattr(progs[0], "run_args", ()))
     elif prep is not None:
         prep(progs)
-    names = {v.name for v, _ in ra or ()}
     if blocks:                      # a run-time run: and the words its kernel reads itself
         names |= set(getattr(img, "prompt_words", ()))
     return progs, sorted(names)
