@@ -310,6 +310,24 @@ def test_mm_sw_line_alone_on_board_model(have_verilator):
     assert ok, msg
 
 
+def test_porta_beats_dropped_at_a_waitw_on_board_model(have_verilator):
+    """An MM, then a WAITW whose word holds at once (ordered after the MM by the word it writes
+    into the MM's output): its end drops port A's held beats (otpu_native_dram a_flush; the
+    MM's scale reads leave the reused beat and a run behind). tb_board stops if a beat outlives
+    the flush; bit for bit against the ISA simulator."""
+    from opentpu import isa as I
+    from opentpu.host.checks import DATA, OUT, SC, W8
+    from opentpu.host.opchecks import CHAIN_AT
+    M, res, flag = CFG.MCOLS, 8192, CHAIN_AT + 0x2000
+    img = diag_image(CFG)
+    img[flag:flag + 4] = np.array([1], "<u4").view(np.uint8)
+    prog = [I.ld(DATA, 0, 4096), I.qact(0, M, 0, 2, 256),
+            I.mm(W8, SC, res, 16, 2, 256, 16, M, 0, 8),
+            I.waitw(flag, res + 16 * M - 1, 1, I.C_EQ), I.st(OUT, res, 16 * M), I.halt()]
+    ok, msg, _ = run_demo(Board(SimTransport(ch_bytes=CFG.DRAM_BYTES // 2)), CFG, prog, img)
+    assert ok, msg
+
+
 def test_waitw_host_check_on_board_model(have_verilator):
     """qual.sh's WAITW phase (checks.waitw_host, waitw_timeout) through the host driver: the board
     model runs a script, so the host's data and flag are there before the start (the writes
