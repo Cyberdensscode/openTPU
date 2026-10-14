@@ -435,9 +435,13 @@ clock on the operator) pays once those are fixed, from about 540 MHz.
   the SE tail's VOP-mode select (`cm` -> `uc`: each lane's `u_m` operands `ma` / `mb`, 512 mux
   selects) ahead of the fmul's significand product: 10 buffers across the VPU (0.50 ns), the mux,
   the product's carry-save tree into its s1 register (17 levels), -0.09 ns on the global route
-  (504 endpoints; +0.17 ns with the TMEM in the corner, its registers then less spread). A
-  registered copy of the mode in each lane, from `ss_act`'s next value (the same cycle), gives
-  every copy one lane's 64 selects.
+  (504 endpoints; +0.17 ns with the TMEM in the corner, its registers then less spread). The
+  lanes now take registered copies of the mode, three a lane, loaded with `ss_act`'s next value
+  so each equals it in the same cycle (`otpu_vpu` `g_sar`: `sa_r` for the lane's RDOT term,
+  `cm_u` / `cm_q` for the tail's U and Q operands; each a kept instance, since identical
+  flip-flops merge, and ORFS's slang import keeps the attribute): the word-level selects on the
+  one flip-flop go from 2181 to the control's 133, and each copy carries one lane's 64-96. Not
+  yet through the flow.
 - The macros are CACTI-fitted estimates (`tools/asic/fakeram.py`), not a compiler's; a real PDK's
   1R1W macros (IHP SG13G2, commercial) replace them through `rtl/tech/asic`'s leaves.
 - Power is vectorless; a VCD from the Verilator RTL (a decode token) would give real activities.

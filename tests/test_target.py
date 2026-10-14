@@ -468,6 +468,47 @@ def test_the_board_counts_the_port_registers_as_requests_pending():
         [f"!x_srst[{k}] && b_rvalid" for k in ("0", "s")]
 
 
+def _lane_loops(code: str) -> dict:
+    """The generate loops over lanes of a source (comments out): {label: body}, the body from
+    "for (genvar l ...) begin : label" to its matching end."""
+    out = {}
+    for m in re.finditer(r"for\s*\(\s*genvar\s+l\b[^)]*\)\s*begin\s*:\s*(\w+)", code):
+        depth = 1
+        for t in re.finditer(r"\b(begin|end)\b", code[m.end():]):
+            depth += 1 if t.group(1) == "begin" else -1
+            if depth == 0:
+                out[m.group(1)] = code[m.end():m.end() + t.start()]
+                break
+    return out
+
+
+def test_the_vpu_lanes_take_ss_act_from_their_copies():
+    """ss_act (the stream engine's grant: stream mode) selects every lane's RDOT term and the
+    tail's VOP-mode operands; as one flip-flop it reached some 2,700 endpoints (the ASIC card
+    point's worst register path, through 190 buffers; only Vivado's max_fanout replicated it).
+    The lanes read copies instead, three a lane (otpu_vpu g_sar: sa_r, cm_u, cm_q, loaded with
+    ss_act's next value, each its own kept instance: identical flip-flops would merge): no lane
+    loop of otpu_vpu reads ss_act, otpu_se_tail has no one-bit mode, and every copy is kept."""
+    vpu = re.sub(r"//.*", "", (ROOT / "rtl/vpu/otpu_vpu.sv").read_text())
+    tail = re.sub(r"//.*", "", (ROOT / "rtl/vpu/otpu_se_tail.sv").read_text())
+
+    def raw(code):
+        return {n: re.findall(r"\bss_act\b", b) for n, b in _lane_loops(code).items()
+                if re.search(r"\bss_act\b", b)}
+    loops = _lane_loops(vpu)
+    assert {"g_red", "g_slane", "g_sar"} <= set(loops) and raw(vpu) == {}
+    assert len(re.findall(r'\(\*\s*keep_hierarchy\s*=\s*"yes"\s*\*\)\s*otpu_delay\b',
+                          loops["g_sar"])) == 3
+    assert re.search(r"\.cm_u\s*,\s*\.cm_q\b", vpu)
+    tl = _lane_loops(tail)
+    assert not re.search(r"\b(cm|uc)\b", tail)
+    assert "cm_u[l]" in tl["g_u"] and "cm_q[l]" in tl["g_lq"]
+    # the check sees one: a lane's term on ss_act again
+    a = "assign rsa[l] = (SE && sa_r[l])"
+    assert vpu.count(a) == 1
+    assert raw(vpu.replace(a, "assign rsa[l] = (SE && ss_act)")) == {"g_red": ["ss_act"]}
+
+
 def test_config_summary_names_the_target(no_env):
     from opentpu.host.board import config_summary
     kw = dict(devname=None, ddr_mts=1066, pair=True, dstep=True, stream=True)

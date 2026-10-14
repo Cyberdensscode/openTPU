@@ -296,6 +296,9 @@ module otpu_vpu
   // tail's X registers (s_xd, s_xa, s_xm), and s_xm at slot 0's pacc (s_mt)
   (* max_fanout = 64 *) logic sen;
   logic       ss_act_d;                        // ss_act's next value
+  // ss_act's copies, three per lane (see g_sar): the lane's RDOT term (sa_r), the tail's U
+  // operand registers and Q multiplier operands (cm_u, cm_q: its complement)
+  logic [LANES-1:0] sa_r, cm_u, cm_q;
   logic       s_init, s_in_v, s_first;
   f32_t       s_in_d [LANES], s_fd [LANES], s_xd [LANES], s_xa [LANES];
   logic [2:0] s_fk;
@@ -1048,8 +1051,8 @@ module otpu_vpu
     assign sb = m0.sq ? sa : (m0.dot && m0.mask[l]) ? yb : F_ONE;
     // stream mode: the term is the tail's S * a (bubbles come only after the last row, and
     // their partials are never captured)
-    assign rsa[l] = (SE && ss_act) ? s_xd[l] : sa;
-    assign rsb[l] = (SE && ss_act) ? s_xa[l] : sb;
+    assign rsa[l] = (SE && sa_r[l]) ? s_xd[l] : sa;
+    assign rsb[l] = (SE && sa_r[l]) ? s_xa[l] : sb;
     // pacc(chunk c) = pacc(chunk c - RL) + term(c): a loop of exactly RL cycles
     if (RMA) begin : g_ma
       // through slot 0's u_ma (term + prev: the add is commutative bit for bit), fed back by
@@ -1318,6 +1321,22 @@ module otpu_vpu
       s_cfg <= ss_cfg;
     end
     assign ss_gnt = ss_act;
+    // ss_act's copies for the lanes: ss_act selects every lane's RDOT term (64 selects a lane)
+    // and the tail's VOP-mode operands (224 a lane), and as one flip-flop (the card's ASIC point,
+    // tm100: through 190 buffers to some 2,700 endpoints, its complement 10 buffers deep into
+    // the tail's multiplier selects, the worst register path) only Vivado replicated it (its
+    // max_fanout). Each copy is loaded with ss_act's next value, so it equals ss_act (cm_*: its
+    // complement) in the same cycle, and is an instance of its own (kept: identical flip-flops
+    // would be merged into one again)
+    wire sa_n = !rst && ss_act_d;
+    for (genvar l = 0; l < LANES; l++) begin : g_sar
+      (* keep_hierarchy = "yes" *)
+      otpu_delay #(.W(1), .N(1)) u_sa (.clk, .en(1'b1), .d(sa_n), .q(sa_r[l]));
+      (* keep_hierarchy = "yes" *)
+      otpu_delay #(.W(1), .N(1)) u_cu (.clk, .en(1'b1), .d(!sa_n), .q(cm_u[l]));
+      (* keep_hierarchy = "yes" *)
+      otpu_delay #(.W(1), .N(1)) u_cq (.clk, .en(1'b1), .d(!sa_n), .q(cm_q[l]));
+    end
     // the tail's X meta, aligned with slot 0's pacc (as mt is for a reduction): u_vt's cap
     otpu_delay #(.W($bits(ss_meta_t)), .N(TA)) u_smt (.clk, .en, .d(s_xm), .q(s_mt));
     assign s_first = ss_act && s_xm.first;
@@ -1330,7 +1349,7 @@ module otpu_vpu
       .kv(root), .kv_v(root_v && !vt_q), .y_v(t_yv), .y_d(ss_y_d), .o_v(t_ov), .o_d(ss_o_d),
       .qp_cap(t_qc), .qp_row_last(t_qrl), .qp_sub(t_qsub), .qp_d(t_qd),
       .qo_v(root_v && vt_q), .qo_d(root_o),
-      .cm(!ss_act), .cen(en), .u_sel(c_sel[1]), .u_a(c_sa[1]), .u_b(c_sb[1]), .u_c(c_sc[1]),
+      .cm_u, .cm_q, .cen(en), .u_sel(c_sel[1]), .u_a(c_sa[1]), .u_b(c_sb[1]), .u_c(c_sc[1]),
       .u_e(c_se[1]), .u_y(c_uy), .q_sel(c_sel[2]), .q_a(c_sa[2]), .q_b(c_sb[2]), .q_c(c_sc[2]),
       .q_y(c_qy));
     // Q's partials registered here (QD = 1: the tail pads its Q path for it), so no path
@@ -1366,6 +1385,9 @@ module otpu_vpu
     assign vt_q = 1'b0;
     assign ss_act = 1'b0;
     assign ss_gnt = 1'b0;
+    assign sa_r = '0;
+    assign cm_u = '1;
+    assign cm_q = '1;
     assign sen = 1'b0;
     assign s_init = 1'b0;
     assign s_first = 1'b0;
