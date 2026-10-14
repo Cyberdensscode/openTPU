@@ -213,8 +213,9 @@ def test_a_loop_program_that_fits_is_not_split():
     tree before the split (3af05a43) without the image's mask tiles (OTPU_TILE=0). With them
     (Qwen3.5-MoE's tiles on by default, em-tile 2bb7bb0b) the image is 1,331,200 bytes longer
     and the areas the programs address move: the same instructions, only address words
-    differing (by 262,144, 1,331,200 and 1,331,328 bytes), their own sum. A change of the
-    programs themselves updates the sums here."""
+    differing (by 262,144, 1,331,200 and 1,331,328 bytes), their own sum; the tiles' DeltaNet
+    rows (Image.dnrows: 8 of the image's gr / on rows for 4) move them by 9,216 and 12,288 bytes
+    more. A change of the programs themselves updates the sums here."""
     import hashlib
     from pathlib import Path
     from opentpu import isa as I
@@ -241,7 +242,7 @@ def test_a_loop_program_that_fits_is_not_split():
     untiled = os.environ.get("OTPU_TILE", "").strip() == "0"
     assert h.hexdigest() == ("7f3bacfe386c84838742206943cb20db6ea989d2a4eb6cf63fdab651d5ffc103"
                              if untiled else
-                             "eb811fa4ebb43cb6c9fdbe9b43caf1a7a78ebc074e0ddf41c446549c8dfdfa6c")
+                             "99da9dd63f736e7c92e4602d9a5a71ba84ba1b23ee78d5b3b2a4a7a349687e49")
 
 
 @pytest.mark.parametrize("P, drafter, sp", [
@@ -417,7 +418,6 @@ def test_moe_mtp_rollback_to_a_held_snapshot_is_a_rerun(tiny_moe_mtp, em, monkey
                                                     _states(ref.eng, spec, ref.slot)))
 
 
-@pytest.mark.xfail(strict=True, raises=ValueError, reason="slot-1 tiled runs: mtp-slot-fix")
 def test_moe_mtp_layer_major_continues_from_slot_1(tiny_moe_mtp, monkeypatch):
     """A chat's next turn on the layer-major path: the first turn's loop (drafts all right)
     leaves the states committed in slot 1, and the next prompt's layer runs read and write that
@@ -437,6 +437,8 @@ def test_moe_mtp_layer_major_continues_from_slot_1(tiny_moe_mtp, monkeypatch):
     ctx = p1 + t1 + p2
     st = dec.generate_card([t1[-1]] + p2, max_new=10, stop=[])
     assert any(k[1:] == ("slot", 1) for k in dec.eng._layer_runs if len(k) == 3)
+    assert any(k[0][-1] == "tile" for k in dec.eng._layer_runs     # (the turn's tiled runs,
+               if len(k) == 3 and k[1:] == ("slot", 1))            # on slot 1)
     fresh = MTPDecoder(_layered(spec, W, True)).generate_card(ctx, max_new=10, stop=[])
     assert st.tokens == fresh.tokens == _plain(spec, W, ctx, 10)
 
@@ -449,9 +451,8 @@ def test_streamed_mtp_engine_from_a_checkpoint_and_an_extended_pool(tiny_moe_mtp
     asks for from the checkpoint). The loop's tokens equal plain greedy decode's from the
     model's pool. MiniCPM-V 4.7's case: a checkpoint without mtp.* is refused, and takes them
     from another (mtp_from), whose identity the pool's key holds: the pool extended for the
-    model's own MTP layer is refused, one extended with --mtp-from serves it. Its engines run
-    their layer runs untiled, the plain one's expert-major runs tiled (a tiled run takes the
-    states' slot 0 alone: branch mtp-slot-fix)."""
+    model's own MTP layer is refused, one extended with --mtp-from serves it. Its expert-major
+    engine runs its layer runs tiled, as the plain one does."""
     import json
     import runpy
     import sys
@@ -512,10 +513,9 @@ def test_streamed_mtp_engine_from_a_checkpoint_and_an_extended_pool(tiny_moe_mtp
     want = ST.engine(m, CFG, pool=a, **kw).generate(prompt, max_new=N)
     eng = ST.engine(m, CFG, pool=b, mtp=True, **kw)
     assert eng.image.rows == 2 and eng.image.offload.layers == spec.layers + 1
-    assert eng.tile_runs is False and not eng.layer_tile    # (untiled: mtp-slot-fix)
     em = dict(kw, expert_major=True, layer_major=2)
-    assert ST.engine(m, CFG, pool=a, **em).layer_tile       # (the plain engine's tiles)
-    assert not ST.engine(m, CFG, pool=b, mtp=True, **em).layer_tile
+    assert ST.engine(m, CFG, pool=a, **em).layer_tile
+    assert ST.engine(m, CFG, pool=b, mtp=True, **em).layer_tile
     dec = MTPDecoder(eng)
     assert dec.generate_card(prompt, max_new=N, stop=[]).tokens == want
     got = np.fromfile(str(b) + ".packed", np.uint8)[nE:]
@@ -561,3 +561,118 @@ def test_moe_mtp_chat_turns_roll_back_to_the_reply(tiny_moe_mtp, monkeypatch):
         assert chat._reply == [x for x in want if x not in spec.eos], i
         start = len(tok.apply_chat_template(chat.history, False, False, True)) - \
             len(chat.history[-1]["content"]) - len(f"{tok.E}\n")
+
+
+def test_chatmoe_traces_each_turns_host_phases(tmp_path, monkeypatch, capsys):
+    """tools/qual/chatmoe.py --trace's host phases (_Phases) on a tiny MoE of 16 DeltaNet heads
+    with an LM head of its own and its MTP layer, from a checkpoint and pools as the card's
+    (pack_pool.py init, pack, extend), three turns that roll back to the reply's start (a
+    Qwen3-shaped template): each turn's phases from its start to its first token, a0 last, the
+    calls' as `calls` (each with its end_prefill), the first rows of the MTP decoder's prompt
+    in a prefill of their own with their runs, a later turn's rollback before its calls and
+    the snapshot (MTP's with the held row's read) between them. Host bookkeeping: the traced
+    run's tokens are the untraced one's (--check), plain decode's and MTP's the same, and the
+    trace keeps its calls as before."""
+    import json
+    import pickle
+    import runpy
+    import sys
+    from pathlib import Path
+
+    from safetensors.numpy import save_file
+
+    from test_chatkv import MESSAGES, _QwenTok
+    root = Path(__file__).resolve().parents[1]
+    m, W, spec = _tiny(nv=16)
+    spec, W = _untied((m, W, spec))
+    W = _moe_mtp_weights(W, spec)
+    m.config.tie_word_embeddings = False
+    d = tmp_path / "model"
+    m.config.save_pretrained(d)
+    save_file({k: np.ascontiguousarray(v) for k, v in W.items()}, str(d / "model.safetensors"))
+
+    def pack(*args):
+        monkeypatch.setattr(sys, "argv", ["pack_pool.py", *map(str, args)])
+        try:
+            runpy.run_path(str(root / "tools" / "offload" / "pack_pool.py"), run_name="__main__")
+        finally:
+            monkeypatch.undo()
+    a, b = tmp_path / "a.bin", tmp_path / "b.bin"
+    pack(d, a, "init")
+    pack(d, a, "pack", 0, 1)
+    pack(d, b, "extend", a)
+    cfg = tmp_path / "cfg.pkl"
+    cfg.write_bytes(pickle.dumps(board_config(DRAM_BYTES=1 << 26, DSTEP=True, STREAM=True,
+                                              PAIR=True)))
+
+    class Tok(_QwenTok):                    # (chatmoe's _Pinned passes the template a date)
+        def apply_chat_template(self, history, add_generation_prompt=True,
+                                enable_thinking=False, tokenize=True, **kw):
+            return super().apply_chat_template(history, add_generation_prompt,
+                                               enable_thinking, tokenize)
+    monkeypatch.delenv("OTPU_FORMATS", raising=False)
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", lambda p: Tok())
+    sys.path.insert(0, str(root / "tools" / "qual"))
+    try:
+        import chatmoe
+    finally:
+        sys.path.remove(str(root / "tools" / "qual"))
+    argv = [str(d), "--cfg", str(cfg), "--cap", "512", "--max-new", "6", "--em-rows", "8"]
+    argv += [x for msg in MESSAGES[:3] for x in ("--turn", msg)]
+
+    def run(*args):
+        assert chatmoe.main(argv + [str(x) for x in args]) == 0
+        return capsys.readouterr().out
+    run("--pool", a, "--trace", tmp_path / "ta.json", "--out", tmp_path / "a.json")
+    run("--pool", b, "--mtp", "--out", tmp_path / "b.json")
+    out = run("--pool", b, "--mtp", "--trace", tmp_path / "tb.json", "--out", tmp_path / "bt.json",
+              "--check", tmp_path / "b.json")
+    assert "[PASS]" in out and out.count("    phases: ") == 3
+    ra, rb, rt = (json.loads((tmp_path / f"{x}.json").read_text()) for x in ("a", "b", "bt"))
+    assert rb["mtp"] and [t["tokens"] for t in ra["turns"]] == [t["tokens"] for t in rb["turns"]]
+    assert all(not t["restarted"] and t["reused"] for t in rb["turns"][1:])
+    assert any(c["em"] for t in rb["turns"] for c in t["calls"])
+    for x, r in (("ta", ra), ("tb", rt)):
+        tr = json.loads((tmp_path / f"{x}.json").read_text())
+        assert tr["run_fields"] == ["key", "start", "end", "cycles"] and \
+            tr["event_fields"] == ["seen", "done", "kind", "layer or expert", "misses or bytes"]
+        assert [(c["rows"], c["em"]) for c in tr["calls"]] == \
+            [(c["rows"], c["em"]) for t in r["turns"] for c in t["calls"]]
+        assert tr["phase_fields"] == ["phase", "start", "end", "cycles"]
+        assert [t["calls"] for t in tr["turns"]] == \
+            [[k - len(t["calls"]), k] for k, t in
+             zip(np.cumsum([len(t["calls"]) for t in r["turns"]]).tolist(), r["turns"])]
+        for i, (t, rt) in enumerate(zip(tr["turns"], r["turns"])):
+            ph = t["phases"]
+            assert t["ttft_s"] == pytest.approx(rt["ttft_s"], abs=1e-3), (x, i)
+            assert {p[0] for p in ph} <= set(chatmoe.PHASES), (x, i)
+            assert all(0 <= p[1] <= p[2] for p in ph), (x, i)
+            a0 = [p for p in ph if p[0] == "a0"]
+            assert len(a0) == 1 and a0[0][2] <= t["ttft_s"] + 1e-3, (x, i)
+            assert all(p[1] <= a0[0][1] for p in ph), (x, i)        # (none starts after a0)
+            calls = [p for p in ph if p[0] == "prefill_layers"]
+            assert len(calls) == len(rt["calls"]), (x, i)
+            for p, c in zip(calls, rt["calls"]):        # (a call's s is inside its span)
+                assert p[2] - p[1] >= c["s"] - 1e-3, (x, i)
+                assert sum(q[0] == "end_prefill" and p[1] <= q[1] <= q[2] <= p[2]
+                           for q in ph) == 1, (x, i)
+            runs = [p for p in ph if p[0] == "run"]
+            assert not any(p[1] < q[1] < p[2] for p in calls for q in runs), (x, i)
+            if i:                       # (the rollback first, the snapshot between the calls)
+                rb_ = [p for p in ph if p[0] == "rollback"]
+                assert len(rb_) == 1 and rb_[0][2] <= calls[0][1], (x, i)
+            snap = [p for p in ph if p[0] == "snapshot"]
+            assert len(snap) == 1 and calls[0][2] <= snap[0][1] <= snap[0][2] <= calls[-1][1]
+            held = [p for p in ph if p[0] == "mtp snapshot"]
+            assert len(held) == (x == "tb"), (x, i)
+            assert not held or held[0][1] <= snap[0][1] <= snap[0][2] <= held[0][2], (x, i)
+            nest = [p for p in ph if p[0] == "mtp prefill"]
+            if x == "ta":
+                assert not nest, i
+            else:                       # (the part before the snapshot, the rest; the first
+                inner = [p for p in nest if any(q is not p and q[1] <= p[1] <= p[2] <= q[2]
+                                                for q in nest)]     # turn's first rows: a
+                assert len(nest) == 2 + (i == 0) and len(inner) == (i == 0), i  # prefill and
+                for p in inner:                                             # runs of their own
+                    assert p[2] <= calls[0][1], i
+                    assert sum(p[1] <= q[1] <= q[2] <= p[2] for q in runs) >= 2, i

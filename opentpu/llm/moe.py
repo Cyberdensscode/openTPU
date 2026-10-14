@@ -908,36 +908,49 @@ def em_x(dev: SimpleNamespace, row, R: int, H: int) -> Tensor:
     return Tensor(em_row(dev, row), (R, H), (dev.em_rec // 4, 1))
 
 
+def need_rows(k: int) -> int:
+    """The rows a need line holds: LINE / 4 ids, k a row (0: not one)."""
+    return (LINE // 4) // max(1, k)
+
+
 def moe_prologue_rows(x, lw, mo: MoESpec, dev: SimpleNamespace, eps: float, row,
                       beside=None) -> None:
     """Expert-major's MoE prologue (docs/offload.md 13.11) of a layer-major run's R rows x [R,
     H] (chunk rows from `row`, a run argument): each row's norm and route as moe_ffn_rows'; to
     each row's record tail its k global ids and weights and the norm's 1 / rms (the expert run
-    norms the row again from X and it: bit for bit); then the rows' R k ids, offset by
-    dev.need_off (2 x layers x E), posted as a need line (a hint's post: the server streams
-    the experts no slot holds and answers nothing; the layer's expert run waits on their
-    directory entries); then to each row's SH the shared expert's output (SwiGLU of the layer
-    block times sigmoid of its gate's logit), or beside()'s ([R, H]: Gemma 4's normed dense
-    MLP, while the host streams). The caller stores x itself to the records' X (em_x). One
-    register."""
+    norms the row again from X and it: bit for bit); then the rows' ids, offset by
+    dev.need_off (2 x layers x E), posted as need lines of need_rows(k) rows each (a hint's
+    post: the server streams the experts no slot holds and answers nothing; the layer's expert
+    run waits on their directory entries); then to each row's SH the shared expert's output
+    (SwiGLU of the layer block times sigmoid of its gate's logit), or beside()'s ([R, H]:
+    Gemma 4's normed dense MLP, while the host streams). The router's and the shared expert's
+    MMs take the R rows at once (a tile's: tiled.qwen35_layer_tile); of more need lines than
+    one, the first goes out before the shared expert and the others as its chunks begin (each
+    post waits for the host to serve the one before: the MXU works meanwhile), the rest after
+    it. The caller stores x itself to the records' X (em_x). One register."""
     b = current()
     if ol.num_programs() != 1:
         raise CompileError("moe_prologue_rows runs on one slice")
     R, H, E, k = x.rows, x.cols, mo.E, mo.k
-    N = R * k
-    if N > LINE // 4:
-        raise CompileError(f"{R} rows of {k} experts: more ids than a need line holds")
+    per = need_rows(k)                                  # rows a need line
+    if per < 1:
+        raise CompileError(f"{k} experts a row: more ids than a need line holds")
     ss = ol.sum(x * x, axis=1)                          # rmsnorm's, its 1 / rms kept
     rinv = ol.rsqrt(ss * (1.0 / H) + eps)
     del ss
     g = ol.load(lw.g_post)
-    if getattr(lw, "g_exp", None) is None:              # (as moe_ffn_rows' quantize(rmsnorm))
-        xs = ol.quantize((x * rinv[:, None]) * g[None, :])
-    else:
-        xn = (x * rinv[:, None]) * g[None, :]
-        xs = ol.quantize(xn)
-        del xn
-    del g
+
+    def normed(r0, n):                                  # rows r0 .. r0 + n, normed, quantized
+        xr, rr = (x, rinv) if n == R else (x[r0:r0 + n, :], rinv[r0:r0 + n])
+        if getattr(lw, "g_exp", None) is None:          # (as moe_ffn_rows' quantize(rmsnorm))
+            return ol.quantize((xr * rr[:, None]) * g[None, :])
+        xn = (xr * rr[:, None]) * g[None, :]
+        return ol.quantize(xn)
+
+    G = min(R, current().cfg.MCOLS) if mo.shared else R  # rows a shared expert pass: whole
+    xs = normed(0, R)                                   # column groups (its outputs' TMEM)
+    if G == R:
+        del g
     lg = ol.dot(xs, lw.router)                          # [R, E] (+ the shared expert's gate)
     gid, wts = ol.empty((R, k), dense=True), ol.empty((R, k), dense=True)
     pr, tmp, ids = ol.empty((2,)), ol.empty((k,)), ol.empty((k,))
@@ -984,27 +997,55 @@ def moe_prologue_rows(x, lw, mo: MoESpec, dev: SimpleNamespace, eps: float, row,
         ol.store(Tensor(t, (k,), (1,)), gid[q, :])
         ol.store(Tensor(t + 4 * k, (k,), (1,)), wts[q, :])
         ol.store(Tensor(t + 8 * k, (1,), (1,)), rinv[q:q + 1])
-    del wts, rinv
-    seq = MB.wait_served(dev.mbox)                      # the need line (MB.post, its count)
-    ol.store(Tensor(Affine(dev.mbox + LINE), (N,), (1,)),
-             gid.reshape(1, N)[0, :] + float(dev.need_off))
-    ol.store(Tensor(Affine(dev.mbox + 4), (1,), (1,)), ol.full((1,), float(N)))
-    seq.set(seq + 1.0)
-    ol.store(Tensor(Affine(dev.mbox), (1,), (1,)), seq)
-    del gid, seq
+    del wts
+    if G == R:
+        del rinv
+    lines, held = list(range(0, R, per)), [gid]         # each need line's first row; the ids
+    del gid                                             # (freed after the last line)
+
+    def post(i=None):                                   # the next need line (MB.post, its count)
+        if not lines:
+            return
+        r0 = lines.pop(0)
+        N = min(per, R - r0) * k
+        seq = MB.wait_served(dev.mbox)
+        ol.store(Tensor(Affine(dev.mbox + LINE), (N,), (1,)),
+                 held[0][r0:r0 + N // k, :].reshape(1, N)[0, :] + float(dev.need_off))
+        ol.store(Tensor(Affine(dev.mbox + 4), (1,), (1,)), ol.full((1,), float(N)))
+        seq.set(seq + 1.0)
+        ol.store(Tensor(Affine(dev.mbox), (1,), (1,)), seq)
+        del seq
+        if not lines:
+            held.clear()
+
+    post()
     if mo.shared:
         gs = ol.empty((R,))
         gs.column().set(lg[:, E:E + 1])
         gate = sigmoid(gs)
         del gs
-        sh = swiglu_down(xs, lw.wg, lw.wu, lw.wd) * gate[:, None]
+        if G < R:
+            del xs
+        for r0 in range(0, R, G):                       # each row's SH
+            n = min(G, R - r0)
+            xg = xs if G == R else normed(r0, n)
+            sh = swiglu_down(xg, lw.wg, lw.wu, lw.wd, each=post if lines else None) * \
+                (gate if G == R else gate[r0:r0 + n])[:, None]
+            del xg
+            for q in range(n):
+                ol.store(Tensor(em_row(dev, row, r0 + q) + 4 * H * (k + 1), (1, H), (H, 1)),
+                         sh[q:q + 1, :])
+            del sh
+        if G < R:
+            del g, rinv
     elif beside is not None:
         del lg
         sh = beside()
-    else:
-        return
-    for q in range(R):
-        ol.store(Tensor(em_row(dev, row, q) + 4 * H * (k + 1), (1, H), (H, 1)), sh[q:q + 1, :])
+        for q in range(R):
+            ol.store(Tensor(em_row(dev, row, q) + 4 * H * (k + 1), (1, H), (H, 1)),
+                     sh[q:q + 1, :])
+    while lines:
+        post()
 
 
 def moe_combine_rows(x, mo: MoESpec, dev: SimpleNamespace, row, residual: bool = True):

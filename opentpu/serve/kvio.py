@@ -11,7 +11,9 @@ what the tokens [0, (i + 1) P) put there and nothing else, so contexts that shar
 share its whole pages, and a context of n tokens is its whole pages, its last partial one
 (m = n - i P positions; its V^T tile whole) and the state the caches do not hold
 (Image.state_regions: Qwen3.5's DeltaNet states and convolution windows, LFM2's convolution
-rings, Gemma 4's sliding rings when shorter than the cache), at the context's position.
+rings, Gemma 4's sliding rings when shorter than the cache), at the context's position. An MTP
+image's (Spec.mtp, opentpu/llm/mtp.py) pages hold its MTP layer's KV cache too, and its state is
+the one in the decoder's committed slot (ContextIO.slot: the DeltaNet states' two slots).
 
 Restoring pages [0, ceil(k / P)) and the position k gives the context of the k tokens they were
 saved for, bit for bit: what lies past k in the last page is overwritten by the next appends
@@ -50,11 +52,12 @@ def _static(x) -> int:
 
 def kv_arrays(image, seq: int = 0) -> list[Array]:
     """The positional KV caches' arrays of sequence `seq` (every slice's: the same addresses),
-    layer by layer, head by head. A layer that shares another's cache (Gemma 4) and a ring
-    shorter than the cache (its sliding layers: state_regions) add none."""
+    layer by layer, head by head, an MTP image's MTP layer (Spec.mtp: layer `layers`) last. A
+    layer that shares another's cache (Gemma 4) and a ring shorter than the cache (its sliding
+    layers: state_regions) add none."""
     m = image.descriptors(0)
     out, seen = [], set()
-    for li in range(image.spec.layers):
+    for li in range(image.spec.layers + bool(getattr(image.spec, "mtp", False))):
         lw = m.layer(li)
         kvs = getattr(lw, "kvs", None)
         if kvs is None:
@@ -88,10 +91,19 @@ class Layout:
         self.cap, self.S = image.cap, S
         self.P = vt_tile(image.cap)
         self.arrays = kv_arrays(image, seq)
+        self.image = image
         self.state = SN.merged(image.state_regions(0)) if SN.stateful(image) else []
         self.state_bytes = S * sum(n for _, n in self.state)
         self.stateful = bool(self.state)
         self.pages = -(-self.cap // self.P)
+        self._slots = {0: self.state}
+
+    def state_in(self, slot: int) -> list[tuple[int, int]]:
+        """The state regions of the DeltaNet states' `slot` (an MTP image's: two; the same
+        bytes as slot 0's)."""
+        if slot not in self._slots:
+            self._slots[slot] = SN.merged(self.image.state_regions(slot))
+        return self._slots[slot]
 
     def regions(self, i: int, m: int | None = None) -> list[tuple[int, int]]:
         """Page i's regions holding its first m positions (default all P): rows m at a time,
@@ -121,10 +133,11 @@ class ContextIO:
     """Reads and writes an Engine's pages and state as host bytes (each slice's after the
     other's). area: the staging area (base, bytes) in the device's DRAM; default
     staging_area(eng) (a card's: the DRAM past the program area), None or too small for a page:
-    direct reads and writes."""
+    direct reads and writes. slot: the state's slot read and written (an MTP decoder's committed
+    one, mtp.MTPDecoder.slot)."""
 
     def __init__(self, eng, seq: int = 0, area=False):
-        self.eng, self.seq = eng, seq
+        self.eng, self.seq, self.slot = eng, seq, 0
         self.layout = Layout(eng.image, eng.cfg.S, seq)
         self.area = staging_area(eng) if area is False else area
         if self.area is not None and self.area[1] < self.layout.page_bytes() // eng.cfg.S:
@@ -163,7 +176,8 @@ class ContextIO:
         if not self.layout.stateful:
             return np.zeros(0, np.uint8)
         be, S = self.eng.backend, self.eng.cfg.S
-        b = np.concatenate([be.read(s, a, n) for s in range(S) for a, n in self.layout.state])
+        b = np.concatenate([be.read(s, a, n) for s in range(S)
+                            for a, n in self.layout.state_in(self.slot)])
         self.stats["read"] += len(b)
         return b
 
@@ -175,7 +189,7 @@ class ContextIO:
                              f"{self.layout.state_bytes}")
         be, S, o = self.eng.backend, self.eng.cfg.S, 0
         for s in range(S):
-            for a, n in self.layout.state:
+            for a, n in self.layout.state_in(self.slot):
                 be.write(s, a, data[o:o + n])
                 o += n
         self.stats["written"] += o

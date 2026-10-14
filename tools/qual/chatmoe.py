@@ -16,7 +16,8 @@ call, docs/offload.md 13.16). Each turn lists its prompt's calls (a layer-major 
 prefill_layers: a model with state has two, up to the snapshot at the reply's start and after):
 rows, expert-major or not, wall and device seconds, the expert server's counts over it and the
 host's time on its requests and idle parts (--trace: each call's runs and the server's timeline
-too). On a tree whose streamed.engine has no em_rows (production's) it runs without --em-rows.
+too, and each turn's host phases up to its first token, _Phases). On a tree whose
+streamed.engine has no em_rows (production's) it runs without --em-rows.
 The pool's page cache is recorded with them: the fraction of its packed experts in it (mincore,
 PoolFile.resident, as tools/offload/pool_disk.py checks its arms) after the load and before and
 after each turn (--pool-calls: each call too; a 17.5 GB pool's check takes 60-90 ms, which
@@ -176,6 +177,130 @@ def _calls(eng, calls: list, trace: list | None = None, pool_calls: bool = False
     eng.prefill_layers = prefill_layers
 
 
+# the host's phases of a turn up to its first token (--trace, _Phases), and the ones that
+# hold others (left out of _Phases.line's sum: their parts are phases of their own)
+PHASES = ("template", "rollback", "mtp prefill", "prefill_layers", "end_prefill", "mtp snapshot",
+          "snapshot", "a0", "run")
+HOLDERS = ("mtp prefill", "mtp snapshot")
+
+
+class _Phases:
+    """--trace: each turn's host phases from its start (before Chat.ask) to its first token,
+    [phase, start, end, cycles] (s from the turn's start; a device run's cycles, else None),
+    in the order they end: "template" (Chat._template: the conversation rendered, the prompt's
+    and reply_start's), "rollback" (Chat._rollback: to a snapshot, its restore's runs in it),
+    "mtp prefill" (MTPDecoder.prefill: the MTP decoder's prompt, a nested one for its first
+    conv_k - 1 rows), "prefill_layers" (each call, as `calls`), "end_prefill" (the expert
+    server's slots back to decode's, in a call), "snapshot" (Engine.snapshot: the state's
+    copy), "mtp snapshot" (MTPDecoder.snapshot: the snapshot and the held row's read), "a0"
+    (the first pick: the first token from the prompt's logits; none starts after it) and "run"
+    (each device run outside the calls: a snapshot's copies, MTP's first rows, a draft). Host
+    bookkeeping: the same calls, runs and tokens."""
+
+    def __init__(self, chat, eng):
+        self.t0, self.done, self.out, self.depth = None, False, [], 0
+        self.wrap(chat, "_template", "template")
+        self.wrap(chat, "_rollback", "rollback")
+        self.wrap(eng, "snapshot", "snapshot")
+        self.wrap(eng, "prefill_layers", "prefill_layers", call=True)
+        srv = getattr(eng, "server", None)
+        if srv is not None and hasattr(srv, "end_prefill"):
+            self.wrap(srv, "end_prefill", "end_prefill")
+        if chat.mtp is not None:
+            self.wrap(chat.mtp, "prefill", "mtp prefill")
+            self.wrap(chat.mtp, "snapshot", "mtp snapshot")
+        chat.pick = _FirstPick(chat.pick, self)
+        b = eng.backend
+        if hasattr(b, "start"):                 # (the card's: run is start, then wait)
+            start, wait, t = b.start, b.wait, [None]
+
+            def started(*a, **kw):
+                t[0] = time.perf_counter() if self.live and not self.depth else None
+                return start(*a, **kw)
+
+            def waited(*a, **kw):
+                st = wait(*a, **kw)
+                if t[0] is not None:
+                    self.add("run", t[0], time.perf_counter(), (st or {}).get("cycles"))
+                    t[0] = None
+                return st
+            b.start, b.wait = started, waited
+        else:
+            self.wrap(b, "run", "run", run=True)
+
+    @property
+    def live(self) -> bool:
+        return self.t0 is not None and not self.done
+
+    def add(self, name: str, t: float, t1: float, cycles=None) -> None:
+        self.out.append([name, round(t - self.t0, 6), round(t1 - self.t0, 6), cycles])
+
+    def wrap(self, obj, attr: str, name: str, call: bool = False, run: bool = False) -> None:
+        """obj.attr stamped `name` (call: a prefill_layers call, whose runs are its own; run:
+        a device run, outside the calls only, its cycles too)."""
+        fn = getattr(obj, attr)
+
+        def timed(*a, **kw):
+            if not self.live or (run and self.depth):
+                return fn(*a, **kw)
+            t, r = time.perf_counter(), None
+            self.depth += call
+            try:
+                r = fn(*a, **kw)
+                return r
+            finally:
+                self.depth -= call
+                self.add(name, t, time.perf_counter(),
+                         r.get("cycles") if run and isinstance(r, dict) else None)
+        setattr(obj, attr, timed)
+
+    def begin(self) -> None:
+        self.t0, self.done, self.out = time.perf_counter(), False, []
+
+    def end(self) -> list:
+        self.t0 = None
+        return self.out
+
+    @staticmethod
+    def line(phases: list, ttft: float | None) -> str:
+        """A turn's phases summed by name, and the rest of its TTFT outside them (the union of
+        the phases' spans but HOLDERS')."""
+        tot: dict = {}
+        for p, a, b, _ in phases:
+            n, s = tot.get(p, (0, 0.0))
+            tot[p] = (n + 1, s + b - a)
+        spans = sorted((a, b) for p, a, b, _ in phases if p not in HOLDERS)
+        cov, end = 0.0, 0.0
+        for a, b in spans:
+            cov += max(0.0, b - max(a, end))
+            end = max(end, b)
+        rest = "" if ttft is None else f"; the rest of TTFT {max(0.0, ttft - cov):.3f} s"
+        return ", ".join(f"{p} {tot[p][1]:.3f} s" + (f" ({tot[p][0]})" if tot[p][0] > 1 else "")
+                         for p in PHASES if p in tot) + rest
+
+
+class _FirstPick:
+    """The chat's sampler (its attributes as they are), its first call in a turn stamped "a0"
+    (_Phases): the turn's first token."""
+
+    def __init__(self, pick, ph: _Phases):
+        self._pick, self._ph = pick, ph
+
+    def __getattr__(self, k):
+        return getattr(self._pick, k)
+
+    def __call__(self, *a, **kw):
+        ph = self._ph
+        if not ph.live:
+            return self._pick(*a, **kw)
+        t = time.perf_counter()
+        try:
+            return self._pick(*a, **kw)
+        finally:
+            ph.add("a0", t, time.perf_counter())
+            ph.done = True
+
+
 def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/dev/xdma0",
         turns=TURNS, max_new: int = 16, cap: int = 2048, pool: str | None = None,
         experts: int = 0, layer_major: int | None = None, sample: bool = False,
@@ -183,7 +308,7 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
         trace: list | None = None, em_pass: int | None = None, mtp: bool = False,
         mtp_from: str | None = None, images=(), max_slices: int | None = None,
         vision_staged: bool | None = None, pool_calls: bool = False,
-        tile_rows: int | None = None) -> dict:
+        tile_rows: int | None = None, phases: list | None = None) -> dict:
     from opentpu.host import chat as C
     from opentpu.host import streamed as ST
     from opentpu.isasim import board_config
@@ -200,9 +325,6 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
         if cfg is not None and cfg != want:
             raise SystemExit(f"the device's configuration is not {cfg_file}'s: {cfg} / {want}")
         cfg = want
-    if mtp and tile_rows is not None:           # (streamed.engine: an MTP engine's runs untiled)
-        raise SystemExit("--tile-rows with --mtp: an MTP engine's layer runs stay untiled (a "
-                         "tiled run takes the states' slot 0 alone; branch mtp-slot-fix)")
     t = time.time()
     eng = ST.engine(path, cfg or board_config(), be, cap, pool or ST.DEFAULT, experts=experts,
                     wformat=wformat, head_format=head, formats=formats, layer_major=layer_major,
@@ -228,6 +350,7 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
     khz = (getattr(eng.backend, "info", None) or {}).get("core_khz")
     chat = C.Chat(eng, tok, False, pick, max_new, clock_mhz=khz / 1e3 if khz else 0.0)
     chat.max_slices = max_slices
+    ph = None if phases is None else _Phases(chat, eng)     # (--trace: each turn's phases)
     out = dict(model=path.name, backend=backend, cfg=cfg_file, sample=sample, seed=seed,
                weights=C.weights_label(eng.image, wformat),
                experts=ST.describe(eng, eng.pool_path), layer_major=eng.layer_major,
@@ -249,7 +372,13 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
                 chat.attach(str(f))
         n0, c0 = len(chat.fed), len(calls)
         res0, io0 = _resident(pf, total), _io(pf)
+        k0 = None if trace is None else len(trace)
+        if ph is not None:
+            ph.begin()
         reply, tr = chat.ask(text)
+        if ph is not None:
+            phases.append(dict(ttft_s=tr.ttft_s, calls=[k0, len(trace)] if trace is not None
+                               else None, phases=ph.end()))
         res1, reads = _resident(pf, total), _reads(io0, _io(pf))
         r = lambda x, k=3: None if x is None else round(x, k)      # noqa: E731
         out["turns"].append(dict(
@@ -323,7 +452,8 @@ def main(argv=None) -> int:
                     help="expert-major runs tiled, T rows a run (Engine.tile_rows: the layer's "
                          "weights once for T rows; default 8 for Qwen3.5-MoE, off with "
                          "OTPU_TILE=0)")
-    ap.add_argument("--trace", help="each turn's calls' runs and the server's timeline, JSON")
+    ap.add_argument("--trace", help="each turn's calls' runs and the server's timeline, and its "
+                                    "host phases up to the first token (PHASES), JSON")
     ap.add_argument("--mtp", action="store_true",
                     help="Qwen3.5-MoE: decode with the MTP drafter, the loop on the device "
                          "(its pool: the -mtp one, pack_pool.py extend)")
@@ -348,7 +478,7 @@ def main(argv=None) -> int:
     ap.add_argument("--check", help="a reference run's JSON: its tokens, turn by turn")
     ap.add_argument("--out", help="this run's JSON")
     a = ap.parse_args(argv)
-    tr = [] if a.trace else None
+    tr, ph = ([], []) if a.trace else (None, None)
     images = []
     for x in a.image:
         n, _, f = x.partition(":")
@@ -360,7 +490,7 @@ def main(argv=None) -> int:
             trace=tr, em_pass=a.em_pass, mtp=a.mtp or a.mtp_from is not None,
             mtp_from=a.mtp_from, images=images, max_slices=a.max_slices,
             vision_staged=True if a.vision_staged else False if a.vision_resident else None,
-            pool_calls=a.pool_calls, tile_rows=a.tile_rows)
+            pool_calls=a.pool_calls, tile_rows=a.tile_rows, phases=ph)
     for i, t in enumerate(r["turns"]):
         print(f"turn {i + 1}: {t['reply']!r}\n  {t['line']}", flush=True)
         print(f"  pool: {_pct(t['pool_before'])} -> {_pct(t['pool_after'])} of its "
@@ -374,11 +504,13 @@ def main(argv=None) -> int:
                   f"({c['parts_s']} s), holds {c['holds']}; pool {_pct(c['pool_before'])} -> "
                   f"{_pct(c['pool_after'])} in the page cache, reads {_rd(c['reads'])}",
                   flush=True)
+        if ph is not None:
+            print(f"    phases: {_Phases.line(ph[i]['phases'], t['ttft_s'])}", flush=True)
     if a.trace:
         Path(a.trace).write_text(json.dumps(dict(
             run_fields=["key", "start", "end", "cycles"],
             event_fields=["seen", "done", "kind", "layer or expert", "misses or bytes"],
-            calls=tr)))
+            calls=tr, phase_fields=["phase", "start", "end", "cycles"], turns=ph)))
     rc = 0
     if a.check:
         ref = json.loads(Path(a.check).read_text())

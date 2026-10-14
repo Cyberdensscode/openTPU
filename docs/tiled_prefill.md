@@ -1438,15 +1438,173 @@ about 18.1 s: -5.1 s of its 90.4 s.
   MMs' cycles, so it should cut the expert runs a lot, toward their bytes: to check in the r2.1
   window's chatmoe.
 - The tiles at MCOLS 8 (r2.1). Co-simulated on the m8 variant (docs/dataflow.md 4.9.1), the
-  int8 DeltaNet layer at T = 8 does not move (1.027 -> 1.020 ms a row; 0.722 both without DSTEP's
-  cost), while the nvfp4 one's other work does (0.720 -> 0.509) and the attention layer (0.710 ->
-  0.488). The tile program is why: a DeltaNet layer's rows run in pieces of 4 (`layer_variants`'
+  int8 DeltaNet layer at T = 8 did not move (1.027 -> 1.020 ms a row; 0.722 both without DSTEP's
+  cost), while the nvfp4 one's other work did (0.720 -> 0.509) and the attention layer (0.710 ->
+  0.488). The tile program was why: a DeltaNet layer's rows ran in pieces of 4 (`layer_variants`'
   drows: the image's gr / on rows, `grows`, RUN_ROWS 4), and the MoE prologue (the router and the
   shared expert, `moe_prologue_rows`) in groups of 2 rows (a need line's LINE / 4 / k ids). So an
-  8-row tile streams the DeltaNet projections twice and the shared expert and the router four
-  times, and int8 weights go at port B's chunk a cycle. To lift for r2.1: gr / on rows for the
-  tile's rows where TMEM holds their projections (m8's 128K words), and the prologue's MMs over
-  the tile's rows with its need lines still written 2 rows at a time; the same bits (an MM's row
-  groups leave its integer sums as they are). The prologue's groups cost m4 too: 16% of the int8
-  DeltaNet layer's run without DSTEP (122K of 770K cycles for 8 rows), ~1 s of MiniCPM-V's image
-  prompt in groups of 4 (estimated from the profile).
+  8-row tile streamed the DeltaNet projections twice and the shared expert and the router four
+  times, and int8 weights go at port B's chunk a cycle. Both are lifted, compile-side, with the
+  same bits (an MM's row groups leave its integer sums as they are):
+  - A tile's MoE prologue takes its rows at once: the router one MM of the T rows, the shared
+    expert in whole column groups of min(T, MCOLS) rows (T would not fit m4's TMEM). Its need
+    lines stay `moe.need_rows(k)` rows each: the first goes out before the shared expert, the
+    others as its passes begin (`swiglu_down(each=)`). A post waits for the host to serve the one
+    before, so back to back they would add the host's poll (~150 us with parts in flight) two or
+    three times a tile; the co-simulation serves at once and cannot show it, the card's A/B can.
+  - A tiled MoE image's gr / on rows are its tile's (16-20 KB more; no expert slot lost at 2048
+    or 4096 tokens), and a DeltaNet layer runs up to MCOLS rows at a time (more only replays).
+  - Co-simulated, ms a row (T = 8, position 256), before / the prologue / both:
+
+    | layer | m4 | m8 |
+    |---|---|---|
+    | DeltaNet, MiniCPM-V's int8 | 1.026 / 0.967 / 0.968 | 1.020 / 0.936 / 0.871 |
+    | DeltaNet, MiniCPM-V's nvfp4 | 0.976 / 0.918 / 0.917 | 0.964 / 0.877 / 0.864 |
+    | attention, MiniCPM-V's | 0.710 / 0.651 / 0.651 | 0.488 / 0.401 / 0.401 |
+    | DeltaNet, qwen35-35b's | 0.936 / - / 0.917 | 0.923 / - / 0.863 |
+    | attention, qwen35-35b's | 0.670 / - / 0.650 | 0.448 / - / 0.400 |
+
+    MiniCPM-V's mixer: m4 37.1 -> 34.8 ms a row (-6.3%: -1.15 s of the image prompt), m8 34.6 ->
+    30.0 (-13.3%: -2.25 s); qwen35-35b's -2.2% and -7.1% (its shared expert 4-bit: half the
+    bytes, and paired at 2 rows). On m4 the gr / on rows change nothing (the same program).
+  - `tests/test_em_tile.py` test_a_tiles_moe_prologue_takes_its_rows_at_once: a tiny model at
+    k = 4 (two need lines a tile): the router's and the shared expert's rows, the posts, and the
+    prompt, blocks and decode steps against today's runs bit for bit, every need landed.
+  - On the card (session emprol, `tools/offload/sessions/emprol.sh`, 2026-10-14; opentpu
+    `~/otpu-build/emprol/run-1014-1320`): r2.1's m8 bitstream 039b34d5, production's host d57a3568
+    as A against these commits as B, a warm-up run in each arm, then A B B A, every run's tokens
+    the warm-up's (A's):
+
+    | request | A: TTFT (device) | B: TTFT (device) | B - A, mean |
+    |---|---|---|---|
+    | MiniCPM-V, doc.png at 9 slices (488 prompt rows) | 53.07 / 52.85 s (25.17 / 25.13) | 51.36 / 50.60 s (23.03 / 22.87) | TTFT -1.98 s (-3.7%), device -2.20 s (-8.7%) |
+    | qwen35-35b, a 260-token text prompt | 15.60 / 15.33 s (13.93 / 13.73) | 15.16 / 15.07 s (13.57 / 13.50) | TTFT -0.35 s (-2.2%), device -0.30 s (-2.1%) |
+
+    The device's -2.20 s on the image request is the co-simulation's -2.25 s. The host's share of
+    its TTFT moved +0.2 s, within the pairs' 0.5 s spread: the need lines' posts between the
+    shared expert's passes cost the card no more than that. Decode unchanged (4.28-4.37 and
+    4.42-4.50 tokens a second).
+
+## 15. Chunked DeltaNet (proposal, parked, 2026-10-14)
+
+Not built: r2.2's prefill ends at section 14. This section sizes the kernel for a later decision.
+
+A Qwen3.5 prompt row's DeltaNet recurrence is DSTEP's: 2,048 cycles a row and value head (the
+head's 16K fp32 state words through the stream engine at 8 a cycle, read from DRAM and written
+back: MiniCPM-V's 488-row image prompt moves 61 GB of state). The chunked form (docs/dataflow.md
+4.9.1: eight matmuls and a triangular solve a chunk of C rows, the state once a chunk) with every
+matmul split (an operand's int8 part and the int8 of its remainder: three MXU passes) at C = 64 is
+the candidate: +0.13 dKL (SE 0.07) on MiniCPM-V's card mix, ~1 GB of state traffic on that
+prompt, and issue cycles a row and head of MXU 768 / VPU 598 / DRAM 16 at MCOLS 4 (MXU 384 at
+MCOLS 8; the VPU's 8 lanes either way).
+
+### 15.1 What it would gain
+
+DSTEP's exposed part, a row's cycles with and without it (tools/vpu_hack.py's nose: every DSTEP /
+STREAM a NOP): MiniCPM-V's from section 14.3's layers (T = 8, position 256; docs/dataflow.md
+4.9.1); the dense models' from tools/perf_tiled.py's run kernel (4 layers: 3 DeltaNet and the
+gated attention, position 256, fp4, runs of 4 rows; the 4B at MCOLS 4 in runs of 2, as its prompt
+runs go today; hwe-bench, `~/mcpv/emprol/K2-*.jsonl` and `K3-*.jsonl`):
+
+| | MCOLS 4: exposed (of DSTEP's cost) | MCOLS 8 |
+|---|---:|---:|
+| MiniCPM-V's image prompt (DSTEP 7.2 s) | 4.1 s (57%) | 5.5 s (76%) |
+| Qwen3.5-0.8B, of a row | 30.6% (89%) | 45.3% (110%) |
+| Qwen3.5-2B | 8.6% (46%) | 24.3% (91%) |
+| Qwen3.5-4B | 10.2% (58%) | 24.2% (84%) |
+
+The chunked recurrence would be a run of its own (15.2), hidden by nothing: 0.29 (MXU and VPU
+overlapped) to 0.48 (one after the other) of DSTEP's cycles at MCOLS 8, 0.375 to 0.67 at MCOLS 4.
+The gain is the exposed part less that (estimated; negative is faster):
+
+| | MCOLS 8 | MCOLS 4 |
+|---|---|---|
+| MiniCPM-V's image prompt | -2.0 to -3.4 s | -1.4 to +0.7 s |
+| qwen35-35b / MiniCPM-V text, a row (30 DeltaNet layers: DSTEP 14.7 ms, taken as exposed as MiniCPM-V's nvfp4 layers', 92% / 52%) | -6.5 to -9.2 ms (-22 to -31% of the mixer's ~30) | -2.1 to +2.2 ms |
+| Qwen3.5-0.8B, a row | -25 to -33% | -8 to -18% |
+| Qwen3.5-2B | -12 to -17% | -2 to +4% |
+| Qwen3.5-4B | -10 to -16% | -4 to +2% |
+
+So MCOLS 8 (r2.1's m8 and later; the 0.8B also at 4), and a compile choice by MCOLS and the
+prompt's rows, not a bitstream's: DSTEP stays for decode, the MTP verify and short prompts. LFM2
+and Gemma 4 have no DeltaNet.
+
+### 15.2 The phase split
+
+C = 64 needs 64 rows of a layer at once, and a tile holds 8 (MoE, section 14) or 4-16 (dense).
+So a DeltaNet layer would run three kinds of run for each chunk j of 64 rows:
+- A(j), the tile without DSTEP, in tiles of T rows: the projections, the convolution and the
+  gates; q, k, g and beta to a DRAM scratch, with k^T and v^T written transposed (the V^T store
+  path);
+- R(j), the chunk's recurrence over every head, one run;
+- C(j): the output's norm and gate, out_proj, the residual and the MoE prologue (its need lines
+  posted as today).
+
+A layer runs A(0)'s tiles, R(0), the tiles of C(0) fused with A(1), R(1), and so on, C's last
+tiles, then (MoE) the expert run: one run more for each 64 rows and layer (~240 on MiniCPM-V's
+image prompt, ~10-20 ms). The last chunk is padded with rows of k = 0, beta = 0 and g = 0 (no
+decay), their outputs dropped. The state keeps DSTEP's layout (St, fp32), so decode follows a
+chunked prompt as it is.
+
+No TMEM copies: four of the eight matmuls contract over the chunk's rows and take an operand
+transposed. A writes k^T and v^T; R forms U^T itself (U^T = (beta v)^T . T^T - St . W^T, St
+already transposed), which M7 (A . U) and M8 (St' = U^T . Kd) take as it is; the beta and
+exp(gc) scalings fold into the TMEM side's operand. `ol.dot`'s w is a DRAM QTensor, so R stores
+T, W, U^T and St's int8 parts and streams them back: ~4 store-and-stream round trips a chunk and
+head (~50 KB), and A's transposed stores are ~12 KB of strided bytes a row and layer. Neither is
+in the cycles above; step 0 (15.5) measures them.
+
+The dense models' prompt runs take every layer a tile at a time, so for them the split means a
+layer-major DeltaNet prefill. Without it, a chunk of the tile's own rows (C = 16, the 0.8B's and
+2B's tiles) takes MXU 636 / VPU 974 cycles a row and head at MCOLS 8 (1,272 / 974 at 4): the
+0.8B -13 to -26% a row and the 2B -3 to -12% at MCOLS 8, the 0.8B -9 to +7% at MCOLS 4; the 4B's
+tiles of 8 rows are too short (a contraction over C < D pads to D).
+
+### 15.3 Fits
+
+- IMEM (4K instructions): R for a value head is 8 matmuls x 3 passes in MMs of at most 16 rows
+  (M8: 128), ~110 MMs, with the splits, the exp / Gamma masks, a looped forward-substitution solve
+  and the state's load and store ~170 instructions. Unrolled over 32 heads that is ~5.4K, which
+  does not fit; a hardware loop over the 16 key heads (two value heads a body, q . k^T and
+  k . k^T shared, DRAM addresses affine in the loop) ~400, in a run of its own. The C + A tile is
+  today's (DeltaNet 1,249 instructions at MCOLS 8, 1,675 at 4) and the scratch stores, ~+10%.
+- TMEM: R's working set at C = 64 is ~72K words a value head (q, k, W, U^T and O 8K each, T and
+  A 4K each, St 16K). MCOLS 8's 128K holds it; MCOLS 4's 64K needs the value dimension in halves
+  (~56K) or C = 32.
+
+### 15.4 Numerics
+
+Not today's bits: the chunk's sums round otherwise than DSTEP's sequential fp32. Every Qwen3.5
+token-exact reference changes, and the gate becomes the dKL against the float model (docs/
+dataflow.md 4.9.1's method). Measured on MiniCPM-V's card mix only (2,000 tokens: +0.13, SE 0.07,
+against a bar of about +0.5); the 0.8B, 2B, 4B and qwen35-35b's mix are not.
+
+### 15.5 Plan, when taken up
+
+1. Step 0, the go / no-go (2-3 days): tools/dn_chunk.py on the 0.8B, 2B, 4B and qwen35-35b's mix
+   at C = 64 and 16; one head pair's chunk of R co-simulated at MCOLS 4 and 8 (the solve, the
+   splits, the round trips and the transposed layout as they would be); A's strided stores. Go if
+   R takes at most ~0.5x DSTEP's cycles at MCOLS 8 and the dKL is at most ~0.3 on every model.
+2. The R kernel (5-7 days): the head-pair loop, the chunk's rows at run time and the padding,
+   St's layout, an MTP image's slots; tests against tools/dn_chunk.py's emulation; the fits at
+   MCOLS 4 and 8.
+3. The MoE phases (5-7 days): `tiled.qwen35_layer_tile` split into A and C, the fused C + A
+   tile, the engine's run order; tests/test_em_tile.py against a chunked reference.
+4. The dense models (4-6 days): a layer-major DeltaNet prefill, or C = 16 in the 0.8B's and 2B's
+   tiles.
+5. References for every Qwen3.5 model, the dKL gate, the card's qualification and an A/B
+   (MiniCPM-V's image, qwen35-35b's text, dense prompts): 2-3 days and card windows.
+
+About 3.5-4.5 weeks; the MoE part (1-3 and 5) 2.5-3.
+
+### 15.6 Other ways
+
+- DSTEP at 16 lanes (RTL): today's bits and no new references; but the state's 128 bytes a cycle
+  are all of DDR3-1066's, so it gains less than 2x (~-2.2 s of the image prompt at MCOLS 4,
+  estimated), and the 61 GB stay.
+- An MM taking ~16-bit operands in one pass (a QACT / QST mode, RTL), with the chunked form: the
+  VPU's 598 cycles a row and head fall to ~294 (the split's residuals go), MXU-bound at 384 on
+  MCOLS 8: ~-0.75 s more of the image prompt.
+- A short-K MM (ASIC, docs/dataflow.md 7.2 item 8): a contraction over C < D rows at C / D of a
+  block's cycles, small chunks ~3x cheaper on the MXU, so a tile's own rows would pay without the
+  phase split.

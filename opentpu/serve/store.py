@@ -15,6 +15,12 @@ of the tail (the last partial page and, for a model with state, the state at n).
 finds where the device can continue a prompt from: for a model whose KV caches hold the whole
 context, any common prefix k of a saved context (its pages up to k; what lies past k is
 overwritten); for a model with state, the end of a saved context that the prompt continues.
+With an MTP drafter (mtp=True, opentpu/llm/mtp.py) the MTP layer's KV row at q took the token at
+q + 1 (h_q, x_(q + 1)): page i is keyed by the tokens [0, (i + 1) P] (one more), the context's
+last row's by the token after it (Entry.follow, the context's next token when it was saved), and
+an entry may keep that row's residual (Entry.held: a part of a prompt before the reply's start),
+from which a prompt that goes on with another token appends the row again
+(mtp.MTPDecoder.refill).
 """
 from __future__ import annotations
 
@@ -262,20 +268,23 @@ def _tok_bytes(tokens) -> bytes:
 @dataclass
 class Entry:
     """A saved context: tokens [0, n), its whole pages' keys, its tail's key (the last partial
-    page's m positions, then the state) or None."""
+    page's m positions, then the state) or None; an MTP context's follow (the token its MTP
+    layer's last row took, or None) and held (the key of that row's residual, or None)."""
     key: str
     tokens: np.ndarray
     pages: list[str]
     tail: str | None
     m: int = 0
     used: float = field(default_factory=time.monotonic)
+    follow: int | None = None
+    held: str | None = None
 
     @property
     def n(self) -> int:
         return len(self.tokens)
 
     def blobs(self) -> list[str]:
-        return self.pages + ([self.tail] if self.tail else [])
+        return self.pages + ([self.tail] if self.tail else []) + ([self.held] if self.held else [])
 
 
 @dataclass
@@ -289,9 +298,10 @@ class Match:
 class PrefixCache:
     """Contexts saved in a BlobStore for one model's layout (kvio.Layout), by their tokens."""
 
-    def __init__(self, store: BlobStore, layout, mkey: str, max_entries: int = 4096):
+    def __init__(self, store: BlobStore, layout, mkey: str, max_entries: int = 4096,
+                 mtp: bool = False):
         self.store, self.L, self.mk = store, layout, mkey
-        self.max_entries = max_entries
+        self.max_entries, self.mtp = max_entries, mtp
         self.entries: OrderedDict = OrderedDict()   # entry key -> Entry (oldest use first)
         self.refs: dict = {}                        # blob key -> entries using it
         self.lock = threading.RLock()
@@ -303,8 +313,11 @@ class PrefixCache:
 
     # ---- keys
     def page_key(self, tokens, i: int) -> str:
+        """Page i's key: the tokens [0, (i + 1) P) (MTP: [0, (i + 1) P], `tokens` with the
+        context's follow after them)."""
         P = self.L.P
-        return f"{self.mk}-p{i}-" + hashlib.sha256(_tok_bytes(tokens[:(i + 1) * P])).hexdigest()[:32]
+        return f"{self.mk}-p{i}-" + hashlib.sha256(
+            _tok_bytes(tokens[:(i + 1) * P + self.mtp])).hexdigest()[:32]
 
     def entry_key(self, tokens) -> str:
         return f"{self.mk}-e-" + hashlib.sha256(_tok_bytes(tokens)).hexdigest()[:32]
@@ -332,10 +345,13 @@ class PrefixCache:
         return best
 
     # ---- save and restore
-    def save(self, io, tokens, pin: bool = False) -> Entry:
+    def save(self, io, tokens, pin: bool = False, follow: int | None = None,
+             held: np.ndarray | None = None) -> Entry:
         """The device's context (its first len(tokens) positions hold `tokens`) into the store:
         the whole pages it does not have yet and the tail (last partial page, state); returns
-        the entry (pinned: its blobs kept until unpin)."""
+        the entry (pinned: its blobs kept until unpin). MTP: follow, the token the MTP layer's
+        last row took (None: not known, -1 in its pages' keys), and held, that row's residual
+        (or None)."""
         P, L = self.L.P, self.L
         toks = np.asarray(tokens, np.int64)
         n = len(toks)
@@ -343,15 +359,22 @@ class PrefixCache:
             raise ValueError("an empty context")
         key = self.entry_key(toks)
         full, m = n // P, n % P
-        pages = [self.page_key(toks, i) for i in range(full)]
+        ext = np.append(toks, -1 if follow is None else follow) if self.mtp else toks
+        pages = [self.page_key(ext, i) for i in range(full)]
         tail = None
         if m or L.stateful:
             tail = f"{self.mk}-t-" + key.rsplit("-", 1)[1]
+        hkey = None if held is None else f"{self.mk}-h-" + key.rsplit("-", 1)[1]
         with self.lock:
             old = self.entries.get(key)
             if old is not None and all(b in self.store for b in old.blobs()):
                 old.used = time.monotonic()
                 self.entries.move_to_end(key)
+                if hkey is not None and old.held is None:    # (the residual row: the
+                    self.store.put(hkey, np.asarray(held, np.float32).view(np.uint8).copy())
+                    old.held = hkey                         # tokens' alone)
+                    self.refs.setdefault(hkey, set()).add(key)
+                    self._persist(old)
                 if pin:
                     self.store.pin(old.blobs())
                 return old
@@ -364,10 +387,12 @@ class PrefixCache:
             if L.stateful:
                 parts.append(io.read_state())
             tail_data = np.concatenate(parts) if len(parts) > 1 else parts[0]
-        e = Entry(key, toks.copy(), pages, tail, m)
+        e = Entry(key, toks.copy(), pages, tail, m, follow=follow, held=hkey)
         with self.lock:
             for i, d in zip(missing, got):
                 self.store.put(pages[i], d)
+            if hkey is not None:
+                self.store.put(hkey, np.asarray(held, np.float32).view(np.uint8).copy())
             self.stats["saved_pages"] += len(missing)
             self.stats["shared_pages"] += len(pages) - len(missing)
             if tail is not None:
@@ -428,6 +453,11 @@ class PrefixCache:
             self.stats["hit_tokens"] += k
         return k
 
+    def held_row(self, e: Entry) -> np.ndarray | None:
+        """The residual row an MTP entry keeps (Entry.held), or None."""
+        d = None if e is None or e.held is None else self.store.get(e.held)
+        return None if d is None else d.view(np.float32)
+
     def unpin(self, e: Entry) -> None:
         self.store.unpin(e.blobs())
 
@@ -476,7 +506,8 @@ class PrefixCache:
     def _persist(self, e: Entry) -> None:
         if self.store.dir is None:
             return
-        meta = json.dumps({"pages": e.pages, "tail": e.tail, "m": e.m}).encode()
+        meta = json.dumps({"pages": e.pages, "tail": e.tail, "m": e.m, "follow": e.follow,
+                           "held": e.held}).encode()
         rec = np.frombuffer(len(meta).to_bytes(8, "little") + meta + _tok_bytes(e.tokens),
                             np.uint8)
         self.store.put(e.key, rec, durable=True)
@@ -496,7 +527,8 @@ class PrefixCache:
             except (ValueError, TypeError):
                 self.store.discard(k)
                 continue
-            e = Entry(k, toks, list(meta["pages"]), meta["tail"], int(meta["m"]))
+            e = Entry(k, toks, list(meta["pages"]), meta["tail"], int(meta["m"]),
+                      follow=meta.get("follow"), held=meta.get("held"))
             if all(b in self.store for b in e.blobs()) and self.entry_key(toks) == k:
                 self._add(e)
             else:

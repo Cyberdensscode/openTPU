@@ -1221,10 +1221,10 @@ def qwen35_layer_tile(m, li: int, pos, row, T: int, block: int = ATTN_BLOCK,
     li. The MoE layer before ends first (moe.moe_combine_rows, EM_GROUP rows at a time); a
     DeltaNet layer's rows in runs of `drows` (default T; at most the image's gr / on rows),
     an attention layer tiled (_attention_tile, gated; spill: x in the records' X while the
-    heads attend); x to X; a MoE layer's route, need lines and shared expert over groups of
-    rows (moe.moe_prologue_rows, LINE / 4 ids a line), a dense layer's MLP tiled. Each row's
-    arithmetic is qwen35_layer_run's."""
-    from .moe import LINE, em_x, moe_combine_rows, moe_prologue_rows
+    heads attend); x to X; a MoE layer's route and shared expert over the T rows, its need
+    lines between the shared expert's chunks (moe.moe_prologue_rows), a dense layer's MLP
+    tiled. Each row's arithmetic is qwen35_layer_run's."""
+    from .moe import em_x, moe_combine_rows, moe_prologue_rows
     from .qwen35 import LIN, _deltanet_rows
     spec, dev = m.spec, m.moe_dev
     if not isinstance(pos, RunRows) or pos.amask is None or spec.moe is None:
@@ -1260,9 +1260,7 @@ def qwen35_layer_tile(m, li: int, pos, row, T: int, block: int = ATTN_BLOCK,
         ol.store(X, x)
         return
     ol.store(X, x)
-    g = max(1, (LINE // 4) // mo.k)             # rows a need line
-    for r0 in range(0, T, g):
-        moe_prologue_rows(x[r0:r0 + min(g, T - r0), :], lw, mo, dev, spec.eps, row + r0)
+    moe_prologue_rows(x, lw, mo, dev, spec.eps, row)
 
 
 @ol.jit
@@ -1437,12 +1435,14 @@ def layer_family(img) -> str | None:
     return name if ok else None
 
 
-def compile_layer_tile(img, li: int, blocks: int, T: int, block: int = ATTN_BLOCK):
+def compile_layer_tile(img, li: int, blocks: int, T: int, block: int = ATTN_BLOCK,
+                       slot: int = 0):
     """(programs, run_args): layer li's expert-major run tiled (LAYER_KERNELS), T rows at a
     run-time position of bucket `blocks` (from conv_k - 1) and a run-time chunk row ("row"),
     in place of the image's compile_layer_run(li, blocks, R=T, em=True) (Engine.prefill_layers'
     runs of more than one row with tiling on: Engine.layer_tile); the first of its forms that
-    fits TMEM, ACT RAM and IMEM (_first_fit)."""
+    fits TMEM, ACT RAM and IMEM (_first_fit). slot: the DeltaNet states' and windows' slot of an
+    MTP image (its committed one, mtp.MTPDecoder: a chat's next turn), as compile_layer_run's."""
     from ..compiler import RunVar
     fam = layer_family(img)
     if fam is None:
@@ -1459,8 +1459,8 @@ def compile_layer_tile(img, li: int, blocks: int, T: int, block: int = ATTN_BLOC
 
     def trace(kw, fit):
         return [LAYER_KERNELS[fam].trace(cfg, 0, {
-            "m": img.descriptors(0), "li": li, "pos": pos, "row": row, "T": T, "block": block,
-            **kw}, fit=fit)]
+            "m": img.descriptors(0, slot) if slot else img.descriptors(0), "li": li, "pos": pos,
+            "row": row, "T": T, "block": block, **kw}, fit=fit)]
 
     return _first_fit(trace, layer_variants(img, fam, T), cfg)
 
@@ -1478,12 +1478,13 @@ def untiled_rows(img) -> int:
 
 def layer_variants(img, fam: str, T: int) -> list:
     """A tiled layer run's forms (variants'): Qwen3.5's DeltaNet rows in runs of at most the
-    image's gr / on rows (grows), then fewer; the run's rows are the engine's (layer_major),
+    image's gr / on rows (dnrows) and MCOLS (more only replay the MXU's groups), then fewer; the
+    run's rows are the engine's (layer_major),
     so then the attention's outputs a part at a time (ranges: the 26B's global layers'
     [8, 16 x 512] outputs alone are TMEM's 64K words)."""
     if fam != "qwen35":
         return ranges(wholes([{}, {"spill": True}]))
-    d = min(T, img.grows)
+    d = min(T, img.dnrows, img.cfg.MCOLS)
     out = [{"drows": d}, {"spill": True, "drows": d}]
     while d > 1:
         d = d - img.cfg.MCOLS if d > img.cfg.MCOLS else d - 1

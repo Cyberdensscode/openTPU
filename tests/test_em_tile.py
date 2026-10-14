@@ -114,3 +114,51 @@ def test_otpu_tile_0_gives_todays_runs(monkeypatch):
         ga, gb = a.step(t), b.step(t)
         assert np.array_equal(ga.view(np.uint32), gb.view(np.uint32))
         t = int(np.argmax(ga))
+
+
+def test_a_tiles_moe_prologue_takes_its_rows_at_once(monkeypatch):
+    """A tile's MoE prologue (moe.moe_prologue_rows over the tile's T rows): the router one MM
+    of the T rows, the shared expert's MMs of whole column groups (min(T, MCOLS) rows), and the
+    need lines (moe.need_rows(k) rows each: 4 here, k = 4, so two a tile of 8) posted one
+    before the shared expert and the next as its second group begins, where the runs of today
+    route and post 2 rows at a time. The prompt's logits, the layers' blocks and the decode
+    steps after equal today's runs of R = 2 bit for bit, every need landed during the expert
+    runs (docs/tiled_prefill.md 14.3)."""
+    import re
+
+    import test_qwen35_moe as TQM
+    from opentpu import isa as I
+    from opentpu.llm import tiled as TL
+    from opentpu.llm.moe import need_rows
+    from opentpu.llm.qwen3 import ATTN_BLOCK
+    monkeypatch.setattr(TQM, "K", 4)
+    spec, W, kw, Q35 = _tiny("fp4")
+    monkeypatch.setattr(Q35, "PREFILL_CHUNK", 24)
+    monkeypatch.delenv("OTPU_TILE", raising=False)
+    k, E = spec.moe.k, spec.moe.E
+    assert k == 4 and need_rows(k) == 4
+    a = Engine(spec, W, **kw)
+    b = Engine(spec, W, tile_runs=False, **kw)
+    assert a.layer_tile and a.tile_rows == 8 and not b.layer_tile
+    for li in (1, 2):                                   # a DeltaNet layer, an attention layer
+        progs, _ = TL.compile_layer_tile(a.image, li, 1, 8, ATTN_BLOCK)
+        mm = [tuple(map(int, re.match(r"mm (\d+)x\d+ \. (\d+)x", i.comment).groups()))
+              for i in progs[0] if i.op == I.MM]
+        r = mm.index((8, E + 1))                        # the router (and the shared gate's row)
+        assert [m for m, _ in mm[r + 1:]] == [4] * 6    # gate, up, down: two groups of 4 rows
+        assert sum(i.op == I.WAITW for i in progs[0]) == 8 // need_rows(k)
+    rng = np.random.default_rng(13)
+    toks = [int(t) for t in rng.integers(0, 1000, 43)]
+    la, lb = a.prefill(toks), b.prefill(toks)
+    assert max(_tiles(a)) == 8 and not _tiles(b)
+    assert np.array_equal(la.view(np.uint32), lb.view(np.uint32))
+    img = a.image
+    assert np.array_equal(a.backend.machine.slices[0].dram[img.layer0:img.head[0]],
+                          b.backend.machine.slices[0].dram[img.layer0:img.head[0]])
+    srv = a.server
+    assert srv.needs_landed == srv.needs_queued > 0 and srv.drained == 0
+    t = int(np.argmax(la))
+    for _ in range(2):
+        ga, gb = a.step(t), b.step(t)
+        assert np.array_equal(ga.view(np.uint32), gb.view(np.uint32))
+        t = int(np.argmax(ga))
