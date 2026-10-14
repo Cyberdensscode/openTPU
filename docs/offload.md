@@ -5058,6 +5058,13 @@ ms a token, 1.127x (turns 1.129 / 1.177 / 1.041 / 1.143 / 1.161x), acceptance 0.
   (server_replay of the 35B's record at 38 and 41: +6 needs a prompt, decode +7 MB a token). Open:
   a --trace of an expert-major turn in each arm on the card.
 
+The next card check is session mtp2 (tools/offload/sessions/mtp2.sh): mtp1c's arms and runs with
+B on F1b and F2, then one more run of each arm with chatmoe --trace (outside the timed ones). It
+puts the measured TTFT B - A of each turn beside the model's, mtp1c's means less the parts the
+two fixes remove (-0.31 / +0.06 / +0.33 / +0.33 / +0.59 s: the first call's part left in turns
+2-5), and from the traced pair the expert-major turns' (3-5) calls by run kind (layer, expert,
+K / V, head): device and wall time, the gaps between runs, the server's idle parts and requests.
+
 Turn 3's 0.55 is the reply's content and the draft head, not the loop: on the fp32 reference
 (Hugging Face's float32 35B along the card's tokens, the base's own mtp.* layer, mtp_transplant.py
 accept, replayed as the k = 1 loop) the head the card has (fp4, the 32K lowest ids) accepts 12 of
