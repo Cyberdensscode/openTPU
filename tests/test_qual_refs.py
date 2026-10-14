@@ -69,11 +69,27 @@ def test_env_key_has_the_kernels_variables_not_the_runtime_ones(tmp_path, monkey
 
 
 def test_parse_run():
-    assert refs.parse_run("qwen3:int8:-") == ("qwen3", "int8", "-", False, False)
-    assert refs.parse_run("lfm2:int8") == ("lfm2", "int8", "-", False, False)
-    assert refs.parse_run("lfm2:int8:-:long,pr") == ("lfm2", "int8", "-", True, True)
+    assert refs.parse_run("qwen3:int8:-") == ("qwen3", "int8", "-", False, False, False)
+    assert refs.parse_run("lfm2:int8") == ("lfm2", "int8", "-", False, False, False)
+    assert refs.parse_run("lfm2:int8:-:long,pr") == ("lfm2", "int8", "-", True, True, False)
+    assert refs.parse_run("phi4-mini:mix:-:xl,pr") == ("phi4-mini", "mix", "-", False, True,
+                                                        True)
     with pytest.raises(ValueError):
         refs.parse_run("lfm2:int8:-:loong")
+    with pytest.raises(ValueError):                             # one prompt a run
+        refs.parse_run("lfm2:int8:-:long,xl")
+
+
+def test_the_xl_prompt_ends_in_its_bucket():
+    """The xl prompt (XL_TOKENS at most) reaches bucket XL_BUCKET (Phi-4-mini's 12-row looped
+    tiles from bucket 6, docs/tiled_prefill.md 13) and NTOK tokens' decode stays in it, within
+    CAP_XL; xl_fits is the card check's test of a prompt's length."""
+    lo = (refs.XL_BUCKET - 1) * refs.ATTN_BLOCK
+    assert lo < refs.XL_TOKENS - 64 and refs.xl_fits(refs.XL_TOKENS - 64, refs.NTOK)
+    assert refs.xl_fits(refs.XL_TOKENS, refs.NTOK) and not refs.xl_fits(lo, refs.NTOK)
+    assert not refs.xl_fits(refs.XL_BUCKET * refs.ATTN_BLOCK - refs.NTOK + 2, refs.NTOK)
+    assert refs.cap(True) == refs.CAP_XL >= refs.XL_BUCKET * refs.ATTN_BLOCK
+    assert refs.cap() == refs.CAP
 
 
 def _pending(kp, pid, age=0.0, host=None):
@@ -123,6 +139,9 @@ def test_key_is_stable_and_format_specific(monkeypatch):
     long_, lp = refs.key(cfg, "lfm2", "int8", "-", 32, long=True)
     pr, _ = refs.key(cfg, "lfm2", "int8", "-", 32, long=True, pr=True)
     assert len({a, long_, pr}) == 3 and "_long_pr_" in pr.name and lp["ids"] != parts["ids"]
+    xl, xp = refs.key(cfg, "lfm2", "int8", "-", 32, pr=True, xl=True)
+    assert xl not in (a, long_, pr) and "_xl_pr_" in xl.name and xp["cap"] == refs.CAP_XL
+    assert refs.run_key(cfg, "lfm2:int8:-:xl,pr", 32) == xl       # qual.sh's run: the same key
     monkeypatch.setenv("OTPU_LOCK_HELD", "xdma0")              # under otpu-lock: the same one
     assert refs.key(cfg, "lfm2", "int8", "-", 32)[0] == a
     monkeypatch.setenv("OTPU_MLP_UNROLL_BODIES", "4")           # lfm2's programs: another one
@@ -137,6 +156,8 @@ def test_the_long_prompt_crosses_the_bucket():
     assert refs.LONG_TOKENS - 8 <= n <= refs.LONG_TOKENS < refs.ATTN_BLOCK
     assert n + refs.NTOK - 2 >= refs.ATTN_BLOCK + 8             # decoded positions past 256
     assert len(refs.prompt_ids(tok)) < 32
+    n = len(refs.prompt_ids(tok, xl=True))                      # the xl prompt: bucket 6
+    assert refs.XL_TOKENS - 8 <= n <= refs.XL_TOKENS and refs.xl_fits(n, refs.NTOK)
 
 
 # ---- the reference and the card check, with a fake engine
@@ -195,8 +216,8 @@ def fake(tmp_path, monkeypatch):
     tok = SimpleNamespace(decode=lambda ids, **kw: "".join(f"<{i}>" for i in ids))
     monkeypatch.setattr(refs, "key", lambda *a, **kw: (kp, {"model": "fake"}))
     monkeypatch.setattr(refs, "load", lambda m: (tmp_path, SimpleNamespace(eos=(0,)), {}, tok))
-    monkeypatch.setattr(refs, "prompt_ids",
-                        lambda t, long=False: list(range(1, 240 if long else 22)))
+    monkeypatch.setattr(refs, "prompt_ids", lambda t, long=False, xl=False: list(
+        range(1, refs.XL_TOKENS if xl else 240 if long else 22)))
     monkeypatch.setattr(refs, "prompt_runs_taken", lambda eng, ids: True)
     monkeypatch.setattr(qwen3, "Engine", FakeEngine)
     monkeypatch.setattr(board, "sim_config", lambda *a, **kw: None)
@@ -250,9 +271,12 @@ def test_a_check_that_does_not_test_what_it_says_fails(fake, capsys, monkeypatch
     monkeypatch.setattr(refs, "prompt_runs_taken", lambda eng, ids: False)
     assert refs.card(cfg, "m", "int8", "-", 32, resident=True, prompt_runs=True) == 1
     assert "prompt runs not taken" in capsys.readouterr().out
-    monkeypatch.setattr(refs, "prompt_ids", lambda t, long=False: list(range(1, 200)))
+    monkeypatch.setattr(refs, "prompt_ids", lambda t, long=False, xl=False: list(range(1, 200)))
     assert refs.card(cfg, "m", "int8", "-", 32, resident=True, long=True) == 1
     assert "does not cross position 256" in capsys.readouterr().out
+    assert refs.card(cfg, "m", "int8", "-", 32, resident=True, xl=True) == 1
+    assert "the xl prompt (199 tokens) and its decode do not end in bucket 6" in \
+        capsys.readouterr().out
 
 
 def test_an_old_reference_is_no_pass(fake, capsys):

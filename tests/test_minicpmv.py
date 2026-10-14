@@ -812,6 +812,44 @@ def test_mtp_image_rows_decode_as_plain(tiny, monkeypatch):
     assert dec.loop_card(a0, d0, N, stop=[], st=st).tokens == want
 
 
+def test_image_rows_run_in_expert_major_tiles(tiny, monkeypatch):
+    """MiniCPM-V's image (Qwen3.5's Image, subclassed) takes the tiled expert-major layer runs
+    (tiled.layer_family by its base class; docs/tiled_prefill.md 14): a prompt with 20 image
+    rows from vis among 31 text rows, expert-major, its layer runs in tiles of 8 rows (layer 0's
+    image rows from vis untiled, 2 a run) against today's runs of 2 rows: the logits and three
+    decode steps, bit for bit."""
+    from opentpu.llm import qwen35 as Q35
+    from opentpu.llm import tiled as TL
+    monkeypatch.setattr(Q35, "PREFILL_CHUNK", 24)
+    monkeypatch.setenv("OTPU_TILE", "1")
+    m, d = tiny
+    spec = replace(load_spec(d), vision_patches=128, vision_rows=64, vision_staged=False)
+    rng = np.random.default_rng(4)
+    W = dict(load_weights(d).items())
+    W.update(_tiny_vision_weights(spec.vision, rng))
+    n, at, v0 = 20, 9, 5
+    rows = (0.5 * rng.standard_normal((n, spec.hidden))).astype(np.float32)
+    toks = [int(t) for t in rng.integers(0, V - 40, 31)]
+    cfg = device_config(spec, 256, rows=1, lookup=True, S=1, experts=2 * K)
+    kw = dict(cap=256, cfg=cfg, rows=1, resident=True, experts=2 * K, layer_major=2,
+              expert_major=True)
+    a = Engine(spec, W, tile_runs=True, tile_rows=8, **kw)
+    b = Engine(spec, W, tile_runs=False, **kw)
+    assert TL.layer_family(a.image) == "qwen35" and a.layer_tile and not b.layer_tile
+    for e in (a, b):
+        e.backend.write(0, e.image.vision.work["vis"] + 4 * v0 * spec.hidden, rows)
+    vis = [-1] * at + list(range(v0, v0 + n)) + [-1] * (len(toks) - at)
+    prompt = toks[:at] + [0] * n + toks[at:]
+    la, lb = a.prefill_layers(prompt, vis=vis), b.prefill_layers(prompt, vis=vis)
+    tiles = [k for k in a._layer_runs if isinstance(k, tuple) and k[-1] == "tile"]
+    assert max(k[2] for k in tiles) == 8 and ("v", 2) in a._layer_runs
+    assert np.array_equal(la.view(np.uint32), lb.view(np.uint32))
+    t = int(np.argmax(la))
+    for _ in range(3):
+        ga, gb = a.step(t), b.step(t)
+        assert np.array_equal(ga.view(np.uint32), gb.view(np.uint32))
+        t = int(np.argmax(ga))
+
 def test_mrope_rows_gather_the_table():
     """mrope_rows: frequency i of a row is the table's entry at the position of section i % 3
     (t, h, w): the rows of a text position are the table's rows bit for bit, an image row's

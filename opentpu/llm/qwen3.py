@@ -420,10 +420,20 @@ def _lookup_alloc(b: "_Bump", spec, cap: int, block: int = None, D: int = 128,
     else:
         emb = {"embed": b.alloc(4 * V * H)}
     if masks or (getattr(spec, "moe", None) is None and not getattr(spec, "experts", 0)):
-        emb.update(amask=b.alloc(amask_table(block, M).nbytes), amask_M=M)
+        emb.update(amask=b.alloc(amask_bytes(block, M)), amask_M=M)
     return {**emb, "cos_t": b.alloc(4 * cap * half), "sin_t": b.alloc(4 * cap * half),
             "zmask": b.alloc(4 * (cap + block)), "half": half, "block": block, "D": D,
             "gen": G.alloc(b, spec, cap, block, imem, waitc)}
+
+
+def amask_bytes(block: int, M: int, tables: int = 1) -> int:
+    """The bytes of `tables` mask tables (amask_table's, one after the other) and AMASK_PAD
+    positions after them: a looped attention's last packed tile reads the next one's mask tiles,
+    at most MCOLS (M) rows past the table (tiled._heads_loop), from the image's own words."""
+    return (tables * block + AMASK_PAD * M) * M * (block + 1) * 4
+
+
+AMASK_PAD = 1       # amask_bytes' padding, in MCOLS positions
 
 
 def amask_table(block: int, M: int, start: bool = False) -> np.ndarray:
@@ -2193,9 +2203,12 @@ class Engine:
     (prefill.warm). tile_runs (docs/tiled_prefill.md; None: OTPU_TILE's choice, on unless it
     is 0: prefill.tile_flag): the prompt runs tiled (opentpu/llm/tiled.py), up to ACT_ROWS
     rows a run, the image's I/O rows at least ACT_ROWS; False: today's. With expert_major a
-    MoE model's layer runs of more than one row, opt-in: tile_runs True or OTPU_TILE=1
-    (prefill.layer_tile_flag; layer_tile: tiled.compile_layer_tile, on an image built with
-    OTPU_TILE=1: its mask tiles).
+    MoE model's layer runs of more than one row (prefill.layer_tile_flag; layer_tile:
+    tiled.compile_layer_tile, on an image with the mask tiles): Qwen3.5-MoE's by default (not
+    with OTPU_TILE=0 as the image is built), Gemma 4's opt-in (tile_runs True or OTPU_TILE=1),
+    of `tile_rows` rows (None: tiled.LAYER_ROWS' 8 for Qwen3.5-MoE, else layer_major's), at
+    most ACT_ROWS; the calls that run layer-major (gate_expert_major's short ones) keep
+    layer_major's rows, untiled.
 
     rollback(k) takes the context back to its first k tokens (a chat's next turn, whose
     template renders the last reply differently from what was fed: opentpu/llm/snapshot.py).
@@ -2215,7 +2228,8 @@ class Engine:
                  restore: str = "lazy", embed_runs: bool = False, release_weights: bool = True,
                  pool_map: bool = True, prog_cache: bool | None = None,
                  prompt_runs: bool = False, layer_ahead=None, expert_major: bool = False,
-                 snapshots: int = 0, batch_area: bool = False, tile_runs: bool | None = None):
+                 snapshots: int = 0, batch_area: bool = False, tile_runs: bool | None = None,
+                 tile_rows: int | None = None):
         from . import prefill as PF
         self.spec, self.cap, self.block = spec, cap, block
         self.prog_cache = PC.enabled() if prog_cache is None else bool(prog_cache)
@@ -2350,16 +2364,20 @@ class Engine:
                                       and not self.layer_hint):
             raise ValueError("expert-major MoE needs layer-major prefill, the expert server "
                              "with pooled slots, and no layer hints (its runs post needs)")
-        # expert-major runs of more than one row tiled, opt-in (tile_runs True, None: OTPU_TILE
-        # set and not 0: prefill.layer_tile_flag; tiled.py's compile_layer_tile: the layer's
-        # weights once for the run's rows, up to ACT_ROWS of them; the image's mask tiles,
-        # which OTPU_TILE=1 gives a MoE image as it is built)
+        # expert-major runs of more than one row tiled (tiled.py's compile_layer_tile: the
+        # layer's weights once for the run's rows, up to ACT_ROWS of them; the image's mask
+        # tiles): Qwen3.5-MoE's by default, tiled.LAYER_ROWS rows a run, unless tile_runs is
+        # False or (None) OTPU_TILE=0 as the image is built; Gemma 4's opt-in (tile_runs True,
+        # or OTPU_TILE=1), layer_major's rows a run: prefill.layer_tile_flag
         from . import tiled as TL
-        self.layer_tile = bool(self.expert_major and PF.layer_tile_flag(tile_runs)
-                               and TL.layer_family(self.image))
-        if self.layer_tile and self.layer_major > self.cfg.act_rows:
-            raise ValueError(f"tiled layer runs of {self.layer_major} rows: one MM over them "
-                             f"needs ACT_ROWS >= {self.layer_major} ({self.cfg.act_rows})")
+        fam = TL.layer_family(self.image)
+        self.layer_tile = bool(self.expert_major and fam
+                               and PF.layer_tile_flag(tile_runs, fam in TL.LAYER_ROWS))
+        self.tile_rows = int(tile_rows or (min(TL.LAYER_ROWS[fam], self.cfg.act_rows)
+                                           if fam in TL.LAYER_ROWS else self.layer_major))
+        if self.layer_tile and self.tile_rows > self.cfg.act_rows:
+            raise ValueError(f"tiled layer runs of {self.tile_rows} rows: one MM over them "
+                             f"needs ACT_ROWS >= {self.tile_rows} ({self.cfg.act_rows})")
         self._gens: dict = {}               # the generate loop: (blocks, mode) -> programs
                                             # (a list, or split: (first parts, second parts))
         self.gen_split = None               # split generate programs: None when a bucket's
@@ -2933,6 +2951,8 @@ class Engine:
             if not tokens:
                 return lg if logits else None
         em = self.expert_major
+        tile = em and self.layer_tile   # (expert-major runs tiled, of T rows: layer 0's from the
+        T = self.tile_rows if tile else R               # host's slot or from vis untiled, R)
         mo = getattr(self.spec, "moe", None)
         self.kept = None
         if fix is not None:             # (the MTP layer's row before Engine.pos again)
@@ -2957,7 +2977,7 @@ class Engine:
                         n = min(R, low - i)
                         runs.append(((li, None, n, True, p), {"row": i}, None))
                     else:
-                        n = min(R, len(part) - i, B - p % B)
+                        n = min(T, len(part) - i, B - p % B)
                         if li == 0 and vp is not None:      # a run of text or of image rows
                             j, im = i + 1, vp[i] >= 0
                             while j < i + n and (vp[j] >= 0) == im and \
@@ -2965,16 +2985,17 @@ class Engine:
                                 j += 1
                             n = j - i
                             if im:                          # (the rows from vis, then layer 0
-                                runs.append((("v", n), {"row": i, "src": vp[i]}, None))  # on them)
+                                n = min(n, R)               # on them, untiled)
+                                runs.append((("v", n), {"row": i, "src": vp[i]}, None))
                                 runs.append(((0, p // B + 1, n, True),
                                              dict(RunPos.values(part[i], p, K, B), row=i), None))
                                 i += n
                                 continue
                         gather = li == 0 and (R == 1 or host)   # (the run gathers its rows:
-                        if gather and self.layer_tile:          # the host's; untiled)
-                            n = min(n, TL.untiled_rows(img))
+                        if gather and tile:                     # the host's; untiled)
+                            n = min(n, R, TL.untiled_rows(img))
                         key = (li, p // B + 1, n, R > 1 and not gather)
-                        if self.layer_tile and n > 1 and not gather:
+                        if tile and n > 1 and not gather:
                             key += ("tile",)                    # (tiled.compile_layer_tile)
                         runs.append((key, dict(RunPos.values(part[i], p, K, B), row=i),
                                      part[i:i + n] if gather else None))

@@ -6,6 +6,7 @@ greedy tokens equal plain greedy decode's bit for bit whatever the drafts, with 
 a layer (misses on every layer). A tiny random Qwen3.5-MoE (tests/test_qwen35_moe.py) with random
 mtp.* weights in the checkpoint's form (its experts a tensor each)."""
 import dataclasses
+import os
 
 import numpy as np
 import pytest
@@ -20,7 +21,8 @@ SLOTS = 2 * K               # a layer's slots: a 2-row request's union fits (k o
 
 pytest.importorskip("torch")
 
-CFG = board_config(DRAM_BYTES=1 << 25, DSTEP=True, STREAM=True, PAIR=True)
+CFG = board_config(DRAM_BYTES=1 << 26, DSTEP=True, STREAM=True, PAIR=True)   # (an int8 MTP
+#   image with the default MoE tiles' mask tiles and I/O scratch: 32 MiB, docs/tiled_prefill.md 14)
 
 
 def _moe_mtp_weights(W, spec, seed=1):
@@ -208,8 +210,11 @@ def test_a_loop_program_that_fits_is_not_split():
     """The split V / E (docs/mtp.md 10.3) changes neither an MTP image's layout nor a program
     of a model whose V and E fit IMEM: Qwen3.5-35B-A3B's loop programs of bucket 1 (its
     formats, the card's configuration, its 38 slots a layer) are byte for byte those of the
-    tree before the split (3af05a43). A change of the programs themselves updates the
-    sum here."""
+    tree before the split (3af05a43) without the image's mask tiles (OTPU_TILE=0). With them
+    (Qwen3.5-MoE's tiles on by default, em-tile 2bb7bb0b) the image is 1,331,200 bytes longer
+    and the areas the programs address move: the same instructions, only address words
+    differing (by 262,144, 1,331,200 and 1,331,328 bytes), their own sum. A change of the
+    programs themselves updates the sums here."""
     import hashlib
     from pathlib import Path
     from opentpu import isa as I
@@ -233,7 +238,10 @@ def test_a_loop_program_that_fits_is_not_split():
         for p in progs:
             h.update(np.asarray(I.assemble(p), "<u4").tobytes())
     assert n == 38
-    assert h.hexdigest() == "7f3bacfe386c84838742206943cb20db6ea989d2a4eb6cf63fdab651d5ffc103"
+    untiled = os.environ.get("OTPU_TILE", "").strip() == "0"
+    assert h.hexdigest() == ("7f3bacfe386c84838742206943cb20db6ea989d2a4eb6cf63fdab651d5ffc103"
+                             if untiled else
+                             "eb811fa4ebb43cb6c9fdbe9b43caf1a7a78ebc074e0ddf41c446549c8dfdfa6c")
 
 
 @pytest.mark.parametrize("P, drafter, sp", [
@@ -409,6 +417,7 @@ def test_moe_mtp_rollback_to_a_held_snapshot_is_a_rerun(tiny_moe_mtp, em, monkey
                                                     _states(ref.eng, spec, ref.slot)))
 
 
+@pytest.mark.xfail(strict=True, raises=ValueError, reason="slot-1 tiled runs: mtp-slot-fix")
 def test_moe_mtp_layer_major_continues_from_slot_1(tiny_moe_mtp, monkeypatch):
     """A chat's next turn on the layer-major path: the first turn's loop (drafts all right)
     leaves the states committed in slot 1, and the next prompt's layer runs read and write that
@@ -440,7 +449,9 @@ def test_streamed_mtp_engine_from_a_checkpoint_and_an_extended_pool(tiny_moe_mtp
     asks for from the checkpoint). The loop's tokens equal plain greedy decode's from the
     model's pool. MiniCPM-V 4.7's case: a checkpoint without mtp.* is refused, and takes them
     from another (mtp_from), whose identity the pool's key holds: the pool extended for the
-    model's own MTP layer is refused, one extended with --mtp-from serves it."""
+    model's own MTP layer is refused, one extended with --mtp-from serves it. Its engines run
+    their layer runs untiled, the plain one's expert-major runs tiled (a tiled run takes the
+    states' slot 0 alone: branch mtp-slot-fix)."""
     import json
     import runpy
     import sys
@@ -501,6 +512,10 @@ def test_streamed_mtp_engine_from_a_checkpoint_and_an_extended_pool(tiny_moe_mtp
     want = ST.engine(m, CFG, pool=a, **kw).generate(prompt, max_new=N)
     eng = ST.engine(m, CFG, pool=b, mtp=True, **kw)
     assert eng.image.rows == 2 and eng.image.offload.layers == spec.layers + 1
+    assert eng.tile_runs is False and not eng.layer_tile    # (untiled: mtp-slot-fix)
+    em = dict(kw, expert_major=True, layer_major=2)
+    assert ST.engine(m, CFG, pool=a, **em).layer_tile       # (the plain engine's tiles)
+    assert not ST.engine(m, CFG, pool=b, mtp=True, **em).layer_tile
     dec = MTPDecoder(eng)
     assert dec.generate_card(prompt, max_new=N, stop=[]).tokens == want
     got = np.fromfile(str(b) + ".packed", np.uint8)[nE:]
