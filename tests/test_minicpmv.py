@@ -558,7 +558,7 @@ def test_pack_pool_keys_the_experts_alone(tiny, tmp_path, monkeypatch):
     spec = replace(load_spec(d), vision_patches=128, vision_rows=64)
     img = spec.image(replace(board_config(), DRAM_BYTES=1 << 40), 1024, 1, 1, "int8", "int8",
                      lookup=True, experts=spec.moe.k)
-    monkeypatch.setattr(PP, "image", lambda model, wformat: img)
+    monkeypatch.setattr(PP, "image", lambda model, wformat, mtp=False: img)
     monkeypatch.setattr(sys, "argv", ["pack_pool.py", str(d), str(pool), "init"])
     PP.main()
     lay, (extra, vk) = img.offload, img.pool_extra
