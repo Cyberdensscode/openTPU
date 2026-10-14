@@ -13,7 +13,8 @@
 // Clocks: the core clock is the caller's (period 10 time units). The controller clock's period is
 // 10 * +ldc_ratio=PPM / 1e6 units (PPM: core MHz / controller MHz * 1e6; default 1e6, the core at
 // the controller's clock; rtlsim.ldc_plusargs), its edges on the nearest unit. The bridges' XDMA
-// side is idle. The dump prints each channel's controller reads and writes and its row changes
+// side (xclk, 8 units: 1.25x the core's) is idle but for the host's writes of +h2c_* (below). The
+// dump prints each channel's controller reads and writes and its row changes
 // (MEM ch<c> rd=<n> wr=<n> row_miss=<row changes> rmw=0).
 module otpu_ldc_mem #(
   parameter int WORDS = 1 << 18,
@@ -97,15 +98,80 @@ module otpu_ldc_mem #(
     assign n_cready[c] = up && bcr;
     assign n_wready[c] = up && bwr;
     assign n_rvalid[c] = up && brv;
+    // +h2c_bpk=N: the host's H2C writes beside the core's traffic (a load for the write
+    // contention's study, docs/offload.md 13.19; none without it): XDMA's side of the bridge writes
+    // N bytes a thousand xclk cycles into this channel, INCR bursts of +h2c_burst=B bytes (default
+    // 256, whole 64-byte beats, at most 4096), from channel byte +h2c_base=A (default the
+    // channel's last +h2c_span=S bytes, default 64 MiB) on, wrapping in the span; with
+    // +h2c_on=K (bytes) and +h2c_off=G (xclk cycles), K bytes then G idle cycles, as the server's
+    // parts and polls. A burst goes once N's credit covers it (at most four bursts banked). The
+    // data is zeros; the dump prints the bursts and bytes the controller took (H2C lines).
+    longint      h_bpk, h_burst, h_base, h_span, h_on, h_off;
+    longint      h_credit, h_left_on, h_idle, h_bursts, h_bytes, h_bresp;
+    logic        h_en, h_awv, h_wv, h_wl;
+    logic [31:0] h_addr, h_next;
+    int          h_beats;
+    initial begin
+      h_bpk = 0; h_burst = 256; h_span = 64 << 20; h_on = 0; h_off = 0;
+      h_en = $value$plusargs("h2c_bpk=%d", h_bpk) && h_bpk > 0;
+      void'($value$plusargs("h2c_burst=%d", h_burst));
+      void'($value$plusargs("h2c_span=%d", h_span));
+      h_base = longint'(WORDS) * 2 - h_span;          // a channel holds half the image's words
+      void'($value$plusargs("h2c_base=%d", h_base));
+      void'($value$plusargs("h2c_on=%d", h_on));
+      void'($value$plusargs("h2c_off=%d", h_off));
+      if (h_en && (h_burst % 64 != 0 || h_burst < 64 || h_burst > 4096 || h_base % 64 != 0 ||
+                   h_span % h_burst != 0 || h_base < 0 || h_base + h_span > longint'(WORDS) * 2))
+        $fatal(1, "otpu_ldc_mem: +h2c_burst %0d, +h2c_base %0d, +h2c_span %0d", h_burst, h_base,
+               h_span);
+      h_credit = 0; h_left_on = h_on; h_idle = 0; h_bursts = 0; h_bytes = 0; h_bresp = 0;
+      h_awv = 1'b0; h_wv = 1'b0; h_wl = 1'b0; h_beats = 0;
+      h_addr = 32'(h_base); h_next = 32'(h_base);
+    end
+    logic h_awr, h_wr, h_bv;
+    always @(posedge xclk) if (h_en && !xrst && up) begin
+      if (h_credit < 4 * 1000 * h_burst) h_credit += h_bpk;
+      if (h_idle != 0) h_idle--;
+      if (h_awv && h_awr) h_awv <= 1'b0;
+      if (h_wv && h_wr) begin             // a beat taken: h_beats left of the burst
+        h_beats--;
+        h_wl <= h_beats == 1;
+        if (h_beats == 0) begin
+          h_wv <= 1'b0;
+          h_bursts++;
+          h_bytes += h_burst;
+        end
+      end
+      if (h_bv) h_bresp++;
+      // the next burst: none in flight, its credit, not in an idle gap
+      if (!h_awv && !h_wv && h_beats == 0 && h_credit >= 1000 * h_burst && h_idle == 0) begin
+        h_credit -= 1000 * h_burst;
+        h_addr <= h_next;
+        h_next = h_next + 32'(h_burst) >= 32'(h_base + h_span) ? 32'(h_base)
+                                                                : h_next + 32'(h_burst);
+        h_awv <= 1'b1;
+        h_wv <= 1'b1;
+        h_beats = int'(h_burst / 16);
+        h_wl <= h_burst == 16;
+        if (h_on != 0) begin
+          h_left_on -= h_burst;
+          if (h_left_on <= 0) begin
+            h_left_on = h_on;
+            h_idle = h_off;
+          end
+        end
+      end
+    end
     otpu_mem_ch #(.XIDW(4)) u_ch (
       .clk, .rst,
       .n_cvalid(up && n_cvalid[c]), .n_cready(bcr), .n_cwe(n_cwe[c]), .n_caddr(n_caddr[c]),
       .n_wvalid(up && n_wvalid[c]), .n_wready(bwr), .n_wdata(n_wdata[c]), .n_wmask(n_wmask[c]),
       .n_rvalid(brv), .n_rdata(n_rdata[c]), .n_wdone(n_wdone[c]), .n_err(),
       .xclk, .xrst,
-      .x_awvalid(1'b0), .x_awready(), .x_awid(4'h0), .x_awaddr(32'h0), .x_awlen(8'h0),
-      .x_wvalid(1'b0), .x_wready(), .x_wdata(128'h0), .x_wstrb(16'h0), .x_wlast(1'b0),
-      .x_bvalid(), .x_bready(1'b1), .x_bid(), .x_bresp(),
+      .x_awvalid(h_awv), .x_awready(h_awr), .x_awid(4'h0), .x_awaddr(h_addr),
+      .x_awlen(8'(h_burst / 16 - 1)),
+      .x_wvalid(h_wv), .x_wready(h_wr), .x_wdata(128'h0), .x_wstrb(16'hFFFF), .x_wlast(h_wl),
+      .x_bvalid(h_bv), .x_bready(1'b1), .x_bid(), .x_bresp(),
       .x_arvalid(1'b0), .x_arready(), .x_arid(4'h0), .x_araddr(32'h0), .x_arlen(8'h0),
       .x_rvalid(), .x_rready(1'b1), .x_rid(), .x_rdata(), .x_rresp(), .x_rlast(),
       .uclk, .urst,
@@ -309,6 +375,11 @@ module otpu_ldc_mem #(
   always @(posedge clk) if (dump) begin
     for (int c = 0; c < 2; c++)
       $display("MEM ch%0d rd=%0d wr=%0d row_miss=%0d rmw=0", c, n_rd[c], n_wr[c], n_miss[c]);
+    if (g_ch[0].h_en)
+      for (int c = 0; c < 2; c++)
+        $display("H2C ch%0d bursts=%0d bytes=%0d bresp=%0d", c,
+                 c ? g_ch[1].h_bursts : g_ch[0].h_bursts,
+                 c ? g_ch[1].h_bytes : g_ch[0].h_bytes, c ? g_ch[1].h_bresp : g_ch[0].h_bresp);
     if (g_ch[0].brk) begin
       $display("BRK ch0 data=%0d ref=%0d mux=%0d rows=%0d xbar=%0d idle=%0d gaps=%0d/%0d/%0d/%0d gapcyc=%0d/%0d/%0d/%0d cont=%0d contcyc=%0d act=%0d reopen=%0d refgaps=%0d refgapcyc=%0d refs=%0d owe=%0d/%0d",
                g_ch[0].bk[0], g_ch[0].bk[1], g_ch[0].bk[2], g_ch[0].bk[3], g_ch[0].bk[4], g_ch[0].bk[5],

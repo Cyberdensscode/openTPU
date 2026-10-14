@@ -18,8 +18,10 @@ two-port controller: there the second layer costs less than the layers after it 
 133.33 MHz: 83.9k cycles, against 91.8k for every layer from the third on), and Qwen3's token
 comes out 5.4% short (3.691 against 3.903 Mcycles; the card: 3.939). The whole model is within
 1.1% of the card (docs/litedram.md section 11). Each image (whole model or prefix) is built
-once, streamed to IMGDIR as tb_top loads it (the image, then the program at the boot address),
-and every point then runs the simulator on that file (the DRAM dump goes nowhere). Points are
+once, streamed to IMGDIR as tb_top loads it (the image, then the program at the boot address,
+and after it the program's wait entries, opentpu.waits, as rtlsim writes them when the board's
+otpu_seq runs WAITC: the target's SEQ_WC), and every point then runs the simulator on that file
+(the DRAM dump goes nowhere). Points are
 cached in CACHE.json (one entry per layer count and point, with the DRAM commands), so a stopped
 run resumes. --table prints Mcycles/token, tokens/s, the
 DRAM bytes read and written per token and GB/s. The configuration comes from the environment
@@ -47,6 +49,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / "tools")]
 
 from opentpu import isa as I  # noqa: E402
 from opentpu import rtlsim, simtmp  # noqa: E402
+from opentpu.waits import wait_counts  # noqa: E402
 from opentpu.compiler import arg_words  # noqa: E402
 from opentpu.isasim import board_config  # noqa: E402
 from opentpu.llm import load_spec, model_dir  # noqa: E402
@@ -87,6 +90,20 @@ class LazyW:
             return h.get_tensor(name).to(torch.float32).numpy()
 
 
+def boot_program(prog: list, cfg) -> tuple[np.ndarray, int]:
+    """The program's words as rtlsim._run boots it, and its instructions (the loader's boot_n):
+    when the board's otpu_seq runs WAITC (rtlsim.BOARD_UARCH's SEQ_WC, the card's since
+    release-2), the compiler's wait entries (opentpu.waits) follow its last chunk, 64 bits each;
+    without them the loader leaves the sidecar empty and the first dependency stops the run."""
+    words = np.asarray(I.assemble(prog), "<u4")
+    n = len(words) // 8
+    if rtlsim.BOARD_UARCH.get("SEQ_WC"):
+        ww = wait_counts(prog, cfg.D, cfg.S)
+        words = np.concatenate([words, np.zeros(-len(words) % (cfg.D // 4), "<u4"),
+                                ww.astype("<u8").view("<u4")])
+    return words, n
+
+
 class Grid:
     def __init__(self, cache: Path, imgdir: Path, mem: str, pos: int, cap: int, head: str,
                  plus: list | None = None, prefixes: bool = False):
@@ -101,6 +118,7 @@ class Grid:
                        ("OTPU_MCOLS", "OTPU_MXU", "OTPU_PAIR", "OTPU_DSTEP", "OTPU_STREAM"))
         return (f"{name}|{env}|{wf}|{self.head}|{mhz}|{ddr}|{n}|step|{self.pos}|{self.cap}|"
                 f"resident" + ("|ldc" if self.mem == "ldc" else "") +
+                ("|wc" if rtlsim.BOARD_UARCH.get("SEQ_WC") else "") +
                 "".join(f"|{x}" for x in self.plus))
 
     @staticmethod
@@ -111,7 +129,9 @@ class Grid:
 
     def image(self, name, spec, W, n, wf) -> dict:
         """The prefix's DRAM file, program and run metadata in imgdir (built once)."""
-        stem = self.imgdir.resolve() / f"{name}_{wf}_{self.head}_{self.pos}_{self.cap}_{n}"
+        wc = bool(rtlsim.BOARD_UARCH.get("SEQ_WC"))
+        stem = self.imgdir.resolve() / (f"{name}_{wf}_{self.head}_{self.pos}_{self.cap}_{n}"
+                                         + ("_wc" if wc else ""))
         meta_p = stem.with_suffix(".json")
         if meta_p.exists():
             return json.loads(meta_p.read_text())
@@ -131,7 +151,7 @@ class Grid:
         cfg = img.cfg
         if 8 * len(progs[0]) > cfg.IMEM_WORDS:
             cfg = dataclasses.replace(cfg, IMEM_WORDS=1 << (8 * len(progs[0]) - 1).bit_length())
-        prog = np.asarray(I.assemble(progs[0]), "<u4")
+        prog, boot_n = boot_program(progs[0], cfg)
         dram = img.build(W)[0]
         n4 = -(-len(dram) // 4) * 4
         at = -(-n4 // cfg.D) * cfg.D
@@ -152,9 +172,9 @@ class Grid:
                 z -= min(z, step)
             prog.astype(">u4").tofile(f)
         tmp.rename(stem.with_suffix(".bin"))
-        rtlsim._write_hex(stem.with_suffix(".hex"), prog)
+        rtlsim._write_hex(stem.with_suffix(".hex"), prog[:8 * boot_n])
         meta = {"DRAM_BYTES": size, "IMEM_WORDS": cfg.IMEM_WORDS, "at": at, "grow": grow,
-                "boot_n": len(prog) // 8, "args": [int(a) for a in args],
+                "boot_n": boot_n, "args": [int(a) for a in args],
                 "nbytes": int(len(dram)), "bin": str(stem.with_suffix(".bin")),
                 "hex": str(stem.with_suffix(".hex"))}
         meta_p.write_text(json.dumps(meta))

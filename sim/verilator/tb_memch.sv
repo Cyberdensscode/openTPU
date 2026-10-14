@@ -30,7 +30,9 @@
 // +xreset=N / +areset=N: reset the XDMA master (and the split, and the bridges' XDMA sides) / the
 // accelerators at cycle N of their clock, for 40 cycles (+xrlen=L / +arlen=L: L cycles),
 // mid-traffic (+xrep=P / +arep=P: again every P cycles); the bytes of the writes then in flight become unknown (not checked) until
-// written again, and unpublished shared beats are written again. +ntx=N runs or bursts per master (+acc0_ntx, +acc1_ntx, +xdma_ntx).
+// written again, and unpublished shared beats are written again. +ntx=N runs or bursts per master
+// (+acc0_ntx, +acc1_ntx, +xdma_ntx; +wpct the same: +xdma_wpct=100 with +wpct=0, the accelerators
+// reading while XDMA writes).
 // Throughput: +seq=1 (back-to-back 32-beat runs / 64-beat bursts through the window, no shared
 // operations); each master prints its data beats per cycle of its clock, from its first command
 // to its last read beat or write counted. Controller models: +axi_stall, +axi_lat, +ldn_busy.
@@ -58,7 +60,10 @@ module tb_memch #(
   parameter int ARD = 64,
   parameter int XRD = 16,
   parameter bit XREG = 1'b0,
-  parameter bit LDC = 1'b0                // the controllers: LiteDRAM's own (otpu_ldc_model), else the model
+  parameter bit LDC = 1'b0,               // the controllers: LiteDRAM's own (otpu_ldc_model), else the model
+  parameter int XQD = 32,                 // otpu_mem_ch's XDMA batches (its defaults)
+  parameter int XT = 256,
+  parameter int XB = 24
 );
   int cp = 414, up = 375, xp = 400;        // half periods: 120.8 / 133.3 / 125 MHz
   logic clk = 1'b0, uclk = 1'b0, xclk = 1'b0;
@@ -146,7 +151,7 @@ module tb_memch #(
       .n_rvalid(nrv[c]), .n_rdata(nrd[c]), .n_wdone(nwdone[c]),
       .a2x_pub(a2x_pub[c]), .x2a_pub(x2a_pub[c]), .done(adone[c]), .bad(abad[c]));
 
-    otpu_mem_ch #(.XIDW(4), .ARD(ARD), .XRD(XRD)) u_ch (
+    otpu_mem_ch #(.XIDW(4), .ARD(ARD), .XRD(XRD), .XQD(XQD), .XT(XT), .XB(XB)) u_ch (
       .clk, .rst,
       .n_cvalid(ncv[c]), .n_cready(ncr[c]), .n_cwe(ncwe[c]), .n_caddr(nca[c]),
       .n_wvalid(nwv[c]), .n_wready(nwr[c]), .n_wdata(nwd[c]), .n_wmask(nwm[c]),
@@ -425,6 +430,7 @@ module tb_memch_nat #(
     void'($value$plusargs({NAME, "_ntx=%d"}, ntx));
     void'($value$plusargs("mstall=%d", mstall));
     void'($value$plusargs("wpct=%d", wpct));
+    void'($value$plusargs({NAME, "_wpct=%d"}, wpct));
     void'($value$plusargs("seq=%d", seq));
     void'($value$plusargs("gapw=%d", gapw));
     void'($value$plusargs("gapc=%d", gapc));
@@ -724,6 +730,7 @@ module tb_memch_axi #(
     void'($value$plusargs({NAME, "_ntx=%d"}, ntx));
     void'($value$plusargs("mstall=%d", mstall));
     void'($value$plusargs("wpct=%d", wpct));
+    void'($value$plusargs({NAME, "_wpct=%d"}, wpct));
     void'($value$plusargs("seq=%d", seq));
     void'($value$plusargs("gapw=%d", gapw));
     void'($value$plusargs("xfull=%d", xfull));

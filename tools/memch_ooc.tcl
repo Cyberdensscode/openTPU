@@ -12,7 +12,8 @@
 #
 # ROUTE: 0 (the default) or 1. Clock periods (ns) from
 # the environment: MEMCH_CLK (core, default 7.968: 125.5 MHz, about the best routed core clock),
-# MEMCH_UCLK (7.5: 133.33 MHz, DDR3-1066), MEMCH_XCLK (8.0: axi_aclk). The module's ports get
+# MEMCH_UCLK (7.5: 133.33 MHz, DDR3-1066), MEMCH_XCLK (8.0: axi_aclk); MEMCH_GENERICS: the
+# module's parameters, e.g. "XQD=16 XT=0 XB=0" (no XDMA batches). The module's ports get
 # input and output delays of 30% of their clock's period (n_* rst: clk, x_* xrst: xclk, c_* urst:
 # uclk), so every path is timed. Reports go to <outdir>; the summary is printed at the end.
 set out [file normalize [lindex $argv 0]]
@@ -26,7 +27,9 @@ file mkdir $out
 
 set_part xc7k480t-ffg1156-2
 read_verilog -sv [list $root/rtl/shell/otpu_afifo.sv $root/rtl/shell/otpu_mem_ch.sv]
-synth_design -top otpu_mem_ch -mode out_of_context -flatten_hierarchy rebuilt
+set gens {}
+foreach g [env_or MEMCH_GENERICS ""] { lappend gens -generic $g }
+synth_design -top otpu_mem_ch -mode out_of_context -flatten_hierarchy rebuilt {*}$gens
 
 create_clock -name clk -period $t_clk [get_ports clk]
 create_clock -name uclk -period $t_ucl [get_ports uclk]
@@ -166,7 +169,8 @@ if {$route} {
 }
 if {[catch {cross_sources $xs_expect} xs]} { set xs [list "?" [list "  cross_sources failed: $xs"]] }
 
-puts "==== otpu_mem_ch OOC (route=$route, clk $t_clk / uclk $t_ucl / xclk $t_xcl ns): $out"
+puts "==== otpu_mem_ch OOC (route=$route, clk $t_clk / uclk $t_ucl / xclk $t_xcl ns,\
+ generics [env_or MEMCH_GENERICS none]): $out"
 puts [expr {$scoped ? "XDC read scoped (-ref otpu_mem_ch)" : "XDC: the scoped read applied nothing; read unscoped instead"}]
 puts "XDC set_max_delay: $nmd active of $n_xmd in the file, $nmd_ign ignored (overridden); waivers: $nwv (the file has $n_xwv create_waiver)"
 puts "XDC queries:"
