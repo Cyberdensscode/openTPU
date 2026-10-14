@@ -404,3 +404,34 @@ def test_the_warm_log_says_when_the_read_ends(tmp_path, monkeypatch):
         reads.release(64)
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_serve_bench_waits_for_a_warming_server(capsys):
+    """serve_bench.wait_up (the sessions' wait for otpu-serve): a 503 "warming" is a server up,
+    waited for past --wait (the server ends it at its warm cap); no answer, another 503 or a
+    body that is not JSON for --wait seconds: SystemExit."""
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location(
+        "serve_bench", Path(__file__).resolve().parents[1] / "tools" / "serve_bench.py")
+    SB = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(SB)
+
+    class Seq:
+        def __init__(self, *answers):
+            self.answers = list(answers)
+
+        def get(self, path):
+            assert path == "/health"
+            a = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+            if isinstance(a, Exception):
+                raise a
+            return a
+    warming = (503, {"status": "warming", "progress": 0.25})
+    nop = lambda s: None                                    # noqa: E731
+    assert SB.wait_up(Seq(warming, warming, warming, (200, {"status": "ok"})), -1, nop) >= 0
+    assert "its expert pool warming (0.25 read)" in capsys.readouterr().out
+    assert SB.wait_up(Seq(ConnectionRefusedError(), (200, {"status": "ok"})), 60, nop) >= 0
+    for never in (ConnectionRefusedError(), (503, {"status": "busy"}), ValueError("not JSON")):
+        with pytest.raises(SystemExit, match="did not come up"):
+            SB.wait_up(Seq(never), -1, nop)
