@@ -8,13 +8,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 # short names for the checkpoints the tools know, downloaded into models/<dir>; the last three
 # are mixture-of-experts models bigger than the card's DRAM, their experts streamed from a pool
-# file (opentpu/host/streamed.py). Gemma 4's are the instruct checkpoints (-it): the base ones
+# file (opentpu/host/streamed.py), as is MiniCPM-V 4.7's language model (Qwen3.5-35B-A3B's
+# architecture: docs/minicpmv.md). Gemma 4's are the instruct checkpoints (-it): the base ones
 # (gemma-4-E2B, ...) have no chat template and continue a chat's text instead of answering
 MODELS = {"qwen3": "Qwen3-0.6B", "lfm2": "LFM2.5-230M", "qwen35": "Qwen3.5-0.8B",
           "lfm2-2.6b": "LFM2-2.6B", "smollm3": "SmolLM3-3B", "phi4-mini": "Phi-4-mini-instruct",
           "qwen35-2b": "Qwen3.5-2B", "qwen35-4b": "Qwen3.5-4B", "gemma4": "gemma-4-E2B-it",
           "gemma4-e4b": "gemma-4-E4B-it", "lfm2-8b": "LFM2.5-8B-A1B",
-          "qwen35-35b": "Qwen3.5-35B-A3B", "gemma4-26b": "gemma-4-26B-A4B-it"}
+          "qwen35-35b": "Qwen3.5-35B-A3B", "gemma4-26b": "gemma-4-26B-A4B-it",
+          "minicpmv-35b": "MiniCPM-V-4.7-35B-A3B"}
 
 
 def model_dir(name) -> Path:
@@ -43,6 +45,8 @@ def load_spec(path):
         from .lfm2 import Spec
     elif t in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"):
         from .qwen35 import Spec
+    elif t == "minicpmv4_7":            # (qwen35's Spec with the vision side)
+        from .minicpmv import Spec
     elif t in ("gemma4", "gemma4_text"):
         from .gemma4 import Spec
     else:
@@ -50,5 +54,5 @@ def load_spec(path):
         if t in MODEL_TYPES:
             return spec_from_hf(path)
         raise ValueError(f"{path}: model type {t!r} is not supported (qwen3, lfm2, qwen3_5 and "
-                         f"their MoE variants, gemma4, {', '.join(MODEL_TYPES)})")
+                         f"their MoE variants, gemma4, minicpmv4_7, {', '.join(MODEL_TYPES)})")
     return Spec.from_hf(path)

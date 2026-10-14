@@ -18,10 +18,16 @@ rows, expert-major or not, wall and device seconds, the expert server's counts o
 host's time on its requests and idle parts (--trace: each call's runs and the server's timeline
 too). On a tree whose streamed.engine has no em_rows (production's) it runs without --em-rows.
 Exit 1 when --check finds another token.
+
+Images (a model with a vision side: MiniCPM-V, docs/minicpmv.md): --image N:PATH attaches PATH
+to turn N (1-based; repeated), --max-slices bounds an image's slices; each turn reports its
+images and their crops' wall seconds through the card's tower (vision_s), and the JSON keeps
+each image's sha256 (the reference's must be the same bytes).
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pickle
 import sys
@@ -91,7 +97,7 @@ def _calls(eng, calls: list, trace: list | None = None) -> None:
                 return st
             b.start, b.wait = started, waited
 
-    def prefill_layers(tokens, logits: bool = True):
+    def prefill_layers(tokens, logits: bool = True, **kw):     # (kw: vis, an image's rows)
         c0 = {k: getattr(srv, k, 0) for k in CALL_COUNTS}
         k, t = len(eng.stats), time.perf_counter()
         srv.events = []                         # (the server's timeline: each poll that did work)
@@ -99,7 +105,7 @@ def _calls(eng, calls: list, trace: list | None = None) -> None:
             runs.clear()
             t0[0] = t
         try:
-            return base(tokens, logits)
+            return base(tokens, logits, **kw)
         finally:
             dt = time.perf_counter() - t
             cyc = sum((x or {}).get("cycles") or 0 for x in eng.stats[k:])
@@ -125,7 +131,8 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
         turns=TURNS, max_new: int = 16, cap: int = 2048, pool: str | None = None,
         experts: int = 0, layer_major: int | None = None, sample: bool = False,
         seed: int = 0, create: bool = False, tok=None, em_rows: int | None = None,
-        trace: list | None = None, em_pass: int | None = None) -> dict:
+        trace: list | None = None, em_pass: int | None = None, images=(),
+        max_slices: int | None = None, vision_staged: bool | None = None) -> dict:
     from opentpu.host import chat as C
     from opentpu.host import streamed as ST
     from opentpu.isasim import board_config
@@ -146,6 +153,7 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
     eng = ST.engine(path, cfg or board_config(), be, cap, pool or ST.DEFAULT, experts=experts,
                     wformat=wformat, head_format=head, formats=formats, layer_major=layer_major,
                     create=create, snapshots=C.SNAPSHOTS,     # (otpu-chat's: its turns roll back)
+                    vision_staged=vision_staged,              # (MiniCPM-V: None, the Spec's)
                     **({} if em_rows is None else {"em_rows": em_rows}),    # (13.16)
                     **({} if em_pass is None else {"em_pass": em_pass}))    # (13.18)
     load_s = time.time() - t
@@ -157,13 +165,20 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
                      sp["repetition_penalty"], getattr(spec, "softcap", None))
     khz = (getattr(eng.backend, "info", None) or {}).get("core_khz")
     chat = C.Chat(eng, tok, False, pick, max_new, clock_mhz=khz / 1e3 if khz else 0.0)
+    chat.max_slices = max_slices
     out = dict(model=path.name, backend=backend, cfg=cfg_file, sample=sample, seed=seed,
                weights=C.weights_label(eng.image, wformat),
                experts=ST.describe(eng, eng.pool_path), layer_major=eng.layer_major,
                expert_major=eng.expert_major, em_rows=getattr(eng, "em_rows", 0),
                em_pass=getattr(eng, "em_pass", None),
-               on_card=chat.on_card, load_s=round(load_s, 1), turns=[])
-    for text in turns:
+               on_card=chat.on_card, load_s=round(load_s, 1), max_slices=max_slices,
+               vision_staged=getattr(getattr(eng.image, "vision", None), "resident", True) is False,
+               images=[dict(turn=i, path=str(f), sha256=hashlib.sha256(
+                   Path(f).read_bytes()).hexdigest()) for i, f in images], turns=[])
+    for k, text in enumerate(turns, 1):
+        for i, f in images:
+            if i == k:
+                chat.attach(str(f))
         n0, c0 = len(chat.fed), len(calls)
         reply, tr = chat.ask(text)
         r = lambda x, k=3: None if x is None else round(x, k)      # noqa: E731
@@ -177,7 +192,8 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
             decode_tok_s=r(tr.decode_tok_s, 2), decode_dev_tok_s=r(tr.decode_dev_tok_s, 2),
             hits=tr.expert_hits, misses=tr.expert_misses,
             hit_rate=r(tr.expert_hit_rate, 4), mb_per_token=r(tr.streamed_mb_per_token, 2),
-            prefill_misses=tr.prefill_misses, calls=calls[c0:], line=tr.line()))
+            prefill_misses=tr.prefill_misses, images=tr.images, vision_s=r(tr.vision_s),
+            calls=calls[c0:], line=tr.line()))
     out["host_mem"] = ST.host_mem()
     return out
 
@@ -191,6 +207,9 @@ def check(got: dict, ref: dict) -> list:
                                  if x != y), min(len(a["tokens"]), len(b["tokens"])))))
     if len(got["turns"]) != len(ref["turns"]):
         bad.append((min(len(got["turns"]), len(ref["turns"])), None))
+    if [x["sha256"] for x in got.get("images", [])] != \
+            [x["sha256"] for x in ref.get("images", [])]:
+        bad.append((None, "images"))
     return bad
 
 
@@ -217,15 +236,33 @@ def main(argv=None) -> int:
                     help="expert-major's entries a pass (default: the configuration's, "
                          "moe.em_pass_rows)")
     ap.add_argument("--trace", help="each turn's calls' runs and the server's timeline, JSON")
+    ap.add_argument("--image", action="append", default=[], metavar="N:PATH",
+                    help="an image for turn N (1-based; repeated): a model with a vision side")
+    ap.add_argument("--max-slices", type=int, help="an image's slices at most (default the "
+                                                   "processor's)")
+    vis = ap.add_mutually_exclusive_group()
+    vis.add_argument("--vision-staged", action="store_true",
+                     help="MiniCPM-V's tower weights staged through the expert slots "
+                          "(minicpmv.Spec.vision_staged, the default; the pool grows by their "
+                          "entries)")
+    vis.add_argument("--vision-resident", action="store_true",
+                     help="MiniCPM-V's tower weights resident in the image")
     ap.add_argument("--sample", action="store_true", help="the model's sampling defaults")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--check", help="a reference run's JSON: its tokens, turn by turn")
     ap.add_argument("--out", help="this run's JSON")
     a = ap.parse_args(argv)
     tr = [] if a.trace else None
+    images = []
+    for x in a.image:
+        n, _, f = x.partition(":")
+        if not n.isdigit() or not Path(f).is_file():
+            ap.error(f"--image {x}: N:PATH, PATH a file")
+        images.append((int(n), Path(f)))
     r = run(a.model, a.backend, a.cfg, a.dev, a.turn or TURNS, a.max_new, a.cap, a.pool,
             a.experts, a.layer_major, a.sample, a.seed, a.pool_create, em_rows=a.em_rows,
-            trace=tr, em_pass=a.em_pass)
+            trace=tr, em_pass=a.em_pass, images=images, max_slices=a.max_slices,
+            vision_staged=True if a.vision_staged else False if a.vision_resident else None)
     for i, t in enumerate(r["turns"]):
         print(f"turn {i + 1}: {t['reply']!r}\n  {t['line']}", flush=True)
         for c in t["calls"]:
@@ -245,7 +282,8 @@ def main(argv=None) -> int:
         bad = check(r, ref)
         r["check"] = dict(ref=a.check, ok=not bad, differ=bad)
         print(f"[{'FAIL' if bad else 'PASS'}] {r['model']} against {a.check}: " +
-              (", ".join(f"turn {i + 1} from token {j}" for i, j in bad) if bad else
+              (", ".join("other images" if i is None else f"turn {i + 1} from token {j}"
+                         for i, j in bad) if bad else
                f"{len(r['turns'])} turns' tokens the same"), flush=True)
         rc = 1 if bad else 0
     if a.out:

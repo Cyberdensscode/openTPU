@@ -39,10 +39,13 @@ IDLE_PARTS = ("v1", "ra", "halt", "v2")      # ExpertServer's idle parts (13.12)
 # per-kind choices (docs/mx_mxu.md 3.6, docs/offload.md 14.2): LFM2.5-8B-A1B nvfp4, experts
 # included, with an int8 head; Qwen3.5-35B-A3B nvfp4 layers (attention, DeltaNet, the shared
 # expert), fp4 experts and an int8 head; Gemma 4 26B-A4B int8 layers, nvfp4 experts (the user's
-# choice for off-distribution text, over the rule's fp4) and an fp4 head (11.5)
+# choice for off-distribution text, over the rule's fp4) and an fp4 head (11.5); MiniCPM-V 4.7
+# (Qwen3.5-35B-A3B's backbone) the 35B's with DeltaNet in layers 0-19 and the shared expert int8:
+# the most expert slots (35 a layer staged) within +4.00% dKL (+3.68%, docs/minicpmv.md 5.1)
 FORMATS = {"lfm2": ("nvfp4", "int8", None),
            "qwen35": ("fp4", "int8", "attn=nvfp4,delta=nvfp4,mlp=nvfp4"),
-           "gemma4": ("int8", "fp4", "experts=nvfp4")}
+           "gemma4": ("int8", "fp4", "experts=nvfp4"),
+           "minicpmv": ("fp4", "int8", "delta@0-19=int8,attn=nvfp4,delta=nvfp4,mlp=int8")}
 # each family's least new prompt rows a call for expert-major (docs/offload.md 13.16): below
 # them the layer-major prompt (pooled, a request a run) is as fast on the card or faster. A
 # short call has few mixer runs to hide its needs behind: they land mostly while its expert
@@ -52,7 +55,7 @@ FORMATS = {"lfm2": ("nvfp4", "int8", None),
 # 31 -0.36 s). Session emdef2's crossover, expert-major calls against layer-major: the 35B's
 # +0.27 s at 27 rows, -0.21 s at 45 (even at about 37); the 26B's at 21 rows over four pairs
 # (emdef2, emdef3) -0.086 s, its device time a gain in each
-EM_ROWS = {"qwen35": 44, "gemma4": 20}
+EM_ROWS = {"qwen35": 44, "gemma4": 20, "minicpmv": 44}     # (MiniCPM-V: the 35B's)
 
 
 class PoolError(ValueError):
@@ -66,7 +69,10 @@ def streams(spec) -> bool:
 
 
 def _family(spec) -> str:
-    return type(spec).__module__.rsplit(".", 1)[-1]
+    """A Spec's family: its module's name, or a subclass's first base's in FORMATS (MiniCPM-V's
+    Spec, minicpmv.py, has its own)."""
+    names = [c.__module__.rsplit(".", 1)[-1] for c in type(spec).__mro__]
+    return next((n for n in names if n in FORMATS), names[0])
 
 
 def defaults(spec) -> tuple:
@@ -141,7 +147,7 @@ def check_pool(pool, image, W, wformat: str = "fp4", formats: str | None = None)
         raise PoolError(f"no expert pool at {pool}: {_pack_hint(model, pool, wformat, formats)}")
     L = image.offload
     n = L.layers * L.E
-    if path.stat().st_size != n * L.slot_bytes:
+    if path.stat().st_size != MO.pool_entries(path, n) * L.slot_bytes:
         raise PoolError(f"{pool} is {path.stat().st_size} bytes, not this image's pool ({n} "
                         f"experts of {L.slot_bytes} bytes, {image.fmt.wformat}): another model "
                         f"or format (pack_pool.py MODEL {pool} info)")
@@ -150,7 +156,7 @@ def check_pool(pool, image, W, wformat: str = "fp4", formats: str | None = None)
     except ValueError as e:
         raise PoolError(str(e)) from None
     done = Path(str(path) + ".packed")
-    have = n if not done.exists() else int(sum(1 for b in done.read_bytes() if b))
+    have = n if not done.exists() else int(sum(1 for b in done.read_bytes()[:n] if b))
     if have < n and not any(".experts." in k for k in W.keys()):
         raise PoolError(f"{pool} holds {have} of {n} experts and {model} has none to pack the "
                         f"rest (a checkpoint without its experts): fill it from the whole "
@@ -166,7 +172,8 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
            layer_ahead=None, expert_major: bool | None = None, em_rows: int | None = None,
            em_pass: int | None = None, ahead_part: int | None = None,
            idle_parts: str = "v2", willneed: bool = True, pool_map: bool = True,
-           release_weights: bool = True, create: bool = False, W=None, **kw):
+           release_weights: bool = True, create: bool = False, W=None,
+           vision_staged: bool | None = None, vision_warm: bool = True, **kw):
     """The Engine of the MoE checkpoint at `model` on `backend` ("isa", or a backend factory
     as Engine takes: the card's BoardBackend) with configuration `cfg` (the card's 4 GiB), its
     experts streamed from `pool` (a path; DEFAULT: the checkpoint's, default_pool; None: packed
@@ -189,7 +196,10 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
     idle_parts: ExpertServer's read ahead and halt-aware parts (IDLE_PARTS); willneed: a
     request's disk reads queued at once (PoolFile.willneed); pool_map, release_weights:
     Engine's. create: a missing pool is made and each expert packed on its first use (else
-    check_pool). W: the weights (default LazyWeights of `model`). kw: Engine's own."""
+    check_pool). W: the weights (default LazyWeights of `model`). vision_staged: MiniCPM-V's
+    Spec.vision_staged (None: the Spec's); vision_warm: its tower programs' wait entries
+    computed ahead in a background process (opentpu/host/vision_warm.py; the engine's
+    `vision_warm`, the process or None). kw: Engine's own."""
     from opentpu.llm import load_spec
     from opentpu.llm.qwen3 import Engine, LazyWeights
     if idle_parts not in IDLE_PARTS:
@@ -203,6 +213,8 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
         spec = replace(spec, embed=embed)
     if hints is not None:                       # (default: the Spec's)
         spec = replace(spec, moe=replace(spec.moe, hint=hints))
+    if vision_staged is not None:               # (MiniCPM-V: its tower through the slots)
+        spec = replace(spec, vision_staged=vision_staged)
     W = LazyWeights(model) if W is None else W
     ekw = {} if embed_host is None else {"embed_host": embed_host}   # (default: the image's)
     img = probe(spec, cfg, cap, wformat=wformat, head_format=head_format, lookup=True, **ekw)
@@ -228,6 +240,8 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
                  resident=True, experts=experts, pool_file=pool, backend=backend,
                  release_weights=release_weights, pool_map=pool_map, **ekw, **kw)
     eng.pool_path = pool
+    if hasattr(eng.image, "check_room"):        # (MiniCPM-V's staged vision: at the engine's
+        eng.image.check_room()                  # slots, not the probe's k a layer)
     if em_pass:                                 # (the expert runs' passes: 13.18)
         eng.em_pass = em_pass
     if eng.expert_major and em_rows:            # (a short call layer-major: 13.16)
@@ -246,6 +260,9 @@ def engine(model, cfg, backend="isa", cap: int = 4096, pool=None, experts: int =
     pf = getattr(srv, "pool_file", None)
     if willneed and pf is not None:             # a request's misses read from the disk at once
         srv.ahead = pf.willneed
+    if vision_warm:                             # (MiniCPM-V on a WAITC card: ~23 s a new crop
+        from opentpu.host import vision_warm as VW      # size's first run, docs/minicpmv.md 6)
+        eng.vision_warm = VW.start(eng)
     return eng
 
 
@@ -263,12 +280,12 @@ def gate_expert_major(eng, rows: int) -> None:
     runs = {True: (eng._layer_runs, eng._layer_next), False: ({}, {})}
     eng.em_rows, eng.em_last, eng.em_calls = rows, None, [0, 0]
 
-    def prefill_layers(tokens, logits: bool = True):
+    def prefill_layers(tokens, logits: bool = True, **kw):
         on = len(tokens) >= rows
         eng.expert_major = on
         eng._layer_runs, eng._layer_next = runs[on]
         try:
-            return base(tokens, logits)
+            return base(tokens, logits, **kw)
         finally:
             eng.expert_major = True
             eng._layer_runs, eng._layer_next = runs[True]

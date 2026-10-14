@@ -52,6 +52,23 @@ def test_an_accumulator_at_its_dram_stride_drains_slower_than_its_array():
         assert [c for _, c in slow] == (["mm 4x32 . 256x32^T"] if loaded else [])
 
 
+def test_rows_loaded_into_an_accumulators_tile_go_one_ld_a_row():
+    """Back-to-back rows loaded into an ol.empty tile (an MXU accumulator's odd row stride) go
+    one LD a row, each to its tile row."""
+    @ol.jit
+    def k(x, out):
+        t = ol.load(x, out=ol.empty([4, 16]))
+        ol.store(out, t + 1.0)
+
+    xs = np.arange(64, dtype=np.float32).reshape(4, 16)
+    comp, _ = compile_kernel(k, Config(), x=Input(xs), out=Output((4, 16)))
+    lds = [p for p in comp.programs[0] if p.op == I.LD]
+    assert [ld.w[2] for ld in lds] == [16] * 4
+    assert [ld.w[1] - lds[0].w[1] for ld in lds] == [0, 17, 34, 51]
+    r = launch(k, Config(), x=Input(xs), out=Output((4, 16)))
+    assert np.array_equal(r.outputs["out"], xs + 1)
+
+
 def test_nested_loops_affine_addresses():
     @ol.jit
     def k(x, out):

@@ -1378,8 +1378,11 @@ class Builder:
         # tile, attention.Additive): one LD, the pad words between the rows included
         strided = out is not None and len(t.shape) == 2 and t.shape[0] > 1 and \
             t.strides[1] == 1 and out.rs == t.strides[0] > t.shape[1]
-        # rows apart in the source go row by row into out's rows, whatever its row stride
-        by_row = len(t.shape) == 2 and t.strides[0] != t.shape[1]
+        # rows apart in the source go row by row into out's rows, whatever its row stride; so
+        # do a source's back-to-back rows into a tile with an odd row stride (ol.empty's: an
+        # MXU accumulator's results of a streamed row in distinct TMEM banks)
+        by_row = len(t.shape) == 2 and (t.strides[0] != t.shape[1] or (
+            out is not None and not strided and out.rs != t.shape[1]))
         if out is None:
             out = self.alloc(t.shape)
         else:
@@ -1400,7 +1403,7 @@ class Builder:
             return out
         if len(t.shape) != 2 or t.strides[1] != 1:
             raise CompileError("loads must be 1-D or row-major 2-D")
-        if t.strides[0] == t.shape[1]:
+        if not by_row:
             ra, imm = self.addr(t.base)
             self.emit(I.ld(imm, out.base, t.shape[0] * t.shape[1], ra=ra, comment="load"))
         else:

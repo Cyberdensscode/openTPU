@@ -69,6 +69,8 @@ class Request:
     at: int | None = None
     rid: str = ""
     skip_special: bool = True         # the text without the tokenizer's special tokens
+    images: list = field(default_factory=list)  # its images (minicpmv.ImageInput, in order):
+    #                                   their tokens in prompt are their keys (minicpmv.keyed)
     # progress (the worker's)
     out: list = field(default_factory=list)
     text: str = ""
@@ -127,6 +129,7 @@ class Worker:
         self.max_running, self.quantum = max_running, quantum
         self.stateful = self.io.layout.stateful
         self.softcap = getattr(eng.spec, "softcap", None)
+        self.vision = None                # minicpmv.Vision, at the first image
         self.waiting: list[Request] = []
         self.running: list[Request] = []
         self.cv = threading.Condition()
@@ -170,6 +173,10 @@ class Worker:
         if len(r.prompt) >= self.eng.cap:
             raise ValueError(f"the prompt's {len(r.prompt)} tokens leave no room in the "
                              f"context of {self.eng.cap}")
+        if r.images and getattr(getattr(self.eng, "image", None), "vision", None) is None:
+            raise ValueError("this model takes no images")
+        if sum(1 for t in r.prompt if t < 0) != sum(im.tokens for im in r.images):
+            raise ValueError("token ids are >= 0 (an image's tokens: its keys, minicpmv.keyed)")
         r.rid = r.rid or f"r{next(self._ids)}"
         r.stop_ids = frozenset(r.stop_ids) or frozenset(self.eng.spec.eos)
         if len(r.stop_ids) > G.N_STOP:
@@ -336,8 +343,32 @@ class Worker:
         self.dev = r.fed                        # (the same list: it grows as r runs)
         self.dirty = True
         self.owner = r
+        self._rope(r)
         if self.eng.pos != len(r.fed):
             raise RuntimeError(f"the device is at {self.eng.pos}, the context has {len(r.fed)}")
+
+    # ---- images (MiniCPM-V)
+    def _real(self, r: Request, keys) -> list:
+        """The token ids of r's keys (its images' tokens: the image token)."""
+        if not r.images:
+            return keys
+        from ..llm import minicpmv as MV
+        return MV.unkeyed(keys, self.eng.spec.vision.image_token)
+
+    def _rope(self, r: Request) -> None:
+        """The RoPE table's rows for r's context: its images' M-RoPE positions (and s + delta
+        past its prompt, the decode's), or the table's own rows (a text-only one, after an
+        image's). Only the rows that differ are written."""
+        if not r.images and self.vision is None:
+            return
+        if self.vision is None:
+            from ..llm import minicpmv as MV
+            self.vision = MV.Vision(self.eng)
+        if r.images:
+            self.vision.positions(self._real(r, r.prompt),
+                                  [s for im in r.images for s in im.sizes])
+        else:
+            self.vision.pristine()
 
     # ---- prefill and decode
     def _sampler(self, r: Request):
@@ -358,8 +389,10 @@ class Worker:
         last token, which becomes r.next: the decode loop feeds it and picks the first token
         on the device (no logits to the host); else the host picks it from the logits."""
         t0 = time.perf_counter()
-        ids = r.prompt
+        ids = r.prompt                          # (its key: with images, their keys)
+        real = self._real(r, ids)
         n = len(r.fed)
+        vis = self.vision.prompt(real, r.images, n) if r.images else None
         last = len(ids) - 1 if self._card_picks(r) else len(ids)
         at = r.at if self.stateful and r.at is not None and n < r.at < last else None
         cut = [at] if at is not None else []
@@ -369,8 +402,12 @@ class Worker:
             if a >= b:
                 continue
             kw = {} if b == len(ids) else {"logits": False}
-            for part, logits in self.eng.prefill_chunks(ids[a:b], **kw):
-                r.fed += part
+            if vis is not None:
+                kw["vis"] = vis[a - n:b - n]
+            i = a
+            for part, logits in self.eng.prefill_chunks(real[a:b], **kw):
+                r.fed += ids[i:i + len(part)]
+                i += len(part)
                 r.prefill_tokens += len(part)
                 self.stats["prefill_tokens"] += len(part)
                 if r.cancelled.is_set():
@@ -387,7 +424,7 @@ class Worker:
             self.stats["prefill_tokens"] += 1
             return
         t = int(np.argmax(logits)) if r.sampling.greedy else \
-            int(self._sampler(r)(logits, r.fed))
+            int(self._sampler(r)(logits, self._real(r, r.fed)))
         self._emit(r, t)
 
     def _emit(self, r: Request, t: int) -> None:
@@ -458,7 +495,7 @@ class Worker:
                 r.fed.append(t)
                 got = eng.generate_card(t, n, stop_ids=sorted(r.stop_ids),
                                         on_token=lambda x: self._emit(r, x), stop=stop,
-                                        sampling=samp, context=list(r.fed),
+                                        sampling=samp, context=list(self._real(r, r.fed)),
                                         rng=pick.rng if samp is not None else None)
                 r.fed += got[:-1]
                 if not got:
@@ -468,10 +505,12 @@ class Worker:
                     r.next = None
                     r.finish = r.finish or "stop"
             else:                               # the host picks each token
+                ctx = list(self._real(r, r.fed))
                 for _ in range(n):
                     r.fed.append(t)
+                    ctx.append(t)
                     lg = eng.step(t)
-                    t = int(np.argmax(lg)) if r.sampling.greedy else int(pick(lg, r.fed))
+                    t = int(np.argmax(lg)) if r.sampling.greedy else int(pick(lg, ctx))
                     self._emit(r, t)
                     if r.finish is not None or len(r.fed) >= eng.cap:
                         break

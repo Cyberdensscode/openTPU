@@ -17,6 +17,11 @@ standard library only, so it runs from the card host's venv).
    second turn at once: the tokens the server held for each (its context from a slot, host RAM
    or disk), the KV store's tiers; then a few second turns again with the cache flushed: the
    same replies (greedy), so the contexts came back bit for bit.
+6. Images (--image PATH, repeated; a model with a vision side, docs/serve.md Images): the first
+   image with a question, greedy; again (the context reused past the image: cached tokens); its
+   next turn (the history reused); each other image with the same question (no context past
+   the other image reused); a text-only question. With --image-ref (tools/qual/chatmoe.py's
+   JSON of the same image, question and slices) the first reply must be its first turn's.
 """
 from __future__ import annotations
 
@@ -258,6 +263,61 @@ def users(cl: Client, n: int, max_tokens: int, checks: int = 3) -> dict:
     return out
 
 
+def _image_part(path: str) -> dict:
+    """An image_url part: the file as a data: URL."""
+    import base64
+    import mimetypes
+    with open(path, "rb") as f:
+        data = base64.b64encode(f.read()).decode()
+    return {"type": "image_url", "image_url": {
+        "url": f"data:{mimetypes.guess_type(path)[0] or 'image/png'};base64,{data}"}}
+
+
+def images(cl: Client, paths: list, max_tokens: int, max_slices: int | None = None,
+           question: str = "Describe this image in one sentence.",
+           follow: str = "What colors stand out? One sentence.", ref: dict | None = None) -> dict:
+    """Part 6 (docs/serve.md Images): each request's reply, prompt and cached tokens and TTFT.
+    Passes when the repeat gives the first reply with most of its prompt cached, the next turn
+    has half the first prompt cached or more, every other image's request less (a context is
+    reused past an image only for the same image), and (ref) the first reply is ref's first
+    turn's."""
+    kw = {"max_tokens": max_tokens, "temperature": 0}
+    if max_slices is not None:
+        kw["max_slices"] = max_slices
+
+    def ask(msgs):
+        r = cl.chat_stream(msgs, **kw)
+        u = r["usage"] or {}
+        return {"text": r["text"], "prompt_tokens": u.get("prompt_tokens", 0),
+                "cached": u.get("prompt_tokens_details", {}).get("cached_tokens", 0),
+                "ttft_s": round(r["ttft"], 3) if r["ttft"] else None, "finish": r["finish"]}
+
+    def asked(path):
+        return [{"role": "user", "content": [_image_part(path),
+                                             {"type": "text", "text": question}]}]
+    m1 = asked(paths[0])
+    first = ask(m1)
+    again = ask(m1)
+    turn2 = ask(m1 + [{"role": "assistant", "content": first["text"]},
+                      {"role": "user", "content": follow}])
+    others = [ask(asked(p)) for p in paths[1:]]
+    text = ask(_msgs("Why is the sky blue? One sentence."))
+    n = first["prompt_tokens"]
+    out = {"images": paths, "max_slices": max_slices, "first": first, "again": again,
+           "turn2": turn2, "others": others, "text": text,
+           "again_equal": again["text"] == first["text"],
+           "again_cached": again["cached"] >= n // 2,
+           "turn2_cached": turn2["cached"] >= n // 2,
+           "others_uncached": all(o["cached"] < n // 2 for o in others)}
+    if ref is not None:
+        want = ref["turns"][0]["reply"]
+        out["ref_reply"] = want
+        out["ref_equal"] = first["text"].strip() == want.strip()
+    out["pass"] = all(out[k] for k in ("again_equal", "again_cached", "turn2_cached",
+                                       "others_uncached")) and out.get("ref_equal", True)
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--host", default="127.0.0.1")
@@ -276,6 +336,14 @@ def main(argv=None):
     ap.add_argument("--arrival-interval", type=float, default=1.5)
     ap.add_argument("--user-tokens", type=int, default=64, help="max tokens of a user's reply")
     ap.add_argument("--wait", type=float, default=900, help="seconds to wait for /health")
+    ap.add_argument("--image", action="append", default=[],
+                    help="an image of the images part (repeated: the first is asked about twice "
+                         "and followed up; none: no images part)")
+    ap.add_argument("--image-slices", type=int, help="the images' max_slices (default the "
+                                                     "server's)")
+    ap.add_argument("--image-tokens", type=int, default=16, help="max tokens of an image's reply")
+    ap.add_argument("--image-ref", help="tools/qual/chatmoe.py's JSON of the first image (its "
+                                        "first turn's reply: the first request's)")
     ap.add_argument("--out")
     ap.add_argument("--skip", default="",
                     help="parts to skip: check,throughput,conversation,users,arrivals")
@@ -314,12 +382,19 @@ def main(argv=None):
     if "users" not in skip and a.users:
         rep["users"] = users(cl, a.users, a.user_tokens)
         print("users:", "PASS" if rep["users"]["pass"] else "FAIL", rep["users"], flush=True)
+    if a.image:
+        ref = None
+        if a.image_ref:
+            with open(a.image_ref) as f:
+                ref = json.load(f)
+        rep["images"] = images(cl, a.image, a.image_tokens, a.image_slices, ref=ref)
+        print("images:", "PASS" if rep["images"]["pass"] else "FAIL", rep["images"], flush=True)
     rep["stats"] = cl.get("/v1/stats")[1]
     print("stats:", json.dumps(rep["stats"])[:2000], flush=True)
     if a.out:
         with open(a.out, "w") as f:
             json.dump(rep, f, indent=1)
-    ok = rep.get("check", {}).get("pass", True) and rep.get("users", {}).get("pass", True)
+    ok = all(rep.get(k, {}).get("pass", True) for k in ("check", "users", "images"))
     return 0 if ok else 1
 
 
