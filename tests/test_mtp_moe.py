@@ -20,7 +20,8 @@ SLOTS = 2 * K               # a layer's slots: a 2-row request's union fits (k o
 
 pytest.importorskip("torch")
 
-CFG = board_config(DRAM_BYTES=1 << 25, DSTEP=True, STREAM=True, PAIR=True)
+CFG = board_config(DRAM_BYTES=1 << 26, DSTEP=True, STREAM=True, PAIR=True)   # (an int8 MTP
+#   image with the default MoE tiles' mask tiles and I/O scratch: 32 MiB, docs/tiled_prefill.md 14)
 
 
 def _moe_mtp_weights(W, spec, seed=1):
