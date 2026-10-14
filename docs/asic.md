@@ -61,26 +61,28 @@ NanGate45 with `tools/asic/fakeram.py`'s macros, 2.5 ns asked (the targets' `cor
 ports with 20% of the period outside. Two clock figures: **register to register**
 (`report_clock_min_period`: the core's own), and **with the ports** (the worst slack including the
 paths into and out of the block's ports, whose budget is a guess until the platform around the
-block exists). Power is OpenSTA's vectorless estimate (default activities) at 400 MHz.
+block exists; from CTS on the flow times them latency-neutral, the virtual clock taking the clock
+tree's insertion delay, [asic_timing_loop.md](asic_timing_loop.md) 4; nangate45-small's and the
+card before's figures are against the ideal virtual clock). Power is OpenSTA's vectorless estimate (default activities) at 400 MHz.
 `tools/asic/flow.py report` and `tools/asic/paths.py` make these numbers from a run.
 nangate45-small is the reference point: ORFS `openroad/orfs:latest` (pulled 2026-10-10) at 35%
 utilisation; the same run with a native ORFS of the same date (f395e4b6, OpenROAD
 26Q4-110-g91e5f5ff2f) gives the same within the tools' noise (422 / 341 MHz, 0.79 W, 0 DRC), and
 its reports are in `asic/nangate45/results/small/`. The card is release r2's arch at ACT_ROWS 8
 (`targets/nangate45.toml`) through that native ORFS on hwe-bench, at 45% with the MXU's macros by
-its columns (below); "before" is the previous card point (2026-10-11: the card's arch before r2,
+its columns and the TMEM's by its readers (below); "before" is the previous card point (2026-10-11: the card's arch before r2,
 ACT_ROWS 4 and three TMEM copies, at 35% on the macro placer's floorplan).
 
-| | nangate45-small | card: r2, ACT_ROWS 8 | card before (2026-10-11) |
+| | nangate45-small | card: r2, ACT_ROWS 8, the TMEM by its readers | card before (2026-10-11) |
 |---|---|---|---|
 | stage | routed, final report (signoff extraction) | CTS; global routing (clean at metal4-6's 7%), timed on its parasitics before its repair | CTS; global routing ends congested |
 | die | 2.65 x 2.65 mm = 7.02 mm² | 4.52 x 4.52 mm = 20.4 mm² | 5.53 x 5.53 mm = 30.6 mm² |
-| standard cells | 1.18 mm², 590 K instances (20.8% of the core): 94 K flip-flops 0.43 mm², 373 K gates 0.66 mm² | 4.46 mm², 1.98 M instances (29.0% of the core outside the macros; 1.78 M after synthesis) | 4.36 mm², 2.02 M instances (18.3% of the core; 1.76 M after synthesis) |
+| standard cells | 1.18 mm², 590 K instances (20.8% of the core): 94 K flip-flops 0.43 mm², 373 K gates 0.66 mm² | 4.48 mm², 2.00 M instances (29.1% of the core outside the macros; 1.78 M after synthesis) | 4.36 mm², 2.02 M instances (18.3% of the core; 1.76 M after synthesis) |
 | macros | 27, 233 KiB, 1.31 mm² | 90, 758 KiB, 4.98 mm² | 113, 1126 KiB, 6.62 mm² |
-| register to register | 2.39 ns: **419 MHz** (no violation at 2.5 ns) | 2.94 ns: **340 MHz** on the global route (3.52 ns, 284 MHz, after CTS on the placement's estimate; clock skew 0.74 ns: the TMEM's macros) | 5.60 ns: 178 MHz (clock skew 2.7 ns) |
-| with the ports | 2.95 ns: 339 MHz (one endpoint: `sw_req`) | 4.97 ns: 201 MHz (port B's write data: the boundary register's to fix) | 6.40 ns: 156 MHz |
-| power at 400 MHz | 0.79 W: sequential 0.28, clock 0.20, combinational 0.15, macros 0.16; leakage 21 mW | 4.96 W: combinational 1.73, sequential 1.23, clock 1.22, macros 0.78; leakage 80 mW | 3.34 W: sequential 1.09, clock 0.93, macros 0.87, combinational 0.46; leakage 82 mW |
-| route | 16.2 m of wire, 0 DRC violations, 0 antenna violations | global: 99.2 m, no overflow (26.9% of the tracks); not detail-routed | not routed |
+| register to register | 2.39 ns: **419 MHz** (no violation at 2.5 ns) | 2.59 ns: **386 MHz** on the global route, before its repair (2.69 ns, 372 MHz, after CTS on the placement's estimate; clock skew 0.26 ns; the VPU's grant fanout the worst path) | 5.60 ns: 178 MHz (clock skew 2.7 ns) |
+| with the ports | 2.95 ns: 339 MHz (one endpoint: `sw_req`) | 2.75 ns: 364 MHz, the ports latency-neutral (port B's write data -0.25 ns; 4.69 ns against the ideal virtual clock) | 6.40 ns: 156 MHz |
+| power at 400 MHz | 0.79 W: sequential 0.28, clock 0.20, combinational 0.15, macros 0.16; leakage 21 mW | 4.87 W: combinational 1.75, sequential 1.24, clock 1.10, macros 0.78; leakage 81 mW | 3.34 W: sequential 1.09, clock 0.93, macros 0.87, combinational 0.46; leakage 82 mW |
+| route | 16.2 m of wire, 0 DRC violations, 0 antenna violations | global: 112.2 m, no overflow (30.9% of the tracks); not detail-routed | not routed |
 
 ### The card: release r2
 
@@ -153,7 +155,7 @@ before the timing repair the macros' clock pins sit at 1.87-2.08 ns and the regi
 1.91-2.13 ns (`-obstruction_aware` builds the same tree; `-macro_clustering_size 1` leaves the
 macros without a clock).
 
-### The card's clock and paths (ACT_ROWS 8, after CTS)
+### The card's clock and paths (ACT_ROWS 8, the TMEM in the corner, after CTS)
 
 The macros' output drive matters here. With fakeram45's scalar clock-to-q (and a 500 fF limit) a
 macro's read data reached its logic through millimetres of unbuffered wire and the resizer saw no
@@ -184,10 +186,10 @@ Everything in the MXU's block now meets 2.5 ns (the array, its fp lanes, the ACT
 bottom-right corner, away from the units that read it (VPU, quantizer, DMA, MXU drain), and the
 macro clock tree reaches them about a nanosecond after the registers; without that, the
 register-to-register period would be about 2.6 ns. The ports' worst is port B's write data
-straight from the DMA's state across the die, which the boundary register (the SW port's has
-one since PR #7) removes.
+straight from the DMA's state across the die, which a boundary register removes (the SW port
+has one on every target; port B's is in work).
 
-### The card's global route (ACT_ROWS 8)
+### The card's global route (ACT_ROWS 8, the TMEM in the corner)
 
 ORFS's global routing on the CTS result, with nangate45's layer adjustments (`fastroute.tcl`:
 metal2-3 50%, metal4-10 25%, set at the floorplan and kept in the database), ends congested
@@ -219,13 +221,13 @@ their maximum slew (56 and 6 after CTS).
 On the column floorplan the macro placer puts the TMEM's 16 macros in a 4 x 4 block in the core's
 bottom-right corner, 3-5 mm from the units that read it, and the clock tree reaches that corner's
 last column late (2.68-2.78 ns against 1.80-2.17 for the other TMEM macros and 1.89 for the
-registers' median). `mxu_macros.tcl` with `TMEM_GAP_UM` (off unless set) places them as a block
-of their own, that far right of the MXU's: two stacks of abutted macros, banks 0-3 on the left
-(pins to the right) and 4-7 on the right (pins to the left), facing a strip (`TMEM_STRIP_UM`, 200
-um) for the banks' muxes and the slice's arbiter, centred on the core's height; global placement
-puts the readers around it, and the macro placer's fence starts right of it. On a8's netlist with
-`TMEM_GAP_UM` 100 (the block at x 1.70-2.47 mm, y 1.10-3.42 mm), after CTS (placement parasitics
-for both):
+registers' median). `mxu_macros.tcl` with `TMEM_GAP_UM` (the card point's `tmem_gap`, 100)
+places them as a block of their own, that far right of the MXU's: two stacks of abutted macros,
+banks 0-3 on the left (pins to the right) and 4-7 on the right (pins to the left), facing a strip
+(`TMEM_STRIP_UM`, 200 um) for the banks' muxes and the slice's arbiter, centred on the core's
+height; global placement puts the readers around it, and the macro placer's fence starts right
+of it. On the same netlist, the TMEM block at x 1.70-2.47 mm, y 1.10-3.42 mm, after CTS
+(placement parasitics for both):
 
 | | TMEM in the corner (the macro placer) | TMEM by its readers |
 |---|---|---|
@@ -393,16 +395,19 @@ clock on the operator) pays once those are fixed, from about 540 MHz.
 - **Grant fanout.** The DMA's stream state -> the arbitration -> the quantizer's and the VPU's
   enables (39 levels), a unit's request -> the banked arbiter -> another unit's grant -> its
   enables (43-45): the stall-by-enable design puts a high-fanout enable behind the arbitration. A
-  registered grant (a cycle from request to grant) or per-unit clock gating is the lever.
+  registered grant (a cycle from request to grant) or per-unit clock gating is the lever. On the
+  card (the TMEM by its readers) the worst register-to-register path is the VPU's stream grant
+  (`ss_act`, `ss_gnt`): one flip-flop (its `max_fanout` is Vivado's, synthesis here ignores it)
+  whose Q and QN drive 2467 gates through 190 buffers, into 2692 registers. The worst of them is
+  the SE tail's VOP-mode select (`cm` -> `uc`: each lane's `u_m` operands `ma` / `mb`, 512 mux
+  selects) ahead of the fmul's significand product: 10 buffers across the VPU (0.50 ns), the mux,
+  the product's carry-save tree into its s1 register (17 levels), -0.09 ns on the global route
+  (504 endpoints; +0.17 ns with the TMEM in the corner, its registers then less spread). A
+  registered copy of the mode in each lane, from `ss_act`'s next value (the same cycle), gives
+  every copy one lane's 64 selects.
 - The macros are CACTI-fitted estimates (`tools/asic/fakeram.py`), not a compiler's; a real PDK's
   1R1W macros (IHP SG13G2, commercial) replace them through `rtl/tech/asic`'s leaves.
 - Power is vectorless; a VCD from the Verilator RTL (a decode token) would give real activities.
-- **The card's TMEM placement.** The macro placer puts the TMEM's 16 macros in a corner of the
-  card's core, and its reads into the VPU, the quantizer, the DMA and the MXU are the card's
-  register-to-register limit (-1.02 ns at 2.5 after CTS, -0.44 ns on the global route, with the
-  macros' clock 0.7-1 ns late). Placed by its readers (`TMEM_GAP_UM`: "The card's TMEM by its
-  readers") every read meets 2.5 ns and the global route's period is 2.59 ns, for 13% more wire;
-  the card point does not take it yet.
 - **The weight chunk's layout** (a data-movement fix, not made). The MXU's FIFO holds the D-byte
   chunk as DRAM brings it, and array position i takes byte i in int8 but nibble i of the chunk's
   low half and nibble i of its high half in the 4-bit formats (`otpu_mxu` `wsel` / `dec4`: int4,

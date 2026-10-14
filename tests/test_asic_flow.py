@@ -75,7 +75,26 @@ def test_card_places_the_mxu_macros_by_column():
     card = flow.config_mk("card", [])
     m = re.search(r"^export MACRO_PLACEMENT_TCL = (\S+)$", card, re.M)
     assert m and Path(m.group(1)).name == "mxu_macros.tcl" and Path(m.group(1)).exists()
-    assert "MACRO_PLACEMENT_TCL" not in flow.config_mk("small", [])
+    small = flow.config_mk("small", [])
+    assert "MACRO_PLACEMENT_TCL" not in small
+    # the TMEM's macros by their readers (mxu_macros.tcl reads TMEM_GAP_UM), global routing's
+    # metal4 and up at 7%: the card's only
+    assert re.search(r"^export TMEM_GAP_UM = 100$", card, re.M)
+    assert "TMEM_GAP_UM" in Path(m.group(1)).read_text()
+    m = re.search(r"^export FASTROUTE_TCL = (\S+)$", card, re.M)
+    assert m and Path(m.group(1)).exists() and "metal4-" in Path(m.group(1)).read_text()
+    assert "TMEM_GAP_UM" not in small and "FASTROUTE_TCL" not in small
+
+
+def test_ports_are_latency_neutral_after_cts():
+    """Every point's ports take the core clock's insertion delay on vclk after CTS (a source
+    latency, which holds whatever a later stage propagates); the SDC itself keeps both ideal."""
+    for p in ("small", "card"):
+        m = re.search(r"^export POST_CTS_TCL = (\S+)$", flow.config_mk(p, []), re.M)
+        assert m and Path(m.group(1)).name == "io_latency.tcl"
+        tcl = Path(m.group(1)).read_text()
+        assert "set_clock_latency -source" in tcl and "[get_clocks vclk]" in tcl
+        assert "set_clock_latency" not in flow.sdc(p)
 
 
 def test_sdc_asks_the_targets_clock():

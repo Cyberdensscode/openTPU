@@ -171,6 +171,13 @@ per-unit clock gating instead of the stall enable on thousands of flip-flops.
 - **The virtual I/O clock.** A propagated core clock with an ideal virtual clock for the ports
   charges every port path the clock tree's insertion delay (~0.95 ns here). Report both views (the
   SDC as is, and the virtual clock given the tree's latency) and compare iterations in the same view.
+  The flow now gives the virtual clock that latency after CTS (`asic/nangate45/io_latency.tcl`,
+  ORFS `POST_CTS_TCL`: a source latency equal to the registers' median clock arrival, kept by the
+  later stages' SDC), so the ports' slacks are latency-neutral from CTS on and the 20% budget
+  before it is as it was. On r2's card (1.95 ns of insertion delay, global-route parasitics) the
+  ports' worst went from -2.19 ns (port B's write data) as the SDC was to -0.25 ns, the outputs'
+  TNS from -2180 to -31 ns, and no input path fails either way; with the TMEM in the corner port
+  B's write data went from -2.47 to -0.52 ns and its ready input (`b_rdy`) from +0.13 to -0.16.
 - **The regression must simulate the change.** openTPU's tests simulate `tb_top` / `otpu_top`, not
   `otpu_asic_top`; a change only in the ASIC top is never tested. Put it behind a parameter of the
   shared module and turn it on through the target.
