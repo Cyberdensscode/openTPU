@@ -5025,3 +5025,42 @@ simulator serves inside its WAITW, so no ISA run could show it. Now run_generate
 serves until the card halts (tests/test_host_runs.py test_a_generate_run_is_served_until_it_halts:
 a fake card that posts its last request 20 ms after its last token; the previous code stops at
 the token and waits).
+
+**mtp1c passed** (2026-10-14, production deploy_hostr21_b10245f5 as arm A, so A has S and B - A
+is MTP alone; ABBA x 2 after a warm-up of each arm; every run's tokens les's five-turn ISA
+reference, the first two production's). Decode, token-weighted over the turns: A 196.8, B 174.7
+ms a token, 1.127x (turns 1.129 / 1.177 / 1.041 / 1.143 / 1.161x), acceptance 0.75 / 0.72 / 0.55 /
+0.82 / 0.82; decode MB a token +15 to +44 (hits -0.05 to -0.09). TTFT +0.02 / +0.37 / +0.65 /
++0.65 / +0.88 s, the means' parts (turns 2-5):
+
+| part of B - A                               | turn 2 | turn 3 | turn 4 | turn 5 |
+|---------------------------------------------|--------|--------|--------|--------|
+| the prompt's last call (5 rows against 4)   | +0.16  | +0.19  | +0.20  | +0.16  |
+| after the calls (the first draft's run)     | +0.16  | +0.13  | +0.13  | +0.14  |
+| the first call (layer-major / expert-major) | +0.05  | +0.32  | +0.32  | +0.59  |
+
+- The last call's extra row: Chat took MTP's snapshot a token before the reply's start and rolled
+  back to k - 1 (the MTP layer's row at k - 1 takes the token at k, which the next turn changes),
+  so each turn fed that position again through the whole model, and 5 rows at R = 2 are 3 runs a
+  layer (122 runs against 81). Now (F2) the snapshot is plain's: the part before it keeps its last
+  row's residual (Engine.prefill_layers(keep=True)), the snapshot holds it, and after a rollback
+  to it the next prefill appends the MTP layer's row before it from that row and the new token
+  (one 1-row K / V run, Engine.prefill_layers(fix=...)), bit for bit a re-run's
+  (tests/test_mtp_moe.py test_moe_mtp_rollback_to_a_held_snapshot_is_a_rerun).
+- The first draft: after the head, a 1-row MTP run of its own (compiled at its position, its MoE
+  request served) before a0 came back. Now (F1b) the prefill returns a0 at once and the loop's run
+  starts with the D1 of the last prompt row's bucket (the loop's own program, its request served
+  in the run), bit for bit the former draft (test_moe_mtp_loop_drafts_the_prompts_last_row_first).
+- The first call: the layer-major one (turn 2) costs only its K / V runs (7: +0.03 s device). The
+  expert-major ones (turns 3-5) streamed the same needs and bytes in both arms (needs queued 4442
+  / 6602 / 4394, 7.6 / 11.3 / 7.5 GB) and still took +0.20 to +0.40 s more device time, their idle
+  parts +0.16 to +0.29 s more; the MTP image's 38 slots a layer against 41 do not explain it
+  (server_replay of the 35B's record at 38 and 41: +6 needs a prompt, decode +7 MB a token). Open:
+  a --trace of an expert-major turn in each arm on the card.
+
+Turn 3's 0.55 is the reply's content and the draft head, not the loop: on the fp32 reference
+(Hugging Face's float32 35B along the card's tokens, the base's own mtp.* layer, mtp_transplant.py
+accept, replayed as the k = 1 loop) the head the card has (fp4, the 32K lowest ids) accepts 12 of
+20 there (the card 11 of 20) and 56 of 75 over the five turns (the card 55 of 76), the full fp32
+head 13 of 18; 13% of turn 3's targets (a markdown list with an en dash, numbers and French names)
+are outside the 32K ids.
