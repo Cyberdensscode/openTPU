@@ -269,21 +269,31 @@ def test_lfu_policy_is_bit_exact(tiny):
 def test_pool_file_is_the_same_pool(tiny, tmp_path):
     """The pool packed once into a file (the page cache or the SSD tier) serves the same bytes
     (read back with pread as they are packed); a second engine reuses the file, its warm
-    thread reading the packed experts into the page cache."""
+    thread reading the packed experts into the page cache. On a loaded host the engine's
+    moe.rewarm (882b008f) can stop the open's read before its end and read again only what is
+    out of the page cache (the file just written: nothing, or a few): the pool is wholly
+    resident either way."""
     _, W, spec = tiny
     toks = [int(t) for t in np.random.default_rng(4).integers(0, 1000, 3)]
     full = _engine(spec, W, experts=K)
     ref = np.array([full.step(t) for t in toks])
     f = tmp_path / "pool.bin"
+    first = None
     for i in range(2):
         eng = Engine(spec, W, cap=256, cfg=device_config(spec, 256, S=1, experts=K),
                      experts=K, pool_file=f)
         got = np.array([eng.step(t) for t in toks])
         assert np.array_equal(got.view(np.uint32), ref.view(np.uint32))
-        warm = eng.server.pool_warm             # (the same tokens: no expert packed second)
+        warm = eng.server.pool_warm
         warm.join(timeout=60)
         packed = int(np.fromfile(str(f) + ".packed", np.uint8).sum())
-        assert packed > 0 and warm.bytes == (packed if i else 0) * eng.image.offload.slot_bytes
+        first = first or packed                 # (the same tokens: no expert packed second)
+        assert packed == first > 0 and warm.error is None
+        slot = eng.image.offload.slot_bytes
+        if i == 0:
+            assert warm.bytes == 0
+        elif warm.bytes != packed * slot:       # (rewarm stopped the open's read)
+            assert warm.bytes == warm.total < packed * slot and warm.resident == 1.0
     assert f.stat().st_size == (len(KINDS) - 1) * E * eng.image.offload.slot_bytes
 
 
