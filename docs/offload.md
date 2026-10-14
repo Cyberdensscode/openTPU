@@ -4828,6 +4828,46 @@ both models, in ABBA order. It splits the two parts by turn:
 - the decode after the long expert-major turn adds the slot order: its hit rate and MB a token
   move, and its time beyond the shared expert's.
 
+**les1's result** (2026-10-13, card, production's bitstream b10245f5; 20 runs, every one token
+for token les's ISA reference; means of four ABBA pairs):
+- S: the 35B's decode -4.09 ms a token (-1.96%). It ships with the next host release.
+- O: the 35B's decode after its long expert-major prompt (turn 4) +2.8 points of hits, -15.1 MB
+  and -9.6 ms a token; but its turn-3 prompt (61 rows expert-major) +0.29 s. The 26B lost: turns
+  2-4 +26.3 / +5.1 / +12.3 MB a token (+8.6 / +2.4 / +6.5 ms). O is not shipped.
+
+**O explained** (`tools/offload/server_replay.py`). The routing does not depend on the server
+(the outputs are bit for bit the same whatever it keeps), so one record of a chat's server
+calls on the ISA simulator replays through any server offline: the load's warm set, each
+prefill's begin and end, its requests and need lines, the decode's requests. les1's five turns
+were recorded for both models (r2's configuration, the MX pools). Replayed through production's
+server and through les's, the replay gives the card's decode hit rates of both arms, every turn
+of both models, within 0.0001 (35B turn 4: 0.6483 and 0.6759; 26B turn 2: 0.6712 and 0.6425),
+and the card's prompt misses and needs queued. O's two parts and three variants
+(decode hit rate; MB a token in turns of 32 tokens):
+
+| server | 35B t3 | 35B t4 | 35B t5 | 26B t1 | 26B t2 | 26B t3 | 26B t4 |
+|:--|:--|:--|:--|:--|:--|:--|:--|
+| production (A) | 0.616, 210.2 | 0.648, 192.7 | 0.676, 177.3 | 0.604 | 0.671, 300.6 | 0.616, 351.6 | 0.640, 328.9 |
+| count: a need line counts a use | 0.622, 207.3 | 0.675, 177.9 | 0.673, 179.1 | 0.613 | 0.643, 326.9 | 0.610, 356.7 | 0.627, 341.2 |
+| order: the layer switch's reorder | 0.616, 210.2 | 0.649, 192.4 | 0.677, 176.9 | 0.604 | 0.671, 300.6 | 0.616, 351.6 | 0.640, 328.9 |
+| O = count + order (les, B) | 0.622, 207.2 | 0.676, 177.6 | 0.674, 178.6 | 0.613 | 0.643, 326.9 | 0.610, 356.7 | 0.627, 341.2 |
+| keep: the prompt's uses only in end_prefill | 0.616, 210.2 | 0.651, 191.4 | 0.676, 177.6 | 0.604 | 0.671, 300.6 | 0.616, 351.6 | 0.640, 328.9 |
+| long: count, calls of >= ~100 rows only | 0.616, 210.2 | 0.676, 177.5 | 0.678, 176.2 | 0.604 | 0.671, 300.6 | 0.616, 351.6 | 0.628, 340.1 |
+
+- All of O's decode effect is its use counting. A need line counts a use of each id and one more
+  of its layer's requests, so the decode's LFU (decayed use) weighs an expert-major prompt as it
+  weighs a layer-major one. The reorder moves the decode by at most 0.1 point and the prompt's
+  needs not at all (the 35B's turn 3: 4442 queued in every variant, as on the card). So its
+  +0.29 s there is not streaming; the card's per-call lines show the same needs with 316 fewer
+  need hits (ids named again while on their way), a timing effect or noise.
+- Counting helps where a long prompt predicts its reply: the 35B's turn 4 summarizes the text it
+  was given. It hurts where the reply follows the previous reply more than the question: the
+  26B's short expert-major turns (its EM_ROWS is 20), with 16 slots a layer for a top-8 router.
+- What each layer keeps at the prompt's end (keep) matters little; the decode's use counts do.
+- Proposal (not built): count need lines for Qwen3.5-MoE only, a family switch beside EM_ROWS,
+  without the reorder. Replayed: the 35B gets O's decode (turn 4 -14.8 MB a token), the 26B and
+  LFM2 nothing. A card A/B would confirm it.
+
 ### 15.5 What we did not take, and the bigger levers
 
 Not taken:
@@ -4888,3 +4928,56 @@ By kind (fp4 32K, matched drafts): chat 0.745 / 0.753, code 0.897 / 0.883, summa
 So MiniCPM-V, which has no mtp.* weights, drafts with the base 35B's MTP layer as well as the
 base does, and one MTP port serves both. The bound is greedy; sampled acceptance (docs/mtp.md:
 about 0.04 lower on the dense models) and the host's per-step costs are not in it.
+
+**The port** (branch les-mtp, on S; docs/mtp.md 12 for the loop's programs):
+- `streamed.engine(mtp=True, mtp_from=None)`, otpu-chat and tools/qual/chatmoe.py `--mtp`
+  (`--mtp-from DIR`): an MTP image of 2 rows, the checkpoint read with its mtp.* tensors, or
+  with another checkpoint's (MiniCPM-V's: the base 35B's); a checkpoint without them is refused.
+- Its pool has one more layer: the MTP layer's 256 experts after the model's (g = 40 E + e),
+  by default pool-mx1-<format>-mtp.bin. `pack_pool.py extend SRC` makes it from the model's
+  own pool, checked by its key, without packing it again: SRC's experts and marks, the MTP
+  layer's unpacked (the run packs each on its first use, or `pack --mtp`, or `recv --mtp`).
+  On btrfs or XFS (the card host's /home) the experts are reflinked: the disk holds only the
+  MTP layer's 438 MB more and production's file is never written. A source with entries past
+  its experts (MiniCPM-V's staged vision pieces) gives its experts only; the pieces go after
+  the MTP layer (41 E + i).
+- The pool's key names the MTP layer's checkpoint when it is another's (`mtp_from`), and so
+  does the image cache's key.
+- The card host's checkpoint has no mtp.* (strip_experts.py drops them):
+  `strip_experts.py BASE DIR --mtp --only mtp. --out mtp.safetensors` (0.1 GiB) beside links
+  to that checkpoint's files makes the MTP image's, production's directory unchanged.
+
+**Bit for bit on the 35B** (ISA simulator, hwe-bench, r2's configuration, the 41-layer pool
+extended from the MX pool, the MTP layer's experts packed on their first use): les1's five chat
+turns through chatmoe --mtp (otpu-chat's Chat: the MTP prefill, layer-major and expert-major,
+the loop on the device, the turns' rollbacks) give plain decode's 135 tokens, every one. The
+drafts were accepted 3 of 4, 13 of 18, 11 of 20, 14 of 17 and 14 of 17 times by turn: 0.72 in
+all (the 32K fp4 head; mtp_transplant's teacher-forced 0.78).
+
+That run found a chat bug: from the second turn on every turn started over (the whole context
+prefilled again: turn 5's 333 tokens against plain's 55), its tokens still exact. The MTP
+prefill's first conv_k - 1 rows (the rows kernel's runs before the layer runs) did not report
+to on_run, so Chat.fed missed three tokens and the next turn found no common part. Fixed
+(MTPDecoder.prefill); test_moe_mtp_chat_turns_roll_back_to_the_reply (three turns on the tiny
+MoE: each rolls back a token before the reply's start; replies equal plain greedy decode's).
+
+**The real programs, co-simulated** (`moe_prefill_cosim.py mtp`: the plain loop's token against
+V and D of mtp.compile_gen, the 35B cut to 4 and 8 layers, the production formats, r2's
+configuration, every expert present; a layer's cost the difference of the prefixes):
+
+| | per 4 layers | 40 layers and the head |
+|:--|--:|--:|
+| plain decode, a token | 9.97 ms | 130.8 ms |
+| V, the verify of 2 rows | 11.64 ms | 147.6 ms |
+| D, the draft | | 5.02 ms |
+
+So the second row costs 0.42 ms a layer (the bound took 0.365), the 248K head on 2 rows +0.05 ms
+(1.0), and the draft 5.02 ms besides its union experts (~0.5 ms) and its own misses (~3.9 ms).
+The MTP image leaves 38 expert slots a layer at the card's 4 GiB (fit_experts; plain 41): the
+2-row buffers, the second DeltaNet state slot, the MTP layer and its draft head. mtp_bound.py
+with these (`--slots 38 --slots-plain 41 --dmix 0.4175 --dhead 0.05 --cdraft 9.42`): 178.4 ->
+145.3 ms a token at a = 0.78 (1.228x; 1.215x at 0.75, about 1.21x at the ISA run's 0.72).
+
+The card check is session mtp1 (tools/offload/sessions/mtp1.sh): production's host, plain,
+against les-mtp's with --mtp on production's bitstream, the 35B's five les1 turns in ABBA order,
+each run's tokens les's reference, each pool wholly in the page cache before its run.

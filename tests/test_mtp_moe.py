@@ -363,3 +363,32 @@ def test_streamed_mtp_engine_from_a_checkpoint_and_an_extended_pool(tiny_moe_mtp
         ST.engine(m2, CFG, pool=b, mtp=True, mtp_from=m, **kw)
     eng = ST.engine(m2, CFG, pool=c, mtp=True, mtp_from=m, **kw)
     assert MTPDecoder(eng).generate_card(prompt, max_new=N, stop=[]).tokens == want
+
+
+def test_moe_mtp_chat_turns_roll_back_to_the_reply(tiny_moe_mtp, monkeypatch):
+    """otpu-chat's turns with MTP on the streamed MoE (Chat over an MTP engine whose prompt goes
+    layer by layer): from the second turn on the context rolls back a token before the last
+    reply's start (the snapshot the turn took there) and feeds the reply and the new message,
+    not the whole conversation (restarted False). Chat.fed holds every token fed, the first
+    prompt's conv_k - 1 rows of the rows kernel too (without them the next turn found no common
+    part and started over). Each turn's reply equals plain greedy decode's of its rendering."""
+    from opentpu.host.chat import Chat, sampler
+    from opentpu.llm import qwen35 as Q35
+    from test_chatkv import MESSAGES, _QwenTok
+    monkeypatch.setattr(Q35, "PREFILL_CHUNK", 24)
+    W, spec = tiny_moe_mtp
+    tok = _QwenTok()
+    chat = Chat(_layered(spec, W, False, snapshots=1), tok, False, sampler(0, 0, 1.0, None), 6)
+    assert chat.use_mtp and chat.mtp.by_layers
+    start = None
+    for i, msg in enumerate(MESSAGES[:3]):
+        reply, turn = chat.ask(msg)
+        ids = tok.apply_chat_template(chat.history[:-1], True, False, True)
+        assert not turn.restarted, i
+        assert chat.fed[:len(ids)] == ids, i
+        assert turn.reused == (start - 1 if i else 0), i
+        want = Engine(spec, W, cap=512, cfg=CFG, rows=1, resident=True,
+                      experts=SLOTS).generate(ids, max_new=6)
+        assert chat._reply == [x for x in want if x not in spec.eos], i
+        start = len(tok.apply_chat_template(chat.history, False, False, True)) - \
+            len(chat.history[-1]["content"]) - len(f"{tok.E}\n")

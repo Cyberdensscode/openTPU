@@ -89,7 +89,7 @@ def record(out: str, args: list) -> None:
     def asked(self, text, *a, **kw):
         ev.append(["turn", text[:60]])
         r = ask(self, text, *a, **kw)
-        ev.append(["reply", len(self._reply)])
+        ev.append(["reply", len(self._reply), r[1].end])
         return r
     C.Chat.ask = asked
     rc = chatmoe.main(args)
@@ -174,7 +174,7 @@ def replay(rec: dict, variant: str = "base") -> list:
     srv.read_ahead = srv.halt_aware = False
     _variant(srv, variant)
     mb = info["slot_bytes"] / 1e6
-    turns, cur, in_prefill, need_layer = [], None, False, None
+    turns, cur, in_prefill, need_layer, decoding = [], None, False, None, False
 
     def idle():                             # the needs land on idle polls, in order
         while srv.pending or srv._next_ahead():
@@ -187,11 +187,13 @@ def replay(rec: dict, variant: str = "base") -> list:
             cur = dict(text=e[1], p_misses=0, p_queued=0, d_hits=0, d_misses=0, tokens=0)
             turns.append(cur)
             c0 = (srv.hits, srv.misses, srv.needs_queued)
+            decoding = False                # (a prompt's rows before its first prefill call:
+                                            # the rows kernel's, conv_k - 1 of them, are its)
         elif k == "begin":
             m = srv.misses
             sc = e[2] * lay.pitch
             srv.begin_prefill(expert_major=e[1], scratch=sc)
-            in_prefill, need_layer = True, None
+            in_prefill, need_layer, decoding = True, None, False
         elif k == "need":
             j = e[1][0] // lay.E
             if need_layer is not None and j != need_layer:
@@ -199,7 +201,7 @@ def replay(rec: dict, variant: str = "base") -> list:
             need_layer = j
             srv.need(e[1])
         elif k == "serve":
-            if in_prefill:
+            if in_prefill or not decoding:
                 srv.serve(e[1])
             else:
                 h, m = srv.hits, srv.misses
@@ -210,16 +212,18 @@ def replay(rec: dict, variant: str = "base") -> list:
         elif k == "end":
             idle()
             srv.end_prefill(e[1])
-            in_prefill = False
+            in_prefill, decoding = False, True
             if cur is not None:
                 cur["p_misses"] = srv.misses - c0[1] - cur["d_misses"]
                 cur["p_queued"] = srv.needs_queued - c0[2]
         elif k == "reply":
             if cur is not None:
-                cur["tokens"] = e[1]
+                cur["tokens"], cur["end"] = e[1], e[2] if len(e) > 2 else None
     for t in turns:
         n = t["d_hits"] + t["d_misses"]
-        steps = max(1, t["tokens"] - 1)     # (the decode's steps: the last token not fed)
+        # the decode's steps: every token's but the last one's at max_new (an end id's step
+        # comes after the last token shown: the card's MB a token over the tokens then)
+        steps = max(1, t["tokens"] - (t.get("end") != "eos"))
         t.update(hit_rate=round(t["d_hits"] / max(1, n), 4),
                  misses_tok=round(t["d_misses"] / steps, 1),
                  mb_tok=round(t["d_misses"] * mb / steps, 1))

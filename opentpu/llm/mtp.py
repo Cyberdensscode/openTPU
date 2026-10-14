@@ -167,8 +167,17 @@ class MTPDecoder:
         K = self.img.spec.conv_k
         if self.by_layers and P > K - 1:    # a streamed MoE's prompt layer by layer: the rows
             n = max(0, K - 1 - p0)          # before conv_k - 1 in the rows kernel's runs first
+            stop = []                       # (their runs reported too: on_run, e.g. Chat.fed)
+
+            def first(part):
+                stop.append(bool(on_run(part)))
+                return stop[-1]
             if n:
-                self.prefill(toks[:n], st, chunk, follow=toks[n])
+                self.prefill(toks[:n], st, chunk, on_run=None if on_run is None else first,
+                             follow=toks[n])
+            if any(stop):
+                self.draft = None
+                return None, None
             return self._prefill_layers(toks[n:], st, pick, on_run, follow)
         a0 = draft = None
         fit = self.img.rows
