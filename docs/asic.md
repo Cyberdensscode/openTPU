@@ -381,15 +381,42 @@ clock on the operator) pays once those are fixed, from about 540 MHz.
 
 ### Open problems
 
-- **The ports.** The SW and port B requests (`sw_req`, `sw_addr`, `sw_wdata`, `b_wmask`, ...) leave
+- **The ports.** The SW and port B requests (`sw_req`, `sw_addr`, `sw_wdata`, `b_wmask`, ...) left
   the block combinationally from the DMA's and quantizer's state through the slice's arbitration
   (12-27 levels): with 20% of the period outside, 339 MHz. A register stage at the boundary (as the
-  platform's adapter would add) frees them. The SW port has one, on every target (the card's
-  too: one design): `otpu_slice`'s SW port register took that block at 3.0 ns from 21 routed port
-  violators to none ([asic_timing_loop.md](asic_timing_loop.md)). `sw_req` is the register's
-  valid bit, and a write waits in it while `sw_req` is high, so a platform's "every write the
-  block gave is taken" is `wr_idle && !sw_req` (as `otpu_board`'s STATUS WR_IDLE and run start).
-  Port B is still combinational.
+  platform's adapter would add) frees them, and every port has one now, on every target (the
+  card's too: one design):
+  - The SW port's register took the small block at 3.0 ns from 21 routed port violators to none
+    ([asic_timing_loop.md](asic_timing_loop.md)).
+  - Port B's output register (`b_req` ... `b_par`) and input register (`b_rvalid`, `b_rtag`,
+    `b_rdata`). At the card point (a8, after CTS, 2.5 ns) every one of port B's 1,092 output
+    endpoints missed, worst `b_wdata` -2.50 ns from the DMA's write-data rotator (18 buffers and
+    six MUX2 levels from one select flip-flop), `b_wmask` -1.28, `b_par` -1.25, `b_addr` -0.97,
+    `b_req` -0.85. Those figures charge the core clock's 1.9 ns insertion delay to the outputs
+    against the ideal virtual I/O clock; with it credited on both sides, `b_wdata` is -0.59 and
+    the rest meet (+0.62 ... +1.16), and the inputs read `b_rdata` -> the DMA's line-buffer macros
+    -0.04, `b_rvalid` +0.25, `b_rtag` +0.27. The routed small block met at 2.5 ns (`b_wmask`
+    +0.09 worst): port B is a card-size problem. The a8 point's global routing overflowed only at
+    the DMA's line-buffer macros on the top edge, where 967 `b_wdata` pins and the buffers' read
+    data meet; the register also lets the pins' drivers sit by the pins, away from the DMA.
+  - Port A's output register (`a_req`, `a_addr`: the MXU's scale reads), the register the card's
+    DRAM adapter (`otpu_native_dram`) took them into, moved into the slice: the card has one
+    register between the MXU and the adapter's queues as before. At the card point `a_req` was
+    -1.62 ns against the ideal I/O clock (+0.25 credited), from the DMA's request through port
+    B's grant and the MXU's issue, `a_addr` -0.93 (+0.94), and `a_rdy` and `b_rdy` crossed the
+    block to `a_req` (input to output, +0.11 and -0.02); the routed small block met (+0.15). Its
+    read data needs no register: the MXU registers `a_rdata` at the port (`a_rvalid` +0.41,
+    `a_rdata` +1.73, credited).
+  - The registers' valid bits are the contract: a request waits in a register while `sw_req` /
+    `a_req` / `b_req` is high, and port B's read data is the block's a cycle after its
+    `b_rvalid`. So a platform's "every write the block gave is taken" is `wr_idle && !sw_req &&
+    !(b_req && b_we)`, and "no read of the block's in flight" is `rd_idle && !a_req && !(b_req &&
+    !b_we)` with no `b_rvalid` the cycle before (as `otpu_board`'s STATUS WR_IDLE and run start;
+    port A's requests are reads).
+  - `a_rdy` and `b_rdy` still reach the slice's grant logic combinationally (-> the MXU's tag
+    count: `b_rdy` -0.30 ns, `a_rdy` -0.18, with the insertion delay credited): a registered
+    ready (a credit: the memory's ready a cycle ahead, or a two-entry skid buffer) waits for the
+    card's routed timing with the TMEM placed by script.
 - **Sequencer dispatch.** `q_pr -> c_fp` (the footprint of the queued command, 50 levels) is the
   worst register-to-register path; `fp_ranges` and `fp_seg` in two cycles would give it a full one.
 - **Grant fanout.** The DMA's stream state -> the arbitration -> the quantizer's and the VPU's

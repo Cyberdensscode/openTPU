@@ -182,8 +182,9 @@ module otpu_board #(
   logic [255:0] a_rdata;
   logic [3:0]  a_be, sw_be;
   logic        sw_req, sw_rdy;
-  logic        m_wr_idle;              // slice 0's adapter's wr_idle (q_wr_idle[0]: with its SW
-                                       //   register, below)
+  logic        m_wr_idle, m_rd_idle;   // slice 0's adapter's wr_idle and rd_idle (q_wr_idle[0],
+  logic        m_rv;                   //   q_rd_idle[0]: with its SW and port registers, below);
+                                       //   m_rv: a b_rvalid the cycle before
   logic [31:0] sw_addr, sw_wdata;
   logic [D/4-1:0] b_wmask;
   logic [D*8-1:0] b_wdata, b_rdata;
@@ -236,13 +237,13 @@ module otpu_board #(
     .axi_err(|n_err),                  // the channels' bridges (otpu_mem_ch)
     .calib(cal_all), .ecc_ded(|ded_s2),
     .b_rd(b_req && b_rdy && !b_we), .b_wr(b_req && b_rdy && b_we),
-    .a_rd(a_req && a_rdy && !a_we), .a_wr(sw_req && sw_rdy), .b_wait(b_req && !b_rdy),
+    .a_rd(a_req && a_rdy && !a_we), .a_wr(sw_req && sw_rdy), .b_wait(pf_c.bwait),
     .temp_v, .temp(temp_q),
     .mxu_busy(pf_c.sq.busy[U_MXU]), .mxu_mac(pf_c.mac), .mxu_starve(pf_c.starve),
     .vpu_busy(pf_c.sq.busy[U_VPU]),
     .qnt_busy(pf_c.sq.busy[U_Q]), .dma_busy(pf_c.sq.busy[U_DMA]), .tmem_deny(pf_c.deny),
     .dram_rd, .dram_wr,
-    .dram_wait((b_req && !b_rdy) || (a_req && !a_rdy) || (sw_req && !sw_rdy)),
+    .dram_wait(pf_c.dwait),           // the units' waits (otpu_slice), not a parked register's
     .instr,
     .tr_en, .tr_stop, .tr_clear, .tr_addr, .tr_count, .tr_drop, .tr_busy, .tr_rdata,
     .i2c_lo, .i2c_in(i2c_s2));
@@ -306,7 +307,7 @@ module otpu_board #(
     .clk, .clk_f, .sys_rst(x_srst[0]), .rst(x_rst[0]), .rinit(x_arg[0]), .ld_start(x_ld_start[0]),
     .ld_addr(x_ld_addr[0]), .ld_n(x_ld_n[0]),
     .ld_busy(q_ld_busy[0]), .a_rdy, .b_rdy, .sw_rdy, .wr_idle(m_wr_idle),
-    .rd_idle(q_rd_idle[0]),
+    .rd_idle(m_rd_idle),
     .a_req, .a_we, .a_addr, .a_wdata, .a_be, .a_rvalid, .a_rdata,
     .sw_req, .sw_addr, .sw_wdata, .sw_be,
     .b_req, .b_tag, .b_we, .b_wmask, .b_wdata, .b_addr, .b_par, .b_rvalid, .b_rtag, .b_rdata,
@@ -345,16 +346,21 @@ module otpu_board #(
   // ---- memory: the native adapter
   // port A's held beats go where the host may have written: between runs, a load, a WAITW.
   // Every write the slice gave is taken (STATUS WR_IDLE, go_ok) once the adapter has none
-  // pending and the slice's SW register is empty: sw_req is the register's valid bit, and a write
-  // there is in neither the slice's units nor the adapter (otpu_slice)
-  assign q_wr_idle[0] = m_wr_idle && !sw_req;
+  // pending and neither the slice's SW register nor its port B output register holds one (sw_req,
+  // b_req: the registers' valid bits); no read of the slice's is in flight (go_ok) once the
+  // adapter has none, neither port A's nor port B's output register holds one (a_req: port A
+  // reads only) and port B's input register holds no data (a b_rvalid the cycle before, m_rv). A
+  // request or data there is in neither the slice's units nor the adapter (otpu_slice)
+  assign q_wr_idle[0] = m_wr_idle && !sw_req && !(b_req && b_we);
+  assign q_rd_idle[0] = m_rd_idle && !a_req && !(b_req && !b_we) && !m_rv;
+  always_ff @(posedge clk) m_rv <= !x_srst[0] && b_rvalid;
   otpu_native_dram #(.D(D), .CHASH(CHASH)) u_mem (
     .clk, .rst(x_srst[0]), .a_flush(x_rst[0] || x_ld_start[0] || a_inval),
     .a_rdy_x(a_rdy), .a_req_x(a_req), .a_we_x(a_we), .a_addr_x(a_addr), .a_wdata_x(a_wdata),
         .a_be_x(a_be), .a_rvalid, .a_rdata,
     .sw_rdy, .sw_req, .sw_addr, .sw_wdata, .sw_be,
     .b_rdy, .b_req, .b_tag, .b_we, .b_wmask, .b_wdata, .b_addr, .b_par, .b_rvalid, .b_rtag,
-    .b_rdata, .wr_idle(m_wr_idle), .rd_idle(q_rd_idle[0]),
+    .b_rdata, .wr_idle(m_wr_idle), .rd_idle(m_rd_idle),
     .n_cvalid(n_cvalid[1:0]), .n_cready(n_cready[1:0]), .n_cwe(n_cwe[1:0]),
     .n_caddr(n_caddr[1:0]), .n_wvalid(n_wvalid[1:0]), .n_wready(n_wready[1:0]),
     .n_wdata(n_wdata[1:0]), .n_wmask(n_wmask[1:0]), .n_rvalid(n_rvalid[1:0]),
@@ -363,7 +369,7 @@ module otpu_board #(
   // ---- slices 1 .. S-1, each on its two channels
   for (genvar s = 1; s < S; s++) begin : g_slice
     logic           a_req, a_we, a_rvalid, a_rdy, b_req, b_tag, b_we, b_par, b_rvalid, b_rtag;
-    logic           b_rdy, a_inval, sw_req, sw_rdy, m_wr_idle;
+    logic           b_rdy, a_inval, sw_req, sw_rdy, m_wr_idle, m_rd_idle, m_rv;
     logic [31:0]    a_addr, a_wdata, b_addr, sw_addr, sw_wdata;
     logic [255:0]   a_rdata;
     logic [3:0]     a_be, sw_be;
@@ -383,7 +389,7 @@ module otpu_board #(
       .clk, .clk_f, .sys_rst(x_srst[s]), .rst(x_rst[s]), .rinit(x_arg[s]), .ld_start(x_ld_start[s]),
       .ld_addr(x_ld_addr[s]), .ld_n(x_ld_n[s]),
       .ld_busy(q_ld_busy[s]), .a_rdy, .b_rdy, .sw_rdy, .wr_idle(m_wr_idle),
-      .rd_idle(q_rd_idle[s]),
+      .rd_idle(m_rd_idle),
       .a_req, .a_we, .a_addr, .a_wdata, .a_be, .a_rvalid, .a_rdata,
       .sw_req, .sw_addr, .sw_wdata, .sw_be,
       .b_req, .b_tag, .b_we, .b_wmask, .b_wdata, .b_addr, .b_par, .b_rvalid, .b_rtag, .b_rdata,
@@ -400,12 +406,14 @@ module otpu_board #(
           .a_be_x(a_be), .a_rvalid, .a_rdata,
       .sw_rdy, .sw_req, .sw_addr, .sw_wdata, .sw_be,
       .b_rdy, .b_req, .b_tag, .b_we, .b_wmask, .b_wdata, .b_addr, .b_par, .b_rvalid, .b_rtag,
-      .b_rdata, .wr_idle(m_wr_idle), .rd_idle(q_rd_idle[s]),
+      .b_rdata, .wr_idle(m_wr_idle), .rd_idle(m_rd_idle),
       .n_cvalid(n_cvalid[2*s +: 2]), .n_cready(n_cready[2*s +: 2]), .n_cwe(n_cwe[2*s +: 2]),
       .n_caddr(n_caddr[2*s +: 2]), .n_wvalid(n_wvalid[2*s +: 2]),
       .n_wready(n_wready[2*s +: 2]), .n_wdata(n_wdata[2*s +: 2]), .n_wmask(n_wmask[2*s +: 2]),
       .n_rvalid(n_rvalid[2*s +: 2]), .n_rdata(n_rdata[2*s +: 2]), .n_wdone(n_wdone[2*s +: 2]));
-    assign q_wr_idle[s] = m_wr_idle && !sw_req;     // as slice 0's
+    assign q_wr_idle[s] = m_wr_idle && !sw_req && !(b_req && b_we);     // as slice 0's
+    assign q_rd_idle[s] = m_rd_idle && !a_req && !(b_req && !b_we) && !m_rv;
+    always_ff @(posedge clk) m_rv <= !x_srst[s] && b_rvalid;
   end
 
   if (S == 1) begin : g_x1

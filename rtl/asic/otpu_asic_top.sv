@@ -63,20 +63,29 @@ module otpu_asic_top
   input  logic                sw_rdy,
   input  logic                wr_idle,
   input  logic                rd_idle,
-  output logic                a_req,
+  output logic                a_req,        // port A's outputs come from a register (otpu_slice): a
+                                            // read waits in it while a_req is high (reads only: a_we
+                                            // is 0; the reads all back: see b_req)
   output logic                a_we,
   output logic [31:0]         a_addr,
   output logic [31:0]         a_wdata,
   output logic [3:0]          a_be,
   output logic                sw_req,       // the SW outputs come from a register (otpu_slice), and
-                                            // a write waits in it while sw_req is high: every write
-                                            // the block gave is taken once wr_idle && !sw_req
+                                            // a write waits in it while sw_req is high (the writes
+                                            // all taken: see b_req)
   output logic [31:0]         sw_addr,
   output logic [31:0]         sw_wdata,
   output logic [3:0]          sw_be,
   input  logic                a_rvalid,
   input  logic [255:0]        a_rdata,      // the aligned 32 bytes holding the word read
-  output logic                b_req,
+  output logic                b_req,        // port B's outputs come from a register, and its read
+                                            // data enters through one (otpu_slice): a request waits
+                                            // in it while b_req is high, read data is the block's a
+                                            // cycle after its b_rvalid; every write the block gave
+                                            // is taken once wr_idle && !sw_req && !(b_req && b_we),
+                                            // no read is in flight once rd_idle && !a_req &&
+                                            // !(b_req && !b_we) and there was no b_rvalid the
+                                            // cycle before
   output logic                b_tag,
   output logic                b_we,
   output logic [D/4-1:0]      b_wmask,
