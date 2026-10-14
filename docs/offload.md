@@ -5006,3 +5006,17 @@ with these (`--slots 38 --slots-plain 41 --dmix 0.4175 --dhead 0.05 --cdraft 9.4
 The card check is session mtp1 (tools/offload/sessions/mtp1.sh): production's host, plain,
 against les-mtp's with --mtp on production's bitstream, the 35B's five les1 turns in ABBA order,
 each run's tokens les's reference, each pool wholly in the page cache before its run.
+
+**mtp1's first run hung** (2026-10-14, B's warm-up): the card ran and never halted (STATUS RUN,
+no error), and the host's wait for HALTED timed out after RUN_TIMEOUT; the card itself was fine
+(the final selftest passed, ECC 0 / 0). The cause is the host's, in BoardBackend.run_generate:
+with a host hook (a streamed MoE's servers) it served the card only until the n-th token landed,
+then waited for HALTED. Plain decode halts right after its last token, but the MTP loop does not:
+its last D runs the MTP layer after the verify that wrote the last token (the MTP layer's KV row
+and the draft, for a later run to continue from), and the MTP layer's MoE request and the rows of
+its two tokens wait for the host's answers. A reply that ends at max_new (les1's turns 2-5; turn
+1 ends at its end id, before n, and was served to the halt) therefore waited forever. The ISA
+simulator serves inside its WAITW, so no ISA run could show it. Now run_generate with a hook
+serves until the card halts (tests/test_host_runs.py test_a_generate_run_is_served_until_it_halts:
+a fake card that posts its last request 20 ms after its last token; the previous code stops at
+the token and waits).

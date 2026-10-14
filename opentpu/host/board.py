@@ -1937,7 +1937,11 @@ class BoardBackend:
         state block), and Board.write writes that beat alone: the card's state stores beside it
         are never rewritten. A run that hands over no token for RUN_TIMEOUT seconds is an error;
         on any error (KeyboardInterrupt, SystemExit too) the stop word goes out and the run gets
-        STOP_WAIT to halt after its token before it is cut short (Board.stop)."""
+        STOP_WAIT to halt after its token before it is cut short (Board.stop). With the host's
+        hook (self.host: a streamed MoE's servers) it is served until the card halts, past the
+        last token: the MTP loop's last D runs the MTP layer after the verify that wrote it (its
+        MoE request, its two rows' post) and waits for the answers (session mtp1, 2026-10-14:
+        served only up to the n-th token, the run waited on its request until RUN_TIMEOUT)."""
         from opentpu.llm import generate as G
         b, t = self.board, self.board.t
         self.start(programs)
@@ -1964,9 +1968,9 @@ class BoardBackend:
         # while the program runs, the tokens are read after it halts
         host, t_take, idle = self.host, 0.0, getattr(t, "host_idle", HOST_IDLE)
         try:
-            while k < n and not getattr(t, "batched", False):
+            while (k < n or host is not None) and not getattr(t, "batched", False):
                 served = host() if host is not None else 0
-                if host is None or time.perf_counter() - t_take >= HOST_TAKE:
+                if k < n and (host is None or time.perf_counter() - t_take >= HOST_TAKE):
                     t_take = time.perf_counter()
                     if take():
                         continue
@@ -1974,7 +1978,9 @@ class BoardBackend:
                     break
                 if time.perf_counter() - t_tok > RUN_TIMEOUT:
                     raise TimeoutError(f"the generate run handed over no token in "
-                                       f"{RUN_TIMEOUT:.0f} s ({k} of {n} so far)")
+                                       f"{RUN_TIMEOUT:.0f} s ({k} of {n} so far)" if k < n else
+                                       f"the generate run did not halt in {RUN_TIMEOUT:.0f} s "
+                                       f"after its last token, served all along")
                 if stop is not None and not asked and state is not None and stop():
                     b.write(state + 4 * G.S_HALT, np.ones(1, np.float32))
                     asked = True
