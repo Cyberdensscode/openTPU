@@ -5065,6 +5065,18 @@ two fixes remove (-0.31 / +0.06 / +0.33 / +0.33 / +0.59 s: the first call's part
 2-5), and from the traced pair the expert-major turns' (3-5) calls by run kind (layer, expert,
 K / V, head): device and wall time, the gaps between runs, the server's idle parts and requests.
 
+mtp2 passed (2026-10-14, token-exact throughout): decode 1.123x, TTFT B - A +0.00 / +0.29 / +0.23 /
++0.33 / +0.32 s. F2 took the last call's extra row away (its part +0.02 to -0.02 s, from +0.16 to
++0.20); F1b only ~0.035 s (0.08 in turn 1). What is left in turns 2-5, besides the first call's,
+is +0.10 to +0.13 s outside the calls, which the call times cannot place. chatmoe.py --trace now
+stamps each turn's host phases up to its first token (_Phases: the template, the rollback with its
+restore, each prefill_layers and its end_prefill, the snapshot and MTP's held row's read, MTP's own
+prefill, a0, and each device run outside the calls with its cycles; host bookkeeping, the same runs
+and tokens: tests/test_mtp_moe.py test_chatmoe_traces_each_turns_host_phases, 16 DeltaNet heads). On
+the ISA simulator only turn 1's MTP prefill of the first conv_k - 1 rows leaves time outside them
+(its compiles, ~0.11 s); the card's step is tools/offload/sessions/mtpt.sh (~10 min: a traced run
+of each arm from one tree, A's and B's tokens the same, each turn's TTFT B - A by phase).
+
 Turn 3's 0.55 is the reply's content and the draft head, not the loop: on the fp32 reference
 (Hugging Face's float32 35B along the card's tokens, the base's own mtp.* layer, mtp_transplant.py
 accept, replayed as the k = 1 loop) the head the card has (fp4, the 32K lowest ids) accepts 12 of

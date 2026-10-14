@@ -25,15 +25,15 @@ def _cos(a, b):
     return (a * b).sum(-1) / np.linalg.norm(a, axis=-1) / np.linalg.norm(b, axis=-1)
 
 
-def _tiny(nk=8):
+def _tiny(nk=8, nv=8):
     """nk DeltaNet key heads (8: one per value head; 4: a pair shares its q and k, as the
-    35B's)."""
+    35B's), nv value heads (16: a real model's register pressure in the device programs)."""
     torch.manual_seed(0)
     hc = transformers.Qwen3_5MoeTextConfig(
         hidden_size=256, num_hidden_layers=len(KINDS), num_attention_heads=8,
         num_key_value_heads=2, head_dim=256, vocab_size=1000,
         layer_types=["full_attention" if k == "attn" else "linear_attention" for k in KINDS],
-        linear_num_key_heads=nk, linear_num_value_heads=8, linear_key_head_dim=128,
+        linear_num_key_heads=nk, linear_num_value_heads=nv, linear_key_head_dim=128,
         linear_value_head_dim=128, linear_conv_kernel_dim=4, tie_word_embeddings=True,
         max_position_embeddings=4096, rms_norm_eps=1e-6, num_experts=E,
         num_experts_per_tok=K, moe_intermediate_size=F, shared_expert_intermediate_size=F,
@@ -47,7 +47,7 @@ def _tiny(nk=8):
             elif "experts" in n or "gate" in n:
                 p.copy_(0.05 * torch.randn_like(p))
     W = {k: v.float().numpy() for k, v in m.state_dict().items()}
-    spec = Spec(256, KINDS, 8, 2, 256, 64, 8, 128, 128, F, 1000, lin_kheads=nk,
+    spec = Spec(256, KINDS, 8, 2, 256, 64, nv, 128, 128, F, 1000, lin_kheads=nk,
                 moe=MoESpec(E=E, k=K, ffn=F, rule="softmax", shared=F))
     return m, W, spec
 

@@ -626,3 +626,23 @@ def test_the_scripted_chat_checks_a_run_against_its_reference(tmp_path, monkeypa
     tr = json.loads((tmp_path / "trace.json").read_text())["calls"]
     assert [(c["rows"], c["em"]) for c in tr] == [(c["rows"], c["em"]) for c in c1 + c2]
     assert "n" in {e[2] for e in tr[0]["events"]} and "d" in {e[2] for e in tr[1]["events"]}
+
+
+def test_the_phases_line_sums_a_turns_phases():
+    """chatmoe.py's phases line (_Phases.line): each phase's seconds by name (a count where it
+    ran more than once), and the rest of the TTFT outside the union of the phases' spans, those
+    that hold others (MTP's prefill and snapshot) left out: their parts are phases of their own."""
+    sys.path.insert(0, str(ROOT / "tools" / "qual"))
+    try:
+        import chatmoe
+    finally:
+        sys.path.remove(str(ROOT / "tools" / "qual"))
+    ph = [["template", 0.0, 0.1, None], ["rollback", 0.1, 0.15, None],
+          ["prefill_layers", 0.3, 0.8, None], ["end_prefill", 0.7, 0.75, None],
+          ["snapshot", 0.82, 0.84, None], ["mtp snapshot", 0.8, 0.85, None],
+          ["prefill_layers", 0.9, 1.4, None], ["run", 1.45, 1.5, 1234],
+          ["a0", 1.55, 1.6, None], ["mtp prefill", 0.2, 1.6, None]]
+    assert chatmoe._Phases.line(ph, 2.0) == (
+        "template 0.100 s, rollback 0.050 s, mtp prefill 1.400 s, prefill_layers 1.000 s (2), "
+        "end_prefill 0.050 s, mtp snapshot 0.050 s, snapshot 0.020 s, a0 0.050 s, run 0.050 s; "
+        "the rest of TTFT 0.730 s")
