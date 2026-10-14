@@ -1791,3 +1791,118 @@ def test_the_isa_hosts_hook_polls_until_the_expert_runs_wait_holds():
     calls = []
     _isa_host(lambda: calls.append(1) or 0)(m)
     assert calls == [1]
+
+
+@pytest.mark.parametrize("policy", ["lfu", "lru"])
+def test_place_takes_free_slots_then_the_least_wanted_across_layers(policy):
+    """place (docs/minicpmv.md 4.2: a host run's pieces, the pool's entries past the experts):
+    free slots first, then the experts of least decayed use ("lru": the least recent of each
+    layer alike), each layer keeping k slots; the victims' entries cleared, the entries'
+    bytes in their slots, no tag; an entry already placed keeps its slot; more than the slots
+    past k is refused with nothing changed; release gives the slots back to their layers,
+    free, and the next misses take them."""
+    lay = Layout.build(4096, E, K, (4, 4), SLOT)
+    mem = SimDram(np.zeros(lay.end + 4096, np.uint8))
+    srv = ExpertServer(mem, lay, _pool, policy=policy)
+    srv.load([0, 1, 2, E, E + 1, E + 2])            # 3 of 4 slots a layer, one free
+    for seq, ids in enumerate(([0, 1], [E, E + 1], [1, 0], [E + 1, E]), 1):
+        _post(mem, lay, seq, ids)                   # all hits: 2 and E + 2 the least wanted
+        srv.poll()
+    G = 2 * E
+    with pytest.raises(RuntimeError):               # 2 a layer past k: 4 at most
+        srv.place([G, G + 1, G + 2, G + 3, G + 4])
+    assert srv.placed == {} and all(len(fr) == 1 for fr in srv.free)
+    at = srv.place([G + 3, G, G + 1, G + 2], sizes={G + i: 100 for i in range(4)})
+    assert len(set(at)) == 4 and all(mem.read(a, SLOT) == _pool(g) for g, a in
+                                      zip([G + 3, G, G + 1, G + 2], at))
+    for g in (2, E + 2):
+        assert _entry(mem, lay, g) == (0, 0.0)
+    for g in (0, 1, E, E + 1):
+        assert _entry(mem, lay, g)[1] == 1.0
+    assert all(np.frombuffer(mem.read(a + lay.tag, 4), np.uint32)[0] == 0 for a in at)
+    assert srv.place_victims == 2 and srv.place([G + 1]) == [at[2]]
+    with pytest.raises(RuntimeError):
+        srv.place([G + 4])
+    srv.release()
+    assert srv.placed == {} and [len(fr) for fr in srv.free] == [2, 2]
+    _post(mem, lay, 5, [2, 3])                      # misses into the freed slots
+    srv.poll()
+    assert {_entry(mem, lay, g)[0] for g in (2, 3)} <= set(at)
+    with pytest.raises(ValueError):
+        srv.place([E - 1])                          # an expert is no placed entry
+
+
+def test_rewarm_reads_again_what_left_the_page_cache(tmp_path, monkeypatch):
+    """moe.rewarm (the Engine's, once its image is built and the build's memory freed): the
+    open's warm stopped if it still runs, then the packed experts with bytes out of the page
+    cache (PoolFile.absent: mincore) read on a new thread in the order given (absent's: file
+    order). The open's thread is kept when it had ended with nothing out; one stopped with
+    nothing out gives an empty read (its record: done); where the host cannot tell (no
+    mincore) the open's read is left to run. On Linux, experts dropped from the page cache
+    come back."""
+    import os
+    import sys
+    import threading
+
+    from opentpu.host import offload as OF
+    from opentpu.llm.moe import rewarm
+    slot, n = 4096 * 2, 8
+    f = tmp_path / "pool.bin"
+    f.write_bytes(np.random.default_rng(0).integers(0, 256, n * slot, dtype=np.uint8).tobytes())
+    pf = OF.PoolFile(f, slot, split=False)
+    pf.ids = np.arange(n)
+    if pf.resident(pf.ids) is None:
+        pytest.skip("no mincore here")
+    assert list(pf.absent(pf.ids)) == []
+    os.truncate(f, (n + 2) * slot)                      # experts 8, 9: a hole, not cached
+    assert list(pf.absent(range(n + 2))) == [8, 9] and list(pf.absent([9, 3, 8])) == [8, 9]
+    t = pf.warm(pf.ids)
+    t.join(60)
+    assert rewarm(pf) is t and pf.warm_t is t           # ended, nothing out: kept
+    held, real = [threading.Semaphore(0)], OF.preadv
+
+    def read(fd, bufs, off):                            # a slow disk: reads held until released
+        assert held[0].acquire(timeout=60)
+        real(fd, bufs, off)
+    monkeypatch.setattr(OF, "preadv", read)
+    release = lambda k: [held[0].release() for _ in range(k)]   # noqa: E731
+
+    t = pf.warm(pf.ids)                                 # still running: stopped, what is out
+    monkeypatch.setattr(pf, "absent", lambda ids: np.array([2, 5]))     # read again
+    threading.Timer(0.2, release, (3,)).start()         # (the read it waits in, then 2)
+    t2 = rewarm(pf)
+    assert t.stop.is_set() and not t.is_alive() and t.bytes == slot
+    assert t2 is pf.warm_t and t2 is not t and t2.total == 2 * slot
+    t2.join(60)
+    assert t2.bytes == 2 * slot and OF.warm_report(t2)["error"] is None
+
+    held[0] = threading.Semaphore(0)                    # stopped with nothing out: an empty read
+    t = pf.warm(pf.ids)
+    monkeypatch.setattr(pf, "absent", lambda ids: np.zeros(0, np.int64))
+    threading.Timer(0.2, release, (1,)).start()
+    t3 = rewarm(pf)
+    assert t.stop.is_set() and t3 is not t and t3.total == 0
+    t3.join(60)
+    r = OF.warm_report(t3)
+    assert r["end"] is not None and r["error"] is None and not r["stopped"]
+
+    held[0] = threading.Semaphore(0)                    # no mincore: the open's read left to run
+    t = pf.warm(pf.ids)
+    monkeypatch.setattr(pf, "_pages", lambda: None)
+    assert rewarm(pf) is t and not t.stop.is_set() and t.is_alive()
+    release(n)
+    t.join(60)
+    assert t.bytes == n * slot
+    monkeypatch.undo()
+    if sys.platform != "linux":
+        return
+    pf = OF.PoolFile(f, slot, split=False)
+    pf.ids = np.arange(n)
+    fd = os.open(f, os.O_RDONLY)
+    os.fsync(fd)
+    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    os.close(fd)
+    if pf.resident(pf.ids) < n * slot:                  # (tmpfs keeps its pages)
+        pf.warm_t = None
+        rewarm(pf).join(60)
+        assert pf.resident(pf.ids) == n * slot and list(pf.absent(pf.ids)) == []

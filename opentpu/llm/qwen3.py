@@ -149,6 +149,11 @@ def finite(v: np.ndarray, name: str) -> np.ndarray:
                      f"inf; the first at {at}): the checkpoint is corrupt or was converted wrong")
 
 
+# a multimodal checkpoint's vision tower and projector: Qwen3.5's model.visual, MiniCPM-V's
+# model.vision_tower and model.merger (docs/minicpmv.md; their loader is minicpmv's)
+VISION = ("model.visual.", "model.vision_tower.", "model.merger.")
+
+
 class Weights(Mapping):
     """The tensors of a HF safetensors checkpoint, read and converted to fp32 numpy arrays
     when first used (load_weights): a multi-billion-parameter model is never all in memory in
@@ -163,7 +168,7 @@ class Weights(Mapping):
         from safetensors import safe_open
         self.model_dir = Path(model_dir)
         self._files, self._where = [], {}
-        skip = ("model.visual.",) if mtp else ("model.visual.", "mtp.")
+        skip = VISION if mtp else VISION + ("mtp.",)
         for f in sorted(Path(model_dir).glob("*.safetensors")):
             h = safe_open(str(f), framework="pt")
             self._files.append(h)
@@ -226,9 +231,10 @@ class Weights(Mapping):
 
 def load_weights(model_dir, mtp: bool = False) -> Weights:
     """All tensors of a HF safetensors checkpoint as fp32 numpy arrays, converted when first
-    used (Weights). Of a multimodal checkpoint (Qwen3.5) only the language model is loaded,
-    under the names of a text-only one (model.language_model.* -> model.*): not the vision
-    tower, nor the multi-token prediction layers (mtp.*) unless `mtp` (Qwen3.5's drafter,
+    used (Weights). Of a multimodal checkpoint (Qwen3.5, MiniCPM-V) only the language model is
+    loaded, under the names of a text-only one (model.language_model.* -> model.*): not the
+    vision tower and projector (VISION), nor the multi-token prediction layers (mtp.*) unless
+    `mtp` (Qwen3.5's drafter,
     opentpu/llm/mtp.py). Gemma 4: gemma4.load_weights (its PLE table read by rows)."""
     cfg = Path(model_dir) / "config.json"
     if cfg.exists() and json.loads(cfg.read_text()).get("model_type") in ("gemma4",
@@ -253,7 +259,7 @@ class LazyWeights(dict):
         for f in sorted(Path(model_dir).glob("*.safetensors")):
             h = self._h[str(f)] = safe_open(str(f), "pt")
             for k in h.keys():
-                if not k.startswith(("model.visual.", "mtp.")):
+                if not k.startswith(VISION + ("mtp.",)):
                     self._at[k.replace("model.language_model.", "model.", 1)] = (str(f), k)
 
     def _open(self, k):
@@ -1917,13 +1923,16 @@ def layer_programs(image, key, block: int, hint: bool = False, em: bool = False)
     """Engine.prefill_layers' run of `key`: (layer (-1: the embed run), blocks, rows,
     embedded), (layer, None, rows, True, compile-time position), (layer, blocks, rows, True,
     "tile") (an expert-major run tiled: Engine.layer_tile), ("x", layer) (an expert run; ("x",
-    layer, C): of passes of C entries, Engine.em_pass) or
+    layer, C): of passes of C entries, Engine.em_pass), ("v", rows) (image rows into the chunk:
+    minicpmv.Image.compile_vis_run) or
     "head" -> (programs, run_args); hint: a layer's run ends with the next MoE layer's hint
     (Engine's layer_ahead "hint"); em: expert-major (Engine's expert_major)."""
     if key == "head":
         return image.compile_prefill_head(**({"em": True} if em else {}))
     if key[0] == "x":                       # (("x", layer, C): passes of C entries)
         return image.compile_expert_run(*key[1:])
+    if key[0] == "v":                       # (("v", rows): image rows, minicpmv.Image)
+        return image.compile_vis_run(key[1], em=em)
     if key[-1] == "tile":
         from . import tiled as TL
         return TL.compile_layer_tile(image, key[0], key[1], key[2], block)
@@ -2211,7 +2220,8 @@ class Engine:
         if pool_file is not None and getattr(self.image, "offload", None) is not None:
             from .moe import open_pool, pool_key    # its read into the page cache runs during
             pool_file = open_pool(self.image.offload, pool_file, mapped=pool_map,  # the build
-                                  key=pool_key(self.image, getattr(W, "model_dir", None)))
+                                  key=pool_key(self.image, getattr(W, "model_dir", None)),
+                                  extra=(getattr(self.image, "pool_extra", None) or (0,))[0])
         images = IC.build(self.image, W, self.layout)     # (opentpu/imgcache.py)
         # rollback's snapshots of the state the KV caches do not hold (snapshot.py)
         self.stateful = SN.stateful(self.image)
@@ -2334,6 +2344,16 @@ class Engine:
         if self.prompt_runs:                # bucket 1's prompt programs, ahead (prefill.warm)
             from . import prefill as PF
             PF.warm(self)
+        # the pool's experts the build took out of the page cache, read in again once its
+        # memory is freed (moe.rewarm); the server's pool_warm is that read
+        pf = getattr(self.server, "pool_file", None)
+        if pf is not None:
+            import gc
+
+            from .moe import rewarm
+            del images
+            gc.collect()
+            self.server.pool_warm = rewarm(pf)
 
     # ---- the compile pipeline
     def _compile(self, pos: int, tok: int | None = None) -> list:
@@ -2647,7 +2667,7 @@ class Engine:
         return n, progs, fit
 
     def prefill_chunks(self, tokens, seq: int = 0, chunk: int | None = None,
-                       logits: bool = True):
+                       logits: bool = True, vis=None):
         """Feed a prompt to sequence `seq` in device runs of up to `chunk` tokens (default:
         the image's rows); yields (the tokens of the run, logits) after each run, the logits
         after the prompt's last token with the last run and None before (always None without
@@ -2667,18 +2687,22 @@ class Engine:
         With the pipeline, the next run's program (after the last run: the first decode
         step's) is compiled while the device runs the current one. With layer_major (a MoE
         model) sequence 0's prompt goes layer by layer (prefill_layers), in one part: its runs'
-        stats are one entry, their cycles summed."""
+        stats are one entry, their cycles summed. vis: prefill_layers' image rows (MiniCPM-V;
+        the layer-major prompt only)."""
         from . import prefill as PF
         tokens = [int(t) for t in tokens]
         if self.layer_major and seq == 0 and chunk is None:
             if tokens:                                  # (docs/offload.md 13)
                 k = len(self.stats)
-                lg = self.prefill_layers(tokens, logits)
+                lg = self.prefill_layers(tokens, logits, **({} if vis is None else
+                                                            {"vis": vis}))
                 runs = self.stats[k:]
                 self.stats[k:] = [{"cycles": sum((s or {}).get("cycles") or 0 for s in runs),
                                    "runs": len(runs), "rows": len(tokens)}]
                 yield tokens, lg
             return
+        if vis is not None and max(vis, default=-1) >= 0:
+            raise ValueError("image rows go in a layer-major prompt (Engine(layer_major=R))")
         if self.prompt_runs and seq == 0 and chunk is None and PF.supported(self) \
                 and PF.covers(self, self.poss[0], self.poss[0] + len(tokens)):
             yield from PF.chunks(self, tokens, logits)  # docs/prefill.md
@@ -2748,7 +2772,7 @@ class Engine:
             pass
         return logits
 
-    def prefill_layers(self, tokens, logits: bool = True) -> np.ndarray | None:
+    def prefill_layers(self, tokens, logits: bool = True, vis=None) -> np.ndarray | None:
         """A MoE model's prompt layer by layer (docs/offload.md, layer-major prefill): each
         chunk of the image's prefill rows passes a layer before the next, in runs of
         `layer_major` rows (the image's compile_layer_run: the first row's position and chunk
@@ -2783,13 +2807,22 @@ class Engine:
         from the first expert slots for the prefill (begin_prefill's scratch: the first
         chunk's records, moe.em_record a row), so the head runs before end_prefill hands them
         back. Bit-identical to step() token by token (the states, the KV cache, the logits):
-        only the slots the experts sit in move. Returns the logits after the last token."""
+        only the slots the experts sit in move. Returns the logits after the last token.
+
+        vis: each token's row of the image's projector output (`vis`, MiniCPM-V's image rows:
+        minicpmv.Image), or -1 for a text token (None: all text). An image token's layer-0 input
+        is that row: layer 0 takes a chunk's image tokens in runs of their own (consecutive vis
+        rows), each a copy run (("v", n): vis_copy_run, the rows into the chunk's residual rows
+        or records) and an embedded layer run; text runs are as without images."""
         from . import tiled as TL
         img, K, B, R = self.image, getattr(self.spec, "conv_k", 1), self.block, self.layer_major
         self._drain()
         tokens = [int(t) for t in tokens]
         if self.pos + len(tokens) > self.cap:
             raise RuntimeError("KV cache full")
+        vis = None if vis is None or max(vis, default=-1) < 0 else [int(v) for v in vis]
+        if vis is not None and len(vis) != len(tokens):
+            raise ValueError(f"vis: {len(vis)} rows for {len(tokens)} tokens")
         part = []
 
         def run(key, vals):
@@ -2805,9 +2838,12 @@ class Engine:
         host = bool(getattr(img, "embed_host", False)) and not self.embed_runs
         if host and self.pos < K - 1:   # the rows before conv_k - 1 token by token (no embed
             n = min(len(tokens), K - 1 - self.pos)          # or compile-time-position runs)
+            if vis is not None and max(vis[:n]) >= 0:
+                raise ValueError(f"an image row before position {K - 1}")
             for _, lg in self.prefill_chunks(tokens[:n], 0, 1, logits and n == len(tokens)):
                 pass
             tokens = tokens[n:]
+            vis = None if vis is None else vis[n:]
             if not tokens:
                 return lg if logits else None
         em = self.expert_major
@@ -2815,7 +2851,10 @@ class Engine:
         chunks, p0 = [], self.pos       # each chunk's runs: (key, run arguments, the host's rows
         for c0 in range(0, len(tokens), img.prefill_rows):  # written before it, or None)
             part, runs = tokens[c0:c0 + img.prefill_rows], []
+            vp = None if vis is None else vis[c0:c0 + len(part)]
             low = max(0, min(len(part), K - 1 - p0))    # rows at compile-time positions
+            if vp is not None and max(vp[:low], default=-1) >= 0:
+                raise ValueError(f"an image row before position {K - 1}")
             for i, t in enumerate([] if host else part[:len(part) if R > 1 else low]):
                 runs.append(((-1, (p0 + i) // B + 1, 1, True),  # (embed_host: the token's row)
                              dict(RunPos.values(t, p0 + i, K, B), row=i), [t]))
@@ -2828,6 +2867,18 @@ class Engine:
                         runs.append(((li, None, n, True, p), {"row": i}, None))
                     else:
                         n = min(R, len(part) - i, B - p % B)
+                        if li == 0 and vp is not None:      # a run of text or of image rows
+                            j, im = i + 1, vp[i] >= 0
+                            while j < i + n and (vp[j] >= 0) == im and \
+                                    (not im or vp[j] == vp[j - 1] + 1):
+                                j += 1
+                            n = j - i
+                            if im:                          # (the rows from vis, then layer 0
+                                runs.append((("v", n), {"row": i, "src": vp[i]}, None))  # on them)
+                                runs.append(((0, p // B + 1, n, True),
+                                             dict(RunPos.values(part[i], p, K, B), row=i), None))
+                                i += n
+                                continue
                         gather = li == 0 and (R == 1 or host)   # (the run gathers its rows:
                         if gather and self.layer_tile:          # the host's; untiled)
                             n = min(n, TL.untiled_rows(img))
@@ -2861,7 +2912,8 @@ class Engine:
         for c, (part, runs) in enumerate(chunks):
             cur = -1
             for key, vals, rows in runs:
-                if send is not None and key[0] != "x" and key[0] > cur:  # a layer's first run:
+                if send is not None and key[0] not in ("x", "v") and \
+                        key[0] > cur:                   # a layer's first run:
                     cur = key[0]                        # the next MoE layer's experts, or
                     j = cur + 1 - first                 # the first's for the next chunk
                     if cur + 1 == self.spec.layers and c + 1 < len(chunks):

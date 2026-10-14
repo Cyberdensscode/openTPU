@@ -265,10 +265,10 @@ def test_moe_on_board_model(tiny, have_verilator):
     hold at their first read. Per-position programs, then the resident decode, then the card's
     generate loop (the DeltaNet layers, the routed experts and the gated shared expert): the ISA
     simulator's logits and tokens bit for bit."""
+    from conftest import sim_board_config
     from opentpu.host.board import Board, BoardBackend, SimTransport
-    from opentpu.isasim import board_config
     _, W, spec = tiny
-    cfg = board_config(DRAM_BYTES=1 << 26)
+    cfg = sim_board_config(DRAM_BYTES=1 << 26)
     tr = SimTransport(ch_bytes=cfg.DRAM_BYTES // 2, stall=20, seed=5)
     assert Board(tr).info()["caps"].get("waitw"), "the board model has no WAITW (CAPS bit31)"
     isa = Engine(spec, W, cap=256, cfg=cfg, rows=1, resident=True)
@@ -350,6 +350,37 @@ def test_layer_major_prefill_is_bit_exact(tiny, wformat, R, b, real, embed_runs,
         assert np.array_equal(ga.view(np.uint32), gb.view(np.uint32))
         t = int(np.argmax(ga))
 
+
+
+@pytest.mark.parametrize("expert_major", [False, True])
+def test_formats_by_layer_range_stream_bit_exact(tiny, expert_major, monkeypatch):
+    """Formats by layer range on the streamed MoE, as MiniCPM-V's mix on the card
+    (streamed.FORMATS, docs/minicpmv.md 5.1: the first DeltaNet layers and the shared expert
+    int8, the other layers nvfp4, fp4 experts): each layer's projections in its range's format,
+    and the layer-major prefill (expert-major and not) gives token by token's logits, then its
+    decode steps', bit for bit, on build B's PAIR, DSTEP and STREAM with 6 slots a layer."""
+    from opentpu.llm import qwen35 as Q35
+    monkeypatch.setattr(Q35, "PREFILL_CHUNK", 24)
+    monkeypatch.delenv("OTPU_FORMATS", raising=False)
+    spec, W = _untied(tiny)
+    spec = replace(spec, formats="delta@0-2=int8,attn=nvfp4,delta=nvfp4,mlp=int8")
+    kw = dict(MCOLS=4, PAIR=True, DSTEP=True, STREAM=True)
+    cfg = device_config(spec, 256, rows=1, lookup=True, S=1, experts=6, wformat="fp4", **kw)
+    a, ref = (Engine(spec, W, cap=256, cfg=cfg, rows=1, resident=True, experts=6,
+                     wformat="fp4", **x)
+              for x in ({"layer_major": 2, "expert_major": expert_major}, {}))
+    assert a.image.lf[0] == ("int8", "nvfp4", "int8", "int8")
+    assert a.image.lf[3] == ("nvfp4", "nvfp4", "int8", "int8")
+    assert a.image.fmt.wformat == "fp4"
+    toks = [int(t) for t in np.random.default_rng(13).integers(0, 1000, 40)]
+    la, lb = a.prefill(toks), ref.prefill(toks)
+    assert a.server.misses > 0
+    assert np.array_equal(la.view(np.uint32), lb.view(np.uint32))
+    t = int(np.argmax(la))
+    for _ in range(2):
+        ga, gb = a.step(t), ref.step(t)
+        assert np.array_equal(ga.view(np.uint32), gb.view(np.uint32))
+        t = int(np.argmax(ga))
 
 
 @pytest.mark.parametrize("ready,hint", [(True, False), (False, False), (True, True)])

@@ -6,6 +6,12 @@ requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 dependencies = ["numpy", "textual"]
 
+[project.optional-dependencies]
+# MiniCPM-V's images (opentpu/llm/minicpmv.py): torchvision's decode and resize as HF's processor,
+# pillow's decode without it; the card's references ran with torchvision 0.29.1 and pillow 12.3.0
+# (docs/minicpmv.md 6)
+minicpmv = ["pillow", "torchvision"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

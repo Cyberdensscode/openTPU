@@ -11,7 +11,9 @@ A MoE layer on the device (`moe_ffn`), one token:
    expert bias, renormalized and scaled; Qwen's softmax of the k largest logits;
 3. the fence, WAITW served >= seq (the host has finished every earlier request: none of this
    layer's slots is being replaced, and the one request row and answer are free), then the
-   ids and seq + 1 to the mailbox;
+   ids and seq + 1 to the mailbox; then what needs no routed expert, while the host streams
+   the missing ones: a shared expert (a dense SwiGLU of the layer block, times sigmoid of its
+   gate's logit; docs/offload.md 15) and beside()'s work;
 4. the directory: each id's present flag;
 5. the experts present (a LOOP over the k ids, a LOOP R[present] inside), then the others
    (LOOP R[1 - present]). A present one takes its slot address from its directory entry, a
@@ -24,8 +26,8 @@ A MoE layer on the device (`moe_ffn`), one token:
    then the answer's words are zeroed (the host writes the next request's answer only after
    its post);
 6. the rows summed in the router's order (the result does not depend on what the cache held),
-   then a shared expert (a dense SwiGLU of the layer block, times sigmoid of its gate's
-   logit), and added to the residual.
+   then the shared expert's output added (last, as before it was computed early: bit for bit
+   the same sum), and the whole to the residual.
 
 It holds one register (the resident decode's run arguments and the layer loops hold the
 rest): the per-expert values are the columns of a small tile that each loop rotates, so
@@ -223,7 +225,10 @@ def pool_key(image, model_dir=None) -> dict:
     the MXU's numerics (quant.MX_NUMERICS: key 2 and on; a key 1 pool holds the scale words of
     the MXU before MX, docs/mx_mxu.md), the quantizer's code (quant_source), the format, D, the
     layout (the pool's and the slot's: ExpertFormat's parts) and the checkpoint
-    (checkpoint_id); "numpy" and "model" are notes, not compared."""
+    (checkpoint_id); "numpy" and "model" are notes, not compared. An image with entries past
+    the experts (`pool_extra`: (their count, their key), MiniCPM-V's vision pieces staged
+    through the slots, docs/minicpmv.md 4.2) adds "vision": their key, which open_pool
+    compares on its own (key_diff does not: the experts' part of a pool is the same)."""
     f, L = image.fmt, image.offload
     return {"key": 2, "numerics": Q.MX_NUMERICS, "quant": quant_source(f.wformat),
             "format": f.wformat, "D": f.D,
@@ -231,7 +236,9 @@ def pool_key(image, model_dir=None) -> dict:
                        "F": f.F0, "C": f.C, "wg": list(f.wg), "wu": list(f.wu),
                        "wd": [list(x) for x in f.wd]},
             "checkpoint": checkpoint_id(model_dir), "numpy": np.__version__,
-            "model": None if model_dir is None else Path(model_dir).name}
+            "model": None if model_dir is None else Path(model_dir).name,
+            **({} if getattr(image, "pool_extra", None) is None else
+               {"vision": image.pool_extra[1]})}
 
 
 def key_diff(have: dict, want: dict) -> list:
@@ -274,8 +281,15 @@ def check_pool_key(pool_file, want: dict) -> None:
             f"the run pack the experts it asks for)")
 
 
+def pool_entries(path: Path, n: int) -> int:
+    """The entries a pool file holds by its key: n experts and its "vision" key's entries."""
+    kf = Path(str(path) + ".key")
+    have = json.loads(kf.read_text()) if kf.exists() else {}
+    return n + int((have.get("vision") or {}).get("entries", 0))
+
+
 def open_pool(layout: Layout, pool_file, mapped: bool = True,
-              key: dict | None = None) -> PoolFile:
+              key: dict | None = None, extra: int = 0) -> PoolFile:
     """The expert pool file for `layout`, opened, and its packed experts' read into the page
     cache started (PoolFile.warm: the host's RAM tier; the Engine opens it before it builds the
     image, so the read runs during the build). The file is the whole pool's size (sparse until
@@ -285,35 +299,77 @@ def open_pool(layout: Layout, pool_file, mapped: bool = True,
     the slot format. With `key` (pool_key) a new file gets it as `<pool_file>.key`, and an
     existing one must have it (check_pool_key; one without a key file is refused).
     The page cache stays the kernel's to reclaim: nothing is pinned. mapped: PoolFile's (its
-    reads touched through a read-only map: docs/offload.md 10.7)."""
+    reads touched through a read-only map: docs/offload.md 10.7).
+
+    extra: entries past the experts (layers x E on; key["vision"] their key: pool_key), each a
+    slot's bytes. A pool whose own extra entries are not these (none, or another key's) keeps
+    its experts and gets these, not packed yet (the file grown or cut past its experts, its
+    key's "vision" replaced); a run without extra opens a pool with them as its experts'."""
     L = layout
     n = L.layers * L.E
+    N = n + extra
     path = Path(pool_file)
     done = Path(str(path) + ".packed")
-    fresh = not path.exists() or path.stat().st_size != n * L.slot_bytes
+    kf = Path(str(path) + ".key")
+    fresh = not path.exists() or path.stat().st_size != pool_entries(path, n) * L.slot_bytes
     if not fresh and key is not None:
         check_pool_key(path, key)
+    want_x = (key or {}).get("vision") if extra else None
+    have_x = json.loads(kf.read_text()).get("vision") if not fresh and kf.exists() else None
     if fresh:
         with open(path, "wb") as f:
+            f.truncate(N * L.slot_bytes)
+    elif extra and have_x != want_x:    # its extra entries replaced, its experts kept
+        with open(path, "r+b") as f:
             f.truncate(n * L.slot_bytes)
-    if fresh or not done.exists() or done.stat().st_size != n:
-        done.write_bytes(bytes(n) if fresh else bytes([1]) * n)
+            f.truncate(N * L.slot_bytes)
+        pk = np.fromfile(done, np.uint8)[:n] if done.exists() else np.ones(n, np.uint8)
+        done.write_bytes(np.concatenate([pk, np.zeros(N - n, np.uint8)]).tobytes())
+        have = json.loads(kf.read_text()) if kf.exists() else dict(key)
+        have["vision"] = want_x
+        kf.write_text(json.dumps(have, indent=1) + "\n")
+    M = pool_entries(path, n) if not fresh else N      # (the file's entries)
+    if fresh or not done.exists() or done.stat().st_size != M:
+        done.write_bytes(bytes(M) if fresh else bytes([1]) * M)
     fmt = Path(str(path) + ".format")
     if fresh:
         fmt.write_text(SPLIT + "\n")
-        kf = Path(str(path) + ".key")
         if key is not None:
             kf.write_text(json.dumps(key, indent=1) + "\n")
         elif kf.exists():
             kf.unlink()
     pf = PoolFile(path, L.slot_bytes, fmt.exists() and fmt.read_text().strip() == SPLIT,
                   mapped=mapped)
-    pf.arr = np.memmap(path, np.uint8, "r+", shape=(n, L.slot_bytes))
-    pf.packed = np.memmap(done, np.uint8, "r+", shape=(n,))
+    pf.arr = np.memmap(path, np.uint8, "r+", shape=(N, L.slot_bytes))
+    pf.packed = np.memmap(done, np.uint8, "r+", shape=(N,))
     pf.ids = np.nonzero(np.asarray(pf.packed))[0]
     pf.resident_at_open = pf.resident(pf.ids)
     pf.warm(pf.ids)
     return pf
+
+
+def rewarm(pf: PoolFile):
+    """The pool's experts that left the page cache since the open's read began, read into it
+    again; the Engine calls it once the image is built and the build's memory freed. A 35B
+    MoE image's build peaks at 28-30 GB of the card host's 31 and takes the pool out of the
+    page cache again (docs/minicpmv.md 6, pooldisk: its turns then read their experts from the
+    disk, ~15-32 ms each against 0.5 ms). The open's read is stopped (it may still run: an
+    image from the image cache), then those of the packed experts with bytes out of the page
+    cache (mincore) are read in file order on a new thread. Returns the warm thread now: the
+    open's when it had ended and nothing left the page cache, or where the host cannot tell
+    (no mincore: the open's read is left to run)."""
+    t = pf.warm_t
+    if pf._pages() is None:                 # (no mincore here; and no map of its own made:
+        return t                            # pool_map False keeps none)
+    stopped = t is not None and t.is_alive()
+    if stopped:
+        t.stop.set()
+        t.join()
+    gone = pf.absent(pf.ids)
+    if gone is None and stopped:            # (mincore failed: all of them again)
+        gone = pf.ids
+    # (a stopped read with nothing left out: an empty one, so the record says done)
+    return t if gone is None or not (len(gone) or stopped) else pf.warm(gone)
 
 
 def serve(layout: Layout, expert, backend, pool_file=None, warm=True,
@@ -502,8 +558,10 @@ def moe_ffn(x, lw, mo: MoESpec, dev: SimpleNamespace, eps: float, beside=None,
 
     beside(): emits work that needs no expert (Gemma 4's dense MLP) right after the request is
     posted, so that it runs while the host streams the missing experts (docs/offload.md 5.3);
-    moe_ffn's register is free during it. residual=False: the FFN's output without x (Gemma 4
-    norms the experts' sum before its residual). y_first: the experts' [k, H] outputs take
+    moe_ffn's register is free during it. A shared expert runs there too, before beside()'s
+    work (docs/offload.md 15: the card waits for its misses in most MoE layers, and a shared
+    expert computed after them lengthened every wait by its time). residual=False: the FFN's
+    output without x (Gemma 4 norms the experts' sum before its residual). y_first: the experts' [k, H] outputs take
     their TMEM before the router's input does (Gemma 4 26B-A4B: 22,544 words, which only the
     free space before the step's later tiles holds)."""
     b = current()
@@ -583,9 +641,14 @@ def moe_ffn(x, lw, mo: MoESpec, dev: SimpleNamespace, eps: float, beside=None,
     ol.store(Tensor(Affine(dev.mbox + 4), (1,), (1,)), ol.full((1,), float(k)))  # (its count)
     seq.set(seq + 1.0)
     ol.store(Tensor(Affine(dev.mbox), (1,), (1,)), seq)
-    if beside is not None:                              # while the host streams
-        b.unscratch(r)
-        beside()
+    sh = None
+    if mo.shared or beside is not None:                 # while the host streams: the work
+        b.unscratch(r)                                  # that needs no routed expert
+        if mo.shared:                                   # (the shared expert, added last)
+            sh = swiglu_down(xs, lw.wg, lw.wu, lw.wd) * gate[:, None]
+            del gate
+        if beside is not None:
+            beside()
         r = b.scratch()
     # the directory: each entry's present flag
     col = lambda row: pe.base + row * pe.rs                       # noqa: E731 (column 0)
@@ -620,8 +683,8 @@ def moe_ffn(x, lw, mo: MoESpec, dev: SimpleNamespace, eps: float, beside=None,
     acc = y[0:1, :]
     for i in range(1, k):
         acc = acc + y[i:i + 1, :]
-    if mo.shared:
-        acc = acc + swiglu_down(xs, lw.wg, lw.wu, lw.wd) * gate[:, None]
+    if sh is not None:
+        acc = acc + sh
     return x + acc if residual else acc
 
 
@@ -735,9 +798,18 @@ def moe_ffn_rows(x, lw, mo: MoESpec, dev: SimpleNamespace, eps: float, beside=No
     ol.store(Tensor(Affine(dev.mbox + 4), (1,), (1,)), ol.full((1,), float(N)))
     seq.set(seq + 1.0)
     ol.store(Tensor(Affine(dev.mbox), (1,), (1,)), seq)
-    if beside is not None:                              # while the host streams
-        b.unscratch(r)
-        beside()
+    sh = None
+    if mo.shared or beside is not None:                 # while the host streams: the work
+        b.unscratch(r)                                  # that needs no routed expert
+        if mo.shared:                                   # (the shared expert, added last)
+            g = ol.empty((R,))
+            g.column().set(lg[:, E:E + 1])
+            gate = sigmoid(g)
+            del g
+            sh = swiglu_down(xs, lw.wg, lw.wu, lw.wd) * gate[:, None]
+            del gate, lg
+        if beside is not None:
+            beside()
         r = b.scratch()
     col = lambda row: pe.base + row * pe.rs                       # noqa: E731 (column 0)
     lp = b.begin_loop(N)                                # the directory: present flags
@@ -780,11 +852,8 @@ def moe_ffn_rows(x, lw, mo: MoESpec, dev: SimpleNamespace, eps: float, beside=No
             acc = y if acc is None else acc + y
         out[q:q + 1, :].set(acc)
         del acc, y
-    if mo.shared:
-        g = ol.empty((R,))
-        g.column().set(lg[:, E:E + 1])
-        gate = sigmoid(g)
-        out = out + swiglu_down(xs, lw.wg, lw.wu, lw.wd) * gate[:, None]
+    if sh is not None:
+        out = out + sh
     return x + out if residual else out
 
 

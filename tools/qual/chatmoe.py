@@ -17,11 +17,25 @@ prefill_layers: a model with state has two, up to the snapshot at the reply's st
 rows, expert-major or not, wall and device seconds, the expert server's counts over it and the
 host's time on its requests and idle parts (--trace: each call's runs and the server's timeline
 too). On a tree whose streamed.engine has no em_rows (production's) it runs without --em-rows.
+The pool's page cache is recorded with them: the fraction of its packed experts in it (mincore,
+PoolFile.resident, as tools/offload/pool_disk.py checks its arms) after the load and before and
+after each turn (--pool-calls: each call too; a 17.5 GB pool's check takes 60-90 ms, which
+the turn's wall times then include), and each call's and turn's pool reads by where they came
+from (PoolFile.io: "cached", "disk"); a turn that read from the disk or began under 95% is
+marked "cold" (its prompt's misses waited on the disk: session r2m8's 35B, 2026-10-13, 2,966
+misses served in 40.2 s against production's 2.9 s, the same calls, read from the SSD at
+~13.5 ms each).
 Exit 1 when --check finds another token.
+
+Images (a model with a vision side: MiniCPM-V, docs/minicpmv.md): --image N:PATH attaches PATH
+to turn N (1-based; repeated), --max-slices bounds an image's slices; each turn reports its
+images and their crops' wall seconds through the card's tower (vision_s), and the JSON keeps
+each image's sha256 (the reference's must be the same bytes).
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pickle
 import sys
@@ -59,7 +73,38 @@ CALL_COUNTS = ("hits", "misses", "need_lines", "needs_queued", "need_hits", "nee
                "drained", "prefetched", "holds", "stage_holds", "bytes")
 
 
-def _calls(eng, calls: list, trace: list | None = None) -> None:
+def _pool(eng):
+    """The engine's pool file (offload.PoolFile) and its packed experts' bytes; (None, 0) for a
+    pool in host RAM."""
+    pf = getattr(getattr(eng, "server", None), "pool_file", None)
+    if pf is None or pf.ids is None or not len(pf.ids):
+        return None, 0
+    return pf, len(pf.ids) * pf.slot
+
+
+def _resident(pf, total: int) -> float | None:
+    """The fraction of the pool's packed experts in the page cache now (PoolFile.resident), or
+    None where the host cannot tell."""
+    res = None if pf is None else pf.resident(pf.ids)
+    return None if res is None else round(res / total, 4)
+
+
+def _io(pf) -> dict:
+    """PoolFile.io's counts now (a copy): {cached | disk | unknown: [reads, s, bytes, absent]}."""
+    return {k: list(v) for k, v in ((pf.io or {}) if pf is not None else {}).items()}
+
+
+def _reads(io0: dict, io1: dict) -> dict:
+    """The pool's reads between two _io copies by where they came from: [reads, s, MB]."""
+    out = {}
+    for k, v in io1.items():
+        d = [x - y for x, y in zip(v, io0.get(k, [0] * len(v)))]
+        if d[0]:
+            out[k] = [d[0], round(d[1], 3), round(d[2] / 1e6, 1)]
+    return out
+
+
+def _calls(eng, calls: list, trace: list | None = None, pool_calls: bool = False) -> None:
     """Each prefill_layers call of eng appended to `calls`: its rows, expert-major or not (the
     gate's choice, streamed.gate_expert_major, else the Engine's), wall and device seconds,
     runs, the server's CALL_COUNTS over it, and from the server's events its requests and the
@@ -67,6 +112,8 @@ def _calls(eng, calls: list, trace: list | None = None) -> None:
     parts (parts_s); with `trace` (a list) also its runs (key, start, end, cycles; s from the
     call's start) and those events (seen, done, kind, layer or expert, misses or bytes)."""
     base, srv = eng.prefill_layers, eng.server
+    pf, total = _pool(eng)
+    res = (lambda: _resident(pf, total)) if pool_calls else (lambda: None)  # noqa: E731
     khz = (getattr(eng.backend, "info", None) or {}).get("core_khz")
     runs, t0 = [], [None]
     if trace is not None:
@@ -91,15 +138,16 @@ def _calls(eng, calls: list, trace: list | None = None) -> None:
                 return st
             b.start, b.wait = started, waited
 
-    def prefill_layers(tokens, logits: bool = True):
+    def prefill_layers(tokens, logits: bool = True, **kw):     # (kw: vis, an image's rows)
         c0 = {k: getattr(srv, k, 0) for k in CALL_COUNTS}
+        res0, io0 = res(), _io(pf)              # (the pool's page cache: outside the timing)
         k, t = len(eng.stats), time.perf_counter()
         srv.events = []                         # (the server's timeline: each poll that did work)
         if trace is not None:
             runs.clear()
             t0[0] = t
         try:
-            return base(tokens, logits)
+            return base(tokens, logits, **kw)
         finally:
             dt = time.perf_counter() - t
             cyc = sum((x or {}).get("cycles") or 0 for x in eng.stats[k:])
@@ -112,7 +160,9 @@ def _calls(eng, calls: list, trace: list | None = None) -> None:
                               runs=len(eng.stats) - k, requests=len(req),
                               serve_s=round(sum(e[1] - e[0] for e in req), 3),
                               parts_s=round(sum(e[1] - e[0] for e in ev if e[2] == "p"), 3),
-                              **{c: getattr(srv, c, 0) - c0[c] for c in CALL_COUNTS}))
+                              **{c: getattr(srv, c, 0) - c0[c] for c in CALL_COUNTS},
+                              pool_before=res0, pool_after=res(),
+                              reads=_reads(io0, _io(pf))))
             if trace is not None:
                 t0[0] = None
                 trace.append(dict(rows=len(tokens), em=bool(em), runs=[list(r) for r in runs],
@@ -125,7 +175,9 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
         turns=TURNS, max_new: int = 16, cap: int = 2048, pool: str | None = None,
         experts: int = 0, layer_major: int | None = None, sample: bool = False,
         seed: int = 0, create: bool = False, tok=None, em_rows: int | None = None,
-        trace: list | None = None, em_pass: int | None = None) -> dict:
+        trace: list | None = None, em_pass: int | None = None, images=(),
+        max_slices: int | None = None, vision_staged: bool | None = None,
+        pool_calls: bool = False) -> dict:
     from opentpu.host import chat as C
     from opentpu.host import streamed as ST
     from opentpu.isasim import board_config
@@ -146,26 +198,40 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
     eng = ST.engine(path, cfg or board_config(), be, cap, pool or ST.DEFAULT, experts=experts,
                     wformat=wformat, head_format=head, formats=formats, layer_major=layer_major,
                     create=create, snapshots=C.SNAPSHOTS,     # (otpu-chat's: its turns roll back)
+                    vision_staged=vision_staged,              # (MiniCPM-V: None, the Spec's)
                     **({} if em_rows is None else {"em_rows": em_rows}),    # (13.16)
                     **({} if em_pass is None else {"em_pass": em_pass}))    # (13.18)
     load_s = time.time() - t
+    pf, total = _pool(eng)
+    if pf is not None and pf.io is None:        # (the reads by where they came from)
+        pf.io = {}
     calls: list = []
     if eng.layer_major:                         # (the prompt's calls, each turn's)
-        _calls(eng, calls, trace)
+        _calls(eng, calls, trace, pool_calls)
     sp = C.sampling(spec, argparse.Namespace(), path)
     pick = C.sampler(sp["temperature"] if sample else 0, sp["top_k"], sp["top_p"], seed,
                      sp["repetition_penalty"], getattr(spec, "softcap", None))
     khz = (getattr(eng.backend, "info", None) or {}).get("core_khz")
     chat = C.Chat(eng, tok, False, pick, max_new, clock_mhz=khz / 1e3 if khz else 0.0)
+    chat.max_slices = max_slices
     out = dict(model=path.name, backend=backend, cfg=cfg_file, sample=sample, seed=seed,
                weights=C.weights_label(eng.image, wformat),
                experts=ST.describe(eng, eng.pool_path), layer_major=eng.layer_major,
                expert_major=eng.expert_major, em_rows=getattr(eng, "em_rows", 0),
                em_pass=getattr(eng, "em_pass", None),
-               on_card=chat.on_card, load_s=round(load_s, 1), turns=[])
-    for text in turns:
+               on_card=chat.on_card, load_s=round(load_s, 1), max_slices=max_slices,
+               vision_staged=getattr(getattr(eng.image, "vision", None), "resident", True) is False,
+               images=[dict(turn=i, path=str(f), sha256=hashlib.sha256(
+                   Path(f).read_bytes()).hexdigest()) for i, f in images],
+               pool_gb=round(total / 1e9, 2), pool_at_load=_resident(pf, total), turns=[])
+    for k, text in enumerate(turns, 1):
+        for i, f in images:
+            if i == k:
+                chat.attach(str(f))
         n0, c0 = len(chat.fed), len(calls)
+        res0, io0 = _resident(pf, total), _io(pf)
         reply, tr = chat.ask(text)
+        res1, reads = _resident(pf, total), _reads(io0, _io(pf))
         r = lambda x, k=3: None if x is None else round(x, k)      # noqa: E731
         out["turns"].append(dict(
             text=text, reply=reply, tokens=list(chat._reply), end=tr.end, fed_before=n0,
@@ -177,7 +243,12 @@ def run(model, backend: str = "isa", cfg_file: str | None = None, dev: str = "/d
             decode_tok_s=r(tr.decode_tok_s, 2), decode_dev_tok_s=r(tr.decode_dev_tok_s, 2),
             hits=tr.expert_hits, misses=tr.expert_misses,
             hit_rate=r(tr.expert_hit_rate, 4), mb_per_token=r(tr.streamed_mb_per_token, 2),
-            prefill_misses=tr.prefill_misses, calls=calls[c0:], line=tr.line()))
+            prefill_misses=tr.prefill_misses, images=tr.images, vision_s=r(tr.vision_s),
+            calls=calls[c0:], line=tr.line(),
+            pool_before=res0, pool_after=res1, reads=reads,
+            cold=bool(reads.get("disk")) or any(c["pool_before"] is not None and
+                                                c["pool_before"] < 0.95 for c in calls[c0:])
+            or (res0 is not None and res0 < 0.95)))
     out["host_mem"] = ST.host_mem()
     return out
 
@@ -191,7 +262,19 @@ def check(got: dict, ref: dict) -> list:
                                  if x != y), min(len(a["tokens"]), len(b["tokens"])))))
     if len(got["turns"]) != len(ref["turns"]):
         bad.append((min(len(got["turns"]), len(ref["turns"])), None))
+    if [x["sha256"] for x in got.get("images", [])] != \
+            [x["sha256"] for x in ref.get("images", [])]:
+        bad.append((None, "images"))
     return bad
+
+
+def _pct(x) -> str:
+    return "?" if x is None else f"{100 * x:.1f}%"
+
+
+def _rd(reads: dict) -> str:
+    return ", ".join(f"{k} {v[0]} ({v[1]} s, {v[2]} MB)"
+                     for k, v in sorted(reads.items())) or "none"
 
 
 def main(argv=None) -> int:
@@ -217,23 +300,50 @@ def main(argv=None) -> int:
                     help="expert-major's entries a pass (default: the configuration's, "
                          "moe.em_pass_rows)")
     ap.add_argument("--trace", help="each turn's calls' runs and the server's timeline, JSON")
+    ap.add_argument("--image", action="append", default=[], metavar="N:PATH",
+                    help="an image for turn N (1-based; repeated): a model with a vision side")
+    ap.add_argument("--max-slices", type=int, help="an image's slices at most (default the "
+                                                   "processor's)")
+    vis = ap.add_mutually_exclusive_group()
+    vis.add_argument("--vision-staged", action="store_true",
+                     help="MiniCPM-V's tower weights staged through the expert slots "
+                          "(minicpmv.Spec.vision_staged, the default; the pool grows by their "
+                          "entries)")
+    vis.add_argument("--vision-resident", action="store_true",
+                     help="MiniCPM-V's tower weights resident in the image")
+    ap.add_argument("--pool-calls", action="store_true",
+                    help="the pool's page cache before and after each call too (mincore: "
+                         "60-90 ms a check of a 17.5 GB pool, in the turn's wall times)")
     ap.add_argument("--sample", action="store_true", help="the model's sampling defaults")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--check", help="a reference run's JSON: its tokens, turn by turn")
     ap.add_argument("--out", help="this run's JSON")
     a = ap.parse_args(argv)
     tr = [] if a.trace else None
+    images = []
+    for x in a.image:
+        n, _, f = x.partition(":")
+        if not n.isdigit() or not Path(f).is_file():
+            ap.error(f"--image {x}: N:PATH, PATH a file")
+        images.append((int(n), Path(f)))
     r = run(a.model, a.backend, a.cfg, a.dev, a.turn or TURNS, a.max_new, a.cap, a.pool,
             a.experts, a.layer_major, a.sample, a.seed, a.pool_create, em_rows=a.em_rows,
-            trace=tr, em_pass=a.em_pass)
+            trace=tr, em_pass=a.em_pass, images=images, max_slices=a.max_slices,
+            vision_staged=True if a.vision_staged else False if a.vision_resident else None,
+            pool_calls=a.pool_calls)
     for i, t in enumerate(r["turns"]):
         print(f"turn {i + 1}: {t['reply']!r}\n  {t['line']}", flush=True)
+        print(f"  pool: {_pct(t['pool_before'])} -> {_pct(t['pool_after'])} of its "
+              f"{r['pool_gb']} GB in the page cache; reads {_rd(t['reads'])}"
+              + ("; COLD (misses read from the disk)" if t["cold"] else ""), flush=True)
         for c in t["calls"]:
             print(f"    call: {c['rows']} rows {'expert' if c['em'] else 'layer'}-major, "
                   f"{c['s']} s (device {c['device_s']}), {c['runs']} runs; misses "
                   f"{c['misses']} ({c['requests']} requests, served in {c['serve_s']} s), needs "
                   f"{c['needs_queued']} ({c['need_lines']} lines), parts {c['prefetched']} "
-                  f"({c['parts_s']} s), holds {c['holds']}", flush=True)
+                  f"({c['parts_s']} s), holds {c['holds']}; pool {_pct(c['pool_before'])} -> "
+                  f"{_pct(c['pool_after'])} in the page cache, reads {_rd(c['reads'])}",
+                  flush=True)
     if a.trace:
         Path(a.trace).write_text(json.dumps(dict(
             run_fields=["key", "start", "end", "cycles"],
@@ -245,7 +355,8 @@ def main(argv=None) -> int:
         bad = check(r, ref)
         r["check"] = dict(ref=a.check, ok=not bad, differ=bad)
         print(f"[{'FAIL' if bad else 'PASS'}] {r['model']} against {a.check}: " +
-              (", ".join(f"turn {i + 1} from token {j}" for i, j in bad) if bad else
+              (", ".join("other images" if i is None else f"turn {i + 1} from token {j}"
+                         for i, j in bad) if bad else
                f"{len(r['turns'])} turns' tokens the same"), flush=True)
         rc = 1 if bad else 0
     if a.out:

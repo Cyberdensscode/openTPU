@@ -78,7 +78,8 @@ HEAD_ROWS = 16384       # LM head rows per pass (quantize_mxu's pieces: the same
 
 
 def family(spec):
-    return {Q3.Spec: Q3, L2.Spec: L2, Q35.Spec: Q35}[type(spec)]
+    fams = {Q3.Spec: Q3, L2.Spec: L2, Q35.Spec: Q35}    # (a subclass: its base's, MiniCPM-V's
+    return next(fams[t] for t in type(spec).__mro__ if t in fams)   # Spec qwen35's)
 
 
 def _ident(v, d=None, n=None):

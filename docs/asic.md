@@ -189,7 +189,12 @@ clock on the operator) pays once those are fixed, from about 540 MHz.
 - **The ports.** The SW and port B requests (`sw_req`, `sw_addr`, `sw_wdata`, `b_wmask`, ...) leave
   the block combinationally from the DMA's and quantizer's state through the slice's arbitration
   (12-27 levels): with 20% of the period outside, 339 MHz. A register stage at the boundary (as the
-  platform's adapter would add) frees them.
+  platform's adapter would add) frees them. The SW port has one, on every target (the card's
+  too: one design): `otpu_slice`'s SW port register took that block at 3.0 ns from 21 routed port
+  violators to none ([asic_timing_loop.md](asic_timing_loop.md)). `sw_req` is the register's
+  valid bit, and a write waits in it while `sw_req` is high, so a platform's "every write the
+  block gave is taken" is `wr_idle && !sw_req` (as `otpu_board`'s STATUS WR_IDLE and run start).
+  Port B is still combinational.
 - **Sequencer dispatch.** `q_pr -> c_fp` (the footprint of the queued command, 50 levels) is the
   worst register-to-register path; `fp_ranges` and `fp_seg` in two cycles would give it a full one.
 - **Grant fanout.** The DMA's stream state -> the arbitration -> the quantizer's and the VPU's

@@ -13,15 +13,18 @@
 # The checkpoints and pools are the offload sessions' (tools/offload/sessions/env.sh: O), each
 # pool stamped with its key (pack_pool.py MODEL POOL stamp); the references are
 # RF/chatmoe-<model>.json. A model whose files are not staged is skipped. Before each model
-# every other file of 100 MB or more under O and ~/openTPU/models leaves the page cache (as
-# card_moe.sh's DROPOTHER; a link out of ~/openTPU and ~/otpu-build is skipped, never opened)
-# and its pool is read into it. Selftest before and after.
+# every other file of 100 MB or more under O, ~/openTPU/models and /data/otpu leaves the page
+# cache (as card_moe.sh's DROPOTHER; a link out of ~/openTPU, ~/otpu-build and /data/otpu is
+# skipped, never opened) and its pool is read into it. /data/otpu: MiniCPM-V's pool (18 GB) stayed
+# in the page cache after session hostr21 (2026-10-14), and the card host's 31 GB then held 63% of
+# the 35B's pool. Selftest before and after.
 # The references, on a host with the whole checkpoints (CFG: the card's refs.py cfg, REFCFG):
 #   python3 tools/qual/chatmoe.py CHECKPOINT --cfg CFG --pool POOL --out chatmoe-<model>.json
 #   (--pool-create where the host has no pool: the experts packed as they are asked for)
 # Run (the card's lock for the whole session; no pipe):
 #   setsid -f otpu-lock --wait 3600 -- bash tools/qual/chatmoe.sh > /dev/null 2>&1
-#   (the log: R/session.log, R = O/SESSION; RUNS="lfm2-8b qwen35-35b gemma4-26b"; env.sh's T,
+#   (the log: R/session.log, R = O/SESSION; RUNS="lfm2-8b qwen35-35b gemma4-26b"; POOL_CALLS=1:
+#   chatmoe.py --pool-calls, the pool's page cache around each call; env.sh's T,
 #   O, RF, REFCFG; G26POOL relative to O)
 set -u
 SESSION=${SESSION:-chatmoe-$(date +%m%d-%H%M)}
@@ -50,10 +53,11 @@ for m in ${RUNS:-lfm2-8b qwen35-35b gemma4-26b}; do
   if [ ! -f $O/$md/config.json ] || [ ! -f $O/$pool ] || [ ! -f $ref ]; then
     echo "  [SKIP] $m: not staged ($O/$md, $O/$pool, $ref)"; continue; fi
   echo "=== $m $(date +%T)"
-  python - $O/$md $O/$pool $O:$HOME/openTPU/models <<'PY'
+  python - $O/$md $O/$pool $O:$HOME/openTPU/models:/data/otpu <<'PY'
 import os, sys                                # every other file of 100 MB or more out of the
 keep = {os.path.realpath(sys.argv[1]), os.path.realpath(sys.argv[2])}    # page cache
-ours = tuple(os.path.realpath(os.path.expanduser(d)) + os.sep for d in ("~/openTPU", "~/otpu-build"))
+ours = tuple(os.path.realpath(os.path.expanduser(d)) + os.sep
+             for d in ("~/openTPU", "~/otpu-build", "/data/otpu"))
 gb = n = 0
 seen = set()
 for d in sys.argv[3].split(":"):
@@ -83,7 +87,8 @@ print(f"  pool: {PoolFile(p, os.path.getsize(p) // n, True, False).resident(rang
 PY
   echo "  (read in $((SECONDS - t0)) s, mem $(mem) GB)"
   timeout 3600 python tools/qual/chatmoe.py $O/$md --pool $O/$pool --backend board \
-    --cfg $R/cfg-dev.pkl --check $ref --out $R/chatmoe-$m.json > $R/chatmoe-$m.log 2>&1
+    --cfg $R/cfg-dev.pkl --check $ref --out $R/chatmoe-$m.json ${POOL_CALLS:+--pool-calls} \
+    > $R/chatmoe-$m.log 2>&1
   echo "  exit $? $(date +%T)"; grep -E "\[(PASS|FAIL)\]|Error|Traceback" $R/chatmoe-$m.log | tail -3
   [ -f $R/chatmoe-$m.json ] || continue
   python - $R/chatmoe-$m.json <<'PY'
@@ -98,6 +103,11 @@ for i, t in enumerate(r["turns"]):
           f"misses; TTFT {t['ttft_s']} s; decode {t['gen_tokens']} tokens at {t['decode_tok_s']} "
           f"tok/s (device {t['decode_dev_tok_s']}), hits {t['hit_rate']}, "
           f"{t['mb_per_token']} MB/token; end {t['end']}")
+    if "cold" in t:                             # (the pool's page cache: chatmoe.py's record)
+        print(f"    pool {t['pool_before']} -> {t['pool_after']} in the page cache, reads "
+              f"{t['reads']}" + ("; COLD: misses read from the disk" if t["cold"] else "")
+              + "".join(f"; call {c['rows']} rows {c['pool_before']} -> {c['pool_after']}"
+                        for c in t["calls"]))
 PY
 done
 echo "=== final selftest $(date +%T)"

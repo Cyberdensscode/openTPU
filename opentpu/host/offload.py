@@ -301,33 +301,53 @@ class PoolFile:
         while self._touches:
             self._touch(*self._touches.pop())
 
-    def resident(self, ids) -> int | None:
-        """Bytes of these experts in the page cache (mincore over the file's pages), or None
-        where the host cannot tell."""
+    def _pages(self) -> np.ndarray | None:
+        """The file's pages in the page cache (mincore: 1 a page in it), or None where the host
+        cannot tell."""
         import ctypes
         import mmap
         size = os.fstat(self.fd).st_size
-        if not size or not len(ids):
-            return 0
+        if not size:
+            return np.zeros(0, np.uint8)
         try:
             libc = ctypes.CDLL(None, use_errno=True)
             mm = mmap.mmap(self.fd, size, prot=mmap.PROT_READ)
         except (OSError, AttributeError, ValueError):
             return None
-        pg = mmap.PAGESIZE
-        vec = (ctypes.c_ubyte * -(-size // pg))()
+        vec = (ctypes.c_ubyte * -(-size // mmap.PAGESIZE))()
         try:
             v = np.frombuffer(mm, np.uint8)
             rc = libc.mincore(ctypes.c_void_p(v.ctypes.data), ctypes.c_size_t(size), vec)
             del v
         finally:
             mm.close()
-        if rc != 0:
+        return None if rc != 0 else np.frombuffer(vec, np.uint8) & 1
+
+    def _held(self, ids) -> tuple | None:
+        """(the experts' ids, the bytes of each in the page cache), or None where the host
+        cannot tell."""
+        import mmap
+        g = np.asarray(ids, np.int64).reshape(-1)
+        vec = self._pages() if len(g) else np.zeros(0, np.uint8)
+        if vec is None:
             return None
-        cum = np.concatenate([[0], np.cumsum(np.frombuffer(vec, np.uint8) & 1)])
-        g = np.asarray(ids, np.int64)
-        lo, hi = g * self.slot // pg, -(-(g + 1) * self.slot // pg)
-        return int(np.minimum((cum[hi] - cum[lo]) * pg, self.slot).sum())
+        pg = mmap.PAGESIZE
+        cum = np.concatenate([[0], np.cumsum(vec, dtype=np.int64)])
+        lo = np.minimum(g * self.slot // pg, len(vec))
+        hi = np.minimum(-(-(g + 1) * self.slot // pg), len(vec))
+        return g, np.minimum((cum[hi] - cum[lo]) * pg, self.slot)
+
+    def resident(self, ids) -> int | None:
+        """Bytes of these experts in the page cache (mincore over the file's pages), or None
+        where the host cannot tell."""
+        h = self._held(ids)
+        return None if h is None else int(h[1].sum())
+
+    def absent(self, ids) -> np.ndarray | None:
+        """Those of these experts with bytes not in the page cache, in file order (mincore),
+        or None where the host cannot tell."""
+        h = self._held(ids)
+        return None if h is None else np.sort(h[0][h[1] < self.slot])
 
     def _absent(self, off: int, n: int) -> int | None:
         """Bytes of the file's pages under [off, off + n) not in the page cache (mincore), or
@@ -392,20 +412,52 @@ class PoolFile:
                 os.posix_fadvise(self.fd, int(g) * self.slot, self.slot, os.POSIX_FADV_WILLNEED)
 
     def warm(self, ids) -> threading.Thread:
+        """The thread reading these experts once into the page cache (warm_t). Its record
+        (warm_report): `bytes` read of `total`; t0 and t1, its start and end (time.time(); t1
+        None while it runs); `error`, what ended it early (a read's exception), or None;
+        `stop`, an Event that ends it at the next expert; and at its end `resident`, the share
+        of the pool's packed experts (ids, else these) in the page cache (mincore; None where
+        the host cannot tell)."""
         import mmap
         scratch = memoryview(mmap.mmap(-1, self.slot))
+        ids = np.asarray(ids, np.int64).reshape(-1)
 
         def run():
-            for g in ids:
-                preadv(self.fd, [scratch], int(g) * self.slot)
-                if self.mapped:
-                    self._touch(int(g) * self.slot, self.slot)
-                t.bytes += self.slot
+            try:
+                for g in ids:
+                    if t.stop.is_set():
+                        break
+                    preadv(self.fd, [scratch], int(g) * self.slot)
+                    if self.mapped:
+                        self._touch(int(g) * self.slot, self.slot)
+                    t.bytes += self.slot
+            except Exception as e:          # (otpu-serve's /health: the warm incomplete)
+                t.error = f"{type(e).__name__}: {e}"
+            finally:
+                pool = ids if self.ids is None else self.ids
+                r = self.resident(pool) if len(pool) else None
+                t.resident = None if r is None else r / (len(pool) * self.slot)
+                t.t1 = time.time()
         t = threading.Thread(target=run, daemon=True, name="otpu-pool-warm")
-        t.bytes = 0
+        t.bytes, t.total, t.t0, t.t1 = 0, len(ids) * self.slot, time.time(), None
+        t.error, t.resident, t.stop = None, None, threading.Event()
         t.start()
         self.warm_t = t
         return t
+
+
+def warm_report(t) -> dict | None:
+    """A PoolFile.warm thread's record: its start and end (time.time(); end None while it
+    runs), the GB it read of how many, its MB/s, the pool's share in the page cache at its end
+    (mincore), and what ended it early (error; stopped: its stop set)."""
+    if t is None:
+        return None
+    s = (t.t1 or time.time()) - t.t0
+    return {"start": round(t.t0, 1), "end": None if t.t1 is None else round(t.t1, 1),
+            "gb": round(t.bytes / 1e9, 2), "of_gb": round(t.total / 1e9, 2),
+            "mb_s": round(t.bytes / 1e6 / s, 1) if s > 0 else None,
+            "resident": None if t.resident is None else round(t.resident, 4),
+            "error": t.error, "stopped": t.stop.is_set()}
 
 
 @dataclass(frozen=True)
@@ -628,6 +680,82 @@ class ExpertServer:
         # need lines served; their ids queued, already in a slot, landed from the queue
         self.need_lines = self.needs_queued = self.need_hits = self.needs_landed = 0
         self.drained = 0                    # needs end_prefill sent (none: each expert run's)
+        # the pool's entries past the experts (ids from layers x E, never a request's) placed
+        # in slots for host-orchestrated runs (place: MiniCPM-V's vision pieces), entry ->
+        # slot; the bytes place wrote, and its slots taken from experts (victims)
+        self.placed: dict = {}
+        self.place_bytes = self.place_victims = 0
+
+    def place(self, entries, sizes=None) -> list:
+        """The pool's entries `entries` (ids from layers x E up: pieces of weights the host's
+        own runs read, docs/minicpmv.md 4.2), each in a slot of its own until release(); returns
+        their slot addresses. Called between runs, outside a layer-major prefill: the card's
+        last request is served first (settle) and hinted experts still on their way are dropped.
+        An entry already placed keeps its slot; the others take free slots first, then the slots
+        of the experts of least decayed use across the layers ("lru": each layer's least
+        recent alike), each layer keeping k slots; the victims' entries are cleared on the card
+        before the entries' bytes are written. sizes[g]: the bytes of entry g its runs read
+        (written in whole RUN blocks; default the slot's). No tag and no directory entry: the
+        runs read the slots' addresses from the host (a table it writes)."""
+        L = self.L
+        G = L.layers * L.E
+        entries = [int(g) for g in entries]
+        if any(g < G for g in entries) or len(set(entries)) != len(entries):
+            raise ValueError(f"place: entries from {G} up (the pool's past its experts), each "
+                             f"once")
+        if self.pooled:
+            raise RuntimeError("place during a layer-major prefill")
+        self.settle()
+        self._unstage()
+        self.armed -= self._used            # (the runs before halted: the card zeroed the
+        self._used = set()                  # last request's tags)
+        for g in list(self.pending):        # hinted experts on their way: dropped
+            del self.pending[g]
+            j = g // L.E
+            self.free[j].append(self.lru[j].pop(g))
+            self.dropped += 1
+        new = [g for g in entries if g not in self.placed]
+        k = L.k
+        cap = [len(lru) + len(fr) for lru, fr in zip(self.lru, self.free)]
+        if sum(max(0, c - k) for c in cap) < len(new):
+            raise RuntimeError(f"place: {len(new)} entries, {sum(max(0, c - k) for c in cap)} "
+                               f"slots past k = {k} a layer")
+        slots = []
+        for j, fr in enumerate(self.free):
+            while fr and len(slots) < len(new) and cap[j] > k:
+                slots.append(self._reuse(fr.pop(0)))
+                cap[j] -= 1
+        if len(slots) < len(new):
+            cand = []                       # (its want, the layer, the expert)
+            for j, lru in enumerate(self.lru):
+                use = self.use[j]
+                for r, g in enumerate(lru):
+                    cand.append((use.get(g, -math.inf) if self.policy == "lfu" else r, j, g))
+            cand.sort(key=lambda c: (c[0], c[1]))
+            for _, j, g in cand:
+                if len(slots) == len(new):
+                    break
+                if cap[j] <= k:
+                    continue
+                slots.append(self._reuse(self.lru[j].pop(g)))
+                self._dir(g, 0)
+                cap[j] -= 1
+                self.place_victims += 1
+        self._dir_flush()
+        n = L.slot_bytes
+        for g, a in zip(new, slots):
+            m = n if sizes is None else min(n, -(-int(sizes[g]) // RUN) * RUN)
+            self._write(a, 0, self._part_of(g, 0, m))
+            self.placed[g] = a
+            self.place_bytes += m
+        self._flush()
+        return [self.placed[g] for g in entries]
+
+    def release(self) -> None:
+        """place's slots back to their own layers, free (decode's misses fill them)."""
+        for a in self.placed.values():
+            self.free[self.L.layer_of(a)].append(a)
+        self.placed.clear()
 
     def load(self, warm=()) -> None:
         """At image load: an empty directory, mailbox and answer, every slot's tag zero, then
@@ -647,6 +775,7 @@ class ExpertServer:
         for lru, fr in zip(self.lru, self.free):
             fr.extend(lru.values())
             lru.clear()
+        self.release()                      # (placed entries' slots)
         for a in self.scratch_slots:        # (a prefill that stopped: its scratch's slots)
             self.free[L.layer_of(a)].append(a)
         self.scratch_slots = []
@@ -1214,6 +1343,7 @@ class ExpertServer:
         if scratch and not expert_major:
             raise ValueError("a scratch is an expert-major prefill's")
         self.settle()
+        self.release()                      # (place's entries: their runs are done)
         self._drop_ahead()
         self._ahead_off = not ahead
         if part is not None:

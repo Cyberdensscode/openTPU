@@ -154,8 +154,9 @@ class Spec:
         c = top.get("text_config", top)
         rope = rope_parameters(c, model_dir)        # (mRoPE: 1-D RoPE for text)
         d = c.get("head_dim") or c["hidden_size"] // c["num_attention_heads"]
-        eos = c.get("eos_token_id", 248044)
-        eos = tuple(eos) if isinstance(eos, list) else (eos,)
+        eos = c.get("eos_token_id")             # (a null one: the default's)
+        eos = tuple(e for e in (eos if isinstance(eos, list) else [eos]) if e is not None) \
+            or (248044,)
         moe = None
         if "num_experts" in c:                  # Qwen3.5-MoE: softmax top-k, a shared expert
             moe = MO.MoESpec(E=c["num_experts"], k=c["num_experts_per_tok"],
@@ -812,6 +813,7 @@ class Image(EmbedHost):
                                               waitc=cfg.SEQ_WC)
         self.choices = {"embed_host": self.embed_host,          # (the compile worker's
                         "formats": self.formats}                # image)
+        self.before_slots(b)
         self.offload = None
         if mo is not None:          # path (a)'s words and expert slots (docs/offload.md)
             self.fmt = MO.ExpertFormat(H, mo.ffn, D, wformat)
@@ -825,6 +827,10 @@ class Image(EmbedHost):
         if self.nbytes > cfg.DRAM_BYTES:
             raise MemoryError(f"model image needs {self.nbytes / 2**20:.0f} MiB per slice, "
                               f"DRAM_BYTES is {cfg.DRAM_BYTES / 2**20:.0f} MiB")
+
+    def before_slots(self, b) -> None:
+        """A subclass's own DRAM, allocated from `b` (qwen3._Bump) after the model's and before
+        the expert slots (which take the rest): MiniCPM-V's vision side (minicpmv.Image)."""
 
     @property
     def mtp_fc(self) -> str:

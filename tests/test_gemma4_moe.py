@@ -191,9 +191,9 @@ def test_chunked_prefill_is_bit_exact(kv):
 K = 2                   # the tiny MoE's top k: the smallest expert cache
 
 
-def _moe_engine(moe, **kw):
+def _moe_engine(moe, cfg=None, **kw):
     _, W, spec = moe
-    return Engine(spec, W, cap=1024, cfg=_cfg(), rows=1, **kw)
+    return Engine(spec, W, cap=1024, cfg=cfg or _cfg(), rows=1, **kw)
 
 
 @pytest.mark.parametrize("wf,formats", [("int8", ""), ("fp4", ""), ("int8", "experts=nvfp4")])
@@ -382,13 +382,14 @@ def test_moe_on_board_model(moe, have_verilator):
     hold at their first read. Per-position programs, then the resident decode, then the card's
     generate loop (the experts beside the dense MLP, sliding and global attention): the ISA
     simulator's logits and tokens bit for bit."""
+    from conftest import sim_board_config
     from opentpu.host.board import Board, BoardBackend, SimTransport
     _, W, spec = moe
-    cfg = _cfg()
+    cfg = sim_board_config(DRAM_BYTES=1 << 26)
     tr = SimTransport(ch_bytes=cfg.DRAM_BYTES // 2, stall=20, seed=5)
     assert Board(tr).info()["caps"].get("waitw"), "the board model has no WAITW (CAPS bit31)"
-    isa = _moe_engine(moe, resident=True)
-    brd = _moe_engine(moe, resident=True,
+    isa = _moe_engine(moe, cfg, resident=True)
+    brd = _moe_engine(moe, cfg, resident=True,
                       backend=lambda c, imgs: BoardBackend(c, imgs, transport=tr))
     assert brd.resident and brd.can_generate and brd.server.misses == 0
     L = brd.image.offload

@@ -16,6 +16,7 @@ import pytest
 
 from opentpu.host import streamed as ST
 from opentpu.host.chat import Chat, Session, Turn, sampler
+from opentpu.host.offload import warm_report
 from opentpu.isasim import board_config
 
 torch = pytest.importorskip("torch")
@@ -118,13 +119,16 @@ def _until_eos(tokens, eos):
 
 def test_streamed_defaults_are_the_cards_runs():
     """--wformat auto for a streamed MoE: each family's formats on the card (docs/offload.md
-    14.2: the MX formats' per-kind choices); the pool's default place is the checkpoint's
-    directory, named by the experts' format."""
-    from opentpu.llm import gemma4, lfm2, qwen35
+    14.2: the MX formats' per-kind choices; MiniCPM-V's its own, docs/minicpmv.md 5.1); the
+    pool's default place is the checkpoint's directory, named by the experts' format."""
+    from opentpu.llm import gemma4, lfm2, minicpmv, qwen35
     assert ST.defaults(object.__new__(qwen35.Spec)) == \
         ("fp4", "int8", "attn=nvfp4,delta=nvfp4,mlp=nvfp4")
     assert ST.defaults(object.__new__(lfm2.Spec)) == ("nvfp4", "int8", None)
     assert ST.defaults(object.__new__(gemma4.Spec)) == ("int8", "fp4", "experts=nvfp4")
+    assert ST.defaults(object.__new__(minicpmv.Spec)) == \
+        ("fp4", "int8", "delta@0-19=int8,attn=nvfp4,delta=nvfp4,mlp=int8")
+    assert ST.em_rows_of(object.__new__(minicpmv.Spec)) == ST.EM_ROWS["qwen35"]
     assert ST.default_pool("models/Qwen3.5-35B-A3B", "fp4") == \
         Path("models/Qwen3.5-35B-A3B/pool-mx1-fp4.bin")      # (beside the MXU before MX's
     assert ST.default_pool("models/LFM2.5-8B-A1B", "nvfp4") == \
@@ -233,6 +237,12 @@ def test_a_chat_turn_is_moe_cards_run(ckpt, formats, tmp_path):
     assert 0 < packed.sum() <= len(packed)
     eng = ST.engine(d, CFG, "isa", 256, pool, experts=K, wformat=wf, head_format=hf)
     assert eng.layer_major == lm and eng.image.offload.slots[0][1] == K
+    pw = eng.server.pool_warm               # the open's read, or moe.rewarm's after the build
+    assert pw is eng.server.pool_file.warm_t
+    pw.join(60)
+    r = warm_report(pw)
+    assert r["end"] and r["error"] is None and pw.bytes == pw.total
+    assert r["resident"] in (None, 1.0)
     chat = _greedy_chat(eng)
     reply, turn = chat.ask(" ".join(map(str, ids)))
     want = _until_eos(ref["tokens"], eng.spec.eos)
@@ -589,14 +599,25 @@ def test_the_scripted_chat_checks_a_run_against_its_reference(tmp_path, monkeypa
     assert t1["calls"][0]["requests"] > 0 and t1["calls"][0]["serve_s"] > 0    # (the host's
     assert t1["calls"][0]["parts_s"] == 0                                       # time on them)
     assert sum(c["rows"] for c in t2["calls"]) == t2["prompt_tokens"]
+    # the pool's page cache around each call and turn (mincore: a fraction of its experts),
+    # the reads by where they came from, a turn read from the disk marked cold
+    assert ref["pool_gb"] > 0 and 0 <= ref["pool_at_load"] <= 1
+    for t in (t1, t2):
+        assert 0 <= t["pool_before"] <= 1 and 0 <= t["pool_after"] <= 1
+        assert t["cold"] == (bool(t["reads"].get("disk")) or t["pool_before"] < 0.95)
+        assert all(c["pool_before"] is None and c["reads"] for c in t["calls"])  # (no --pool-calls)
+    assert 0 < sum(v[0] for c in t1["calls"] for v in c["reads"].values()) <= \
+        sum(v[0] for v in t1["reads"].values())
     # the DRAM filled, expert-major from 6 rows a call (--em-rows 6): the first turn's call,
     # not the second's 4 rows; the same tokens as the 2-slot run's; --trace: each call's
     # server timeline (need lines, then requests)
     full = [str(d), "--cfg", str(tmp_path / "cfg.pkl"), "--max-new", "5", "--em-rows", "6",
             "--turn", "11 22 33 44 55 66", "--turn", "77 88 99",
             "--trace", str(tmp_path / "trace.json"), "--out", str(tmp_path / "em.json")]
-    assert chatmoe.main(full + ["--check", str(tmp_path / "ref.json")]) == 0
+    assert chatmoe.main(full + ["--check", str(tmp_path / "ref.json"), "--pool-calls"]) == 0
     r = json.loads((tmp_path / "em.json").read_text())
+    assert all(0 <= c[k] <= 1 for t in r["turns"] for c in t["calls"]
+               for k in ("pool_before", "pool_after"))       # (--pool-calls: each call's too)
     assert r["expert_major"] and r["em_rows"] == 6
     c1, c2 = (t["calls"] for t in r["turns"])
     assert [(c["rows"], c["em"]) for c in c1] == [(6, True)] and c1[0]["need_lines"] > 0

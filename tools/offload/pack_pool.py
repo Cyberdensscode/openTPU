@@ -122,7 +122,10 @@ def main():
     img = image(a.model, a.wformat)
     L = img.offload
     n, slot = L.layers * L.E, L.slot_bytes
-    key = MO.pool_key(img, a.model)
+    # the experts' key: a file of n experts (staged vision's entries past them, pool_key's
+    # "vision", are appended by the first staged run's open_pool, which then adds "vision";
+    # with it here, pool_entries would count them, and open_pool truncate the pool as new)
+    key = {k: v for k, v in MO.pool_key(img, a.model).items() if k != "vision"}
     if a.mode == "info":
         info(a, key)
         return

@@ -53,7 +53,9 @@ module otpu_asic_top
   output logic [31:0]         a_addr,
   output logic [31:0]         a_wdata,
   output logic [3:0]          a_be,
-  output logic                sw_req,
+  output logic                sw_req,       // the SW outputs come from a register (otpu_slice), and
+                                            // a write waits in it while sw_req is high: every write
+                                            // the block gave is taken once wr_idle && !sw_req
   output logic [31:0]         sw_addr,
   output logic [31:0]         sw_wdata,
   output logic [3:0]          sw_be,

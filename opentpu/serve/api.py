@@ -6,7 +6,8 @@
 Endpoints: POST /v1/chat/completions and /v1/completions (stream or not, n choices, stop
 strings and token ids, the model's sampling defaults, usage with the prompt tokens the KV
 cache already held), SGLang's POST /generate (text or input_ids, sampling_params, meta_info),
-GET /v1/models, /health, /v1/stats (the queue, throughput, the slots, the KV store), POST
+GET /v1/models, /health (503 "warming" while a streamed MoE's expert pool is read into the page
+cache), /v1/stats (the queue, throughput, the slots, the KV store), POST
 /flush_cache (forget the saved contexts). Many clients at once: a model whose image holds
 several sequences decodes their requests together in KV slots (opentpu/serve/batching.py),
 the others run them in turns (opentpu/serve/scheduler.py); contexts move in and out of the
@@ -15,8 +16,11 @@ continues a saved context (a chat's next turn, a shared system prompt) feeds onl
 
 The chat template renders the messages as otpu-chat does (thinking off unless --think or the
 request's chat_template_kwargs {"enable_thinking": true}); with --reasoning-parser qwen3 a
-reply's <think> ... </think> goes to reasoning_content. The standard library's HTTP server: no
-dependency beyond the chat's.
+reply's <think> ... </think> goes to reasoning_content. A model with a vision side (MiniCPM-V,
+docs/minicpmv.md) takes image_url content parts (data: URLs; http(s) with --image-fetch) and a
+request's max_slices; a context's key holds its images' content keys (minicpmv.keyed), so a
+saved context is reused past an image only for the same image. The standard library's HTTP
+server: no dependency beyond the chat's.
 """
 from __future__ import annotations
 
@@ -31,6 +35,14 @@ from pathlib import Path
 
 from . import scheduler as SC
 from . import store as ST
+
+IMAGE_BYTES = 32 << 20      # an image_url's file at most
+FETCH_S = 20.0              # an http(s) image's fetch timeout (--image-fetch)
+MAX_SLICES = 36             # a request's max_slices at most
+
+
+WARM_CAP = 300.0         # /health's 503 "warming" at most this long (s; the card host's HDD
+                         # reads an 18 GB pool in ~80 s, its SSD in ~37: docs/minicpmv.md 6)
 
 
 class APIError(Exception):
@@ -118,12 +130,40 @@ def _partial(s: str, tag: str) -> int:
     return 0
 
 
+def _parts(c, urls: list):
+    """A message's content for a model that takes images: its text and image parts in order
+    ({"type": "image"} for each image_url / input_image part, whose url goes to `urls`); as
+    _content's string when it has no image."""
+    if not isinstance(c, list) or not any(
+            isinstance(p, dict) and p.get("type") in ("image_url", "input_image") for p in c):
+        return _content(c)
+    out = []
+    for p in c:
+        if isinstance(p, str):
+            out.append({"type": "text", "text": p})
+        elif isinstance(p, dict) and p.get("type") in ("text", "input_text"):
+            out.append({"type": "text", "text": str(p.get("text", ""))})
+        elif isinstance(p, dict) and p.get("type") in ("image_url", "input_image"):
+            u = p.get("image_url")
+            u = u.get("url") if isinstance(u, dict) else u
+            if not isinstance(u, str) or not u:
+                raise APIError(400, "an image_url part without a url", param="messages")
+            urls.append(u)
+            out.append({"type": "image"})
+        else:
+            raise APIError(400, f"content part of type {p.get('type')!r} is not supported "
+                                f"(text and image_url)", param="messages")
+    return out
+
+
 class Server:
     """The API over a scheduler.Worker: requests parsed, rendered, submitted; responses built."""
 
     def __init__(self, worker: SC.Worker, tok, spec, name: str, defaults: dict,
                  think: bool = False, reasoning: str | None = None, aliases=(),
-                 api_key: str | None = None, max_queue: int = 256, info: dict | None = None):
+                 api_key: str | None = None, max_queue: int = 256, info: dict | None = None,
+                 max_slices: int | None = None, fetch: bool = False,
+                 warm_cap: float = WARM_CAP):
         self.w, self.tok, self.spec, self.name = worker, tok, spec, name
         self.defaults, self.think, self.reasoning = dict(defaults), think, reasoning
         self.names = {name, *aliases}
@@ -132,28 +172,95 @@ class Server:
         self.info = info or {}
         self.lock = worker.tok_lock
         self.t0 = time.time()
+        self.vs = getattr(spec, "vision", None)     # (MiniCPM-V's: images)
+        self.max_slices, self.fetch = max_slices, fetch
+        # a streamed MoE's expert pool file: its read into the page cache gates /health
+        self.pool = getattr(getattr(worker.eng, "server", None), "pool_file", None)
+        self.warm_cap = warm_cap
 
     # ---- rendering
     def encode(self, text: str) -> list[int]:
         with self.lock:
             return list(self.tok(text)["input_ids"])
 
-    def render(self, messages, think: bool, add_prompt: bool = True) -> list[int]:
+    def render(self, messages, think: bool, add_prompt: bool = True,
+               images=()) -> list[int]:
+        """images: the messages' images (minicpmv.ImageInput, in order): each one's
+        placeholder in place of its <|image_pad|> (as otpu-chat's)."""
         with self.lock:
             if getattr(self.tok, "chat_template", None) is None:
                 return list(self.tok("".join(m["content"] for m in messages))["input_ids"])
+            if images:
+                from ..llm import minicpmv as MV
+                text = self.tok.apply_chat_template(messages, add_generation_prompt=add_prompt,
+                                                    enable_thinking=think, tokenize=False)
+                return list(self.tok(MV.expand(text, images))["input_ids"])
             ids = self.tok.apply_chat_template(messages, add_generation_prompt=add_prompt,
                                                enable_thinking=think, tokenize=True)
         return list(ids["input_ids"] if hasattr(ids, "keys") else ids)
 
-    def reply_start(self, messages, ids, think: bool) -> int | None:
+    def image_bytes(self, url: str) -> bytes:
+        """An image_url's file: a data: URL's (base64), or with --image-fetch an http(s) URL's;
+        never a file of the server's."""
+        import base64
+        import binascii
+        if url.startswith("data:"):
+            head, _, data = url.partition(",")
+            if not head.endswith(";base64"):
+                raise APIError(400, "image_url: a data: URL's image in base64", param="messages")
+            try:
+                raw = base64.b64decode(data)
+            except (binascii.Error, ValueError):
+                raise APIError(400, "image_url: the base64 does not decode",
+                               param="messages") from None
+        elif url.startswith(("http://", "https://")):
+            if not self.fetch:
+                raise APIError(400, "image_url: data: URLs (this server fetches none: "
+                                    "otpu-serve --image-fetch)", param="messages")
+            import urllib.request
+            try:
+                with urllib.request.urlopen(url, timeout=FETCH_S) as f:
+                    raw = f.read(IMAGE_BYTES + 1)
+            except Exception as e:
+                raise APIError(400, f"image_url: {e}", param="messages") from None
+        else:
+            raise APIError(400, "image_url: a data: or http(s) URL", param="messages")
+        if len(raw) > IMAGE_BYTES:
+            raise APIError(400, f"image_url: an image over {IMAGE_BYTES >> 20} MB",
+                           param="messages")
+        return raw
+
+    def images(self, urls: list, body: dict) -> list:
+        """The request's images (minicpmv.prepare, numbered in order) at its max_slices (the
+        server's default, else the processor's)."""
+        from ..llm import minicpmv as MV
+        ms = body.get("max_slices", self.max_slices)
+        if ms is not None:
+            if isinstance(ms, bool) or not isinstance(ms, int) or not 1 <= ms <= MAX_SLICES:
+                raise APIError(400, f"max_slices: 1 .. {MAX_SLICES}", param="max_slices")
+        out = []
+        for i, u in enumerate(urls):
+            raw = self.image_bytes(u)
+            try:
+                out.append(MV.prepare(raw, self.vs, ms, image_id=i))
+            except Exception as e:
+                raise APIError(400, f"image {i}: {type(e).__name__}: {e}",
+                               param="messages") from None
+        rows = sum(im.tokens for im in out)
+        room = getattr(self.spec, "vision_rows", rows)
+        if rows > room:
+            raise APIError(400, f"the images' {rows} tokens: the model's image holds {room} "
+                                f"(fewer images or a lower max_slices)", param="messages")
+        return out
+
+    def reply_start(self, messages, ids, think: bool, images=()) -> int | None:
         """Where the next turn's rendering parts from this one (chat.Chat.reply_start): a
         model with state keeps a saved context there."""
         if not self.w.stateful:
             return None
         stand_in = [{"role": "assistant", "content": "x"}, {"role": "user", "content": "y"}]
         try:
-            nxt = self.render(messages + stand_in, think, add_prompt=False)
+            nxt = self.render(messages + stand_in, think, add_prompt=False, images=images)
         except Exception:
             return None
         return SC.Worker._common(ids, nxt)
@@ -213,7 +320,8 @@ class Server:
         if self.w.busy() >= self.max_queue:
             raise APIError(503, "the server's queue is full; retry later", kind="server_error")
 
-    def submit(self, body: dict, ids, at=None) -> list[SC.Request]:
+    def submit(self, body: dict, ids, at=None, images=()) -> list[SC.Request]:
+        """ids: the prompt's key (with images: minicpmv.keyed)."""
         self._check(body, ids)
         stop_ids, stop_strs = self._stops(body)
         n = int(body.get("n", 1) or 1)
@@ -222,7 +330,8 @@ class Server:
             r = SC.Request(list(ids), max_new=self._max_new(body, len(ids)),
                            sampling=self._sampling(body, i), stop_ids=stop_ids,
                            stop_strs=stop_strs, at=at,
-                           skip_special=bool(body.get("skip_special_tokens", True)))
+                           skip_special=bool(body.get("skip_special_tokens", True)),
+                           images=list(images))
             try:
                 out.append(self.w.submit(r))
             except ValueError as e:
@@ -235,22 +344,32 @@ class Server:
         msgs = body.get("messages")
         if not isinstance(msgs, list) or not msgs:
             raise APIError(400, "messages: a non-empty list", param="messages")
-        messages = []
+        messages, urls = [], []
         for m in msgs:
             if not isinstance(m, dict) or "role" not in m:
                 raise APIError(400, "each message has a role and content", param="messages")
             role = m["role"]
             if role == "developer":
                 role = "system"
-            messages.append({"role": role, "content": _content(m.get("content"))})
+            c = m.get("content")
+            messages.append({"role": role, "content": _content(c) if self.vs is None else
+                             _parts(c, urls)})
         kw = body.get("chat_template_kwargs") or {}
         think = bool(kw.get("enable_thinking", self.think))
+        images = self.images(urls, body) if urls else []
         try:
-            ids = self.render(messages, think)
+            ids = self.render(messages, think, images=images)
         except Exception as e:
             raise APIError(400, f"the chat template refused the messages: {e}") from None
-        at = self.reply_start(messages, ids, think)
-        reqs = self.submit(body, ids, at)
+        at = self.reply_start(messages, ids, think, images)
+        key = ids
+        if images:
+            from ..llm import minicpmv as MV
+            try:
+                key = MV.keyed(ids, images, self.vs.image_token)
+            except ValueError as e:
+                raise APIError(400, f"the images: {e}", param="messages") from None
+        reqs = self.submit(body, key, at, images)
         split = self.reasoning and body.get("separate_reasoning", True)
         opened = split and self._opens_think(ids)
         return reqs, len(ids), split, opened
@@ -355,10 +474,36 @@ class Server:
         u = self.w.usage()
         up = time.time() - self.t0
         dec = u["decode_s"]
+        warm = {}
+        if self.pool is not None:
+            from ..host.offload import warm_report
+            warm = {"pool_warm": warm_report(self.pool.warm_t)}
         return {"model": self.name, "uptime_s": round(up, 1), **self.info,
                 "throughput": {"generated_tok_s": round(u["generated"] / up, 2) if up else 0,
                                "decode_tok_s": round(u["generated"] / dec, 2) if dec else None},
-                **u}
+                **warm, **u}
+
+    def health(self) -> tuple[int, dict]:
+        """/health's status and body. While the expert pool's read into the page cache runs
+        (its warm thread: moe.rewarm's, after the engine's open), 503 "warming" with the read's
+        progress, for at most warm_cap seconds from its start; then ok, with "warm":
+        "incomplete" and a note where it did not read all it was to (still running past the
+        cap, an error, stopped). Advisory: requests are served while it runs, their misses
+        from the disk (docs/minicpmv.md 6, pooldisk)."""
+        t = getattr(self.pool, "warm_t", None)
+        if t is None:
+            return 200, {"status": "ok"}
+        prog = round(t.bytes / t.total, 3) if t.total else 1.0
+        if t.is_alive():
+            if time.time() - t.t0 < self.warm_cap:
+                return 503, {"status": "warming", "progress": prog}
+            return 200, {"status": "ok", "warm": "incomplete", "progress": prog,
+                         "note": f"the pool's warm runs past the {self.warm_cap:g} s cap"}
+        if t.error or t.t1 is None or t.bytes < t.total:
+            return 200, {"status": "ok", "warm": "incomplete", "progress": prog,
+                         "note": t.error or ("the pool's warm thread died" if t.t1 is None
+                                             else "the pool's warm stopped")}
+        return 200, {"status": "ok"}
 
 
 def _sse(obj) -> bytes:
@@ -423,7 +568,7 @@ def make_handler(srv: Server):
                 self._auth()
                 path = self.path.split("?")[0].rstrip("/")
                 if path in ("/health", "/v1/health", "/health_generate"):
-                    return self._json(200, {"status": "ok"})
+                    return self._json(*srv.health())
                 if path == "/v1/models":
                     return self._json(200, srv.models())
                 if path.startswith("/v1/models/"):
@@ -682,6 +827,32 @@ def load(a):
     return eng, tok, spec, path, defaults, weights
 
 
+def log_warm(t, out=None) -> None:
+    """The expert pool's read into the page cache (a PoolFile.warm thread) on `out` (stdout):
+    a line now, and one when it ends (a watcher thread): its start and end, GB, MB/s, the
+    pool's share in the page cache at its end (mincore), and what ended it early."""
+    import threading
+
+    from ..host.offload import warm_report
+    if t is None:
+        return
+    hm = lambda x: time.strftime("%H:%M:%S", time.localtime(x))     # noqa: E731
+    pr = lambda s: print(f"pool warm: {s}", file=out or sys.stdout, flush=True)   # noqa: E731
+    r = warm_report(t)
+    pr(f"started {hm(r['start'])}, {r['gb']:g} of {r['of_gb']:g} GB read"
+       + ("" if r["end"] is None else ", ended"))
+
+    def watch():
+        t.join()
+        r = warm_report(t)
+        how = "done" if not r["error"] and not r["stopped"] and t.bytes >= t.total else \
+            f"incomplete ({r['error'] or 'stopped'})"
+        res = "?" if r["resident"] is None else f"{100 * r['resident']:.1f}%"
+        pr(f"{how}: {hm(r['start'])} - {hm(r['end'])}, {r['gb']:g} GB, {r['mb_s']} MB/s; "
+           f"{res} of the pool in the page cache")
+    threading.Thread(target=watch, daemon=True, name="otpu-warm-log").start()
+
+
 def batchable(spec) -> bool:
     """The model's image holds several sequences' KV caches (Qwen3 and the Llama-likes)."""
     from ..llm import qwen3
@@ -739,6 +910,16 @@ def main(argv=None):
     ap.add_argument("--no-prompt-runs", action="store_true")
     ap.add_argument("--pool", help="a streamed MoE's expert pool file")
     ap.add_argument("--experts", type=int, default=0)
+    ap.add_argument("--max-slices", type=int,
+                    help="images (MiniCPM-V): an image's slices at most besides its thumbnail, "
+                         "unless a request's max_slices says (default the processor's 9): the "
+                         "latency knob, each crop about 3.7 s of vision at MCOLS 4 and 64 "
+                         "prompt tokens")
+    ap.add_argument("--image-fetch", action="store_true",
+                    help="images: fetch http(s) image_urls (default: data: URLs only)")
+    ap.add_argument("--warm-cap", type=float, default=WARM_CAP,
+                    help="a streamed MoE: /health says 503 'warming' while its expert pool is "
+                         "read into the page cache, at most this many seconds (0: never)")
     a = ap.parse_args(argv)
     return busy_exits(_main)(a)
 
@@ -762,7 +943,12 @@ def _main(a):
                  aliases=(a.model,), api_key=a.api_key, max_queue=a.max_queue,
                  info={"path": str(path), "backend": a.backend, "weights": weights,
                        "cap": a.cap, "kv_page_bytes": w.io.layout.page_bytes(),
-                       "staged": w.io.area is not None, "slots": eng.batch})
+                       "staged": w.io.area is not None, "slots": eng.batch,
+                       "images": getattr(getattr(eng, "image", None), "vision", None)
+                       is not None},
+                 max_slices=a.max_slices, fetch=a.image_fetch, warm_cap=a.warm_cap)
+    if srv.pool is not None:
+        log_warm(srv.pool.warm_t)
     httpd = serve(srv, a.host, a.port)
     print(f"otpu-serve: {name} on http://{a.host}:{a.port}/v1 (context {a.cap}, KV store "
           f"{a.kv_ram_gb:g} GB RAM + {a.kv_disk_gb:g} GB disk, sampling {defaults})",
