@@ -599,14 +599,25 @@ def test_the_scripted_chat_checks_a_run_against_its_reference(tmp_path, monkeypa
     assert t1["calls"][0]["requests"] > 0 and t1["calls"][0]["serve_s"] > 0    # (the host's
     assert t1["calls"][0]["parts_s"] == 0                                       # time on them)
     assert sum(c["rows"] for c in t2["calls"]) == t2["prompt_tokens"]
+    # the pool's page cache around each call and turn (mincore: a fraction of its experts),
+    # the reads by where they came from, a turn read from the disk marked cold
+    assert ref["pool_gb"] > 0 and 0 <= ref["pool_at_load"] <= 1
+    for t in (t1, t2):
+        assert 0 <= t["pool_before"] <= 1 and 0 <= t["pool_after"] <= 1
+        assert t["cold"] == (bool(t["reads"].get("disk")) or t["pool_before"] < 0.95)
+        assert all(c["pool_before"] is None and c["reads"] for c in t["calls"])  # (no --pool-calls)
+    assert 0 < sum(v[0] for c in t1["calls"] for v in c["reads"].values()) <= \
+        sum(v[0] for v in t1["reads"].values())
     # the DRAM filled, expert-major from 6 rows a call (--em-rows 6): the first turn's call,
     # not the second's 4 rows; the same tokens as the 2-slot run's; --trace: each call's
     # server timeline (need lines, then requests)
     full = [str(d), "--cfg", str(tmp_path / "cfg.pkl"), "--max-new", "5", "--em-rows", "6",
             "--turn", "11 22 33 44 55 66", "--turn", "77 88 99",
             "--trace", str(tmp_path / "trace.json"), "--out", str(tmp_path / "em.json")]
-    assert chatmoe.main(full + ["--check", str(tmp_path / "ref.json")]) == 0
+    assert chatmoe.main(full + ["--check", str(tmp_path / "ref.json"), "--pool-calls"]) == 0
     r = json.loads((tmp_path / "em.json").read_text())
+    assert all(0 <= c[k] <= 1 for t in r["turns"] for c in t["calls"]
+               for k in ("pool_before", "pool_after"))       # (--pool-calls: each call's too)
     assert r["expert_major"] and r["em_rows"] == 6
     c1, c2 = (t["calls"] for t in r["turns"])
     assert [(c["rows"], c["em"]) for c in c1] == [(6, True)] and c1[0]["need_lines"] > 0

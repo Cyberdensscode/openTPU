@@ -21,7 +21,8 @@
 #   (--pool-create where the host has no pool: the experts packed as they are asked for)
 # Run (the card's lock for the whole session; no pipe):
 #   setsid -f otpu-lock --wait 3600 -- bash tools/qual/chatmoe.sh > /dev/null 2>&1
-#   (the log: R/session.log, R = O/SESSION; RUNS="lfm2-8b qwen35-35b gemma4-26b"; env.sh's T,
+#   (the log: R/session.log, R = O/SESSION; RUNS="lfm2-8b qwen35-35b gemma4-26b"; POOL_CALLS=1:
+#   chatmoe.py --pool-calls, the pool's page cache around each call; env.sh's T,
 #   O, RF, REFCFG; G26POOL relative to O)
 set -u
 SESSION=${SESSION:-chatmoe-$(date +%m%d-%H%M)}
@@ -83,7 +84,8 @@ print(f"  pool: {PoolFile(p, os.path.getsize(p) // n, True, False).resident(rang
 PY
   echo "  (read in $((SECONDS - t0)) s, mem $(mem) GB)"
   timeout 3600 python tools/qual/chatmoe.py $O/$md --pool $O/$pool --backend board \
-    --cfg $R/cfg-dev.pkl --check $ref --out $R/chatmoe-$m.json > $R/chatmoe-$m.log 2>&1
+    --cfg $R/cfg-dev.pkl --check $ref --out $R/chatmoe-$m.json ${POOL_CALLS:+--pool-calls} \
+    > $R/chatmoe-$m.log 2>&1
   echo "  exit $? $(date +%T)"; grep -E "\[(PASS|FAIL)\]|Error|Traceback" $R/chatmoe-$m.log | tail -3
   [ -f $R/chatmoe-$m.json ] || continue
   python - $R/chatmoe-$m.json <<'PY'
@@ -98,6 +100,11 @@ for i, t in enumerate(r["turns"]):
           f"misses; TTFT {t['ttft_s']} s; decode {t['gen_tokens']} tokens at {t['decode_tok_s']} "
           f"tok/s (device {t['decode_dev_tok_s']}), hits {t['hit_rate']}, "
           f"{t['mb_per_token']} MB/token; end {t['end']}")
+    if "cold" in t:                             # (the pool's page cache: chatmoe.py's record)
+        print(f"    pool {t['pool_before']} -> {t['pool_after']} in the page cache, reads "
+              f"{t['reads']}" + ("; COLD: misses read from the disk" if t["cold"] else "")
+              + "".join(f"; call {c['rows']} rows {c['pool_before']} -> {c['pool_after']}"
+                        for c in t["calls"]))
 PY
 done
 echo "=== final selftest $(date +%T)"
