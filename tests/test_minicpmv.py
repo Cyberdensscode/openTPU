@@ -1029,6 +1029,7 @@ def test_serve_takes_image_url_parts():
 
     from opentpu.llm import minicpmv as MV
     from opentpu.serve import api as API
+    pytest.importorskip("PIL")              # (the images' PNGs, and their decode without torchvision)
     vs = MV.VisionSpec(image_token=1000, image_start=1001, image_end=1002, slice_start=1003,
                        slice_end=1004)
     spec = SimpleNamespace(vision=vs, vision_rows=2048, eos=[999])

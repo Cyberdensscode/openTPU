@@ -642,7 +642,8 @@ On opentpu, `/data/otpu/minicpmv/` holds:
 - `img/` (the sessions' images) and `refs/` (their ISA references);
 - `pylib/`: torchvision 0.29.1+cpu, pillow 12.3.0 and transformers 5.18.0 over the venv's torch
   2.14.0 (hwe-bench's `~/mcpv/tf518`, file for file). Neither host's venv has torchvision or
-  pillow, and without torchvision the resize falls back to torch's (not bit for bit HF's): the
+  pillow (pyproject's `minicpmv` extra names them; the tests that need pillow skip without it),
+  and without torchvision the resize falls back to torch's (not bit for bit HF's): the
   card's image rows would not be the references'. The processor's crops of the sessions'
   images hash the same on hwe-bench and opentpu with it.
 
