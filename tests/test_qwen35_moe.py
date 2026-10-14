@@ -265,10 +265,10 @@ def test_moe_on_board_model(tiny, have_verilator):
     hold at their first read. Per-position programs, then the resident decode, then the card's
     generate loop (the DeltaNet layers, the routed experts and the gated shared expert): the ISA
     simulator's logits and tokens bit for bit."""
+    from conftest import sim_board_config
     from opentpu.host.board import Board, BoardBackend, SimTransport
-    from opentpu.isasim import board_config
     _, W, spec = tiny
-    cfg = board_config(DRAM_BYTES=1 << 26)
+    cfg = sim_board_config(DRAM_BYTES=1 << 26)
     tr = SimTransport(ch_bytes=cfg.DRAM_BYTES // 2, stall=20, seed=5)
     assert Board(tr).info()["caps"].get("waitw"), "the board model has no WAITW (CAPS bit31)"
     isa = Engine(spec, W, cap=256, cfg=cfg, rows=1, resident=True)
