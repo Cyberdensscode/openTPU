@@ -470,6 +470,11 @@ def _run(cfg, programs: list, images: list, dram_lat: int = 8, max_cycles: int =
         stats["axi_detail"] = [{"ar_a": n["a_runs"] + n["sw_rd"], "row_miss": m["row_miss"],
                                 "rmw": m["rmw"], "rmw_a": n["part_a"] + n["part_sw"]}
                                for m, n in zip(mem, nat)]
+        # the co-simulated controller's cycle breakdown (+ldc_break) and the H2C load's bursts
+        # and bytes per channel (+h2c_bpk; sim/verilator/otpu_ldc_mem.sv)
+        stats["brk"] = re.findall(r"^BRK .*$", out, re.M)
+        stats["h2c"] = [dict(zip(("bursts", "bytes", "bresp"), map(int, m))) for m in
+                        re.findall(r"H2C ch\d bursts=(\d+) bytes=(\d+) bresp=(\d+)", out)]
     if trace:
         stats["trace"] = out
     return drams, tmems, stats

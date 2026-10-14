@@ -2183,6 +2183,16 @@ Mcycles/token, tokens/s (DRAM GB/s, % of the 17.07 GB/s peak):
 The old bank model's grid (`docs/board.md`, "Faster DDR3") predicted 35.4 / 36.3 tokens/s for
 Qwen3 at 150 / 200 MHz. It had no crossbar lock.
 
+### The host's writes during a run (2026-10-14)
+
+Everything above has XDMA idle. Host writes that stream while the core reads (the streamed MoE's
+parts) cost the core 0.10-0.20 s a GB written, 1.7-3.4x the data's own time, and LiteDRAM's
+multiplexer and command buffers cannot win it back: the cost is per turn of `otpu_mem_ch`'s
+arbiter, which let XDMA in every 32 of the core's commands with a burst or two queued. Its
+batches (XQD, XT, XB) hold XDMA's writes for whole turns and take a quarter to a half off it;
+with XDMA idle nothing changes. Measured in docs/offload.md 13.19
+(`tools/litedram/h2c_contention.py`).
+
 ## 12. The core's timing at 133.33 MHz (ld-fmax, 2026-09-30)
 
 The 812bb01 full build (main at 133.33 MHz: WNS +0.074) had three LiteDRAM sys-domain path

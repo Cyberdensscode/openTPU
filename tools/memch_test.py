@@ -38,6 +38,8 @@ BUILDS = {
     # LiteDRAM's own controller (otpu_ldc_ch.v, the production core's settings) for the model
     "ldc": dict(LDC=1),
     "ldcx": dict(LDC=1, XREG=1),
+    # the arbiter without XDMA's batches (otpu_mem_ch XT 0, its FIFOs as before them)
+    "ldcn": dict(LDC=1, XQD=16, XT=0, XB=0),
 }
 
 SCEN = {
@@ -157,6 +159,10 @@ PERF += [("ldn", "acc seq rd busy2", ["+wpct=0", "+xdma_ntx=0", "+ldn_busy=2"] +
          ("ldn", "acc seq wr stall10", ["+wpct=100", "+xdma_ntx=0", "+axi_stall=10"] + PERF_BASE)]
 PERF += [("xreg", "xdma seq rd", ["+wpct=0", "+acc0_ntx=0", "+acc1_ntx=0"] + PERF_BASE),
          ("xreg", "xdma seq wr", ["+wpct=100", "+acc0_ntx=0", "+acc1_ntx=0"] + PERF_BASE)]
+# the accelerators reading while XDMA writes, each as fast as it can: XDMA's share of the channel
+# with its batches (ldc: otpu_mem_ch's XT and XB) and without them (ldcn)
+PERF += [(b, "acc seq rd + xdma seq wr", ["+wpct=0", "+xdma_wpct=100"] + PERF_BASE)
+         for b in ("ldc", "ldcn")]
 
 # mutations: (name, build, substitutions, scenarios[, "missed": a known blind spot])
 MUT = [

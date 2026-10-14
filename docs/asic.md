@@ -12,6 +12,12 @@ memory ports at the boundary (port A words, the SW byte writes, port B chunks, t
 idle handshakes), the run control (resets, the loader, the run's arguments) and the status. The
 DRAM side (PHY, controller, the channel interleave of `otpu_native_dram`) is the platform's, as
 LiteDRAM is the YPCB card's; the block is what every openTPU chip shares.
+The platform's memory system must batch the host's writes per arbitration turn: each switch
+between the accelerator's reads and a host write costs the controller a bus turnaround and its
+open rows, so on the card single 256-byte host bursts cost the accelerator 0.20 s per GB written
+(3.4x the data's own 0.059 s); queueing them into turns of up to 32 beats halves that (a
+quarter to a third less at 2-3 GB/s), at no cost while the host is idle (`otpu_mem_ch` XT, XB;
+docs/offload.md 13.19).
 
 ## Memories
 

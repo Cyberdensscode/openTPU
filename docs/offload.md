@@ -3085,6 +3085,7 @@ and the misses fall, and three costs take it back:
 1. DRAM write contention. A run with no misses waits for nothing, yet it slows down while
    parts stream into DRAM during it. This is 0.13-0.18 s of the card's compute per GB written
    during compute. A demand miss writes the same bytes while the card waits, and does not pay it.
+   The bridge's batches (13.19) take a third off it in co-simulation.
 
    | run with no misses | no ahead | with ahead | parts during it | slower |
    |:--|--:|--:|--:|--:|
@@ -4425,6 +4426,84 @@ branch les (15.4); step 2 is not.
   - the next pass's rows quantized to a second ACT RAM block range while the current pass's MMs
     read the first.
 
+### 13.19 The write contention in co-simulation, and the bridge's batches (2026-10-14)
+
+13.8's contention comes from the channel bridge, not from the link or the controller.
+`tools/litedram/h2c_contention.py` runs a card program on the RTL with the card's LiteDRAM
+controllers (DDR3-1066, the core at 133.33 MHz, the board's configuration), once alone and once
+beside a host load on XDMA's side of each channel's `otpu_mem_ch`
+(`sim/verilator/otpu_ldc_mem.sv`'s `+h2c_*`: 256-byte INCR bursts at a rate, into the channels'
+top, which no program uses). CT is the run's extra time per GB the controllers took from the
+load. The works are Qwen3.5-35B-A3B's: a layer run (`layer:PREFIX:R`, the prefix's last layer on
+R rows; `1` DeltaNet, `4` attention) and the expert run on 131 rows (`em:131`, 13.17).
+
+- **The card's case.** With the server's parts (512 KiB at 2.2 GB/s, 0.29 ms between them) the
+  DeltaNet layer at R = 2 runs 12.9% slower and attention 13.6%: 13.8 measured 13% and 15% on the
+  card.
+- **Steady loads** (s a GB; R = 1 is a decode step's layer):
+
+  | load | DeltaNet R = 1 | attention R = 1 | DeltaNet R = 2 | expert run |
+  |:--|--:|--:|--:|--:|
+  | 1 GB/s | 0.199 | 0.206 | 0.193 | 0.032 |
+  | 2 GB/s | 0.128 | | 0.121 | |
+  | 3 GB/s | 0.101 | 0.105 | 0.098 | 0.025 |
+  | 2 GB/s in 4 KiB bursts | 0.092 | | 0.086 | 0.024 |
+
+- **What it is.** The floor is the writes' own data on the bus, a beat a cycle on each channel:
+  0.059 s a GB. Channel 0's cycles (`+ldc_break`) at 2 GB/s beside DeltaNet R = 1 split the
+  extra time into the writes' column commands 46%, the multiplexer's read-write turnarounds 31%,
+  rows 19%, the crossbar 8%, refresh 3% and 7% less idle. Everything but the data comes once per
+  turn of the bridge's arbiter: it let XDMA in after each 32 of the accelerator's commands, and
+  XDMA's 16-beat FIFOs held a burst or two, so each 256-byte burst paid a turnaround and a row
+  change. CT falls as more beats come per turn: with the rate (0.20 at 1 GB/s, 0.10 at 3), and
+  with the burst size.
+- **LiteDRAM's own batching does not help** (`tools/litedram/gen_ldc.py` variants). Its
+  multiplexer's read and write times (128 / 64, 512 / 256 and 1024 / 512 cycles against 256 /
+  128) and command buffers of 16 (against 8) leave CT within 0.004 of the default, and move the
+  runs alone by -0.3 to +0.3%. The controller already batches what it holds; the bridge gave it
+  too little at a time.
+- **The bridge's batches** (`otpu_mem_ch` XQD, XT, XB). Once the accelerator has had its RUN, a
+  ready XDMA goes only when it has waited XT = 256 cycles since its last command or has XB = 24
+  commands queued, in FIFOs of XQD = 32 beats. With the accelerator idle (a demand miss) it goes
+  at once, and with XDMA idle the arbiter is the one before. CT, s a GB (load landed, GB/s):
+
+  | load | work | without | XT 256 alone | XT 256, XB 24 |
+  |:--|:--|--:|--:|--:|
+  | 1 GB/s | DeltaNet R = 1 | 0.199 | 0.104 | 0.104 |
+  | | DeltaNet R = 2 | 0.193 | 0.097 | 0.097 |
+  | | expert run | 0.032 | 0.016 | 0.016 |
+  | 2 GB/s | DeltaNet R = 1 | 0.128 | 0.078 | 0.082 |
+  | | DeltaNet R = 2 | 0.121 | 0.074 | 0.078 |
+  | | expert run | | 0.012 | 0.013 |
+  | 3 GB/s | DeltaNet R = 1 | 0.101 | 0.070 (2.80) | 0.075 (3.00) |
+  | | DeltaNet R = 2 | 0.098 | 0.067 (2.75) | 0.073 (3.00) |
+  | | expert run | 0.025 (2.98) | 0.013 (2.98) | 0.015 (3.00) |
+  | parts, 2.2 GB/s | DeltaNet R = 2 | 0.107 (12.9% slower) | | 0.075 (8.3%) |
+  | | attention R = 2 | 0.119 (13.6%) | | 0.081 (9.1%) |
+
+  The wait alone caps XDMA at RUN commands per XT + RUN cycles while the accelerator streams, so
+  at the link's 3 GB/s it landed 2.75-2.80 GB/s beside a layer run; XB lets a stream go once its
+  batch is in, and costs 0.005 s a GB at 2 GB/s for it. XT 512 gains under 0.005 over 256 and
+  caps XDMA at 1.93-1.95 of 2 GB/s.
+- **Cost** (Vivado out of context, routed, xc7k480t-2, a channel; `tools/memch_ooc.tcl`
+  MEMCH_GENERICS): +51 LUTs and +32 flip-flops a channel, no LUTRAM (a RAM32M is 32 deep, so 16
+  -> 32 beats takes the same cells) and no block RAM. uclk's worst slack +0.120 -> +0.174 ns
+  (the same output path, which the change does not touch), the arbiter's registers 3.4-4.2 ns;
+  every crossing constrained as before.
+- **No host writes, no change.** The layer and expert runs alone take the same cycles with and
+  without the batches, and so does a whole decode token (`tools/perf_ddr.py`, fp4 at 133.33 MHz:
+  Qwen3 3,714,482 cycles, Qwen3.5 4,803,926, the same DRAM commands).
+- **Tests.** `test_ldc_host_writes` (test_rtl.py): a stream of loads at 400 MHz beside 2 GB/s,
+  the core bit-exact, every burst landed, CT 0.006 s a GB against 0.034 without the batches.
+  `tools/memch_test.py`'s functional suite runs the bridge at its defaults (and `ldcn` without
+  batches); its perf run "acc seq rd + xdma seq wr" has the accelerators at 0.88 / 0.83 beats a
+  cycle beside XDMA's full rate (0.78 / 0.77 without the batches).
+
+In the card's case the batches take 30-32% off CT (0.107-0.119 -> 0.075-0.081 s a GB); on
+13.8's 0.13-0.18 measured on the card that would be about 0.09-0.13, which moves LES's estimate
+(15.3) part of the way toward its CT = 0.07 column. An ASIC's memory system needs the same: host
+writes batched per arbitration turn (docs/asic.md).
+
 ## 14. Chatting with a streamed MoE (otpu-chat)
 
 otpu-chat runs the three MoE models bigger than the card's 4 GiB. Their experts stream from a pool
@@ -4788,8 +4867,9 @@ ways:
 
 So the LES prefetch is closed on the measurement above (not built). It is worth another look
 if any of these change, since each moves the balance; `lesim.py time --set K=V` re-runs it:
-- the write contention falls: CT = 0 lifts `pre` to +10% and `prev_in` to +8%. It is a
-  property of the controller's write and read turnarounds, which an RTL change could batch;
+- the write contention falls: CT = 0 lifts `pre` to +10% and `prev_in` to +8%. It comes from
+  the controller's write and read turnarounds, which the bridge's batches cut by about a third
+  (13.19);
 - the link gets faster (PART and REC shorter);
 - the slot count changes (`--slots`);
 - MCOLS 8 changes the card's own time (F, W0).
