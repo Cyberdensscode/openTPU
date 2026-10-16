@@ -6,8 +6,9 @@
 # stage has already run repair_design (3_4_place_resized); here the GRT step's is a no-op and its
 # repair_timing works on the failing paths only: on main's card (5873d298, r3's floorplan) with a
 # 0.5 ns setup margin, 100 s, 41 buffers and 295 cells upsized, register to register 2.497 ->
-# 2.000 ns (docs/timing_ffs.md section 4). The nets over their maximum capacitance or slew that
-# no failing path crosses stay as placement left them.
+# 2.000 ns; with a 1.0 ns margin it stalls at 1.99 ns, the VPU's floating-point stages
+# (docs/timing_ffs.md section 4). The nets over their maximum capacitance or slew that no failing
+# path crosses stay as placement left them.
 proc ::repair_design_helper { } {
   puts "grt_repair.tcl: the global route's repair_design skipped (repair_timing only)"
 }

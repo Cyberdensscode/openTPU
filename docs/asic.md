@@ -354,7 +354,12 @@ parasitics, single-threaded) does not fit this block's size: on r3 `repair_desig
 46 resizes by then), more than 8 hours to go before `repair_timing` began; it was stopped. The
 numbers here are before that repair (2,248 nets over their maximum capacitance and 111 pins over
 their maximum slew left on r3), and a routed card point needs a faster repair: by region, or
-limited to the failing paths' nets.
+limited to the failing paths' nets. The card point now has the latter (`asic/nangate45/grt_repair.tcl`,
+`PRE_GLOBAL_ROUTE_TCL`: the GRT step's `repair_design` a no-op, its `repair_timing` on the failing
+paths). On main's card (5873d298 on r3's floorplan) with a 0.5 ns setup margin it took 100 s, 41
+buffers and 295 upsized cells, and register to register went from 2.497 to 2.000 ns on the
+route's parasitics; with a 1.0 ns margin it stalled at 1.99 ns (the VPU's floating-point stages)
+after ~3,000 moves (docs/timing_ffs.md section 4).
 
 ### Before: the previous card point (2026-10-11)
 
