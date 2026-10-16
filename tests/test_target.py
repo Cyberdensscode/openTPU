@@ -509,6 +509,43 @@ def test_the_vpu_lanes_take_ss_act_from_their_copies():
     assert raw(vpu.replace(a, "assign rsa[l] = (SE && ss_act)")) == {"g_red": ["ss_act"]}
 
 
+def test_the_long_wire_drivers_are_copies_per_consumer():
+    """A register whose loads spread over the die pays its route (r22's m8 at 133.33 MHz: 88% of
+    the near-critical core delay, half the paths at most one LUT): the drivers that fanned out so
+    have a copy per consumer group, each loaded with the same next value (cycle-exact), kept
+    (identical flip-flops would merge). The VPU's enable per lane (g_enl: no lane loop, tail unit
+    or composite lane reads the one en), the fill index per lane (g_sfi), the MXU's decoded scale
+    per column (g_bd) and result FIFO write counters per row slice (g_rfm g_s), the ACT RAM's
+    second hop per column (g_row u_h) and the pumped TMEM's write stage per RAM (g_pmp g_sl)."""
+    def src(p):
+        return re.sub(r"//.*", "", (ROOT / p).read_text())
+    kept = r'\(\*\s*keep_hierarchy\s*=\s*"yes"\s*\*\)\s*otpu_delay\b'
+    bare_en = r"(?<![.\w])en(?![\w(\[])"
+    vpu, tail, comp = (src("rtl/vpu/otpu_vpu.sv"), src("rtl/vpu/otpu_se_tail.sv"),
+                       src("rtl/vpu/otpu_se_comp.sv"))
+    loops = _lane_loops(vpu)
+    for n in ("g_cbuf", "g_lane", "g_slane", "g_red"):
+        assert not re.search(bare_en, loops[n]) and "en_l[l]" in loops[n], n
+    assert len(re.findall(kept, loops["g_enl"])) == 1 and len(re.findall(kept, loops["g_sfi"])) == 1
+    assert re.search(r"\.cen\(en_l\)", vpu) and re.search(r"\.en_l\b", vpu)
+    tl = _lane_loops(tail)
+    assert "cen[l]" in tl["g_u"] and "cen[l]" in tl["g_lq"] and "fi[l]" in tl["g_buf"]
+    assert not re.search(r"\bue\b", tail) and not re.search(r"\[fi\]", tail)
+    cl = _lane_loops(comp)
+    assert "en_l[l]" in cl["g_lane"] and not re.search(bare_en, cl["g_lane"])
+    mxu = src("rtl/mxu/otpu_mxu.sv")
+    assert re.search(r"begin\s*:\s*g_bd\s*" + kept, mxu)
+    assert "dhi1[j].s[g]" in mxu and "vhi1[j]" in mxu and not re.search(r"\bdhi1\.s\b", mxu)
+    assert re.search(r"begin\s*:\s*g_rfm.*?begin\s*:\s*g_s\b.*?logic \[RFW-1:0\] wt;", mxu, re.S)
+    act = src("rtl/mem/otpu_actram.sv")
+    assert re.search(r"begin\s*:\s*g_row.*?" + kept + r".*?u_h\b", act, re.S)
+    assert not re.search(r"\b(w_idx_h|w_data_h|we_h)\b", act.split("begin : g_row")[0])
+    tm = src("rtl/mem/otpu_tmem.sv")
+    pmp = tm[tm.index("begin : g_pmp"):tm.index("begin : g_ram")]
+    sl = pmp[pmp.index("begin : g_sl"):]
+    assert "otpu_pump_bank" in sl and re.search(r"\.wv\(sv\)", sl) and re.search(r"\.wa\(sa\)", sl)
+
+
 def test_config_summary_names_the_target(no_env):
     from opentpu.host.board import config_summary
     kw = dict(devname=None, ddr_mts=1066, pair=True, dstep=True, stream=True)
