@@ -606,6 +606,33 @@ def test_late_pushes_reach_no_lut_ram_write_enable():
                               mxu.index("if (!rst && al_st == 2'd3)")]
 
 
+def test_the_mxu_epilogue_advances_on_a_register():
+    """The MXU's TMEM grant, the end of the slice's arbitration, was the epilogue's enable (the
+    drain's lanes, the read-modify-write, RMAX, the ASCALE loads: on the m8 card ~11.3 k enables,
+    the MXU's worst paths at a 150 MHz equivalent). With TQ (the default) the epilogue advances on
+    ea, a flip-flop, and the grant only pops a queue of two TMEM beats (g_tq); TQ 0 keeps the
+    grant as the enable (g_ng). The read port's lost reads (t_lost) hold the advance that would
+    take a replayed read's word."""
+    def src(p):
+        return re.sub(r"//.*", "", (ROOT / p).read_text())
+    mxu = src("rtl/mxu/otpu_mxu.sv")
+    assert re.search(r"parameter bit TQ\s*=\s*1'b1", mxu)
+    tq = mxu[mxu.index("if (TQ) begin : g_tq"):mxu.index("end else begin : g_ng")]
+    ng = mxu[mxu.index("end else begin : g_ng"):]
+    ng = ng[:ng.index("\n  end\n")]
+    rest = mxu.replace(tq, "").replace(ng, "")
+    # the grant reaches the port declaration and nothing else outside the TMEM interface
+    assert re.findall(r"\bt_gnt\b", rest) == ["t_gnt"], re.findall(r".*\bt_gnt\b.*", rest)
+    assert "assign ea = ea_q;" in tq and re.search(r"\(\*\s*max_fanout\s*=\s*\d+\s*\*\)\s*logic ea_q;", tq)
+    assert re.search(r"ea_q <= .*!t_lost", tq) and "assign ea = t_gnt;" in ng
+    # in g_tq the grant only moves the queue and marks the read taken
+    used = {re.match(r"\s*wire\s+(?:\[[^]]*\]\s*)?(\w+)", l).group(1)
+            for l in tq.splitlines() if re.search(r"\bt_gnt\b", l) and "wire" in l}
+    assert used <= {"pop", "push", "rd_done_n"}, used
+    sl = src("rtl/top/otpu_slice.sv")
+    assert re.search(r"\.t_lost\(tm_lost\[P_MXU\]\)", sl)
+
+
 def test_config_summary_names_the_target(no_env):
     from opentpu.host.board import config_summary
     kw = dict(devname=None, ddr_mts=1066, pair=True, dstep=True, stream=True)
