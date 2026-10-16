@@ -131,8 +131,12 @@ module otpu_tmem #(
     always_ff @(posedge clk) begin
       wi_en <= w_en;
       wi_gnt <= w_gnt;
+      // with WPB 1 every cycle (the selection takes a port's lanes only under its registered
+      // grant, wi_gnt, so the words are the granted ones there): the grant, the arbiter's logic,
+      // then enables no address and data flip-flops (on the m8 card one LUT of it enabled
+      // 11,254, the MXU's lanes with them)
       for (int p = 0; p < NWP; p++)
-        if (w_gnt[p]) begin
+        if (w_gnt[p] || WPB == 1) begin
           wi_addr[p] <= w_addr[p];
           wi_data[p] <= w_data[p];
         end

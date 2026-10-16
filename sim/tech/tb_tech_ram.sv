@@ -2,7 +2,8 @@
 // after the first read prints the read data. Built once with rtl/tech/generic (inferred) and once
 // with rtl/tech/asic (tiled onto the macros' models, tools/asic/fakeram.py); tests/test_tech_ram.py
 // compares the two traces. KIND 0 otpu_ram_1r1w, 1 otpu_ram_1r1w_be, 2 otpu_ram_1rw, 3
-// otpu_ram_1rw1r. Every word is written first (the macros' models start undefined), and a 1R1W
+// otpu_ram_1rw1r, 4 otpu_ram_1r1w_ra (read ahead: its reads name any word, the one written at
+// the same edge included). Every word is written first (the macros' models start undefined), and a 1R1W
 // read never names the word written at the same edge (undefined on a macro; no user of the RAMs
 // does it). The 1RW1R RAM reads first on both ports, so its reads name any word: port A's write
 // cycles and port B's reads of the word written print the word before the write.
@@ -20,6 +21,8 @@ module tb_tech_ram #(parameter int W = 40, parameter int N = 8192, parameter int
     otpu_ram_1r1w #(.W(W), .N(N)) u (.clk, .we, .wa, .wd, .re, .ra, .rd);
   end else if (KIND == 1) begin : g_be
     otpu_ram_1r1w_be #(.W(W), .N(N)) u (.clk, .we, .wbe, .wa, .wd, .re, .ra, .rd);
+  end else if (KIND == 4) begin : g_ra
+    otpu_ram_1r1w_ra #(.W(W), .N(N)) u (.clk, .we, .wa, .wd, .ra_n(ra), .rd);
   end else if (KIND == 2) begin : g_1p
     otpu_ram_1rw #(.W(W), .N(N)) u (.clk, .en, .we, .a(wa), .wd, .rd);
   end else begin : g_dp
@@ -58,6 +61,11 @@ module tb_tech_ram #(parameter int W = 40, parameter int N = 8192, parameter int
         ra = (($random(seed) % 4) == 0) ? wa : A'($random(seed));
         if (en) any_read = 1'b1;
         if (re) any_b = 1'b1;
+      end else if (KIND == 4) begin
+        // read ahead: every cycle reads (rd is the word at last cycle's ra_n), a third of them
+        // the word written at the same edge (the bypass)
+        ra = (($random(seed) % 3) == 0) ? wa : A'($random(seed));
+        any_read = 1'b1;
       end else begin
         re = ($random(seed) % 5) < 3;
         ra = A'($random(seed));

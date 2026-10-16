@@ -834,37 +834,40 @@ module otpu_mxu
   end
   // each copy has its own write enable and address (replicas of rv and rf_t): one register
   // driving the three copies' write ports was the worst slow-clock path of the MX experiment's
-  // 4-column OOC (docs/mx_mxu.md section 5, +0.329 ns)
-  // and each copy is RSN slices of the row, each with its own (one per column: a copy's LUT RAMs
-  // are some 220 cells, and one wt drove all their write addresses, r22's m8: fanout 1,125, 6.7 ns
-  // of route)
-  localparam int RSN = MCOLS;
-  localparam int RSW = (RW_ + RSN - 1) / RSN;
+  // 4-column OOC (docs/mx_mxu.md section 5, +0.329 ns). The copies are block RAMs read ahead
+  // (otpu_ram_1r1w_ra: at rf_q's next value, rf_qn, plus c; the RAM bypasses the row written at
+  // the last edge, the copy the one written at this one). As LUT RAMs a copy was some 1,100 cells
+  // whose every one each address bit reached (the card's m8: 37,632 address pins), and the write
+  // took a kept wv / wt per column slice (r22's m8: one wt at fanout 1,125, 6.7 ns of route)
+  wire [RFW-1:0] rf_qn = rst ? '0 : RFW'(rf_q + RFW'(rf_hs));
+`ifndef SYNTHESIS
+  logic [RW_-1:0] msh [RF];                  // the rows as written (the checks)
+  always_ff @(posedge clk) if (!rst && rf_push) msh[rf_t] <= rowp;
+`endif
   for (genvar c = 0; c < 3; c++) begin : g_rfm
-    logic [RW_-1:0] rqc;
+    logic [RW_-1:0] rqm;                     // row rf_q + c as the RAM has it (to the last edge)
 `ifndef SYNTHESIS
-    logic [RW_-1:0] mh;                      // the copy's row at the head (the check below)
+    logic [RW_-1:0] mh;                      // the row at the head (the check below)
 `endif
-    for (genvar s = 0; s < RSN; s++) begin : g_s
-      localparam int LO = s * RSW;
-      localparam int W = (LO + RSW > RW_) ? RW_ - LO : RSW;
-      (* ram_style = "distributed" *) logic [W-1:0] m [RF];
-      (* keep *) logic           wv;
-      (* keep *) logic [RFW-1:0] wt;
-      always_ff @(posedge clk) begin
-        wv <= !rst && tl_v;
-        if (rst) wt <= '0;
-        else if (wv) wt <= wt + 1'b1;
-      end
-      always_ff @(posedge clk) if (!rst && wv) m[wt] <= rowp[LO +: W];
-      assign rqc[LO +: W] = (wv && wt == rf_qc[c]) ? rowp[LO +: W] : m[rf_qc[c]];
-`ifndef SYNTHESIS
-      assign mh[LO +: W] = m[RFW'(rf_q + RFW'(rf_hs))];
-      always @(posedge clk) if (!rst && (wv != rf_push || wt != rf_t))
-        $fatal(1, "otpu_mxu: result FIFO copy %0d slice %0d's write is not rf_push / rf_t", c, s);
-`endif
+    logic           wv;
+    logic [RFW-1:0] wt;
+    always_ff @(posedge clk) begin
+      wv <= !rst && tl_v;
+      if (rst) wt <= '0;
+      else if (wv) wt <= wt + 1'b1;
     end
-    assign rq[c] = rqc;
+    otpu_ram_1r1w_ra #(.W(RW_), .N(RF), .STYLE("block")) u_m (
+      .clk, .we(!rst && wv), .wa(wt), .wd(rowp), .ra_n(RFW'(rf_qn + RFW'(c))), .rd(rqm));
+    assign rq[c] = (wv && wt == rf_qc[c]) ? rowp : rqm;
+`ifndef SYNTHESIS
+    assign mh = msh[RFW'(rf_q + RFW'(rf_hs))];
+    always @(posedge clk) begin
+      if (!rst && (wv != rf_push || wt != rf_t))
+        $fatal(1, "otpu_mxu: result FIFO copy %0d's write is not rf_push / rf_t", c);
+      if (!rst && rqm != msh[rf_qc[c]])
+        $fatal(1, "otpu_mxu: result FIFO copy %0d's read ahead is not row %0d", c, rf_qc[c]);
+    end
+`endif
   end
   always_ff @(posedge clk) begin
     rh0 <= rf_hs ? rq[1] : rq[0];           // the head (rf_q + rf_hs) as it is after this cycle

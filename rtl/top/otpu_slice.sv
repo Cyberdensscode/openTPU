@@ -969,9 +969,10 @@ module otpu_slice
       b_addr <= b_addr_c; b_par <= b_par_c;
     end
     b_rvalid_i <= !sys_rst && b_rvalid;
-    if (b_rvalid) begin
-      b_rtag_i <= b_rtag; b_rdata_i <= b_rdata;
-    end
+    // every cycle, not on b_rvalid: every reader takes them in a b_rvalid_i cycle only (the
+    // loader's IMEM and sidecar writes, the DMA's line buffer, the MXU's FIFO), so they are the
+    // same there, and b_rvalid (the DRAM's logic) enables no 1,025 flip-flops
+    b_rtag_i <= b_rtag; b_rdata_i <= b_rdata;
   end : pb_reg
 
   // ---- port A's register (docs/asic.md "The ports"): the MXU's scale reads (a_req, a_addr) leave

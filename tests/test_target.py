@@ -515,9 +515,10 @@ def test_the_long_wire_drivers_are_copies_per_consumer():
     have a copy per consumer group, each loaded with the same next value (cycle-exact), kept
     (identical flip-flops would merge). The VPU's enable per lane (g_enl: no lane loop, tail unit
     or composite lane reads the one en), the fill index per lane (g_sfi), the MXU's decoded scale
-    per column (g_bd) and result FIFO write counters per row slice (g_rfm g_s), the pumped TMEM's
-    write stage per RAM (g_pmp g_sl) and, with wait counts, the sequencer's command store write
-    per unit (g_cmd g_wq: a cycle late). Wide data stays one register: the ACT RAM's write stage
+    per column (g_bd), the pumped TMEM's write stage per RAM (g_pmp g_sl) and, with wait counts,
+    the sequencer's command store write per unit (g_cmd g_wq: a cycle late). The MXU's result
+    FIFO needs none: a block RAM read ahead (test below). Wide data stays one register: the ACT
+    RAM's write stage
     (wbe, wd) a copy per column cost the m8 card 9 k LUTs and 9.5 k flip-flops and a congested
     corner (docs/timing_ffs.md section 3); its pieces copy only their address and select."""
     def src(p):
@@ -539,7 +540,7 @@ def test_the_long_wire_drivers_are_copies_per_consumer():
     mxu = src("rtl/mxu/otpu_mxu.sv")
     assert re.search(r"begin\s*:\s*g_bd\s*" + kept, mxu)
     assert "dhi1[j].s[g]" in mxu and "vhi1[j]" in mxu and not re.search(r"\bdhi1\.s\b", mxu)
-    assert re.search(r"begin\s*:\s*g_rfm.*?begin\s*:\s*g_s\b.*?logic \[RFW-1:0\] wt;", mxu, re.S)
+    assert re.search(r"begin\s*:\s*g_rfm.*?otpu_ram_1r1w_ra\b.*?\.ra_n\(RFW'\(rf_qn", mxu, re.S)
     act = src("rtl/mem/otpu_actram.sv")
     head, row = act.split("begin : g_row", 1)
     assert re.search(r"logic \[D\*8-1:0\]\s+wd;", head) and not re.search(r"\bwd\s*;", row.split("end")[0])
@@ -553,6 +554,30 @@ def test_the_long_wire_drivers_are_copies_per_consumer():
     assert re.search(r"if \(WAITC\) begin\s*:\s*g_wq\s*" + kept, cmd)
     assert re.search(r"if \(we\) m\[wa\] <= WAITC \? c_cmd_w : c_cmd;", cmd)
     assert not re.search(r"m\[free_slot\]", seq)
+
+
+def test_the_widest_lut_rams_are_block_rams_read_ahead():
+    """A LUT RAM puts every address bit on each of its cells (6 data bits a RAM32M), so a wide one
+    is a fanout of thousands per bit: on r22-era m8 the DMA's gather (39,424 address pins), the B
+    response FIFO (38,528) and the MXU's result FIFO (37,632) were the most of any memories. They
+    are otpu_ram_1r1w_ra (rtl/tech: a block RAM read at the address's next value, the same cycles
+    as the asynchronous read; flip-flops on the ASIC), read ahead at their pointer's next value,
+    and the per-RAM copies of their write addresses that the LUT RAMs needed are gone."""
+    def src(p):
+        return re.sub(r"//.*", "", (ROOT / p).read_text())
+    ra = r"otpu_ram_1r1w_ra\s*#\([^;]*?\.ra_n\((\w+)"
+    dma = src("rtl/dma/otpu_dma.sv")
+    gb = dma[dma.index("begin : g_gb"):]
+    assert re.search(ra, gb).group(1) == "gh_n" and "logic [31:0] gb [NGC]" not in dma
+    assert re.search(r"assign gh_n = ", dma) and not re.search(r"gb_wa \[SPC\]\[W\]", dma)
+    nd = src("rtl/mem/otpu_native_dram.sv")
+    assert re.search(ra, nd[nd.index("begin : g_rb"):]).group(1) == "rb_hn"
+    assert "rb_tq" not in nd and not re.search(r"\brbm\s*\[", nd)
+    mxu = src("rtl/mxu/otpu_mxu.sv")
+    rfm = mxu[mxu.index("begin : g_rfm"):]
+    assert re.search(ra, rfm) and "begin : g_s" not in rfm.split("end\n  always_ff")[0]
+    for fam in ("generic", "asic"):
+        assert "module otpu_ram_1r1w_ra" in src(f"rtl/tech/{fam}/otpu_tech_ram.sv"), fam
 
 
 def test_config_summary_names_the_target(no_env):

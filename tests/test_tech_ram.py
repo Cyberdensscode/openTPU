@@ -28,7 +28,7 @@ def _trace(tmp: Path, family: str, w: int, n: int, kind: int, seed: int) -> list
     obj = tmp / f"obj_{family}"
     obj.mkdir(parents=True)
     srcs = [ROOT / f"rtl/tech/{family}/otpu_tech_ram.sv", ROOT / "sim/tech/tb_tech_ram.sv"]
-    if family == "asic":
+    if family == "asic" and kind != 4:          # (the read-ahead RAM is flip-flops there)
         ms = tiles({2: "1rw", 3: "1rw1r"}.get(kind, "1r1w"), w, n)
         for m in ms:
             srcs.append(fakeram.write(m, tmp / "macros")["v"])
@@ -50,7 +50,9 @@ def _trace(tmp: Path, family: str, w: int, n: int, kind: int, seed: int) -> list
                                       (64, 256, 1),       # byte enables
                                       (130, 8192, 2),     # one port, both tilings
                                       (40, 8192, 3),      # two ports (1RW1R), read first
-                                      (200, 64, 3)])
+                                      (200, 64, 3),
+                                      (32, 64, 4),        # read ahead (its bypass)
+                                      (200, 32, 4)])
 def test_asic_rams_match_generic(tmp_path, w, n, kind):
     g = _trace(tmp_path / "g", "generic", w, n, kind, 3)
     a = _trace(tmp_path / "a", "asic", w, n, kind, 3)
@@ -66,7 +68,8 @@ def test_families_define_the_same_rams():
             norm = lambda s: re.sub(r"\s+", " ", s).strip()   # noqa: E731
             mods[m.group(1)] = (norm(m.group(2)), norm(m.group(3)))
         return mods
-    pub = {"otpu_ram_1r1w", "otpu_ram_1r1w_be", "otpu_ram_1rw", "otpu_ram_1rw1r"}
+    pub = {"otpu_ram_1r1w", "otpu_ram_1r1w_ra", "otpu_ram_1r1w_be", "otpu_ram_1rw",
+           "otpu_ram_1rw1r"}
     g = iface(ROOT / "rtl/tech/generic/otpu_tech_ram.sv")
     a = iface(ROOT / "rtl/tech/asic/otpu_tech_ram.sv")
     assert set(g) == pub and pub <= set(a)
