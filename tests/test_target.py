@@ -578,6 +578,32 @@ def test_the_widest_lut_rams_are_block_rams_read_ahead():
     assert re.search(ra, rfm) and "begin : g_s" not in rfm.split("end\n  always_ff")[0]
     for fam in ("generic", "asic"):
         assert "module otpu_ram_1r1w_ra" in src(f"rtl/tech/{fam}/otpu_tech_ram.sv"), fam
+    # the native adapter's SW queue data and fill data (11,980 address pins each), at qw_f's next
+    g_mem = nd[nd.index("begin : g_mem"):nd.index("assign ra_head")]
+    assert [m for m in re.findall(ra, g_mem) if m != "rb_hn"] == ["qw_fn"] * 2
+    assert not re.search(r"\b(qwd|wrm)\s*\[", nd)
+
+
+def test_late_pushes_reach_no_lut_ram_write_enable():
+    """A queue whose LUT RAM is written on its push puts the push, which comes late (the end of a
+    grant or of the native adapter's write issue: 9 to 12 levels on the card), on every cell's
+    write enable (hundreds). The native adapter's A queue (qam) writes its tail every cycle (2 QD
+    slots, as its B queue's qbm), and the in-order channel FIFOs (otpu_afifo OOO 0: u_aq, u_ad,
+    u_xq, u_xd) write the tail slot every cycle there is room (wready: the pointers' registers);
+    a push only moves the tail. And the MXU's ASCALE factors (alpha), registers that hold a value
+    rather than a pipeline stage, load off the TMEM grant's fan-out."""
+    def src(p):
+        return re.sub(r"//.*", "", (ROOT / p).read_text())
+    nd = src("rtl/mem/otpu_native_dram.sv")
+    assert re.search(r"qam \[2 \* QD\];", nd)
+    assert re.search(r"always_ff @\(posedge clk\) qam\[", nd)
+    af = src("rtl/shell/otpu_afifo.sv")
+    assert "if (OOO ? wput : wready) mem[waddr] <= wdata;" in af
+    mxu = src("rtl/mxu/otpu_mxu.sv")
+    load = mxu[mxu.index("if (!rst && al_st == 2'd3)"):]
+    assert "alpha[j] <= t_rdata" in load.split("`ifndef SYNTHESIS")[0]
+    assert "t_gnt" not in mxu[mxu.index("if (!rst && al_st == 2'd3)") - 40:
+                              mxu.index("if (!rst && al_st == 2'd3)")]
 
 
 def test_config_summary_names_the_target(no_env):

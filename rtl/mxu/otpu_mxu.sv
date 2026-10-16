@@ -1211,6 +1211,35 @@ module otpu_mxu
     end
   end
 
+  // ASCALE factors: alpha takes the words every cycle they are there (al_st 3), not only at the
+  // grant that moves al_st on. TMEM holds the MXU's read data until its next grant (r1's xo takes
+  // it there too) and al_i moves only with the grant, so after that grant alpha is what it was;
+  // alpha is read (alr) only with the grant, and no ASCALE row is in r0 while it loads (drain_go
+  // waits for al_st 2). Its MCOLS x 32 enables are off the grant's fan-out (the m8 card at a 150
+  // MHz equivalent: 90 of the grant net's 127 failing endpoints). One write per entry (a constant
+  // index): a variable-index write of several lanes makes Vivado try, and crash while
+  // dissolving, a RAM for these MCOLS registers
+  always_ff @(posedge clk)
+    if (!rst && al_st == 2'd3)
+      for (int j = 0; j < MCOLS; j++)
+        if (32'(j) >= 32'(al_i) && 32'(j) < 32'(al_i) + LANES)
+          alpha[j] <= t_rdata[$clog2(LANES)'(32'(j) - 32'(al_i))];
+`ifndef SYNTHESIS
+  // alpha_g: as loaded at the grant only (the old enables); the factor a row reads is its value
+  logic [31:0] alpha_g [MCOLS];
+  always_ff @(posedge clk)
+    if (!rst && t_gnt && al_st == 2'd3)
+      for (int j = 0; j < MCOLS; j++)
+        if (32'(j) >= 32'(al_i) && 32'(j) < 32'(al_i) + LANES)
+          alpha_g[j] <= t_rdata[$clog2(LANES)'(32'(j) - 32'(al_i))];
+  always @(posedge clk)
+    if (!rst && t_gnt && r0.v && c_asc)
+      for (int k = 0; k < NL; k++)
+        if (r0.m[k] && alpha[r0.col[k][MW-2:0]] != alpha_g[r0.col[k][MW-2:0]])
+          $fatal(1, "otpu_mxu: ASCALE factor %0d is %h, at the grant %h", r0.col[k][MW-2:0],
+                 alpha[r0.col[k][MW-2:0]], alpha_g[r0.col[k][MW-2:0]]);
+`endif
+
   // ---- statistics for the profiler (per completed command): cycles the stream was starved
   // (work, no chunk), backpressured (chunks, no consumption), the drain frozen by the TMEM grant,
   // the issuer denied a DRAM port. The conditions are registered (st_c) and summed a cycle
@@ -1459,12 +1488,7 @@ module otpu_mxu
         end
         if (al_go) al_st <= 2'd1;
         if (al_st == 2'd1) al_st <= 2'd3;     // the read leaves the request register
-        if (al_st == 2'd3) begin
-          // one write per entry (a constant index): a variable-index write of several lanes makes
-          // Vivado try, and crash while dissolving, a RAM for these MCOLS registers
-          for (int j = 0; j < MCOLS; j++)
-            if (32'(j) >= 32'(al_i) && 32'(j) < 32'(al_i) + LANES)
-              alpha[j] <= t_rdata[$clog2(LANES)'(32'(j) - 32'(al_i))];
+        if (al_st == 2'd3) begin               // (the words into alpha: below)
           if (32'(al_i) + LANES >= 32'(c_M)) al_st <= 2'd2;
           else begin
             al_i <= al_i + 8'(LANES);
