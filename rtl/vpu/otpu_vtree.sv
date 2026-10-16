@@ -4,7 +4,8 @@
 // cycle (sub = 0..RL-1, RL = 64 / LANES): `cap` marks a cycle that carries final partials,
 // `row_last` the row's last. The root comes out RD cycles after the row's last partials
 // (root_v). Rows must start a multiple of RL cycles apart (the adders follow a fixed
-// schedule); every register advances with `en`.
+// schedule); every register advances with `en`, a lane's row levels (g_tree) with its copy of it
+// (en_l[k] == en: the VPU's per-lane copies, so no one net reaches every lane's adders).
 module otpu_vtree
   import otpu_fp::*;
 #(
@@ -14,6 +15,7 @@ module otpu_vtree
   input  logic       clk,
   input  logic       rst,
   input  logic       en,
+  input  logic [LANES-1:0] en_l,     // en's copies, one per lane (g_tree)
   input  f32_t       pacc [LANES],
   input  logic       cap,
   input  logic       row_last,
@@ -95,8 +97,9 @@ module otpu_vtree
   for (genvar k = 0; k < LANES; k++) begin : g_tree
     f32_t pdd, oa, ob;
     logic [DMAX:1][31:0] td;                 // tr_y[k] delayed 1..DMAX
-    otpu_delay #(.W(32), .N(RL / 2 - 1)) u_pd (.clk, .en, .d(pacc[k]), .q(pdd));
-    always_ff @(posedge clk) if (en) begin
+    wire  ek = en_l[k];
+    otpu_delay #(.W(32), .N(RL / 2 - 1)) u_pd (.clk, .en(ek), .d(pacc[k]), .q(pdd));
+    always_ff @(posedge clk) if (ek) begin
       td[1] <= tr_y[k];
       for (int d = 2; d <= DMAX; d++) td[d] <= td[d-1];
     end
@@ -112,8 +115,8 @@ module otpu_vtree
       wire  lv2n = rsr[DL - 3];              // level 2 one cycle early
       always_ff @(posedge clk)
         if (rst) la <= 1'b0;
-        else if (en) la <= lvn[1] || lv2n;
-      always_ff @(posedge clk) if (en) qb <= lv2n ? tr_y[k] : pdd;
+        else if (ek) la <= lvn[1] || lv2n;
+      always_ff @(posedge clk) if (ek) qb <= lv2n ? tr_y[k] : pdd;
       assign oa = la ? td[2] : pacc[k];
       assign ob = lv[1] ? tr_y[k] : qb;
     end else begin : g_gen
@@ -124,7 +127,7 @@ module otpu_vtree
       // shift-register LUT (the value after reset is never used)
       always_ff @(posedge clk)
         if (rst) pd <= '0;
-        else if (en) pd <= pdd;
+        else if (ek) pd <= pdd;
       assign sa[0] = pd;
       assign sb[0] = pacc[k];
       for (genvar j = 1; j < LR; j++) begin : g_op
@@ -137,7 +140,7 @@ module otpu_vtree
           if (lv[j]) begin oa = sa[j]; ob = sb[j]; end
       end
     end
-    otpu_fadd #(.LAT(LA)) u_tree (.clk, .en, .a(oa), .b(ob), .y(tr_y[k]));
+    otpu_fadd #(.LAT(LA)) u_tree (.clk, .en(ek), .a(oa), .b(ob), .y(tr_y[k]));
   end
 
   // lane levels n = LANES >> q: xl[q][k] = xl[q-1][k] + xl[q-1][k + n], k < n; the root is
@@ -209,6 +212,8 @@ module otpu_vtree
   assign root = LN2 ? xs[0] : xl[LW][0];
   assign root_v = root_v_i;
 `ifndef SYNTHESIS
+  always_ff @(posedge clk)
+    if (en_l != {LANES{en}}) $fatal(1, "otpu_vtree: en_l is not en");
   // the tree schedule needs rows a multiple of RL cycles apart: level 0 (issuing while the
   // subs >= RL/2 are on `pacc`) must never meet another level
   always_ff @(posedge clk)
