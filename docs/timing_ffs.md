@@ -4,7 +4,8 @@ The question (2026-10-16): the card's clock is limited by route delay, not by lo
 flip-flops fix it, and what else in the flow can improve? This is the exploration's record: where
 the delay is (the FPGA card, the ASIC card), what the tools do alone, three batches of
 cycle-exact register copies (branch `worktree-timing-ffs`), FPGA builds at 133.33 MHz and at a
-150 MHz equivalent, and the ASIC flow's timing repair.
+150 MHz equivalent, the ASIC flow's timing repair, and (the follow-up question: reduce the
+fanout) a census of what the card's nets fan out to and three batches that cut it.
 
 **Short answer.**
 - **On the FPGA, flip-flops help where the long wire carries a register that is already a cycle
@@ -23,6 +24,13 @@ cycle-exact register copies (branch `worktree-timing-ffs`), FPGA builds at 133.3
   grant with a skid, a start a cycle later) or a different structure (section 5). Vivado alone
   (replication, re-placement) reaches ~137 MHz on E3; main's own 150 MHz-equivalent build ~136
   MHz core to core and ~129 MHz at the clk -> clk2x crossing.
+- **Most of the card's fanout was LUT RAM addresses, and block RAMs read ahead remove it**
+  (section 6): 56% of the loads on nets of 200 or more were LUT RAM address pins. The widest
+  memories as block RAMs read at their pointer's next value (a cycle early, so the same cycles),
+  late pushes off LUT RAM write enables, and the VPU's enable copies per consumer: at the 150 MHz
+  equivalent the failing endpoints go 2,066 -> 820, TNS -177 -> -40 ns, the clock it reaches
+  ~140 -> ~145 MHz, for 7.9 k fewer LUTs and 90 more block RAM tiles. The MXU's TMEM grant
+  (11.3 k enables) is what is left, and it needs a protocol change.
 - **On the ASIC the gain is in the flow, not the RTL.** The card's timing repair never ran: CTS's
   repair saw only ports (it runs before their clock latency is set), and the global route's
   `repair_design` does not finish on 2.5 M nets. With the global route's repair as
@@ -226,13 +234,93 @@ detailed routing has not been run on the card.
   feeds them; on a device at 87% of its slices that is congestion, and congestion lengthens every
   route (section 3, the ACT RAM).
 
-## 6. Next
+## 6. Fanout: what the nets reach, and what was cut
+
+**The census** (`b_t4_def`'s opt_design checkpoint: aa3ec024 at 133.33 MHz; every signal net with 200
+or more loads, its loads by pin kind). 562 nets carry 278,123 loads: **LUT RAM address pins
+156,954 (56%)**, flip-flop enables 53,987 (19%), LUT inputs 25,723, resets 20,477 (most of them
+XDMA's own), LUT RAM write enables 18,024 (6.5%). Over every LUT RAM of the design: 1,535 memories,
+357,960 address pins, 39,880 write enables. A LUT RAM takes the whole address on every cell (a
+RAM32M holds 6 bits of a 32-deep memory), so a 512-bit queue is a fanout of ~86 per address bit
+from its pointer register, and a wide memory's pointer was the widest net of its unit: the DMA's
+gather (39,424 address pins), the native adapter's B response FIFO (38,528), the MXU's result FIFO
+(37,632), the native adapter's A response RAM (19,152), its B queue (12,960), its SW queue's data
+and fill data (11,980 each), the channel bridges' output FIFOs (11,980 each), the sequencer's
+command store (10,820). The enables: the MXU's TMEM grant (11,254 enables: its whole epilogue,
+held while TMEM does not grant), the quantizer's pipeline enable (8,254), the VPU's per-lane
+enable copies (~2,500 each).
+
+**Batch 5 (0a2750a4): the widest LUT RAMs as block RAMs read ahead.** `otpu_ram_1r1w_ra`
+(`rtl/tech`, both families) is a LUT RAM's behaviour on a block RAM: `rd` is the word at the read
+address register, every write to the last edge in it, from the address's next value (`ra_n`) a
+cycle early; generic: a block RAM read at `ra_n` and a registered bypass of the word written at
+that edge; asic: flip-flops and a multiplexer at the registered address. `tb_tech_ram` kind 4
+checks the two families against each other (a third of its reads the word written at that
+edge). The DMA's gather (`g_gb`, at `gh_n`), the B response FIFO (`g_rb`, at `rb_hn`; its tail
+copies `rb_tq` gone) and the MXU's result FIFO (`g_rfm`, three copies at `rf_qn + c`) use it; each
+next value is checked in simulation against its register. And two enables that held for nothing:
+port B's input register in the slice (its readers take it only under `b_rvalid_i`) and TMEM's
+input stage address and data with one write port per bank (taken only under `wi_gnt`).
+
+**Batch 6 (8bf19b12): late pushes off LUT RAM write enables.** A queue written on its push puts
+the push, decided late, on every cell's write enable. The in-order channel FIFOs (`otpu_afifo` OOO
+0: `u_aq`, `u_ad`, `u_xq`, `u_xd`) write the tail slot every cycle there is room (`wready`, the
+pointers' registers), and the native adapter's A queue (`qam`, 2 QD slots) its tail every cycle,
+as its B queue already did; a push only moves the tail. (A first version took the room a cycle
+old: the push the synchronized read pointer had just made room for was then not written; the
+board model's turnaround test caught it.) The SW queue's data and fill data (`u_qwd`, `u_wrm`) are
+block RAMs read ahead at `qw_fn`. The MXU's ASCALE factors (`alpha`) load every cycle the words are
+there, not only at the grant (TMEM holds them until it; checked against a grant-only copy at
+every read, and a mutation loading early is caught): 90 of the grant net's 127 failing endpoints
+in b_t4_150. `tools/memch_test.py` (the bridge's own bench, func and mutations) passes as before.
+
+**Batch 7 (0c0b16c8): the VPU's enable copies per lane and per consumer.** `g_enl` keeps four
+copies per lane, each loaded with `en_r`'s next value: the lanes' own stages, the composites, the
+tail's units, and the tree's lanes (`otpu_vtree` takes `en_l` for its row levels). One copy per
+lane reached ~2,500 enables, 0 levels and 92% route.
+
+Every batch: `tests/test_rtl.py` 176 passed, 1 skipped; the SE, composite, tail, stream, quantizer,
+fp, wait-count, vops, models-on-board, board, target, tech RAM and ASIC flow tests pass; the five
+co-simulations are cycle-exact (950,732 / 2,539,392 / 1,617,739 / 1,708,259 / 4,489,345 cycles, as
+main).
+
+**FPGA at the 150 MHz equivalent** (the same recipe and constraints as section 3's table):
+
+| build | b_t4_150 (aa3ec024) | + batch 5 (b_t5_150) | + batch 6 (b_t6_150) |
+|---|---|---|---|
+| core -> core WNS, failing, TNS | -0.255 ns, 1,577, -142 | -0.236, 1,731, -124 | **-0.202, 732, -36** |
+| core -> clk2x / clk2x -> core | -0.241 / -0.225 | -0.006 / -0.029 | -0.122 / -0.003 |
+| clk2x -> clk2x | -0.150 | +0.075 | -0.050 |
+| failing endpoints, all clocks | 2,066 | 1,738 | **820** |
+| reaches | 7.148 ns, 139.9 MHz | 6.903 ns, 144.9 MHz | 6.910 ns, 144.7 MHz |
+| LUTs (as memory) | 186,027 (30,535) | 178,435 (22,204) | 178,168 (20,949) |
+| flip-flops | 165,387 | 169,067 | 171,043 |
+| block RAM tiles | 436 (45.7%) | 496.5 (52.0%) | 526.5 (55.1%) |
+| slices | 88.3% | 87.0% | 87.0% |
+
+Batch 5 takes the clk2x crossings, which bounded b_t4_150, from -0.24 to -0.03 ns (~140 -> ~145
+MHz), and 8.3 k LUTs of memory out (-27%), for 3.7 k flip-flops (the bypass registers) and 60
+block RAM tiles. Batch 6 halves the failing endpoints again and cuts TNS by two thirds; the
+worst path moves. In b_t6_150 no failing path touches a LUT RAM. What fails there: the VPU's
+per-lane enable copies (1,803 endpoints within 0.2 ns, 0 levels; batch 7), TMEM's `rpv` into the
+VPU (12 levels), the sequencer's dispatch (`sv`, `vout`), the MXU's TMEM grant (`u_rw` `E`, 11,301
+loads: its epilogue's stage enables) and the ACT RAM's write stage.
+
+**What fanout is left**: the MXU's grant reaches its whole epilogue (the lanes, `r0` / `r1`, the
+fmadd, the delay lines: 11.3 k enables) in the cycle TMEM decides it. It needs the protocol change
+of section 5: the epilogue running free into a skid of its depth (a pipeline's worth of entries,
+popped one per granted cycle, so the requests TMEM sees stay the same cycles), or a registered
+grant. The quantizer's enable (8,254) is on no failing path. The remaining LUT RAMs are the
+channel bridges' FIFOs (asynchronous: their reads cross clocks, so a block RAM there is a CDC
+change) and the native adapter's A response RAM (read at `ra_h + drop`, two registers' sum).
+
+## 7. Next
 
 - The FPGA: a real build above 133.33 MHz needs an even MMCM divide for CLK2X, which
   `bd_native.tcl`'s fixed 800 MHz VCO (50 MHz x 16) does not have; a VCO parameter would (850
-  MHz, M 17: core 141.7 / clk2x 283.3 MHz; 900 MHz, M 18: 150 / 300); a second level of enable copies
-  (`g_enl` per lane and stage group); then the protocol changes below. Land the narrow copies
-  (aa3ec024) on main for the card, and drop r22's ECO from its recipe.
+  MHz, M 17: core 141.7 / clk2x 283.3 MHz; 900 MHz, M 18: 150 / 300); then the protocol changes
+  below. Land the narrow copies and the fanout batches (through 0c0b16c8) on main for the card,
+  and drop r22's ECO from its recipe.
 - The ASIC: run the card's flow (both hooks are its default now) through detailed routing, with
   the clock at 2.0 ns rather than a margin (the global route's 2.0 ns is on the guides'
   parasitics); put the copies behind a target parameter (FPGA on, ASIC off); at 2.0 ns the VPU's
