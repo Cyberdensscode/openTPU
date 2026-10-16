@@ -54,6 +54,7 @@ module otpu_mxu
   parameter int IMPL  = 2,       // the dot product: 2 systolic (the only one; CFG_UARCH reports it)
   parameter int CL    = 16,      // products per cascade chain (at most D/8)
   parameter int E     = 0,       // epilogue lanes (0: MCOLS / 2, at least 1; more than MCOLS: MCOLS)
+  parameter bit TQ    = 1'b1,    // the epilogue on a registered advance and a TMEM request queue
   parameter int SID   = 0
 ) (
   input  logic                  clk,
@@ -97,7 +98,8 @@ module otpu_mxu
   output logic [LANES-1:0]        t_wen,
   output logic [LANES-1:0][31:0]  t_waddr,
   output logic [LANES-1:0][31:0]  t_wdata,
-  input  logic                    t_gnt
+  input  logic                    t_gnt,
+  input  logic                    t_lost      // TMEM_IMPL 3 RPL: the read port's read lost (replayed)
 );
   localparam int BW = $clog2(LANES);
   localparam int PW = $clog2(DEPTH);
@@ -970,14 +972,17 @@ module otpu_mxu
   wire [MW:0]      st_mid = dstep(d_rest, c_run);
   wire [MW:0]      st_grp = d_nl ? {h.dfl, h.dnl} : dstep(MW'(MCOLS), c_run);
   wire [NL-1:0]    ln_mid = dlanes(st_mid[MW-1:0]), ln_grp = dlanes(st_grp[MW-1:0]);
-  wire             d_pop = t_gnt && drain_row_done;   // a row leaves the result FIFO
+  logic            ea;          // the epilogue's advance: the TMEM grant (TQ 0) or a flip-flop
+  logic [1:0]      tq_n;        // TQ: the epilogue's TMEM beats waiting (the TMEM interface)
+  wire             d_pop = ea && drain_row_done;      // a row leaves the result FIFO
 `ifndef SYNTHESIS
   always @(posedge clk) if (!rst && rf_n != 0 && rfh != g_rfm[0].mh)
     $fatal(1, "otpu_mxu: registered head row is not row %0d", rf_q + RFW'(rf_hs));
 `endif
 
   // ---- the epilogue lanes: the pick registered (P1), i2f48, x Sw, x Sa' (otpu_mx_lane), the
-  // pick's lanes, addresses and columns alongside; everything advances with the TMEM grant. The
+  // pick's lanes, addresses and columns alongside; everything advances with ea (the TMEM grant,
+  // or with TQ its flip-flop: the TMEM interface below). The
   // lane output (lo_*) is the drain's TMEM request: a write, or ACC's read of the old values
   typedef struct packed {
     logic                   v;
@@ -994,33 +999,33 @@ module otpu_mxu
   f32_t                lo_y [NL];
   always_ff @(posedge clk)
     if (rst) p1 <= '0;
-    else if (t_gnt) begin
+    else if (ea) begin
       p1.v <= drain_go;
       p1.m <= drain_go ? dln : '0;
       p1.ad <= dal;
       p1.col <= dcol_l;
     end
   always_ff @(posedge clk)
-    if (t_gnt) begin
+    if (ea) begin
       p1_x <= dx_l; p1_sa <= dsa_l; p1_sw <= rfh_sw;
     end
   for (genvar k = 0; k < NL; k++) begin : g_lane
-    otpu_mx_lane #(.LM(LM)) u_l (.clk, .en(t_gnt), .x(p1_x[k]), .sw(p1_sw), .sa(p1_sa[k]),
+    otpu_mx_lane #(.LM(LM)) u_l (.clk, .en(ea), .x(p1_x[k]), .sw(p1_sw), .sa(p1_sa[k]),
                                  .y(lo_y[k]));
   end
   // the picks' addresses and columns in a delay line; their valid and lane bits in reset
   // registers (a run stopped in the middle of a drain leaves no write to come out after rst)
   lmeta_t lo_p;
-  otpu_delay #(.W($bits(lmeta_t)), .N(LLAT - 2)) u_lm (.clk, .en(t_gnt), .d(p1), .q(lo_p));
+  otpu_delay #(.W($bits(lmeta_t)), .N(LLAT - 2)) u_lm (.clk, .en(ea), .d(p1), .q(lo_p));
   logic [LLAT-2:0][NL:0] lvm;
   always_ff @(posedge clk)
     if (rst) lvm <= '0;
-    else if (t_gnt) begin
+    else if (ea) begin
       lvm[0] <= {p1.v, p1.m};
       for (int s = 1; s <= LLAT - 2; s++) lvm[s] <= lvm[s-1];
     end
   always_ff @(posedge clk)
-    if (t_gnt) begin
+    if (ea) begin
       lo_ad <= lo_p.ad;
       lo_col <= lo_p.col;
     end
@@ -1052,7 +1057,7 @@ module otpu_mxu
   f32_t xo [NL], alr [NL];
   always_ff @(posedge clk)
     if (rst) r1 <= '0;
-    else if (t_gnt) begin
+    else if (ea) begin
       r1 <= r0;
       for (int k = 0; k < NL; k++) begin
         xo[k]  <= t_rdata[k];
@@ -1060,10 +1065,10 @@ module otpu_mxu
       end
     end
   for (genvar k = 0; k < NL; k++) begin : g_rmw
-    otpu_fmadd #(.LM(LM), .LA(LA)) u_y (.clk, .en(t_gnt), .a(xo[k]), .b(alr[k]), .c(r1.nv[k]),
+    otpu_fmadd #(.LM(LM), .LA(LA)) u_y (.clk, .en(ea), .a(xo[k]), .b(alr[k]), .c(r1.nv[k]),
                                         .y(ry[k]));
   end
-  otpu_delay #(.W($bits(rmw_t)), .N(LM + LA)) u_rw (.clk, .en(t_gnt), .d(r1), .q(rw));
+  otpu_delay #(.W($bits(rmw_t)), .N(LM + LA)) u_rw (.clk, .en(ea), .d(r1), .q(rw));
   logic [3:0] rmw_n;                          // rows' lanes in flight (any nonzero = busy)
 
   // RMAX: the running max is kept as its sort key (mk = fkey(max); the max is always stored
@@ -1084,8 +1089,8 @@ module otpu_mxu
         rh[k][j]  = r1.v && c_rmax && r1.m[k] && (r1.col[k][MW-2:0] == (MW-1)'(j));
         rxh[k][j] = rx.v && rx.m[k] && (rx.col[k][MW-2:0] == (MW-1)'(j));
       end
-  otpu_delay #(.W(NL * MCOLS), .N(LM + LA - 1)) u_rwh (.clk, .en(t_gnt), .d(rh), .q(rh_p));
-  always_ff @(posedge clk) if (rst) rwh <= '0; else if (t_gnt) rwh <= rh_p;
+  otpu_delay #(.W(NL * MCOLS), .N(LM + LA - 1)) u_rwh (.clk, .en(ea), .d(rh), .q(rh_p));
+  always_ff @(posedge clk) if (rst) rwh <= '0; else if (ea) rwh <= rh_p;
   // per column: the candidate key is selected by the hits alone, the compare only makes the
   // enable. At most one lane hits a column per cycle (lanes drain distinct columns) and rx / rw
   // are exclusive (rx only for !c_acc commands, rw only for c_acc ones)
@@ -1109,7 +1114,7 @@ module otpu_mxu
     end
 `ifndef SYNTHESIS
   always_ff @(posedge clk)
-    if (!rst && t_gnt)
+    if (!rst && ea)
       for (int j = 0; j < MCOLS; j++) begin
         int n;
         n = 0;
@@ -1136,7 +1141,7 @@ module otpu_mxu
   always @(posedge clk) if (!rst && mx_gq != (mx_q && !mx_done))
     $fatal(1, "otpu_mxu: mx_gq %0d, mx_q %0d, mx_done %0d", mx_gq, mx_q, mx_done);
 `endif
-  wire c_fin     = c_drained && (!c_rmax || mx_done || c_tz);
+  wire c_fin     = c_drained && (!c_rmax || mx_done || c_tz) && tq_n == 2'd0;
   // the head completes (while the pop head may pop the next command's chunks)
   wire c_done    = c_fin;
   wire al_go     = c_act && c_asc && al_st == 2'd0;
@@ -1158,35 +1163,37 @@ module otpu_mxu
         $fatal(1, "otpu_mxu: RMAX lane %0d address %0h, mxo %0h, mx_i %0d", k, mxl[k], h.mxo, mx_i);
 `endif
 
-  // TMEM's input stage (release r2, docs/tmem_nocopy.md 7): the read request is a register, a
-  // stage of the grant's pipeline (it advances with t_gnt), so no unit logic (the ASCALE
+  // TMEM's input stage (release r2, docs/tmem_nocopy.md 7): the read request is a register
+  // (rq_*), a stage of the epilogue (it advances with ea), so no unit logic (the ASCALE
   // addresses' adder and compare, the drain's lane mux) precedes TMEM's lane routing, ranks and
-  // block RAM pins; the word arrives a cycle later (rA, al_st 3)
-  logic [LANES-1:0]       t_ren_c;
-  logic [LANES-1:0][31:0] t_raddr_c;
+  // block RAM pins; the word arrives a cycle after TMEM reads it (rA, al_st 3)
+  logic [LANES-1:0]       t_ren_c, rq_en;
+  logic [LANES-1:0][31:0] t_raddr_c, rq_ad;
+  logic [LANES-1:0]       tw_en;                 // this cycle's writes
+  logic [LANES-1:0][31:0] tw_ad, tw_d;
   always_ff @(posedge clk)
-    if (rst) t_ren <= '0;
-    else if (t_gnt) begin t_ren <= t_ren_c; t_raddr <= t_raddr_c; end
+    if (rst) rq_en <= '0;
+    else if (ea) begin rq_en <= t_ren_c; rq_ad <= t_raddr_c; end
   always_comb begin
-    t_ren_c = '0; t_raddr_c = '0; t_wen = '0; t_waddr = '0; t_wdata = '0;
+    t_ren_c = '0; t_raddr_c = '0; tw_en = '0; tw_ad = '0; tw_d = '0;
     if (lo.v) begin
       for (int k = 0; k < NL; k++) begin
         if (c_acc) begin
           t_ren_c[k] = lo.m[k];
           t_raddr_c[k] = lo.ad[k];
         end else begin
-          t_wen[k] = lo.m[k];
-          t_waddr[k] = lo.ad[k];
-          t_wdata[k] = lo_y[k];
+          tw_en[k] = lo.m[k];
+          tw_ad[k] = lo.ad[k];
+          tw_d[k] = lo_y[k];
         end
       end
     end
     if (rw.v) begin
       for (int k = 0; k < NL; k++) begin
         if (rw.m[k]) begin
-          t_wen[k] = 1'b1;
-          t_waddr[k] = rw.ad[k];
-          t_wdata[k] = ry[k];
+          tw_en[k] = 1'b1;
+          tw_ad[k] = rw.ad[k];
+          tw_d[k] = ry[k];
         end
       end
     end
@@ -1203,12 +1210,84 @@ module otpu_mxu
     if (mx_go) begin
       for (int k = 0; k < LANES; k++) begin
         if (mxm[k]) begin
-          t_wen[k] = 1'b1;
-          t_waddr[k] = mxl[k];
-          t_wdata[k] = unkey(mk[MW'(32'(mx_i) + 32'(k))]);
+          tw_en[k] = 1'b1;
+          tw_ad[k] = mxl[k];
+          tw_d[k] = unkey(mk[MW'(32'(mx_i) + 32'(k))]);
         end
       end
     end
+  end
+
+  // ---- the TMEM interface. A beat is what the epilogue gives TMEM in one advance: the read in
+  // the request register and this cycle's writes, granted together (the slice grants the MXU's
+  // read and write ports as one group). TQ 0: the epilogue advances on the grant itself (ea =
+  // t_gnt), which reached every register of the epilogue in the cycle the slice decides it (the
+  // m8 card: ~11.3 k enables, the end of the arbitration; at a 150 MHz equivalent the worst MXU
+  // paths, 720 endpoints within 0.2 ns). TQ 1: ea is a flip-flop, and a beat the grant does not
+  // take waits in a queue of two (tqb), its head what TMEM sees; the grant only pops the queue
+  // (and with it empty takes the beat as it is issued: no extra cycle when TMEM grants every
+  // cycle). ea is the room for one more beat and the word of the read in flight: the epilogue
+  // takes a read's word at the advance after the read's, so it holds there until TMEM has read
+  // it (rd_done) and no replay is pending (a lost read, t_lost: its word comes a replay later).
+  // One read is in flight at a time (the advance that takes its word is the one that issues the
+  // next), so the queue holds at most one, its newest beat. ea's next value comes from the
+  // grant, the queue and t_lost, so the grant ends at a few flip-flops. A command completes once
+  // its beats have all left the queue (c_fin), so a unit that waits on it reads what it wrote.
+  typedef struct packed {
+    logic [LANES-1:0]       ren;
+    logic [LANES-1:0][31:0] raddr;
+    logic [LANES-1:0]       wen;
+    logic [LANES-1:0][31:0] waddr;
+    logic [LANES-1:0][31:0] wdata;
+  } beat_t;
+  beat_t lb, tb;                                 // the epilogue's beat; the beat TMEM sees
+  assign lb.ren = rq_en, lb.raddr = rq_ad, lb.wen = tw_en, lb.waddr = tw_ad, lb.wdata = tw_d;
+  assign t_ren = tb.ren, t_raddr = tb.raddr, t_wen = tb.wen, t_waddr = tb.waddr,
+         t_wdata = tb.wdata;
+  if (TQ) begin : g_tq
+    beat_t tqb [2];
+    logic  tq_h;                                  // the head's slot
+    (* max_fanout = 128 *) logic ea_q;
+    logic  rd_iss, rd_done;                      // the read in flight: issued, read by TMEM
+    wire   byp  = tq_n == 2'd0;                   // the queue empty: TMEM sees the issued beat
+    wire   iss  = ea_q && ((|lb.ren) || (|lb.wen));
+    wire   pop  = !byp && t_gnt;
+    wire   push = iss && !(byp && t_gnt);
+    wire [1:0] tq_nn = tq_n + 2'(push) - 2'(pop);
+    wire   rd_iss_n  = ea_q ? (|lb.ren) : rd_iss;
+    wire   rd_done_n = ea_q ? ((|lb.ren) && byp && t_gnt)
+                            : (rd_done || (rd_iss && pop && (|tqb[tq_h].ren)));
+    assign ea = ea_q;
+    assign tb = byp ? (ea_q ? lb : '0) : tqb[tq_h];
+    always_ff @(posedge clk) begin
+      if (push) tqb[tq_h ^ tq_n[0]] <= lb;
+      if (rst) begin
+        tq_n <= '0; tq_h <= 1'b0; rd_iss <= 1'b0; rd_done <= 1'b0; ea_q <= 1'b0;
+      end else begin
+        tq_n <= tq_nn;
+        tq_h <= tq_h ^ pop;
+        rd_iss <= rd_iss_n;
+        rd_done <= rd_done_n;
+        ea_q <= (tq_nn <= 2'd1) && (!rd_iss_n || (rd_done_n && !t_lost));
+      end
+    end
+`ifndef SYNTHESIS
+    // TMEM's replay flag, as the MXU sees it (t_lost registered)
+    logic rpv_q;
+    always_ff @(posedge clk) rpv_q <= !rst && t_lost;
+    always @(posedge clk)
+      if (!rst) begin
+        if (push && tq_n == 2'd2) $fatal(1, "otpu_mxu: TMEM beat queue overflow");
+        if (ea_q && rd_iss && !(rd_done && !rpv_q))
+          $fatal(1, "otpu_mxu: advance before the read's word is there");
+        if (push && (|lb.ren) && tq_n != 2'd0 && (|tqb[tq_h].ren))
+          $fatal(1, "otpu_mxu: two reads in flight");
+      end
+`endif
+  end else begin : g_ng
+    assign ea = t_gnt;
+    assign tb = lb;
+    assign tq_n = '0;
   end
 
   // ASCALE factors: alpha takes the words every cycle they are there (al_st 3), not only at the
@@ -1228,12 +1307,12 @@ module otpu_mxu
   // alpha_g: as loaded at the grant only (the old enables); the factor a row reads is its value
   logic [31:0] alpha_g [MCOLS];
   always_ff @(posedge clk)
-    if (!rst && t_gnt && al_st == 2'd3)
+    if (!rst && ea && al_st == 2'd3)
       for (int j = 0; j < MCOLS; j++)
         if (32'(j) >= 32'(al_i) && 32'(j) < 32'(al_i) + LANES)
           alpha_g[j] <= t_rdata[$clog2(LANES)'(32'(j) - 32'(al_i))];
   always @(posedge clk)
-    if (!rst && t_gnt && r0.v && c_asc)
+    if (!rst && ea && r0.v && c_asc)
       for (int k = 0; k < NL; k++)
         if (r0.m[k] && alpha[r0.col[k][MW-2:0]] != alpha_g[r0.col[k][MW-2:0]])
           $fatal(1, "otpu_mxu: ASCALE factor %0d is %h, at the grant %h", r0.col[k][MW-2:0],
@@ -1427,8 +1506,8 @@ module otpu_mxu
         rf_t <= rf_t + 1;
         rn = rn + 1;
       end
-      // ---- drain (holds while the TMEM grant is withheld)
-      if (t_gnt) begin
+      // ---- drain (holds while the epilogue does not advance)
+      if (ea) begin
         r0 <= rA;
         rA <= '0;
         rx <= '0;
@@ -1502,7 +1581,7 @@ module otpu_mxu
       // RMAX lane addresses: they advance with mx_i while the writes run, else h.mxo + k
       for (int k = 0; k < LANES; k++)
         if (!mx_go) mxl[k] <= h.mxo + 32'(k);
-        else if (t_gnt && 32'(mx_i) + LANES < 32'(c_M)) mxl[k] <= mxl[k] + 32'(LANES);
+        else if (ea && 32'(mx_i) + LANES < 32'(c_M)) mxl[k] <= mxl[k] + 32'(LANES);
       rows_live <= rl;
       rows_p <= rp;
       // rn != 0, rl != 0 from the counts' own zero / one tests: the grant enters last
@@ -1516,14 +1595,14 @@ module otpu_mxu
         c_left <= n.total;
       end
       // ---- statistics
-      st_c <= {want_iss && !go_iss, !t_gnt && (drain_go || lo.v || rw.v || mx_go || al_go),
+      st_c <= {want_iss && !go_iss, !ea && (drain_go || lo.v || rw.v || mx_go || al_go),
                more && f_count != 0 && !pop, more && f_count == 0};
       st_f <= c_done;
       mx_q <= c_drained && c_rmax && !mx_done && !c_tz;
       // mx_q's next value and mx_done's (set by the last RMAX lanes' grant; a completing head
       // clears it, and then mx_q's next is low: it completes only with mx_done or c_tz)
       mx_gq <= c_drained && c_rmax && !mx_done && !c_tz &&
-               !(t_gnt && mx_go && 32'(mx_i) + LANES >= 32'(c_M));
+               !(ea && mx_go && 32'(mx_i) + LANES >= 32'(c_M));
       st_starve <= st_starve + 32'(st_g[0]);
       st_bp <= st_bp + 32'(st_g[1]);
       st_frz <= st_frz + 32'(st_g[2]);
@@ -1590,7 +1669,7 @@ module otpu_mxu
           dln <= dlanes(st[MW-1:0]);
           for (int k = 0; k < LANES; k++) mxm[k] <= 32'(k) < 32'(hx.M);
         end else begin
-          if (t_gnt && drain_go) begin
+          if (ea && drain_go) begin
             if (!d_fin) begin
               {d_fin, ncnt} <= st_mid;
               dln <= ln_mid;
@@ -1600,7 +1679,7 @@ module otpu_mxu
               dln <= ln_grp;
             end
           end
-          if (t_gnt && mx_go && 32'(mx_i) + LANES < 32'(c_M)) mxm <= mxm_nx;
+          if (ea && mx_go && 32'(mx_i) + LANES < 32'(c_M)) mxm <= mxm_nx;
         end
         // the pop head's entry, from the entries, not from the command being accepted: a
         // command that becomes the head as it is accepted gets its entry a cycle later (cl_ld;
