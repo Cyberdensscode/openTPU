@@ -323,6 +323,9 @@ module otpu_vpu
   // reaches every pipeline register of the lanes and the tree (~21k loads on the board), so it
   // must not come from the arbiter in the same cycle.
   logic en;
+  // ... and its copies, one per lane (g_wbuf's g_enl): the lanes' stages, the tail's units and the
+  // composites' lanes take their lane's, so no one register's replicas cross the VPU
+  logic [LANES-1:0] en_l;
   assign ren = en;
 
   // ------------------------------------------------------------------ issue
@@ -472,7 +475,7 @@ module otpu_vpu
   // main chunks' data (mi.cb) -- the fill runs >= 2 chunks ahead, so a word is written first
   for (genvar l = 0; l < LANES; l++) begin : g_cbuf
     f32_t cbuf [CBD], dbuf [CBD];
-    always_ff @(posedge clk) if (en) begin
+    always_ff @(posedge clk) if (en_l[l]) begin
       if (m0.fill) begin
         cbuf[m0.cb] <= xb[l];
         dbuf[m0.cb] <= od_one ? F_ONE : od_sc ? xa[0] : xa[l];
@@ -666,7 +669,7 @@ module otpu_vpu
         lst_t p0, p1, p2;
         logic e1, e2;                    // the entry in p0 / p1 is an EXP2
         logic g1, g2;                    // ... a LOG2
-        always_ff @(posedge clk) if (en) begin
+        always_ff @(posedge clk) if (en_l[l]) begin
           lst_t t;
           logic lo, hi;
           t = st[s];
@@ -774,7 +777,7 @@ module otpu_vpu
       lst_t       sr;
       logic [1:0] dr, dd;
       logic       nr, nd;
-      always_ff @(posedge clk) if (en) begin
+      always_ff @(posedge clk) if (en_l[l]) begin
         ra <= ia; rb <= ib; sr <= sin_; dr <= dest; nr <= negd;
       end
       // rc has a sync reset so it can't join u_c's two stages in a shift-register LUT: the
@@ -782,14 +785,14 @@ module otpu_vpu
       // F_NZ is every slot's default c, so bits constant across a slot's cases stay constant.
       always_ff @(posedge clk)
         if (rst)     rc <= F_NZ;
-        else if (en) rc <= ic_;
+        else if (en_l[l]) rc <= ic_;
       if (s == 0) begin : g_mma
         // slot 0: a*b + c*e (OUTER's second product; e = 1.0 otherwise)
         f32_t re;
-        always_ff @(posedge clk) if (en) re <= ie;
-        otpu_fmma #(.LM(LM), .LA(LA)) u_ma (.clk, .en, .a(ra), .b(rb), .c(rc), .e(re), .y(r));
+        always_ff @(posedge clk) if (en_l[l]) re <= ie;
+        otpu_fmma #(.LM(LM), .LA(LA)) u_ma (.clk, .en(en_l[l]), .a(ra), .b(rb), .c(rc), .e(re), .y(r));
       end else begin : g_ma
-        otpu_fmadd #(.LM(LM), .LA(LA)) u_ma (.clk, .en, .a(ra), .b(rb), .c(rc), .y(r));
+        otpu_fmadd #(.LM(LM), .LA(LA)) u_ma (.clk, .en(en_l[l]), .a(ra), .b(rb), .c(rc), .y(r));
       end
       if (s == 0 && RMA) begin : g_pacc
         assign pacc[l] = r;
@@ -797,22 +800,22 @@ module otpu_vpu
       // the live fields only (see k1_live); the dead ones read as 0 and are never used
       assign sd.v = '0;
       if (k1_live(s)) begin : g_k1
-        otpu_delay #(.W(32), .N(LM + LA)) u_k1 (.clk, .en, .d(sr.k1), .q(sd.k1));
+        otpu_delay #(.W(32), .N(LM + LA)) u_k1 (.clk, .en(en_l[l]), .d(sr.k1), .q(sd.k1));
       end else begin : g_nk1
         assign sd.k1 = '0;
       end
       if (k2_live(s)) begin : g_k2
-        otpu_delay #(.W(32), .N(LM + LA)) u_k2 (.clk, .en, .d(sr.k2), .q(sd.k2));
+        otpu_delay #(.W(32), .N(LM + LA)) u_k2 (.clk, .en(en_l[l]), .d(sr.k2), .q(sd.k2));
       end else begin : g_nk2
         assign sd.k2 = '0;
       end
       if (ii_live(s)) begin : g_ii
-        otpu_delay #(.W(9), .N(LM + LA)) u_ii (.clk, .en, .d(sr.ii), .q(sd.ii));
+        otpu_delay #(.W(9), .N(LM + LA)) u_ii (.clk, .en(en_l[l]), .d(sr.ii), .q(sd.ii));
       end else begin : g_nii
         assign sd.ii = '0;
       end
-      otpu_delay #(.W(3), .N(LM + LA)) u_f (.clk, .en, .d(sr.f), .q(sd.f));
-      otpu_delay #(.W(3), .N(LM + LA)) u_dst (.clk, .en, .d({dr, nr}), .q({dd, nd}));
+      otpu_delay #(.W(3), .N(LM + LA)) u_f (.clk, .en(en_l[l]), .d(sr.f), .q(sd.f));
+      otpu_delay #(.W(3), .N(LM + LA)) u_dst (.clk, .en(en_l[l]), .d({dr, nr}), .q({dd, nd}));
       always_comb begin
         f32_t rr;
         rr = nd ? fneg(r) : r;
@@ -880,14 +883,14 @@ module otpu_vpu
         default: ;
       endcase
     end
-    always_ff @(posedge clk) if (en) begin
+    always_ff @(posedge clk) if (en_l[l]) begin
       ra <= c_s0 ? c_sa[0][l] : ia; rb <= c_s0 ? c_sb[0][l] : ib; re <= c_s0 ? c_se[0][l] : ie;
     end
     // sync reset keeps rc out of u_c's SRL (see g_slot)
     always_ff @(posedge clk)
       if (rst)     rc <= F_NZ;
-      else if (en) rc <= c_s0 ? c_sc[0][l] : ic_;
-    otpu_fmma #(.LM(LM), .LA(LA)) u_ma (.clk, .en, .a(ra), .b(rb), .c(rc), .e(re), .y(st[1]));
+      else if (en_l[l]) rc <= c_s0 ? c_sc[0][l] : ic_;
+    otpu_fmma #(.LM(LM), .LA(LA)) u_ma (.clk, .en(en_l[l]), .a(ra), .b(rb), .c(rc), .e(re), .y(st[1]));
     if (RMA) begin : g_pacc
       assign pacc[l] = st[1];
     end
@@ -908,7 +911,7 @@ module otpu_vpu
     assign sy[1] = c_uy;
     assign sy[2] = c_qy;
     otpu_se_comp #(.LANES(LANES), .MW(AW + 1), .NS(CNS), .HA(3), .EXT(1'b1)) u_comp (
-      .clk, .rst, .en, .in_v(m0.v && m0d.cf), .in_c(m0d.cc), .in_a(c_ia),
+      .clk, .rst, .en, .en_l, .in_v(m0.v && m0d.cf), .in_c(m0d.cc), .in_a(c_ia),
       .in_b(c_ib), .in_m(m0.mask), .in_meta({m0.waddr, m0.all_last}), .hold(c_hold),
       .st_sel(c_sel), .st_a(c_sa), .st_b(c_sb), .st_c(c_sc), .st_e(c_se), .st_y(sy),
       .out_v(c_ov), .out_d(c_od), .out_m(c_om), .out_meta(c_ometa));
@@ -1060,26 +1063,26 @@ module otpu_vpu
       // are on m0 then (mi2), the first ones' +0. rc keeps the adder's c off a shift register.
       // A stream clears c instead, on its X segment's first flag (mi2 is idle then).
       f32_t fbq, fbd;
-      otpu_delay #(.W(32), .N(DF - 1)) u_fb (.clk, .en, .d(pacc[l]), .q(fbd));
-      always_ff @(posedge clk) if (en) fbq <= mi2.first ? F_ZERO : fbd;
+      otpu_delay #(.W(32), .N(DF - 1)) u_fb (.clk, .en(en_l[l]), .d(pacc[l]), .q(fbd));
+      always_ff @(posedge clk) if (en_l[l]) fbq <= mi2.first ? F_ZERO : fbd;
       assign rfb[l] = s_first ? F_ZERO : fbq;
     end else begin : g_acc
       f32_t tq, prev;
       assign rfb[l] = F_ZERO;
-      otpu_fmul #(.LAT(LM)) u_sq (.clk, .en, .a(sa), .b(sb), .y(tq));
+      otpu_fmul #(.LAT(LM)) u_sq (.clk, .en(en_l[l]), .a(sa), .b(sb), .y(tq));
       if (RL - LA >= 1) begin : g_fbq
         // the loop's last stage is a flip-flop with a sync clear (the first chunks' +0): no
         // shift-register LUT and no mux in front of the adder
         f32_t fbq, fbd;
-        otpu_delay #(.W(32), .N(RL - LA - 1)) u_fb (.clk, .en, .d(pacc[l]), .q(fbd));
-        always_ff @(posedge clk) if (en) fbq <= first_e ? F_ZERO : fbd;
+        otpu_delay #(.W(32), .N(RL - LA - 1)) u_fb (.clk, .en(en_l[l]), .d(pacc[l]), .q(fbd));
+        always_ff @(posedge clk) if (en_l[l]) fbq <= first_e ? F_ZERO : fbd;
         assign prev = fbq;
       end else begin : g_fbw
         f32_t fb;
-        otpu_delay #(.W(32), .N(RL - LA)) u_fb (.clk, .en, .d(pacc[l]), .q(fb));
+        otpu_delay #(.W(32), .N(RL - LA)) u_fb (.clk, .en(en_l[l]), .d(pacc[l]), .q(fb));
         assign prev = mtq.first ? F_ZERO : fb;
       end
-      otpu_fadd #(.LAT(LA)) u_acc (.clk, .en, .a(prev), .b(tq), .y(pacc[l]));
+      otpu_fadd #(.LAT(LA)) u_acc (.clk, .en(en_l[l]), .a(prev), .b(tq), .y(pacc[l]));
     end
   end
 
@@ -1146,6 +1149,7 @@ module otpu_vpu
   logic                     wb_e;          // no write pending
   if (!WBUF) begin : g_wdir
     assign en = (SE && ss_act) ? sen : gnt;
+    assign en_l = {LANES{en}};
     assign wb_e = (tw_en == '0);
     always_ff @(posedge clk) begin
       if (rst) begin
@@ -1215,6 +1219,17 @@ module otpu_vpu
       end
 `endif
     always_ff @(posedge clk) if (push) wq[wt] <= '{en: cw_en, a: cw_addr, d: cw_data, dn: pdn};
+    // en_r's next value, and its copies per lane (kept instances: identical flip-flops merge),
+    // loaded with it: en_r's max_fanout replicas each reached 64 registers anywhere in the VPU
+    // (r22's m8: into the tail's units, 7.0 ns of route with no logic; at 150 MHz, 977 endpoints)
+    wire en_rd = SE ? en_q && !rhold : (pop ? (wn_p1 < 2) : (wn_p0 < 2)) && red_thr && !rhold;
+    for (genvar l = 0; l < LANES; l++) begin : g_enl
+      (* keep_hierarchy = "yes" *)
+      otpu_delay #(.W(1), .N(1)) u_en (.clk, .en(1'b1), .d(!rst && en_rd), .q(en_l[l]));
+    end
+`ifndef SYNTHESIS
+    always @(posedge clk) if (en_l != {LANES{en_r}}) $fatal(1, "otpu_vpu: en_l is not en_r");
+`endif
     always_ff @(posedge clk) begin
       if (rst) begin
         wh <= '0; wt <= '0; wn <= '0; en_r <= 1'b0; en_q <= 1'b0;
@@ -1232,9 +1247,9 @@ module otpu_vpu
         wn <= wn_nx;
         if (SE) begin
           en_q <= ss_act_d ? ss_pe : (pop ? (wn_p1 < 2) : (wn_p0 < 2)) && red_thr;  // a stream: its pe (as sen)
-          en_r <= en_q && !rhold;
+          en_r <= en_rd;
         end else begin
-          en_r <= (pop ? (wn_p1 < 2) : (wn_p0 < 2)) && red_thr && !rhold;
+          en_r <= en_rd;
         end
         done <= pop && hd.dn;
         dpend <= pdn && !en;
@@ -1355,7 +1370,7 @@ module otpu_vpu
       .kv(root), .kv_v(root_v && !vt_q), .y_v(t_yv), .y_d(ss_y_d), .o_v(t_ov), .o_d(ss_o_d),
       .qp_cap(t_qc), .qp_row_last(t_qrl), .qp_sub(t_qsub), .qp_d(t_qd),
       .qo_v(root_v && vt_q), .qo_d(root_o),
-      .cm_u, .cm_q, .cen(en), .u_sel(c_sel[1]), .u_a(c_sa[1]), .u_b(c_sb[1]), .u_c(c_sc[1]),
+      .cm_u, .cm_q, .cen(en_l), .u_sel(c_sel[1]), .u_a(c_sa[1]), .u_b(c_sb[1]), .u_c(c_sc[1]),
       .u_e(c_se[1]), .u_y(c_uy), .q_sel(c_sel[2]), .q_a(c_sa[2]), .q_b(c_sb[2]), .q_c(c_sc[2]),
       .q_y(c_qy));
     // Q's partials registered here (QD = 1: the tail pads its Q path for it), so no path
