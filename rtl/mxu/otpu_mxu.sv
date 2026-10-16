@@ -646,20 +646,30 @@ module otpu_mxu
   endfunction
   // the low block: the advance's half (4-bit without PAIR) or the entry's low block
   wire [63:0] blo0 = (w40 && !pr0 && m0.h) ? sr1 : sr0[63:0];
-  bdec_t dlo1, dhi1;
-  logic  vlo1, vhi1;
+  // the decoded blocks (S1), a registered copy per column (g_bd: kept instances, since identical
+  // registers merge) beside the column's shifts: one register driving every column's was the
+  // ASIC card's worst path (r4: a DFF_X1 of dhi1 into the four columns' bm2 across the die,
+  // 1.01 ns of clock-to-Q into its load)
+  bdec_t dlo0, dhi0;
+  always_comb begin
+    dlo0 = bdec(blo0, wf0, cu0 || rs0);
+    dhi0 = bdec(sr1, wf0, cu0 || rs0);
+  end
+  bdec_t dlo1 [MCOLS];
+  bdec_t dhi1 [MCOLS];
+  logic [MCOLS-1:0] vlo1, vhi1;
+  for (genvar j = 0; j < MCOLS; j++) begin : g_bd
+    (* keep_hierarchy = "yes" *)
+    otpu_delay #(.W(2 * $bits(bdec_t) + 2), .N(1)) u_bd (.clk, .en(1'b1),
+      .d({dlo0, dhi0, m0.v, m0.v && m0.o}), .q({dlo1[j], dhi1[j], vlo1[j], vhi1[j]}));
+  end
   logic [MCOLS-1:0][3:0][7:0] da1;
   logic [MCOLS-1:0] hi1;
-  always_ff @(posedge clk) begin
-    dlo1 <= bdec(blo0, wf0, cu0 || rs0);
-    dhi1 <= bdec(sr1, wf0, cu0 || rs0);
-    vlo1 <= m0.v;
-    vhi1 <= m0.v && m0.o;
+  always_ff @(posedge clk)
     for (int j = 0; j < MCOLS; j++) begin
       da1[j] <= act_scale[j*64 + 32 +: 32];
       hi1[j] <= hi0[j];
     end
-  end
   logic [MCOLS-1:0][7:0][16:0] bm2;
   always_ff @(posedge clk)
     for (int j = 0; j < MCOLS; j++)
@@ -668,9 +678,9 @@ module otpu_mxu
         logic [10:0] s;
         logic [5:0]  m;
         logic        v;
-        s = hi1[j] ? dhi1.s[g] : dlo1.s[g];
-        m = hi1[j] ? dhi1.m[g] : dlo1.m[g];
-        v = hi1[j] ? vhi1 : vlo1;
+        s = hi1[j] ? dhi1[j].s[g] : dlo1[j].s[g];
+        m = hi1[j] ? dhi1[j].m[g] : dlo1[j].m[g];
+        v = hi1[j] ? vhi1[j] : vlo1[j];
         sh = s - 11'(da1[j][g / 2]);
         bm2[j][g] <= (v && !sh[10]) ? 17'(17'(m) << sh[4:0]) : 17'd0;
       end
@@ -825,21 +835,36 @@ module otpu_mxu
   // each copy has its own write enable and address (replicas of rv and rf_t): one register
   // driving the three copies' write ports was the worst slow-clock path of the MX experiment's
   // 4-column OOC (docs/mx_mxu.md section 5, +0.329 ns)
+  // and each copy is RSN slices of the row, each with its own (one per column: a copy's LUT RAMs
+  // are some 220 cells, and one wt drove all their write addresses, r22's m8: fanout 1,125, 6.7 ns
+  // of route)
+  localparam int RSN = MCOLS;
+  localparam int RSW = (RW_ + RSN - 1) / RSN;
   for (genvar c = 0; c < 3; c++) begin : g_rfm
-    (* ram_style = "distributed" *) logic [RW_-1:0] m [RF];
-    (* keep *) logic           wv;
-    (* keep *) logic [RFW-1:0] wt;
-    always_ff @(posedge clk) begin
-      wv <= !rst && tl_v;
-      if (rst) wt <= '0;
-      else if (wv) wt <= wt + 1'b1;
-    end
-    always_ff @(posedge clk) if (!rst && wv) m[wt] <= rowp;
-    assign rq[c] = (wv && wt == rf_qc[c]) ? rowp : m[rf_qc[c]];
+    logic [RW_-1:0] rqc;
 `ifndef SYNTHESIS
-    always @(posedge clk) if (!rst && (wv != rf_push || wt != rf_t))
-      $fatal(1, "otpu_mxu: result FIFO copy %0d's write is not rf_push / rf_t", c);
+    logic [RW_-1:0] mh;                      // the copy's row at the head (the check below)
 `endif
+    for (genvar s = 0; s < RSN; s++) begin : g_s
+      localparam int LO = s * RSW;
+      localparam int W = (LO + RSW > RW_) ? RW_ - LO : RSW;
+      (* ram_style = "distributed" *) logic [W-1:0] m [RF];
+      (* keep *) logic           wv;
+      (* keep *) logic [RFW-1:0] wt;
+      always_ff @(posedge clk) begin
+        wv <= !rst && tl_v;
+        if (rst) wt <= '0;
+        else if (wv) wt <= wt + 1'b1;
+      end
+      always_ff @(posedge clk) if (!rst && wv) m[wt] <= rowp[LO +: W];
+      assign rqc[LO +: W] = (wv && wt == rf_qc[c]) ? rowp[LO +: W] : m[rf_qc[c]];
+`ifndef SYNTHESIS
+      assign mh[LO +: W] = m[RFW'(rf_q + RFW'(rf_hs))];
+      always @(posedge clk) if (!rst && (wv != rf_push || wt != rf_t))
+        $fatal(1, "otpu_mxu: result FIFO copy %0d slice %0d's write is not rf_push / rf_t", c, s);
+`endif
+    end
+    assign rq[c] = rqc;
   end
   always_ff @(posedge clk) begin
     rh0 <= rf_hs ? rq[1] : rq[0];           // the head (rf_q + rf_hs) as it is after this cycle
@@ -944,7 +969,7 @@ module otpu_mxu
   wire [NL-1:0]    ln_mid = dlanes(st_mid[MW-1:0]), ln_grp = dlanes(st_grp[MW-1:0]);
   wire             d_pop = t_gnt && drain_row_done;   // a row leaves the result FIFO
 `ifndef SYNTHESIS
-  always @(posedge clk) if (!rst && rf_n != 0 && rfh != g_rfm[0].m[RFW'(rf_q + RFW'(rf_hs))])
+  always @(posedge clk) if (!rst && rf_n != 0 && rfh != g_rfm[0].mh)
     $fatal(1, "otpu_mxu: registered head row is not row %0d", rf_q + RFW'(rf_hs));
 `endif
 

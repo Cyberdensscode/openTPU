@@ -648,31 +648,47 @@ module otpu_tmem #(
           // registered write stage (pk_*, release r2): its sub-bank's decode and the RAM row are
           // taken before the register, so the bank's write pins (on clk_f, a half core cycle
           // from the register) come straight from flip-flops kept next to it, not through the
-          // bank-level pw's decode and fanout (r2m4: pw_* -> the pumped banks, clk -> clk2x)
-          (* keep = "true" *) logic          pk_v;
-          (* keep = "true" *) logic [RW-1:0] pk_a;
-          (* keep = "true" *) logic [31:0]   pk_d;
-          always_ff @(posedge clk) begin
-            pk_v <= bw_v[b][0] && sub_of(bw_a[b][0]) == LW'(k);
-            pk_a <= ram_row(bw_a[b][0]);
-            pk_d <= bw_d[b][0];
+          // bank-level pw's decode and fanout (r2m4: pw_* -> the pumped banks, clk -> clk2x).
+          // The RAM is PSN slices of PSW bits, each one block RAM at RD rows (RAMB36: 32K bits),
+          // each with its own copy of the write stage and its own phase (u_pb): a register drives
+          // one RAM's write pins, not the PSN RAMs Vivado tiles 32 bits into (r22's m8: one pk_a
+          // through the ad_a mux to 8 RAMs spread over 22 RAM rows, clk -> clk2x -0.202 ns)
+          localparam int PSW = (RD >= 32768) ? 1 : (32768 / RD >= 32) ? 32 : 32768 / RD;
+          localparam int PSN = 32 / PSW;
+          logic [PSN-1:0]           pk_v;
+          logic [PSN-1:0][RW-1:0]   pk_a;
+          logic [31:0]              pk_d, pkd;
+          for (genvar z = 0; z < PSN; z++) begin : g_sl
+            (* keep = "true" *) logic           sv;
+            (* keep = "true" *) logic [RW-1:0]  sa;
+            (* keep = "true" *) logic [PSW-1:0] sd;
+            always_ff @(posedge clk) begin
+              sv <= bw_v[b][0] && sub_of(bw_a[b][0]) == LW'(k);
+              sa <= ram_row(bw_a[b][0]);
+              sd <= bw_d[b][0][z*PSW +: PSW];
+            end
+            assign pk_v[z] = sv;
+            assign pk_a[z] = sa;
+            assign pk_d[z*PSW +: PSW] = sd;
+`ifndef SYNTHESIS
+            initial sv = 1'b0;
+`endif
+            otpu_pump_bank #(.N(RD), .W(PSW), .STYLE("block"), .FW(1'b1)) u_pb (
+              .clk, .clk_f, .wv(sv), .wa(sa), .wd(pkd[z*PSW +: PSW]),
+              .rena(s_en[b][k][1]), .ra(s_a[b][k][1]), .renb(s_en[b][k][0]), .rb(s_a[b][k][0]),
+              .qa(s_q[b][k][1][z*PSW +: PSW]), .qb(s_q[b][k][0][z*PSW +: PSW]));
           end
-          logic [31:0] pkd;
 `ifdef SYNTHESIS
           assign pkd = pk_d;
 `else
           assign pkd = pk_d ^ fault(0, b, pw_a[b][0]);
-          initial pk_v = 1'b0;
-          // the copy is the bank's write stage at this RAM
+          // every slice's copy is the bank's write stage at this RAM
           always @(posedge clk)
-            if (pk_v != wh || (wh && (pk_a != ram_row(pw_a[b][0]) || pk_d != pw_d[b][0])))
-              $fatal(1, "TMEM%0d: bank %0d RAM %0d's write copy differs from the write stage", SID,
-                     b, k);
+            for (int z = 0; z < PSN; z++)
+              if (pk_v[z] != wh || (wh && (pk_a[z] != ram_row(pw_a[b][0]) || pk_d != pw_d[b][0])))
+                $fatal(1, "TMEM%0d: bank %0d RAM %0d slice %0d's write copy differs from the write stage",
+                       SID, b, k, z);
 `endif
-          otpu_pump_bank #(.N(RD), .STYLE("block"), .FW(1'b1)) u_pb (
-            .clk, .clk_f, .wv(pk_v), .wa(pk_a), .wd(pkd),
-            .rena(s_en[b][k][1]), .ra(s_a[b][k][1]), .renb(s_en[b][k][0]), .rb(s_a[b][k][0]),
-            .qa(s_q[b][k][1]), .qb(s_q[b][k][0]));
 `ifndef SYNTHESIS
           // the dump: a shadow of the RAM's words (the same writes), not a reference into u_pb
           logic [31:0] shd [RD];
@@ -680,7 +696,7 @@ module otpu_tmem #(
           always @(posedge clk) begin
             if (dump)
               for (int r = 0; r < RD; r++) img[row_of(k, r) * LANES + b] = shd[r];
-            if (pk_v) shd[pk_a] <= pkd;
+            if (pk_v[0]) shd[pk_a[0]] <= pkd;
           end
 `endif
         end else begin : g_ram
@@ -983,6 +999,7 @@ endmodule
 (* keep_hierarchy = "yes" *)
 module otpu_pump_bank #(
   parameter int    N     = 8192,
+  parameter int    W     = 32,       // the word's bits (otpu_tmem: a slice of the 32, one RAM)
   parameter string STYLE = "block",
   parameter bit    FW    = 1'b1      // the phase from a fast-domain register (below)
 ) (
@@ -990,13 +1007,13 @@ module otpu_pump_bank #(
   input  logic                 clk_f,
   input  logic                 wv,
   input  logic [$clog2(N)-1:0] wa,
-  input  logic [31:0]          wd,
+  input  logic [W-1:0]         wd,
   input  logic                 rena,
   input  logic [$clog2(N)-1:0] ra,
   input  logic                 renb,
   input  logic [$clog2(N)-1:0] rb,
-  output logic [31:0]          qa,
-  output logic [31:0]          qb
+  output logic [W-1:0]         qa,
+  output logic [W-1:0]         qb
 );
   // the phase: tog flips at every core edge; tq is its copy a fast edge later. They differ during
   // a core cycle's first half (the next fast edge is odd) and agree in its second (even next).
@@ -1020,7 +1037,7 @@ module otpu_pump_bank #(
   wire [$clog2(N)-1:0] ad_a = ev ? ra : wa;
   wire                 en_b = ev && renb;
   if (STYLE == "ultra") begin : g_u
-    (* ram_style = "ultra" *) logic [31:0] mem [N];
+    (* ram_style = "ultra" *) logic [W-1:0] mem [N];
     always_ff @(posedge clk_f)
       if (en_a) begin
         if (we_a) mem[ad_a] <= wd;
@@ -1032,7 +1049,7 @@ module otpu_pump_bank #(
     initial for (int i = 0; i < N; i++) mem[i] = '0;
 `endif
   end else begin : g_b
-    (* ram_style = "block" *) logic [31:0] mem [N];
+    (* ram_style = "block" *) logic [W-1:0] mem [N];
     always_ff @(posedge clk_f)
       if (en_a) begin
         if (we_a) mem[ad_a] <= wd;

@@ -302,7 +302,7 @@ module otpu_vpu
   logic       s_init, s_in_v, s_first;
   f32_t       s_in_d [LANES], s_fd [LANES], s_xd [LANES], s_xa [LANES];
   logic [2:0] s_fk;
-  logic [4:0] s_fi;
+  logic [4:0] s_fi [LANES];
   ss_cfg_t    s_cfg;
   ss_meta_t   s_xm, s_mt;
   // the tail's Q final partials, registered here (q_*); the root is a Q dot's (vt_q)
@@ -1316,7 +1316,7 @@ module otpu_vpu
         s1_fk <= ss_act ? ss_fk : SF_NONE;
         s_fk <= s1_fk;
       end
-      s1_fi <= ss_fi; s1_fd <= ss_fd; s_fi <= s1_fi; s_fd <= s1_fd;
+      s1_fi <= ss_fi; s1_fd <= ss_fd; s_fd <= s1_fd;
       s1_in_v <= ss_in_v; s1_in_d <= ss_in_d; s_in_v <= s1_in_v; s_in_d <= s1_in_d;
       s_cfg <= ss_cfg;
     end
@@ -1336,6 +1336,12 @@ module otpu_vpu
       otpu_delay #(.W(1), .N(1)) u_cu (.clk, .en(1'b1), .d(!sa_n), .q(cm_u[l]));
       (* keep_hierarchy = "yes" *)
       otpu_delay #(.W(1), .N(1)) u_cq (.clk, .en(1'b1), .d(!sa_n), .q(cm_q[l]));
+    end
+    // the fill's segment index, a copy per lane (s1_fi's next stage, kept instances): one register
+    // drove every lane's buffer write addresses (r22's m8: s_fi, fanout 816, 7.1 ns of route)
+    for (genvar l = 0; l < LANES; l++) begin : g_sfi
+      (* keep_hierarchy = "yes" *)
+      otpu_delay #(.W(5), .N(1)) u_fi (.clk, .en(1'b1), .d(s1_fi), .q(s_fi[l]));
     end
     // the tail's X meta, aligned with slot 0's pacc (as mt is for a reduction): u_vt's cap
     otpu_delay #(.W($bits(ss_meta_t)), .N(TA)) u_smt (.clk, .en, .d(s_xm), .q(s_mt));

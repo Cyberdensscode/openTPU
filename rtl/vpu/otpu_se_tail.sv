@@ -48,7 +48,7 @@ module otpu_se_tail
   input  ss_cfg_t          cfg,         // valid from before the fill to the stream's last o
   // fill (the DMA's TMEM reads): a vector segment at index fi, a row scalar segment, K0, K1
   input  logic [2:0]       fk,          // SF_*
-  input  logic [4:0]       fi,
+  input  logic [4:0]       fi [LANES],  // the segment's index, a copy per lane (the VPU's g_sfi)
   input  f32_t             fd [LANES],
   // stream
   input  logic             pe,
@@ -156,11 +156,11 @@ module otpu_se_tail
   for (genvar l = 0; l < L; l++) begin : g_buf
     f32_t kb [CBD], kb2 [CBD], qb [CBD], vb [CBD], gb [CBD];
     always_ff @(posedge clk) begin
-      if (fa) kb[fi] <= fd[l];
-      if (fk == SF_K) kb2[fi] <= fd[l];
-      if (fk == SF_Q) qb[fi] <= fd[l];
-      if (fk == SF_X) vb[fi] <= fd[l];
-      if (fk == SF_G) gb[fi] <= fd[l];
+      if (fa) kb[fi[l]] <= fd[l];
+      if (fk == SF_K) kb2[fi[l]] <= fd[l];
+      if (fk == SF_Q) qb[fi[l]] <= fd[l];
+      if (fk == SF_X) vb[fi[l]] <= fd[l];
+      if (fk == SF_G) gb[fi[l]] <= fd[l];
     end
     // pad64: the columns past 64 (segments 8..15) read +0
     assign kx[l] = (c_pad && xj[CBW-1:3] != '0) ? F_ZERO : kb[xj];
