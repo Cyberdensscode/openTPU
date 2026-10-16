@@ -283,7 +283,9 @@ export PLACE_DENSITY_LB_ADDON = {P.get('addon', 0.10)}
 export RTLMP_MIN_CHANNEL_SIZE = 60 60
 # and no row narrower than that pitch (a pocket boxed in by macros: its rails would float)
 export TAPCELL_TCL = {ROOT / 'asic' / 'nangate45' / 'tapcell.tcl'}
-# after CTS the ports' virtual clock takes the core clock's insertion delay (latency-neutral ports)
+# after CTS the ports' virtual clock takes the core clock's insertion delay (latency-neutral ports),
+# already for the CTS step's own timing repair (cts_latency.tcl: else it repairs ports only)
+export PRE_CTS_TCL = {ROOT / 'asic' / 'nangate45' / 'cts_latency.tcl'}
 export POST_CTS_TCL = {ROOT / 'asic' / 'nangate45' / 'io_latency.tcl'}
 export TNS_END_PERCENT = 100
 export LEC_CHECK = 0
