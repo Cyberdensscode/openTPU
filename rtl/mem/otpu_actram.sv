@@ -75,17 +75,15 @@ module otpu_actram #(
   // the quantizer's write as it arrives (_i) and again (_h): the long hop from the quantizer is
   // these two narrow registers (on 959b425 at 133.33 MHz the quantizer sat 600 RPM units from
   // these block RAMs and the wide write register below, fed straight from it, missed timing; on
-  // 812bb01, with one, its replicas by the placement logic were the worst path, 96% route). The
-  // second (_h) is a copy per column (g_row's u_h: kept instances), the first hop's fanout, so
-  // each column's lane placement and write registers start at a flip-flop of its own: one _h
-  // drove every column's (r22's m8: w_idx_h and w_data_h, 6.9-7.1 ns of route, no logic)
-  (* shreg_extract = "no" *) logic [LANES-1:0]      we_i;
+  // 812bb01, with one, its replicas by the placement logic were the worst path, 96% route)
+  (* shreg_extract = "no" *) logic [LANES-1:0]      we_i, we_h;
   (* shreg_extract = "no" *) logic [7:0]            w_row_i, w_off_i, s_row_i;
-  (* shreg_extract = "no" *) logic [DW+BW-1:0]      w_idx_i;
-  (* shreg_extract = "no" *) logic [LANES-1:0][7:0] w_data_i;
-  (* shreg_extract = "no" *) logic                  w_dup_i, swe_i;
-  (* shreg_extract = "no" *) logic [BW-1:0]         s_blk_i;
-  (* shreg_extract = "no" *) logic [63:0]           s_data_i;
+  (* shreg_extract = "no" *) logic [7:0]            w_row_h, w_off_h, s_row_h;
+  (* shreg_extract = "no" *) logic [DW+BW-1:0]      w_idx_i, w_idx_h;
+  (* shreg_extract = "no" *) logic [LANES-1:0][7:0] w_data_i, w_data_h;
+  (* shreg_extract = "no" *) logic                  w_dup_i, swe_i, w_dup_h, swe_h;
+  (* shreg_extract = "no" *) logic [BW-1:0]         s_blk_i, s_blk_h;
+  (* shreg_extract = "no" *) logic [63:0]           s_data_i, s_data_h;
   always_ff @(posedge clk) begin
     we_i <= we;
     w_row_i <= w_row;
@@ -97,58 +95,58 @@ module otpu_actram #(
     s_row_i <= s_row;
     s_blk_i <= s_blk[BW-1:0];
     s_data_i <= s_data;
+    we_h <= we_i;
+    w_row_h <= w_row_i;
+    w_idx_h <= w_idx_i;
+    w_data_h <= w_data_i;
+    w_dup_h <= w_dup_i;
+    w_off_h <= w_off_i;
+    swe_h <= swe_i;
+    s_row_h <= s_row_i;
+    s_blk_h <= s_blk_i;
+    s_data_h <= s_data_i;
+  end
+
+  // the write, as byte enables and bytes in place (registered; the block address, column select
+  // and group per column and piece in g_row), and the scale write (registered); per column:
+  // selected, and the group of the row it writes
+  logic [D-1:0]     wbe;
+  logic [D*8-1:0]   wd;
+  logic [MCOLS-1:0] ssel;
+  logic [GW-1:0]    sg [MCOLS];
+  logic [BW-1:0]    sb;
+  logic [63:0]      sd;
+  // the placement register's inputs: per column, selected and the group of the row it writes
+  logic [MCOLS-1:0] wsel_n, ssel_n;
+  logic [GW-1:0]    wg_n [MCOLS], sg_n [MCOLS];
+  always_comb
+    for (int j = 0; j < MCOLS; j++) begin
+      wsel_n[j] = sel(j, w_row_h, w_dup_h, w_off_h) && (|we_h);
+      ssel_n[j] = swe_h && sel(j, s_row_h, w_dup_h, w_off_h);
+      wg_n[j] = sgrp(j, w_row_h, w_off_h);
+      sg_n[j] = sgrp(j, s_row_h, w_off_h);
+    end
+  always_ff @(posedge clk) begin
+    wbe <= '0;
+    wd <= '0;
+    for (int l = 0; l < LANES; l++) begin
+      wbe[w_idx_h[DW-1:0] + DW'(l)] <= we_h[l];
+      wd[8 * (w_idx_h[DW-1:0] + DW'(l)) +: 8] <= w_data_h[l];
+    end
+    ssel <= ssel_n;
+    for (int j = 0; j < MCOLS; j++) sg[j] <= sg_n[j];
+    sb <= s_blk_h;
+    sd <= s_data_h;
   end
 `ifndef SYNTHESIS
-  initial begin we_i = '0; swe_i = 1'b0; end
+  initial begin we_i = '0; swe_i = 1'b0; we_h = '0; swe_h = 1'b0; ssel = '0; end
 `endif
-  localparam int HW = LANES + 3 * 8 + DW + BW + LANES * 8 + 2 + BW + 64;
-  wire [HW-1:0] h_d = {we_i, w_row_i, w_off_i, s_row_i, w_idx_i, w_data_i, w_dup_i, swe_i, s_blk_i,
-                       s_data_i};
 
   for (genvar j = 0; j < MCOLS; j++) begin : g_row
-    // the column's copy of the second hop
-    logic [LANES-1:0]      we_h;
-    logic [7:0]            w_row_h, w_off_h, s_row_h;
-    logic [DW+BW-1:0]      w_idx_h;
-    logic [LANES-1:0][7:0] w_data_h;
-    logic                  w_dup_h, swe_h;
-    logic [BW-1:0]         s_blk_h;
-    logic [63:0]           s_data_h;
-    (* keep_hierarchy = "yes" *)
-    otpu_delay #(.W(HW), .N(1)) u_h (.clk, .en(1'b1), .d(h_d),
-      .q({we_h, w_row_h, w_off_h, s_row_h, w_idx_h, w_data_h, w_dup_h, swe_h, s_blk_h, s_data_h}));
-    // the write, as byte enables and bytes in place (registered; the block address, column select
-    // and group per piece below), and the scale write (registered): selected, and the group of
-    // the row it writes
-    wire           wsel_n = sel(j, w_row_h, w_dup_h, w_off_h) && (|we_h);
-    wire           ssel_n = swe_h && sel(j, s_row_h, w_dup_h, w_off_h);
-    wire [GW-1:0]  wg_n = sgrp(j, w_row_h, w_off_h);
-    wire [GW-1:0]  sg_n = sgrp(j, s_row_h, w_off_h);
-    logic [D-1:0]   wbe;
-    logic [D*8-1:0] wd;
-    logic           ssel;
-    logic [GW-1:0]  sg;
-    logic [BW-1:0]  sb;
-    logic [63:0]    sd;
-    always_ff @(posedge clk) begin
-      wbe <= '0;
-      wd <= '0;
-      for (int l = 0; l < LANES; l++) begin
-        wbe[w_idx_h[DW-1:0] + DW'(l)] <= we_h[l];
-        wd[8 * (w_idx_h[DW-1:0] + DW'(l)) +: 8] <= w_data_h[l];
-      end
-      ssel <= ssel_n;
-      sg <= sg_n;
-      sb <= s_blk_h;
-      sd <= s_data_h;
-    end
-`ifndef SYNTHESIS
-    initial ssel = 1'b0;
-`endif
     logic [63:0]    rs;
     wire [BW-1:0] rb = r_hi[j] ? r_blk2[BW-1:0] : r_blk[BW-1:0];
     wire [GW+BW-1:0] ra = (GROUPS > 1) ? {r_grp[GW-1:0], rb} : (GW+BW)'(rb);
-    wire [GW+BW-1:0] sa = (GROUPS > 1) ? {sg, sb} : (GW+BW)'(sb);
+    wire [GW+BW-1:0] sa = (GROUPS > 1) ? {sg[j], sb} : (GW+BW)'(sb);
     // a piece's block RAMs take their write address from a copy of the block address (and
     // select, group) of their own: on 812bb01 one wb drove all MCOLS * D / 8 of them across
     // the systolic array's span, 6.7 ns of wire with no logic
@@ -159,8 +157,8 @@ module otpu_actram #(
       logic [PB*8-1:0] rd;
       always_ff @(posedge clk) begin
         wb <= w_idx_h[DW +: BW];
-        wsel <= wsel_n;
-        wg <= wg_n;
+        wsel <= wsel_n[j];
+        wg <= wg_n[j];
       end
       wire [GW+BW-1:0] wa = (GROUPS > 1) ? {wg, wb} : (GW+BW)'(wb);
       // the piece's bytes: a technology RAM with byte enables (rtl/tech)
@@ -174,7 +172,7 @@ module otpu_actram #(
     end
     // the column's block scale records
     otpu_ram_1r1w #(.W(64), .N(GROUPS*BLOCKS), .STYLE("auto")) u_asc (
-      .clk, .we(ssel), .wa(sa[RAW-1:0]), .wd(sd), .re(ren[j]), .ra(ra[RAW-1:0]), .rd(rs));
+      .clk, .we(ssel[j]), .wa(sa[RAW-1:0]), .wd(sd), .re(ren[j]), .ra(ra[RAW-1:0]), .rd(rs));
     assign r_scale[j*64 +: 64] = rs;
 `ifndef SYNTHESIS
     // a consumed read of a block (or its scale) with a write in any register: it would return
@@ -185,12 +183,12 @@ module otpu_actram #(
     wire [GW+BW-1:0] wa_1 = (GROUPS > 1) ? {sgrp(j, w_row_i, w_off_i), w_idx_i[DW +: BW]}
                                          : (GW+BW)'(w_idx_i[DW +: BW]);
     wire [GW+BW-1:0] sa_1 = (GROUPS > 1) ? {sgrp(j, s_row_i, w_off_i), s_blk_i} : (GW+BW)'(s_blk_i);
-    wire [GW+BW-1:0] wa_n = (GROUPS > 1) ? {wg_n, w_idx_h[DW +: BW]} : (GW+BW)'(w_idx_h[DW +: BW]);
-    wire [GW+BW-1:0] sa_n = (GROUPS > 1) ? {sg_n, s_blk_h} : (GW+BW)'(s_blk_h);
+    wire [GW+BW-1:0] wa_n = (GROUPS > 1) ? {wg_n[j], w_idx_h[DW +: BW]} : (GW+BW)'(w_idx_h[DW +: BW]);
+    wire [GW+BW-1:0] sa_n = (GROUPS > 1) ? {sg_n[j], s_blk_h} : (GW+BW)'(s_blk_h);
     always @(posedge clk)
-      if (ren[j] && r_use && ((g_pc[0].wsel && wa == ra) || (wsel_n && wa_n == ra) ||
-                           (wsel_1 && wa_1 == ra) || (ssel && sa == ra) ||
-                           (ssel_n && sa_n == ra) || (ssel_1 && sa_1 == ra)))
+      if (ren[j] && r_use && ((g_pc[0].wsel && wa == ra) || (wsel_n[j] && wa_n == ra) ||
+                           (wsel_1 && wa_1 == ra) || (ssel[j] && sa == ra) ||
+                           (ssel_n[j] && sa_n == ra) || (ssel_1 && sa_1 == ra)))
         $fatal(1, "otpu_actram: column %0d block %0d read while its write is in flight at %0t",
                j, ra, $time);
 `endif

@@ -515,9 +515,11 @@ def test_the_long_wire_drivers_are_copies_per_consumer():
     have a copy per consumer group, each loaded with the same next value (cycle-exact), kept
     (identical flip-flops would merge). The VPU's enable per lane (g_enl: no lane loop, tail unit
     or composite lane reads the one en), the fill index per lane (g_sfi), the MXU's decoded scale
-    per column (g_bd) and result FIFO write counters per row slice (g_rfm g_s), the ACT RAM's
-    second hop per column (g_row u_h), the pumped TMEM's write stage per RAM (g_pmp g_sl) and,
-    with wait counts, the sequencer's command store write per unit (g_cmd g_wq: a cycle late)."""
+    per column (g_bd) and result FIFO write counters per row slice (g_rfm g_s), the pumped TMEM's
+    write stage per RAM (g_pmp g_sl) and, with wait counts, the sequencer's command store write
+    per unit (g_cmd g_wq: a cycle late). Wide data stays one register: the ACT RAM's write stage
+    (wbe, wd) a copy per column cost the m8 card 9 k LUTs and 9.5 k flip-flops and a congested
+    corner (docs/timing_ffs.md section 3); its pieces copy only their address and select."""
     def src(p):
         return re.sub(r"//.*", "", (ROOT / p).read_text())
     kept = r'\(\*\s*keep_hierarchy\s*=\s*"yes"\s*\*\)\s*otpu_delay\b'
@@ -539,8 +541,9 @@ def test_the_long_wire_drivers_are_copies_per_consumer():
     assert "dhi1[j].s[g]" in mxu and "vhi1[j]" in mxu and not re.search(r"\bdhi1\.s\b", mxu)
     assert re.search(r"begin\s*:\s*g_rfm.*?begin\s*:\s*g_s\b.*?logic \[RFW-1:0\] wt;", mxu, re.S)
     act = src("rtl/mem/otpu_actram.sv")
-    assert re.search(r"begin\s*:\s*g_row.*?" + kept + r".*?u_h\b", act, re.S)
-    assert not re.search(r"\b(w_idx_h|w_data_h|we_h)\b", act.split("begin : g_row")[0])
+    head, row = act.split("begin : g_row", 1)
+    assert re.search(r"logic \[D\*8-1:0\]\s+wd;", head) and not re.search(r"\bwd\s*;", row.split("end")[0])
+    assert re.search(r"wb <= w_idx_h\[DW \+: BW\];", row) and "wsel <= wsel_n[j];" in row
     tm = src("rtl/mem/otpu_tmem.sv")
     pmp = tm[tm.index("begin : g_pmp"):tm.index("begin : g_ram")]
     sl = pmp[pmp.index("begin : g_sl"):]
