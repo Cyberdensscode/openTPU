@@ -313,6 +313,22 @@ per-lane enable copies (1,803 endpoints within 0.2 ns, 0 levels; batch 7 did not
 VPU (12 levels), the sequencer's dispatch (`sv`, `vout`), the MXU's TMEM grant (`u_rw` `E`, 11,301
 loads: its epilogue's stage enables) and the ACT RAM's write stage.
 
+**The census after** (`b_t6_def`'s opt_design checkpoint: 8bf19b12 at 133.33 MHz, against
+`b_t4_def`'s): LUT RAM address pins over every memory 357,960 -> **218,406 (-39%)**, LUT RAM write
+enables 39,880 -> 26,457 (-34%), LUT RAM cells 53,226 -> 39,803; the loads of nets of 200 or more
+278,123 -> **231,299 (-17%)**, those nets 562 -> 425 (their LUT RAM address loads 156,954 ->
+114,198, enables 53,987 -> 51,145, LUT RAM write enables 18,024 -> 15,370; LUT inputs +2,459, the
+bypass multiplexers). The five memories converted have no address pins left; the widest nets
+are now the MXU's grant (10,783 enables), the quantizer's enable (8,029), XDMA's reset and the
+VPU's per-lane copies (~2,500 each).
+
+**At 133.33 MHz without the production strategy** (`b_t6_def`, as `b_t4_def` in section 3): core
+-0.026 ns at one endpoint (the MXU's `mxm` into TMEM's read selection `rpv`, 90% route: class C),
+clk2x +0.420 (b_t4_def +0.065), the crossings +0.111 / +0.066 (+0.005 / +0.001), the PCIe block's
+`userclk1` +0.040 (-0.004); 181,260 LUTs (187,606), slices 81.0% (81.4%). Both miss by one
+endpoint and a few picoseconds, so at 133.33 MHz the fanout batches are a wash on the worst path
+and margin everywhere else (the clk2x paths +0.36 ns).
+
 **What fanout is left**: the MXU's grant reaches its whole epilogue (the lanes, `r0` / `r1`, the
 fmadd, the delay lines: 11.3 k enables) in the cycle TMEM decides it. It needs the protocol change
 of section 5: the epilogue running free into a skid of its depth (a pipeline's worth of entries,
