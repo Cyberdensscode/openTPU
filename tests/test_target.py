@@ -516,7 +516,8 @@ def test_the_long_wire_drivers_are_copies_per_consumer():
     (identical flip-flops would merge). The VPU's enable per lane (g_enl: no lane loop, tail unit
     or composite lane reads the one en), the fill index per lane (g_sfi), the MXU's decoded scale
     per column (g_bd) and result FIFO write counters per row slice (g_rfm g_s), the ACT RAM's
-    second hop per column (g_row u_h) and the pumped TMEM's write stage per RAM (g_pmp g_sl)."""
+    second hop per column (g_row u_h), the pumped TMEM's write stage per RAM (g_pmp g_sl) and,
+    with wait counts, the sequencer's command store write per unit (g_cmd g_wq: a cycle late)."""
     def src(p):
         return re.sub(r"//.*", "", (ROOT / p).read_text())
     kept = r'\(\*\s*keep_hierarchy\s*=\s*"yes"\s*\*\)\s*otpu_delay\b'
@@ -544,6 +545,11 @@ def test_the_long_wire_drivers_are_copies_per_consumer():
     pmp = tm[tm.index("begin : g_pmp"):tm.index("begin : g_ram")]
     sl = pmp[pmp.index("begin : g_sl"):]
     assert "otpu_pump_bank" in sl and re.search(r"\.wv\(sv\)", sl) and re.search(r"\.wa\(sa\)", sl)
+    seq = src("rtl/seq/otpu_seq.sv")
+    cmd = seq[seq.index("begin : g_cmd"):]
+    assert re.search(r"if \(WAITC\) begin\s*:\s*g_wq\s*" + kept, cmd)
+    assert re.search(r"if \(we\) m\[wa\] <= WAITC \? c_cmd_w : c_cmd;", cmd)
+    assert not re.search(r"m\[free_slot\]", seq)
 
 
 def test_config_summary_names_the_target(no_env):

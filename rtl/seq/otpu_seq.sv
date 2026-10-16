@@ -818,21 +818,42 @@ module otpu_seq
   // reads its command only while its request is pending: the enable is two flip-flops, not the
   // start decode (133.33 MHz, 812bb01: sstarted -> the collective's can_start -> its copy's
   // enable, fanout 120, 7 levels, +0.165 ns)
+  // WAITC: the store is written a cycle after the dispatch, from flip-flops: the enable and the
+  // slot a copy per unit (kept), the command one register. A slot starts two cycles after its
+  // dispatch at the earliest (w_all_q, w_dram_q), so its command is in the store by then. The
+  // dispatch decision and the free slot then end at a few flip-flops instead of every store's
+  // write port (r22's m8 at 150 MHz: sv -> the free slot -> the LUT RAMs' write addresses, 3036
+  // pins, -0.49 ns; vout -> c_go -> their write enables, 868, -0.34)
+  cmd_t c_cmd_w;
+  always_ff @(posedge clk) c_cmd_w <= c_cmd;
   logic [SW-1:0] ucs [NUNITS];
   for (genvar u = 0; u < NUNITS; u++) begin : g_cmd
     (* ram_style = "distributed" *) logic [$bits(cmd_t)-1:0] m [WIN];
     logic [$bits(cmd_t)-1:0] q;
+    logic          we;
+    logic [SW-1:0] wa;
     wire q_en = (u == U_COLL) ? urdy[u] && !ustart[u] : can_start[u];
-    always_ff @(posedge clk) if (!rst && c_go) m[free_slot] <= c_cmd;
+    if (WAITC) begin : g_wq
+      (* keep_hierarchy = "yes" *)
+      otpu_delay #(.W(1 + SW), .N(1)) u_w (.clk, .en(1'b1), .d({!rst && c_go, free_slot}),
+                                          .q({we, wa}));
+    end else begin : g_wd
+      assign we = !rst && c_go;
+      assign wa = free_slot;
+    end
+    always_ff @(posedge clk) if (we) m[wa] <= WAITC ? c_cmd_w : c_cmd;
     always_ff @(posedge clk) if (!rst && q_en) q <= m[start_slot[u]];
     assign ucmd[u] = cmd_t'(q);
 `ifndef SYNTHESIS
-    // the copy is the started slot's command while the slot is in the window
+    // the copy is the started slot's command while the slot is in the window; no start reads a
+    // slot whose write is still on its way
     always @(posedge clk) begin
       if (!rst && sv[ucs[u]] && sstarted[ucs[u]] && soh[ucs[u]][u] && q != m[ucs[u]])
         $fatal(1, "otpu_seq: unit %0d's command is not slot %0d's", u, ucs[u]);
       if (!rst && can_start[u] && !q_en)
         $fatal(1, "otpu_seq: unit %0d starts without loading its command", u);
+      if (WAITC && !rst && we && can_start[u] && start_slot[u] == wa)
+        $fatal(1, "otpu_seq: unit %0d starts slot %0d before its command is written", u, wa);
     end
 `endif
   end
