@@ -433,13 +433,32 @@ module otpu_quant
   logic [NB-1:0] sv;
 
   // ------------------------------------------------------------------ pass 1: offsets
-  // d = min(31, e(amax) - e(a) - (f(a) > f(amax))), 0 for a = 0 and in ROW mode (a <= amax)
+  // d = min(31, e(amax) - e(a) - (f(a) > f(amax))), 0 for a = 0 and in ROW mode (a <= amax).
+  // A carry select: e(amax) - e(a) and e(amax) - e(a) - 1 (+ ~e(a)) beside the fraction compare,
+  // which picks one, saturated (the compare was the subtract's operand: the group RAMs' output,
+  // the compare's and the subtract's carry chains and the saturation in series, 9 levels, the
+  // m8 card at a 150 MHz equivalent -0.026 ns)
   function automatic logic [4:0] dval(input logic [30:0] a, input f32_t amax, input logic row);
+    logic [8:0] d0, d1;
+    if (row || a == 0) return 5'd0;
+    d0 = 9'(amax[30:23]) - 9'(a[30:23]);
+    d1 = 9'(amax[30:23]) + {1'b1, ~a[30:23]};
+    if (a[22:0] > amax[22:0]) return (d1[8:5] != 0) ? 5'd31 : d1[4:0];
+    return (d0[8:5] != 0) ? 5'd31 : d0[4:0];
+  endfunction
+`ifndef SYNTHESIS
+  function automatic logic [4:0] dval_ref(input logic [30:0] a, input f32_t amax, input logic row);
     logic [8:0] d;
     if (row || a == 0) return 5'd0;
     d = 9'(amax[30:23]) - 9'(a[30:23]) - ((a[22:0] > amax[22:0]) ? 9'd1 : 9'd0);
     return (d > 9'd31) ? 5'd31 : d[4:0];
   endfunction
+  always @(posedge clk) if (!rst && en)
+    for (int s = 0; s < 4; s++)
+      if (dval(bm ? grd[s] : grd_d[s], amx_q[m1s.row[1:0]], rowm)
+          != dval_ref(bm ? grd[s] : grd_d[s], amx_q[m1s.row[1:0]], rowm))
+        $fatal(1, "otpu_quant: dval is not the reference's");
+`endif
   // inv * 2^d: inv is +0, +inf or positive and normal (otpu_qscale), so the product is exact:
   // the exponent field plus d, +inf where it reaches 255
   function automatic f32_t p2mul(input f32_t inv, input logic [4:0] d);

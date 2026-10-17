@@ -813,11 +813,13 @@ module otpu_seq
   // The command store is one distributed RAM per unit (1 write, 1 asynchronous read, no reset):
   // a single read port each, so it infers as LUT-RAM and trims the fields its unit never reads
   // (as do the registers).
-  // The collective's copy loads on every cycle the collective is ready and not starting (urdy:
-  // no request pending, a flip-flop in otpu_slice), which covers its starts, and the collective
-  // reads its command only while its request is pending: the enable is two flip-flops, not the
-  // start decode (133.33 MHz, 812bb01: sstarted -> the collective's can_start -> its copy's
-  // enable, fanout 120, 7 levels, +0.165 ns)
+  // Each copy loads on every cycle its unit is ready and not starting (urdy, ustart), which covers
+  // its starts: the enable is the unit's rdy and a flip-flop, not the start decode (133.33 MHz,
+  // 812bb01: sstarted -> the collective's can_start -> its copy's enable, fanout 120, 7 levels,
+  // +0.165 ns; the m8 card at a 150 MHz equivalent, unit 2's, 216 loads, -0.028). The units read
+  // their command only at ustart (the DMA, the MXU, the quantizer and the VPU copy it then; the
+  // MXU's release reads none), when the copy holds (ustart is up), and the collective only while
+  // its request is pending (urdy low). Between starts the copy follows start_slot, unread.
   // WAITC: the store is written a cycle after the dispatch, from flip-flops: the enable and the
   // slot a copy per unit (kept), the command one register. A slot starts two cycles after its
   // dispatch at the earliest (w_all_q, w_dram_q), so its command is in the store by then. The
@@ -832,7 +834,7 @@ module otpu_seq
     logic [$bits(cmd_t)-1:0] q;
     logic          we;
     logic [SW-1:0] wa;
-    wire q_en = (u == U_COLL) ? urdy[u] && !ustart[u] : can_start[u];
+    wire q_en = urdy[u] && !ustart[u];
     if (WAITC) begin : g_wq
       (* keep_hierarchy = "yes" *)
       otpu_delay #(.W(1 + SW), .N(1)) u_w (.clk, .en(1'b1), .d({!rst && c_go, free_slot}),
@@ -845,10 +847,11 @@ module otpu_seq
     always_ff @(posedge clk) if (!rst && q_en) q <= m[start_slot[u]];
     assign ucmd[u] = cmd_t'(q);
 `ifndef SYNTHESIS
-    // the copy is the started slot's command while the slot is in the window; no start reads a
-    // slot whose write is still on its way
+    // the copy is the started slot's command when the unit reads it (at ustart; the collective
+    // while its request is pending); no start reads a slot whose write is still on its way
     always @(posedge clk) begin
-      if (!rst && sv[ucs[u]] && sstarted[ucs[u]] && soh[ucs[u]][u] && q != m[ucs[u]])
+      if (!rst && (ustart[u] || (u == U_COLL && !urdy[u])) && sv[ucs[u]] && sstarted[ucs[u]]
+          && soh[ucs[u]][u] && q != m[ucs[u]])
         $fatal(1, "otpu_seq: unit %0d's command is not slot %0d's", u, ucs[u]);
       if (!rst && can_start[u] && !q_en)
         $fatal(1, "otpu_seq: unit %0d starts without loading its command", u);
