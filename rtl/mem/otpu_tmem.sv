@@ -252,6 +252,16 @@ module otpu_tmem #(
   logic [NRP-1:0][LANES-1:0]         pb_en;
   logic [NRP-1:0][LANES-1:0][IW-1:0] pb_a;
   logic [NRP-1:0][LANES-1:0][31:0]   pq;      // the bank data each port's copy returns
+  // IMPL 3 without the bypass (PMP 1), a host port (pdir): its side's RAM words, bank b's RAM k at
+  // b * NSB + k (pr), and the RAM each bank read (pss); its lanes select a word by {bank, RAM}, one
+  // NSB x LANES : 1 select from the RAMs (LUT6s, MUXF7s, a MUXF8 in a slice at NSB 2), not the
+  // bank's RAM select and then the lane's bank select (two LUTs and a route between: the m8 card
+  // at 150 MHz, the pumped RAMs -> 4 levels -> the VPU's, the quantizer's, the DMA's capture,
+  // -0.112 ns of a full core cycle, 3.9 ns of route)
+  localparam int PSB = (NSB > 1) ? $clog2(NSB) : 1;
+  logic [NRP-1:0][LANES*NSB-1:0][31:0] pr;
+  logic [NRP-1:0][LANES-1:0][PSB-1:0]  pss;
+  logic [NRP-1:0]                      pdir;
   logic [NRP-1:0][LANES-1:0]         rpf;     // IMPL 3 RPL: the lanes a replay reads now
   for (genvar p = 0; p < NRP; p++) begin : g_preq
     // per bank: the address of the lane that reads it (lanes of one port hit distinct banks or
@@ -752,10 +762,24 @@ module otpu_tmem #(
     for (genvar p = 0; p < NRP; p++) begin : g_pq
      if (GST && SH_MASK[p]) begin : g_gu
       assign pq[p] = pq[SH_HOST];
+      assign pr[p] = '0;
+      assign pss[p] = '0;
+      assign pdir[p] = 1'b0;
      end else begin : g_ho
       localparam int SD = sd_of(p);
       logic [LANES-1:0][LW-1:0]  ss;
       logic [LANES-1:0]          bh;
+      for (genvar b = 0; b < LANES; b++) begin : g_pr
+        for (genvar k = 0; k < NSB; k++) begin : g_k
+          assign pr[p][b * NSB + k] = s_q[b][k][SD];
+        end
+        assign pss[p][b] = PSB'(ss[b]);
+      end
+`ifdef OTPU_TMEM_ABL_DSEL
+      assign pdir[p] = 1'b0;
+`else
+      assign pdir[p] = !BYP;
+`endif
       always_ff @(posedge clk)
         for (int b = 0; b < LANES; b++)
 `ifdef OTPU_TMEM_ABL_RPL
@@ -787,6 +811,11 @@ module otpu_tmem #(
     assign lost = '0;
     assign frz = '0;
     assign rpf = '0;
+    for (genvar p = 0; p < NRP; p++) begin : g_npr
+      assign pr[p] = '0;
+    end
+    assign pss = '0;
+    assign pdir = '0;
   end
   for (genvar p = 0; p < NRP; p++) begin : g_port
    if (IMPL != 3 && host_of(p) == p) begin : g_copy
@@ -929,11 +958,22 @@ module otpu_tmem #(
         if (GEN_R[p] && r_en[p][l]) sel[l] <= r_addr[p][l][BW-1:0];
         if (fresh[l]) held[l] <= lq[l];
       end
+    logic [LANES-1:0][BW-1:0] bk;          // the lane's bank
     always_comb
       for (int l = 0; l < LANES; l++) begin
-        lq[l] = GEN_R[p] ? qb[sel[l]] : qb[(l + int'(rq[l])) % LANES];
+        bk[l] = GEN_R[p] ? sel[l] : BW'((l + int'(rq[l])) % LANES);
+        // pdir: the word by {bank, the bank's RAM}, both from flip-flops (pq's select in the index)
+        lq[l] = pdir[p] ? pr[p][int'(bk[l]) * NSB + int'(pss[p][bk[l]])] : qb[bk[l]];
         r_data[p][l] = fresh[l] ? lq[l] : held[l];
       end
+`ifndef SYNTHESIS
+    // the select by {bank, RAM} is the bank's word (pq), lane by lane
+    always @(posedge clk)
+      for (int l = 0; l < LANES; l++)
+        if (pdir[p] && fresh[l] && lq[l] !== qb[bk[l]])
+          $fatal(1, "TMEM%0d: port %0d lane %0d's word %h is not bank %0d's %h", SID, p, l, lq[l],
+                 bk[l], qb[bk[l]]);
+`endif
   end
 
 `ifndef SYNTHESIS

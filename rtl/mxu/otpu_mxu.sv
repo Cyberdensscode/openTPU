@@ -314,6 +314,11 @@ module otpu_mxu
   logic [15:0] ck;
   logic [7:0]  cg;                          // the group of the row being consumed (replay)
   logic [31:0] c_left;                      // chunks of the pop head not yet freed
+  // c_left == 0, a flip-flop loaded with c_left (an entry's tz, or c_left == 1 at its decrement):
+  // the drain's test (c_drained -> c_done -> the drain lanes' address enables) and the pop's
+  // (more) start at it, not at a 32-bit compare of c_left (fanout 136; the m8 card at 150 MHz:
+  // c_left -> c_drained -> dal's enables, 8 levels, 5.7 ns of route, -0.080 ns)
+  logic        c_lz;
   // a command accepted last cycle became the head: c_left takes its total now, from h (a flop),
   // not from cmd_total in the start cycle. It cannot pop yet (released a cycle after its start at
   // the earliest), and nothing may treat the stale c_left == 0 as drained meanwhile
@@ -324,9 +329,14 @@ module otpu_mxu
 `ifndef SYNTHESIS
   always @(posedge clk) if (!rst && p_act && last_k != (32'(ck) + 1 == 32'(c_KBa)))
     $fatal(1, "otpu_mxu: last_k %0d, ck %0d, KBa %0d", last_k, ck, c_KBa);
+  bit cl_seen;                                 // a reset seen (registers start arbitrary)
+  initial cl_seen = 1'b0;
+  always @(posedge clk) if (rst) cl_seen <= 1'b1;
+  always @(posedge clk) if (!rst && cl_seen && c_lz != (c_left == 0))
+    $fatal(1, "otpu_mxu: c_lz %0d, c_left %0d", c_lz, c_left);
 `endif
   wire last_g   = (cg + 1 == p_G);          // the row's last group: its pops free FIFO entries
-  wire more     = p_act && (c_left != 0);
+  wire more     = p_act && !c_lz;
   // the chunk of advance ck (4-bit without PAIR: two advances a chunk) and whether the advance
   // finishes it
   wire [15:0] ckc = (c_w4 && !c_pair) ? {1'b0, ck[15:1]} : ck;
@@ -1138,7 +1148,7 @@ module otpu_mxu
       end
 `endif
 
-  wire c_drained = c_act && !cl_ld && (pn || c_left == 0) && (rows_live == 0) && (rmw_n == 0) &&
+  wire c_drained = c_act && !cl_ld && (pn || c_lz) && (rows_live == 0) && (rmw_n == 0) &&
                    (ln_n == 0) && !rA.v && !r0.v && !r1.v && !rx.v && mq_h == '0;
   // RMAX writes start a cycle after the head has drained: mx_q registers the test, so the
   // drained compares (c_left == 0, rows_live, rmw_n, ...) are off the TMEM write request and the
@@ -1376,7 +1386,7 @@ module otpu_mxu
       occ <= '0; tg_n <= '0; tg_t <= '0; tg_h <= '0;
       f_head <= '0; f_tail <= '0; f_count <= '0; f_rd <= '0; f_tl <= '0; f_rdl <= '0;
       s_head <= '0; s_tail <= '0; s_count <= '0; s_rd <= '0;
-      ck <= '0; cg <= '0; dg <= '0; dg1 <= 8'd1; c_left <= '0; cl_ld <= 1'b0; rows_live <= '0;
+      ck <= '0; cg <= '0; dg <= '0; dg1 <= 8'd1; c_left <= '0; c_lz <= 1'b1; cl_ld <= 1'b0; rows_live <= '0;
       rf_q <= '0; rf_hs <= 1'b0; rf_t <= '0; rf_n <= '0; rf_nz <= 1'b0; rl_nz <= 1'b0;
       dj <= '0; mx_done <= 1'b0; mx_have <= '0; mq_h <= '0;
       d_last <= 1'b0; d_fin <= 1'b0; ncnt <= '0; dln <= '0; mxm <= '0;
@@ -1403,7 +1413,7 @@ module otpu_mxu
       np = n;
       pnx = pn;
       cl_ld <= 1'b0;
-      if (cl_ld) c_left <= h.total;
+      if (cl_ld) begin c_left <= h.total; c_lz <= h.tz; end
       // ---- accept a command (the head if the queue is empty, else the next entry); the issuer
       // loads its addresses in the next cycle (i_ini)
       if (start) begin
@@ -1516,7 +1526,7 @@ module otpu_mxu
         if (!c_unit) s_head <= s_head + 1;
       end
       if (pop) begin
-        if (last_g) c_left <= c_left - 1;
+        if (last_g) begin c_left <= c_left - 1; c_lz <= (c_left == 32'd1); end
         // the next read: the next entry, or back to the head for the row's next group
         if (last_k && !last_g) begin
           f_rd <= f_head;
@@ -1623,10 +1633,11 @@ module otpu_mxu
       rl_nz <= (pop && ck == 0 && !pn) || (rl_nz && !(rows_live == 1 && d_pop));
       // the pop head moves to the next command once the head's chunks have all popped, if the
       // pipeline treats both alike (PAIR, and M under PAIR: pr0, hi0 and M0 are read late)
-      if (!pn && !cl_ld && c_left == 0 && q_n == 2'd2 && n.go && !c_done &&
+      if (!pn && !cl_ld && c_lz && q_n == 2'd2 && n.go && !c_done &&
           n.pair == h.pair && (!h.pair || n.M == h.M)) begin
         pnx = 1'b1;
         c_left <= n.total;
+        c_lz <= n.tz;
       end
       // ---- statistics
       st_c <= {want_iss && !go_iss, !ea && (drain_go || lo.v || rw.v || mx_go || al_go),
@@ -1651,6 +1662,7 @@ module otpu_mxu
           // the next head's chunk count: the queued entry's, or (cl_ld) the total of a command
           // accepted this cycle, a cycle later
           c_left <= (q_n == 2'd2) ? n.total : '0;
+          c_lz <= (q_n == 2'd2) ? n.tz : 1'b1;
           if (start && q_n == 2'd1) cl_ld <= 1'b1;
         end else begin                            // it already runs the next command: its rows
           rows_live <= rp;

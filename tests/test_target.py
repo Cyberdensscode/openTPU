@@ -652,6 +652,26 @@ def test_the_mxu_epilogue_advances_on_flip_flops():
     assert "if (MXU_TQ && rpl_frz[G_MXU]) r_en[P_MXU] = '0;" in sl
 
 
+def test_the_real_150_mhz_paths_start_at_flip_flops():
+    """The m8 card at a real 150 MHz (r150a): the pumped TMEM's word into the units' capture
+    registers is a full core cycle from a clk2x block RAM (multicycle), and it went through the
+    bank's RAM select, the lane's bank select and the hold (4 levels, 3.9 ns of route, -0.112 ns):
+    a host port of the pumped TMEM (no bypass) selects its lanes' words by {bank, RAM}, one select
+    from the RAMs' outputs with its index from flip-flops. The MXU's drained test (c_left == 0, a
+    32-bit compare of a 136-load register into the drain lanes' enables, -0.080) is a flip-flop
+    (c_lz). The sequencer's command copies load on the unit's readiness, not its start decode."""
+    def src(p):
+        return re.sub(r"//.*", "", (ROOT / p).read_text())
+    tm = src("rtl/mem/otpu_tmem.sv")
+    assert "lq[l] = pdir[p] ? pr[p][int'(bk[l]) * NSB + int'(pss[p][bk[l]])] : qb[bk[l]];" in tm
+    assert "assign pdir[p] = !BYP;" in tm and "assign pr[p][b * NSB + k] = s_q[b][k][SD];" in tm
+    mxu = src("rtl/mxu/otpu_mxu.sv")
+    assert "wire more     = p_act && !c_lz;" in mxu and "(pn || c_lz)" in mxu
+    assert not re.search(r"c_left\s*[!=]=\s*0\b", mxu.split("`ifndef SYNTHESIS")[0])
+    seq = src("rtl/seq/otpu_seq.sv")
+    assert "wire q_en = urdy[u] && !ustart[u];" in seq
+
+
 def test_config_summary_names_the_target(no_env):
     from opentpu.host.board import config_summary
     kw = dict(devname=None, ddr_mts=1066, pair=True, dstep=True, stream=True)
