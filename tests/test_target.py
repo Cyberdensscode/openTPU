@@ -513,8 +513,8 @@ def test_the_long_wire_drivers_are_copies_per_consumer():
     """A register whose loads spread over the die pays its route (r22's m8 at 133.33 MHz: 88% of
     the near-critical core delay, half the paths at most one LUT): the drivers that fanned out so
     have a copy per consumer group, each loaded with the same next value (cycle-exact), kept
-    (identical flip-flops would merge). The VPU's enable per lane and consumer group (g_enl: no
-    lane loop, tail unit or composite lane reads the one en), the fill index per lane (g_sfi), the MXU's decoded scale
+    (identical flip-flops would merge). The VPU's enable per lane (g_enl: no lane loop, tail unit
+    or composite lane reads the one en), the fill index per lane (g_sfi), the MXU's decoded scale
     per column (g_bd), the pumped TMEM's write stage per RAM (g_pmp g_sl) and, with wait counts,
     the sequencer's command store write per unit (g_cmd g_wq: a cycle late). The MXU's result
     FIFO needs none: a block RAM read ahead (test below). Wide data stays one register: the ACT
@@ -530,10 +530,8 @@ def test_the_long_wire_drivers_are_copies_per_consumer():
     loops = _lane_loops(vpu)
     for n in ("g_cbuf", "g_lane", "g_slane", "g_red"):
         assert not re.search(bare_en, loops[n]) and "en_l[l]" in loops[n], n
-    assert len(re.findall(kept, loops["g_enl"])) == 3 and len(re.findall(kept, loops["g_sfi"])) == 1
-    for q in ("en_l", "en_t", "en_c"):                # a copy per lane and consumer group
-        assert re.search(r"\.q\(" + q + r"\[l\]\)", loops["g_enl"]), q
-    assert re.search(r"\.cen\(en_t\)", vpu) and re.search(r"\.en_l\(en_c\)", vpu)
+    assert len(re.findall(kept, loops["g_enl"])) == 1 and len(re.findall(kept, loops["g_sfi"])) == 1
+    assert re.search(r"\.cen\(en_l\)", vpu) and re.search(r"\.en_l\b", vpu)
     tl = _lane_loops(tail)
     assert "cen[l]" in tl["g_u"] and "cen[l]" in tl["g_lq"] and "fi[l]" in tl["g_buf"]
     assert not re.search(r"\bue\b", tail) and not re.search(r"\[fi\]", tail)

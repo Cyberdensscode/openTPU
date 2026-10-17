@@ -324,12 +324,8 @@ module otpu_vpu
   // must not come from the arbiter in the same cycle.
   logic en;
   // ... and its copies, one per lane (g_wbuf's g_enl): the lanes' stages, the tail's units and the
-  // composites' lanes take their lane's, so no one register's replicas cross the VPU. Three per
-  // lane, one per consumer group: en_l the lanes', en_t the tail's units', en_c the composites'
-  // lanes' (one per lane drove ~2.6 k loads, the tail and the composites ~180 rows from the
-  // lanes: the copies sat by TMEM's lost, their D, and the m8 card at a 150 MHz equivalent had
-  // 6.4 ns of route to the tail, -0.044 ns)
-  logic [LANES-1:0] en_l, en_t, en_c;
+  // composites' lanes take their lane's, so no one register's replicas cross the VPU
+  logic [LANES-1:0] en_l;
   assign ren = en;
 
   // ------------------------------------------------------------------ issue
@@ -915,7 +911,7 @@ module otpu_vpu
     assign sy[1] = c_uy;
     assign sy[2] = c_qy;
     otpu_se_comp #(.LANES(LANES), .MW(AW + 1), .NS(CNS), .HA(3), .EXT(1'b1)) u_comp (
-      .clk, .rst, .en, .en_l(en_c), .in_v(m0.v && m0d.cf), .in_c(m0d.cc), .in_a(c_ia),
+      .clk, .rst, .en, .en_l, .in_v(m0.v && m0d.cf), .in_c(m0d.cc), .in_a(c_ia),
       .in_b(c_ib), .in_m(m0.mask), .in_meta({m0.waddr, m0.all_last}), .hold(c_hold),
       .st_sel(c_sel), .st_a(c_sa), .st_b(c_sb), .st_c(c_sc), .st_e(c_se), .st_y(sy),
       .out_v(c_ov), .out_d(c_od), .out_m(c_om), .out_meta(c_ometa));
@@ -1154,8 +1150,6 @@ module otpu_vpu
   if (!WBUF) begin : g_wdir
     assign en = (SE && ss_act) ? sen : gnt;
     assign en_l = {LANES{en}};
-    assign en_t = {LANES{en}};
-    assign en_c = {LANES{en}};
     assign wb_e = (tw_en == '0);
     always_ff @(posedge clk) begin
       if (rst) begin
@@ -1232,15 +1226,9 @@ module otpu_vpu
     for (genvar l = 0; l < LANES; l++) begin : g_enl
       (* keep_hierarchy = "yes" *)
       otpu_delay #(.W(1), .N(1)) u_en (.clk, .en(1'b1), .d(!rst && en_rd), .q(en_l[l]));
-      (* keep_hierarchy = "yes" *)
-      otpu_delay #(.W(1), .N(1)) u_et (.clk, .en(1'b1), .d(!rst && en_rd), .q(en_t[l]));
-      (* keep_hierarchy = "yes" *)
-      otpu_delay #(.W(1), .N(1)) u_ec (.clk, .en(1'b1), .d(!rst && en_rd), .q(en_c[l]));
     end
 `ifndef SYNTHESIS
-    always @(posedge clk)
-      if (en_l != {LANES{en_r}} || en_t != {LANES{en_r}} || en_c != {LANES{en_r}})
-        $fatal(1, "otpu_vpu: en_l, en_t or en_c is not en_r");
+    always @(posedge clk) if (en_l != {LANES{en_r}}) $fatal(1, "otpu_vpu: en_l is not en_r");
 `endif
     always_ff @(posedge clk) begin
       if (rst) begin
@@ -1382,7 +1370,7 @@ module otpu_vpu
       .kv(root), .kv_v(root_v && !vt_q), .y_v(t_yv), .y_d(ss_y_d), .o_v(t_ov), .o_d(ss_o_d),
       .qp_cap(t_qc), .qp_row_last(t_qrl), .qp_sub(t_qsub), .qp_d(t_qd),
       .qo_v(root_v && vt_q), .qo_d(root_o),
-      .cm_u, .cm_q, .cen(en_t), .u_sel(c_sel[1]), .u_a(c_sa[1]), .u_b(c_sb[1]), .u_c(c_sc[1]),
+      .cm_u, .cm_q, .cen(en_l), .u_sel(c_sel[1]), .u_a(c_sa[1]), .u_b(c_sb[1]), .u_c(c_sc[1]),
       .u_e(c_se[1]), .u_y(c_uy), .q_sel(c_sel[2]), .q_a(c_sa[2]), .q_b(c_sb[2]), .q_c(c_sc[2]),
       .q_y(c_qy));
     // Q's partials registered here (QD = 1: the tail pads its Q path for it), so no path
