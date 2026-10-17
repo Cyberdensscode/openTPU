@@ -636,7 +636,9 @@ def test_the_mxu_epilogue_advances_on_flip_flops():
     assert re.findall(r".*\bt_lost\b.*", tq.split("`ifndef SYNTHESIS")[0]) == ["        lost_q <= t_lost;"]
     ea = re.search(r"\(\*\s*max_fanout\s*=\s*\d+\s*\*\)\s*wire ea_t = ([^;]*);", tq).group(1)
     assert set(re.findall(r"\w+", ea)) == {"room_q", "lost_q", "tq_z", "rq_any"}, ea
-    assert "assign ea = ea_t;" in tq and "assign t_ren = rq_en & {LANES{rd}};" in tq
+    assert "assign ea = ea_t;" in tq and "assign t_ren = t_ren_q;" in tq
+    # TMEM's read enable a register, its next value off t_lost (the slice masks a replay's cycle)
+    assert re.search(r"t_ren_q <= \(ea_t \? t_ren_c : rq_en\) & ", tq)
     # the queue's slots: flip-flops written from the counters' registers, never on a push
     gs = tq[tq.index("begin : g_s"):]
     gs = gs[:gs.index("\n    end\n")]
@@ -647,6 +649,7 @@ def test_the_mxu_epilogue_advances_on_flip_flops():
     assert re.search(r"localparam bit MXU_TQ = TMEM_IMPL == 3 && TMEM_RPL;", sl)
     assert ".TQ(MXU_TQ)" in sl and re.search(r"\.t_lost\(tm_lost\[P_MXU\]\)", sl)
     assert "if (!MXU_TQ) r_en[P_MXU] = '0;" in sl
+    assert "if (MXU_TQ && rpl_frz[G_MXU]) r_en[P_MXU] = '0;" in sl
 
 
 def test_config_summary_names_the_target(no_env):

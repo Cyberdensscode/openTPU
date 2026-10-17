@@ -192,6 +192,7 @@ module otpu_mxu
     logic [31:0]      out, total;
     logic             tz;              // total == 0 (registered: off the drain path)
     logic [15:0]      KB, KBa;         // KBa: advances per row
+    logic [15:0]      KBm1;            // KBa - 1: the last advance's ck (last_k a compare, no adder)
     logic             pair;
     logic [MCOLS-1:0] hi;              // PAIR: the columns that take the odd blocks (j >= M)
     logic [31:0]      mxo;             // RMAX output base: out + M * ors (no multiply later)
@@ -221,6 +222,7 @@ module otpu_mxu
     cmd_e.tz    = cmd_tz;
     cmd_e.KB    = 16'(cmd_KB8);
     cmd_e.KBa   = cmd_KBa;
+    cmd_e.KBm1  = cmd_KBa - 16'd1;
     cmd_e.pair  = cmd_pair;
     for (int j = 0; j < MCOLS; j++) cmd_e.hi[j] = cmd_pair && 32'(j) >= 32'(cmd.w6[23:16]);
     cmd_e.mxo   = cmd.w3 + 32'(cmd.w6[23:16]) * 32'(cmd.w6[15:0]);
@@ -318,7 +320,11 @@ module otpu_mxu
   logic        cl_ld;
   logic [RFW:0] rows_live;                  // the head's rows popped (first block), not drained
   logic [RFW:0] rows_p;                     // the pop head's, while it is not the head
-  wire last_k   = (ck + 1 == c_KBa);
+  wire last_k   = (ck == pop_e.KBm1);         // (ck + 1 == c_KBa)
+`ifndef SYNTHESIS
+  always @(posedge clk) if (!rst && p_act && last_k != (32'(ck) + 1 == 32'(c_KBa)))
+    $fatal(1, "otpu_mxu: last_k %0d, ck %0d, KBa %0d", last_k, ck, c_KBa);
+`endif
   wire last_g   = (cg + 1 == p_G);          // the row's last group: its pops free FIFO entries
   wire more     = p_act && (c_left != 0);
   // the chunk of advance ck (4-bit without PAIR: two advances a chunk) and whether the advance
@@ -408,7 +414,10 @@ module otpu_mxu
   // past an odd KB the high block is not the MM's (block ab + KB, outside its ACT range: a later
   // QACT may be writing it, and the scoreboard does not hold that one back): the high rows read
   // the even block again, which their zero multipliers (m0.o low) ignore
-  assign act_blk2 = 16'(c_ab) + {ck[14:0], !(last_k && c_KB[0])};
+  // (both blocks' addresses from flip-flops, last_k picking at the end: it was the adder's carry in,
+  // and the address goes on to the ACT RAMs' block RAM pins, the m8 card's -0.044 ns at 150 MHz)
+  wire [15:0] act_b0 = 16'(c_ab) + {ck[14:0], 1'b0}, act_b1 = 16'(c_ab) + {ck[14:0], 1'b1};
+  assign act_blk2 = (last_k && c_KB[0]) ? act_b0 : act_b1;
   assign act_hi = c_hi;
   assign act_grp = cg;
 `ifndef SYNTHESIS
@@ -1092,27 +1101,32 @@ module otpu_mxu
       end
   otpu_delay #(.W(NL * MCOLS), .N(LM + LA - 1)) u_rwh (.clk, .en(ea), .d(rh), .q(rh_p));
   always_ff @(posedge clk) if (rst) rwh <= '0; else if (ea) rwh <= rh_p;
-  // per column: the candidate key is selected by the hits alone, the compare only makes the
-  // enable. At most one lane hits a column per cycle (lanes drain distinct columns) and rx / rw
-  // are exclusive (rx only for !c_acc commands, rw only for c_acc ones)
-  logic [MCOLS-1:0] mx_hit, mx_upd;
-  logic [31:0] mx_cand [MCOLS];
+  // per column: the candidate key is selected by the hits alone. At most one lane hits a column
+  // per cycle (lanes drain distinct columns) and rx / rw are exclusive (rx only for !c_acc
+  // commands, rw only for c_acc ones). The compare is a stage later: each column's hit and key
+  // are registered at the advance (mq_h, mq_k) and compared with mk, and applied, the cycle after,
+  // advance or not (fkey of the fmadd's sum, the lanes' selection, a 32-bit compare and the
+  // update's enable were one cycle: the m8 card at a 150 MHz equivalent, -0.057 ns, 10 levels).
+  // The running max holds: each column's keys reach mk one at a time, in order, each compared
+  // with the max of those before it; a command completes only with the stage empty (c_drained)
+  logic [MCOLS-1:0] mx_hit, mx_upd, mq_h;
+  logic [31:0] mx_cand [MCOLS], mq_k [MCOLS];
   always_comb
     for (int j = 0; j < MCOLS; j++) begin
-      mx_hit[j] = 1'b0; mx_upd[j] = 1'b0; mx_cand[j] = '0;
+      mx_hit[j] = 1'b0; mx_cand[j] = '0;
       for (int k = 0; k < NL; k++) begin
         if (rxh[k][j]) begin
           mx_hit[j] = 1'b1;
           mx_cand[j] = mx_cand[j] | fkey(rx.nv[k]);
-          mx_upd[j] = mx_upd[j] | !mx_have[j] | (fkey(rx.nv[k]) > mk[j]);
         end
         if (rwh[k][j]) begin
           mx_hit[j] = 1'b1;
           mx_cand[j] = mx_cand[j] | fkey(ry[k]);
-          mx_upd[j] = mx_upd[j] | !mx_have[j] | (fkey(ry[k]) > mk[j]);
         end
       end
+      mx_upd[j] = mq_h[j] && (!mx_have[j] || mq_k[j] > mk[j]);
     end
+  always_ff @(posedge clk) if (ea) for (int j = 0; j < MCOLS; j++) mq_k[j] <= mx_cand[j];
 `ifndef SYNTHESIS
   always_ff @(posedge clk)
     if (!rst && ea)
@@ -1125,7 +1139,7 @@ module otpu_mxu
 `endif
 
   wire c_drained = c_act && !cl_ld && (pn || c_left == 0) && (rows_live == 0) && (rmw_n == 0) &&
-                   (ln_n == 0) && !rA.v && !r0.v && !r1.v && !rx.v;
+                   (ln_n == 0) && !rA.v && !r0.v && !r1.v && !rx.v && mq_h == '0;
   // RMAX writes start a cycle after the head has drained: mx_q registers the test, so the
   // drained compares (c_left == 0, rows_live, rmw_n, ...) are off the TMEM write request and the
   // grant it feeds. The test holds while drained (nothing new enters the head until it
@@ -1249,6 +1263,7 @@ module otpu_mxu
     logic [1:0] tq_h, tl;                        // the head's slot, the tail's (0..2)
     (* max_fanout = 64 *) logic room_q, tq_z, lost_q;
     logic       rq_any;                          // a read in the request register (|rq_en)
+    logic [LANES-1:0] t_ren_q;                   // the read TMEM sees: rq_en while room_q, tq_z
     (* max_fanout = 128 *) wire ea_t = room_q && !lost_q && (tq_z || !rq_any);
     wire        rd   = room_q && !lost_q && tq_z;  // the request register's read happens now
     wire        iw   = ea_t && (|tw_en);           // writes issued
@@ -1259,7 +1274,12 @@ module otpu_mxu
     assign ea = ea_t;
     assign tl = (32'(tq_h) + 32'(tq_n) >= 3) ? 2'(32'(tq_h) + 32'(tq_n) - 3) : tq_h + tq_n;
     assign hd = s[tq_h];
-    assign t_ren = rq_en & {LANES{rd}};
+    // TMEM's read enable is a register (its next value from rq_en's, room_q's and tq_z's: no LUT
+    // in front of TMEM's read selection, whose conflicts decide the other ports' replays; the
+    // m8 card at 150 MHz: room_q -> rd -> TMEM -> the VPU's hold, -0.041 ns). It leaves out
+    // lost_q: in a replay's cycle the read stays up and the slice does not read it (rpl_frz, as
+    // lost_q a register of TMEM's lost); the epilogue does not advance then, and reads it after
+    assign t_ren = t_ren_q;
     assign t_wen = tq_z ? (ea_t ? tw_en : '0) : hd.wen;
     assign t_waddr = tq_z ? tw_ad : hd.waddr;
     assign t_wdata = tq_z ? tw_d : hd.wdata;
@@ -1270,6 +1290,7 @@ module otpu_mxu
     always_ff @(posedge clk)
       if (rst) begin
         tq_n <= '0; tq_h <= '0; tq_z <= 1'b1; room_q <= 1'b0; lost_q <= 1'b0; rq_any <= 1'b0;
+        t_ren_q <= '0;
       end else begin
         tq_n <= tq_nn;
         tq_z <= tq_nn == 2'd0;
@@ -1277,6 +1298,7 @@ module otpu_mxu
         room_q <= 3'(tq_n) + 3'(iw) <= 3'd2;
         lost_q <= t_lost;
         if (ea_t) rq_any <= |t_ren_c;
+        t_ren_q <= (ea_t ? t_ren_c : rq_en) & {LANES{3'(tq_n) + 3'(iw) <= 3'd2 && tq_nn == 2'd0}};
       end
 `ifndef SYNTHESIS
     bit rst_seen;                                // (registers start arbitrary)
@@ -1288,8 +1310,10 @@ module otpu_mxu
         if (rq_any != (|rq_en)) $fatal(1, "otpu_mxu: rq_any is not the request register's");
         if (tq_z != (tq_n == 2'd0)) $fatal(1, "otpu_mxu: tq_z is not the queue's");
         if ((|t_ren) && !tq_z) $fatal(1, "otpu_mxu: a read passes a waiting write");
-        // TMEM loses only a read the MXU asked this cycle or its replay
-        if (t_lost && !(|t_ren) && !lost_q) $fatal(1, "otpu_mxu: TMEM lost a read not asked");
+        if (t_ren_q != (rq_en & {LANES{room_q && tq_z}}))
+          $fatal(1, "otpu_mxu: t_ren_q is not the request register's read");
+        // TMEM loses only a read the MXU asked this cycle (and the slice took) or its replay
+        if (t_lost && !((|t_ren) && rd) && !lost_q) $fatal(1, "otpu_mxu: TMEM lost a read not asked");
       end
 `endif
   end else begin : g_ng
@@ -1354,7 +1378,7 @@ module otpu_mxu
       s_head <= '0; s_tail <= '0; s_count <= '0; s_rd <= '0;
       ck <= '0; cg <= '0; dg <= '0; dg1 <= 8'd1; c_left <= '0; cl_ld <= 1'b0; rows_live <= '0;
       rf_q <= '0; rf_hs <= 1'b0; rf_t <= '0; rf_n <= '0; rf_nz <= 1'b0; rl_nz <= 1'b0;
-      dj <= '0; mx_done <= 1'b0; mx_have <= '0;
+      dj <= '0; mx_done <= 1'b0; mx_have <= '0; mq_h <= '0;
       d_last <= 1'b0; d_fin <= 1'b0; ncnt <= '0; dln <= '0; mxm <= '0;
       al_st <= 2'd0; al_i <= '0; mx_i <= '0;
       r0 <= '0; rA <= '0; rx <= '0; rmw_n <= '0; ln_n <= '0;
@@ -1515,6 +1539,12 @@ module otpu_mxu
         rf_t <= rf_t + 1;
         rn = rn + 1;
       end
+      // ---- RMAX: the stage's keys into the running max (every cycle), the advance's hits into it
+      for (int j = 0; j < MCOLS; j++) begin
+        if (mx_upd[j]) mk[j] <= mq_k[j];
+        if (mq_h[j]) mx_have[j] <= 1'b1;
+      end
+      mq_h <= ea ? mx_hit : '0;
       // ---- drain (holds while the epilogue does not advance)
       if (ea) begin
         r0 <= rA;
@@ -1562,11 +1592,6 @@ module otpu_mxu
             dj <= dj + ncnt;
             dal <= dlane_a(dad, dj + ncnt);
           end
-        end
-        // RMAX (rx: registered so the lane selection and the max compare are in different cycles)
-        for (int j = 0; j < MCOLS; j++) begin
-          if (mx_upd[j]) mk[j] <= mx_cand[j];
-          if (mx_hit[j]) mx_have[j] <= 1'b1;
         end
         rmw_n <= rmw_n + ((lo.v && c_acc) ? 4'd1 : 4'd0) - (rw.v ? 4'd1 : 4'd0);
         ln_n <= ln_n + (drain_go ? 4'd1 : 4'd0) - (lo.v ? 4'd1 : 4'd0);

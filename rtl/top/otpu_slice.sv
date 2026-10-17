@@ -690,6 +690,7 @@ module otpu_slice
     w_gnt[W_VPU] = gnt[G_VPU];
     w_gnt[W_COLL] = gnt[G_COLL];
     if (!gnt[G_MXU])  begin if (!MXU_TQ) r_en[P_MXU] = '0; w_en[W_MXU] = '0; end
+    if (MXU_TQ && rpl_frz[G_MXU]) r_en[P_MXU] = '0;   // the MXU's read waits out its replay
     if (!gnt[G_Q])    begin r_en[P_Q] = '0; r_en[P_Q2] = '0; r_en[P_Q3] = '0; end
     if (!v_ren)       begin r_en[P_VA] = '0; r_en[P_VB] = '0; end
     if (!gnt[G_VPU])  w_en[W_VPU] = '0;
