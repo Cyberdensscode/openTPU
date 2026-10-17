@@ -75,6 +75,21 @@ if {![regexp {otpu_ddr_phy_place: (\d+ flops|off)} $ilog]} {
 }
 open_run impl_1
 
+# ---- the setup margin (create_project.tcl, OTPU_SETUP_MARGIN): the core clocks' worst setup slack
+# with it (the route's target), then without it for everything below
+set margin_line ""
+set mf [get_files -quiet -of_objects [get_filesets constrs_1] *otpu_margin.tcl]
+if {$mf ne ""} {
+  set fh [open $mf]; set mt [read $fh]; close $fh
+  if {![regexp {setup margin ([0-9.]+) ns} $mt -> margin]} { error "otpu_margin.tcl: no margin in $mf" }
+  set mc [list [get_clocks core_clk_otpu_bd_clk_wiz_0_0] [get_clocks core_clk2x_otpu_bd_clk_wiz_0_0]]
+  set mp [lindex [get_timing_paths -quiet -setup -max_paths 1 -nworst 1 -from $mc -to $mc] 0]
+  set ms [expr {$mp eq "" ? "n/a" : [get_property SLACK $mp]}]
+  foreach a $mc { foreach b $mc { set_clock_uncertainty -setup -from $a -to $b 0 } }
+  set margin_line [format "MARGIN %s ns (OTPU_SETUP_MARGIN): the core clocks' worst setup slack with it %s ns" $margin $ms]
+  puts $margin_line
+}
+
 # ---- PCIe Gen2: the PCIe block's 500 MHz paths into its own block RAMs (userclk1_reroute.tcl)
 source $here/userclk1_reroute.tcl
 
@@ -104,6 +119,7 @@ set fh [open $out/reports/SUMMARY.txt w]
 set wns [get_property SLACK [lindex [get_timing_paths -max_paths 1 -nworst 1 -setup] 0]]
 set whs [get_property SLACK [lindex [get_timing_paths -max_paths 1 -nworst 1 -hold] 0]]
 puts $fh "WNS $wns ns   WHS $whs ns"
+if {$margin_line ne ""} { puts $fh $margin_line }
 # the XADC's ADC clock: DCLK / the divider in INIT_42[15:8] (bd_native.tcl DCLK_FREQUENCY), at
 # most 26 MHz (DS182)
 foreach x [get_cells -quiet -hierarchical -filter {REF_NAME == XADC}] {

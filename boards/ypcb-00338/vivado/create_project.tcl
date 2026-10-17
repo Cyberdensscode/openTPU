@@ -139,6 +139,28 @@ add_files -fileset constrs_1 -norecurse [list $cons/otpu_top_ld.xdc \
 set late [list $cons/otpu_mem_ch.tcl $cons/otpu_top_native.tcl]
 if {$CLK2X} { lappend late $cons/otpu_clk2x.tcl }
 lappend late $cons/otpu_mxu_place.tcl $cons/otpu_ddr_phy_place.tcl
+# a setup margin (OTPU_SETUP_MARGIN, ns; unset or 0: none): implementation times every setup check
+# between the core clocks (core_clk, core_clk2x) with that much more uncertainty, so a route that
+# meets it has that much slack at the real clock. Generated here (otpu_margin.tcl, in OUT_DIR);
+# build.tcl reports the core's slack with it, then removes it for the reports and the bitstream
+set SETUP_MARGIN [expr {[info exists ::env(OTPU_SETUP_MARGIN)] && $::env(OTPU_SETUP_MARGIN) ne "" ? $::env(OTPU_SETUP_MARGIN) : 0}]
+if {![string is double -strict $SETUP_MARGIN] || $SETUP_MARGIN < 0 || $SETUP_MARGIN > 1} {
+  error "OTPU_SETUP_MARGIN '$SETUP_MARGIN': a margin in ns, 0 to 1"
+}
+if {$SETUP_MARGIN > 0} {
+  set fh [open $out/otpu_margin.tcl w]
+  puts $fh "# otpu_margin.tcl (create_project.tcl, OTPU_SETUP_MARGIN): +$SETUP_MARGIN ns setup uncertainty"
+  puts $fh "# on every check between the core clocks (implementation only; build.tcl removes it)"
+  puts $fh "set otpu_m_c \[list \[get_clocks -quiet core_clk_otpu_bd_clk_wiz_0_0\] \[get_clocks -quiet core_clk2x_otpu_bd_clk_wiz_0_0\]\]"
+  puts $fh "if {\[llength \[join \$otpu_m_c\]\] == 2} {"
+  puts $fh "  foreach a \$otpu_m_c { foreach b \$otpu_m_c { set_clock_uncertainty -setup -from \$a -to \$b $SETUP_MARGIN } }"
+  puts $fh "  puts \"otpu_margin.tcl: setup margin $SETUP_MARGIN ns on the core clocks\""
+  puts $fh "} else {"
+  puts $fh "  puts \"CRITICAL WARNING: \\\[otpu_margin.tcl\\\] core clocks not found (\$otpu_m_c): no setup margin\""
+  puts $fh "}"
+  close $fh
+  lappend late $out/otpu_margin.tcl
+}
 add_files -fileset constrs_1 -norecurse $late
 set_property SCOPED_TO_REF otpu_mem_ch [get_files $cons/otpu_mem_ch.tcl]
 set_property PROCESSING_ORDER LATE [get_files $late]
