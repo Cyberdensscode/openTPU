@@ -30,7 +30,7 @@ module tb_se_comp;
   f32_t          st_a [NS][L], st_b [NS][L], st_c [NS][L], st_e [NS][L], st_y [NS][L];
 
   otpu_se_comp #(.LANES(L), .NS(NS), .MW(MW), .HA(HA), .EXT(EXT)) dut (
-    .clk, .rst, .en, .en_l({L{en}}), .in_v, .in_c, .in_a, .in_b, .in_m, .in_meta, .hold, .st_sel, .st_a, .st_b,
+    .clk, .rst, .en, .en_l({L{en}}), .in_v, .in_c, .in_a, .in_b, .in_m, .in_meta, .hold, .hold_n(), .st_sel, .st_a, .st_b,
     .st_c, .st_e, .st_y, .out_v, .out_d, .out_m, .out_meta);
 
   if (EXT) begin : g_units

@@ -60,6 +60,8 @@ module otpu_se_comp
   input  logic [LANES-1:0] in_m,             // lane mask (carried)
   input  logic [MW-1:0]    in_meta,
   output logic             hold,             // an entry HA cycles from now would collide
+  output logic             hold_n,           // ... HA + 1 cycles from now (after this cycle's
+                                             // step: an issuer a step ahead of `en`, otpu_vpu FB)
   // the stage units (EXT): operands at stage s's input mux this cycle (st_sel[s]), the
   // result SL cycles later; y = a*b + c*e (e = 1.0; the Q stage takes a*b + c)
   output logic [NS-1:0]    st_sel,
@@ -78,7 +80,7 @@ module otpu_se_comp
   localparam int SL = 1 + LM + LA;         // a stage: input registers, multiply, add
   localparam int RRL = 3;                  // RR: clamp | floor | i2f
   localparam int T = NS * SL + RRL + 1;    // S0 to S0 (the loop register is the 1)
-  initial if (NS < 1 || HA < 1 || HA >= T)
+  initial if (NS < 1 || HA < 1 || HA + 1 >= T)
     $fatal(1, "otpu_se_comp: unsupported NS / HA");
 
   localparam f32_t F_NZ = 32'h8000_0000;   // -0: (a*b) + -0 == a*b exactly
@@ -349,6 +351,7 @@ module otpu_se_comp
   logic         ret_r;
   assign ret  = ret_r;
   assign hold = cpos[T - HA - 1];         // it will return HA cycles from now
+  assign hold_n = cpos[T - HA - 2];       // HA + 1
   assign out_v = lp_v && fin;
   assign out_m = lp_m.mask;
   assign out_meta = lp_m.m;
