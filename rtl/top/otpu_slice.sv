@@ -217,6 +217,10 @@ module otpu_slice
                                         ((NRP'(1) << P_VB) | (NRP'(1) << P_Q3) | (NRP'(1) << P_Q2) |
                                          (NRP'(1) << P_COLL));
   localparam logic [NRP-1:0] TM_SIDE = (TMEM_SDM >= 0) ? NRP'(TMEM_SDM) : TM_SIDED;
+  // the MXU's TMEM interface (otpu_mxu TQ): with replays its reads are not granted (TMEM reads
+  // what it asks and replays a lost read, as the VPU's), the grant takes its writes from a queue,
+  // and its epilogue advances on flip-flops instead of the grant
+  localparam bit MXU_TQ = TMEM_IMPL == 3 && TMEM_RPL;
   initial if (TMEM_IMPL == 3 && (WPB != 1 || ARB_MASK != TMEM_RPL))
     $fatal(1, "otpu_slice: TMEM_IMPL 3 needs WPB = 1 (WPB %0d), and RPB >= %0d with TMEM_RPL",
            WPB, NRP * LANES);
@@ -495,7 +499,7 @@ module otpu_slice
     .ss_y_v, .ss_y_d, .ss_o_v, .ss_o_d);
 
   otpu_mxu #(.D(D), .MCOLS(MCOLS), .ROWS(ACT_ROWS), .DEPTH(FIFO_DEPTH), .LANES(ULANES), .IMPL(MXU_IMPL),
-             .CL(MXU_CL), .E(MXU_E), .SID(SID)) u_mxu (
+             .CL(MXU_CL), .E(MXU_E), .TQ(MXU_TQ), .SID(SID)) u_mxu (
     .clk, .rst(rst_mxu), .start(ustart[U_MXU]), .go(urel), .cmd(ucmd[U_MXU]), .rdy(r_mxu), .done(d_mxu),
     .computing(mxu_pop), .pf_level(mxu_level), .pf_starve(mxu_starve), .pf_block(mxu_block),
     .pf_u(mxu_u), .pf_uv(mxu_uv),
@@ -685,7 +689,7 @@ module otpu_slice
     w_gnt[W_MXU] = gnt[G_MXU];
     w_gnt[W_VPU] = gnt[G_VPU];
     w_gnt[W_COLL] = gnt[G_COLL];
-    if (!gnt[G_MXU])  begin r_en[P_MXU] = '0; w_en[W_MXU] = '0; end
+    if (!gnt[G_MXU])  begin if (!MXU_TQ) r_en[P_MXU] = '0; w_en[W_MXU] = '0; end
     if (!gnt[G_Q])    begin r_en[P_Q] = '0; r_en[P_Q2] = '0; r_en[P_Q3] = '0; end
     if (!v_ren)       begin r_en[P_VA] = '0; r_en[P_VB] = '0; end
     if (!gnt[G_VPU])  w_en[W_VPU] = '0;
@@ -1022,7 +1026,7 @@ module otpu_slice
   // after its last cycle (pf.w), the halt totals the cycle after the halt (pf.h). Counting
   // stops the cycle after the halt. In simulation, +trace prints the trace lines from pf.
   // a unit "loses" a cycle when it requested TMEM ports and was not granted
-  wire lose_mxu = !gnt[G_MXU] && ((|rq_en[P_MXU]) || (|wq_en[W_MXU]));
+  wire lose_mxu = !gnt[G_MXU] && ((!MXU_TQ && (|rq_en[P_MXU])) || (|wq_en[W_MXU]));
   wire lose_q   = !gnt[G_Q] && ((|rq_en[P_Q]) || (|rq_en[P_Q2]) || q3_en);
   wire lose_vpu = !gnt[G_VPU] && ((|rq_en[P_VA]) || (|rq_en[P_VB]) || (|wq_en[W_VPU]));
   wire lose_col = !gnt[G_COLL] && ((|rq_en[P_COLL]) || (|wq_en[W_COLL]));

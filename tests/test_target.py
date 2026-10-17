@@ -606,31 +606,47 @@ def test_late_pushes_reach_no_lut_ram_write_enable():
                               mxu.index("if (!rst && al_st == 2'd3)")]
 
 
-def test_the_mxu_epilogue_advances_on_a_register():
+def test_the_mxu_epilogue_advances_on_flip_flops():
     """The MXU's TMEM grant, the end of the slice's arbitration, was the epilogue's enable (the
     drain's lanes, the read-modify-write, RMAX, the ASCALE loads: on the m8 card ~11.3 k enables,
-    the MXU's worst paths at a 150 MHz equivalent). With TQ (the default) the epilogue advances on
-    ea, a flip-flop, and the grant only pops a queue of two TMEM beats (g_tq); TQ 0 keeps the
-    grant as the enable (g_ng). The read port's lost reads (t_lost) hold the advance that would
-    take a replayed read's word."""
+    the MXU's worst paths at a 150 MHz equivalent). With TQ (the slice's MXU_TQ: TMEM_IMPL 3 with
+    replays) TMEM reads what the MXU asks (a lost read is replayed, as the VPU's), the grant only
+    takes the writes from a queue (g_tq), and the epilogue advances on ea, a function of flip-flops
+    the grant and t_lost reach only through their next values. A first version (72cbb745) kept the
+    read in the granted beat: the grant and t_lost fanned out to ea's 118 replicas, the read
+    address came out of the queue's LUT RAM, and a push enabled every slot's flip-flops (b_t8_150:
+    -0.49 ns). So: TMEM's read address is the request register, the slots load from registers'
+    conditions, and the grant reaches the queue's counters only. TQ 0 keeps the grant as the
+    enable (g_ng)."""
     def src(p):
         return re.sub(r"//.*", "", (ROOT / p).read_text())
     mxu = src("rtl/mxu/otpu_mxu.sv")
-    assert re.search(r"parameter bit TQ\s*=\s*1'b1", mxu)
     tq = mxu[mxu.index("if (TQ) begin : g_tq"):mxu.index("end else begin : g_ng")]
     ng = mxu[mxu.index("end else begin : g_ng"):]
     ng = ng[:ng.index("\n  end\n")]
     rest = mxu.replace(tq, "").replace(ng, "")
     # the grant reaches the port declaration and nothing else outside the TMEM interface
     assert re.findall(r"\bt_gnt\b", rest) == ["t_gnt"], re.findall(r".*\bt_gnt\b.*", rest)
-    assert "assign ea = ea_q;" in tq and re.search(r"\(\*\s*max_fanout\s*=\s*\d+\s*\*\)\s*logic ea_q;", tq)
-    assert re.search(r"ea_q <= .*!t_lost", tq) and "assign ea = t_gnt;" in ng
-    # in g_tq the grant only moves the queue and marks the read taken
-    used = {re.match(r"\s*wire\s+(?:\[[^]]*\]\s*)?(\w+)", l).group(1)
-            for l in tq.splitlines() if re.search(r"\bt_gnt\b", l) and "wire" in l}
-    assert used <= {"pop", "push", "rd_done_n"}, used
+    assert "assign ea = t_gnt;" in ng and "assign t_raddr = rq_ad;" in rest
+    # in g_tq the grant only takes or pops writes, t_lost only reaches lost_q, and ea is flip-flops'
+    def wires(sig):
+        return {re.match(r"\s*wire\s+(?:\[[^]]*\]\s*)?(\w+)", l).group(1)
+                for l in tq.splitlines() if re.search(rf"\b{sig}\b", l) and re.match(r"\s*wire\b", l)}
+    assert wires("t_gnt") == {"take", "pop"}, wires("t_gnt")
+    assert re.findall(r".*\bt_lost\b.*", tq.split("`ifndef SYNTHESIS")[0]) == ["        lost_q <= t_lost;"]
+    ea = re.search(r"\(\*\s*max_fanout\s*=\s*\d+\s*\*\)\s*wire ea_t = ([^;]*);", tq).group(1)
+    assert set(re.findall(r"\w+", ea)) == {"room_q", "lost_q", "tq_z", "rq_any"}, ea
+    assert "assign ea = ea_t;" in tq and "assign t_ren = rq_en & {LANES{rd}};" in tq
+    # the queue's slots: flip-flops written from the counters' registers, never on a push
+    gs = tq[tq.index("begin : g_s"):]
+    gs = gs[:gs.index("\n    end\n")]
+    assert re.search(r"if \(tq_n != 2'd3 && tl == 2'\(i\)\) s\[i\] <=", gs)
+    assert not re.search(r"\b(push|t_gnt|ea_t|ea)\b", gs) and "s[" not in tq.replace(gs, "").replace(
+        "assign hd = s[tq_h];", "")
     sl = src("rtl/top/otpu_slice.sv")
-    assert re.search(r"\.t_lost\(tm_lost\[P_MXU\]\)", sl)
+    assert re.search(r"localparam bit MXU_TQ = TMEM_IMPL == 3 && TMEM_RPL;", sl)
+    assert ".TQ(MXU_TQ)" in sl and re.search(r"\.t_lost\(tm_lost\[P_MXU\]\)", sl)
+    assert "if (!MXU_TQ) r_en[P_MXU] = '0;" in sl
 
 
 def test_config_summary_names_the_target(no_env):

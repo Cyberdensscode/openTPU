@@ -54,7 +54,8 @@ module otpu_mxu
   parameter int IMPL  = 2,       // the dot product: 2 systolic (the only one; CFG_UARCH reports it)
   parameter int CL    = 16,      // products per cascade chain (at most D/8)
   parameter int E     = 0,       // epilogue lanes (0: MCOLS / 2, at least 1; more than MCOLS: MCOLS)
-  parameter bit TQ    = 1'b1,    // the epilogue on a registered advance and a TMEM request queue
+  parameter bit TQ    = 1'b0,    // reads not granted (TMEM replays them), writes through a queue,
+                                 //   the epilogue's advance from flip-flops (the slice: TMEM_IMPL 3 RPL)
   parameter int SID   = 0
 ) (
   input  logic                  clk,
@@ -99,7 +100,7 @@ module otpu_mxu
   output logic [LANES-1:0][31:0]  t_waddr,
   output logic [LANES-1:0][31:0]  t_wdata,
   input  logic                    t_gnt,
-  input  logic                    t_lost      // TMEM_IMPL 3 RPL: the read port's read lost (replayed)
+  input  logic                    t_lost      // TQ: this cycle's read (or its replay) lost (replayed)
 );
   localparam int BW = $clog2(LANES);
   localparam int PW = $clog2(DEPTH);
@@ -972,8 +973,8 @@ module otpu_mxu
   wire [MW:0]      st_mid = dstep(d_rest, c_run);
   wire [MW:0]      st_grp = d_nl ? {h.dfl, h.dnl} : dstep(MW'(MCOLS), c_run);
   wire [NL-1:0]    ln_mid = dlanes(st_mid[MW-1:0]), ln_grp = dlanes(st_grp[MW-1:0]);
-  logic            ea;          // the epilogue's advance: the TMEM grant (TQ 0) or a flip-flop
-  logic [1:0]      tq_n;        // TQ: the epilogue's TMEM beats waiting (the TMEM interface)
+  logic            ea;          // the epilogue's advance: the TMEM grant (TQ 0) or flip-flops'
+  logic [1:0]      tq_n;        // TQ: the epilogue's TMEM writes waiting (the TMEM interface)
   wire             d_pop = ea && drain_row_done;      // a row leaves the result FIFO
 `ifndef SYNTHESIS
   always @(posedge clk) if (!rst && rf_n != 0 && rfh != g_rfm[0].mh)
@@ -982,7 +983,7 @@ module otpu_mxu
 
   // ---- the epilogue lanes: the pick registered (P1), i2f48, x Sw, x Sa' (otpu_mx_lane), the
   // pick's lanes, addresses and columns alongside; everything advances with ea (the TMEM grant,
-  // or with TQ its flip-flop: the TMEM interface below). The
+  // or with TQ a function of flip-flops: the TMEM interface below). The
   // lane output (lo_*) is the drain's TMEM request: a write, or ACC's read of the old values
   typedef struct packed {
     logic                   v;
@@ -1218,82 +1219,90 @@ module otpu_mxu
     end
   end
 
-  // ---- the TMEM interface. A beat is what the epilogue gives TMEM in one advance: the read in
-  // the request register and this cycle's writes, granted together (the slice grants the MXU's
-  // read and write ports as one group). TQ 0: the epilogue advances on the grant itself (ea =
-  // t_gnt), which reached every register of the epilogue in the cycle the slice decides it (the
-  // m8 card: ~11.3 k enables, the end of the arbitration; at a 150 MHz equivalent the worst MXU
-  // paths, 720 endpoints within 0.2 ns). TQ 1: ea is a flip-flop, and a beat the grant does not
-  // take waits in a queue of two (tqb), its head what TMEM sees; the grant only pops the queue
-  // (and with it empty takes the beat as it is issued: no extra cycle when TMEM grants every
-  // cycle). ea is the room for one more beat and the word of the read in flight: the epilogue
-  // takes a read's word at the advance after the read's, so it holds there until TMEM has read
-  // it (rd_done) and no replay is pending (a lost read, t_lost: its word comes a replay later).
-  // One read is in flight at a time (the advance that takes its word is the one that issues the
-  // next), so the queue holds at most one, its newest beat. ea's next value comes from the
-  // grant, the queue and t_lost, so the grant ends at a few flip-flops. A command completes once
-  // its beats have all left the queue (c_fin), so a unit that waits on it reads what it wrote.
-  typedef struct packed {
-    logic [LANES-1:0]       ren;
-    logic [LANES-1:0][31:0] raddr;
-    logic [LANES-1:0]       wen;
-    logic [LANES-1:0][31:0] waddr;
-    logic [LANES-1:0][31:0] wdata;
-  } beat_t;
-  beat_t lb, tb;                                 // the epilogue's beat; the beat TMEM sees
-  assign lb.ren = rq_en, lb.raddr = rq_ad, lb.wen = tw_en, lb.waddr = tw_ad, lb.wdata = tw_d;
-  assign t_ren = tb.ren, t_raddr = tb.raddr, t_wen = tb.wen, t_waddr = tb.waddr,
-         t_wdata = tb.wdata;
+  // ---- the TMEM interface. The epilogue gives TMEM, at each advance, the read in the request
+  // register and this cycle's writes; it takes a read's word at the advance after the read's.
+  // TQ 0: the slice grants the MXU's read and write ports as one group, and the epilogue
+  // advances on the grant itself (ea = t_gnt), which reached every register of the epilogue in
+  // the cycle the slice decides it (the m8 card: ~11.3 k enables at the end of the arbitration;
+  // at a 150 MHz equivalent the MXU's worst paths, 720 endpoints within 0.2 ns).
+  // TQ 1 (the slice's MXU_TQ: TMEM_IMPL 3 with replays): the reads are not granted. TMEM reads
+  // what the MXU asks, as the VPU's (a read that loses a RAM is replayed the next cycle, t_lost),
+  // and the grant takes only the writes, which wait for it in a queue of three (s: flip-flops,
+  // the tail written every cycle it is free, so no grant or push reaches their enables; with
+  // the queue empty TMEM takes the writes as they are issued). ea is then a function of
+  // flip-flops, none of which the grant or t_lost reach in the cycle they decide: the room for
+  // one more beat's writes, counted without this cycle's pop (room_q), no replay pending
+  // (lost_q: the lost read's word comes the cycle after its replay), and, with a read in the
+  // request register, no write waiting (tq_z: a read never passes an older write; it is read
+  // with its advance's own writes, as one granted beat was). The request register is TMEM's
+  // read address as it was (no logic before TMEM's lane routing). The grant reaches the queue's
+  // counters only. A command completes once its writes have left the queue (c_fin).
+  assign t_raddr = rq_ad;
   if (TQ) begin : g_tq
-    beat_t tqb [2];
-    logic  tq_h;                                  // the head's slot
-    (* max_fanout = 128 *) logic ea_q;
-    logic  rd_iss, rd_done;                      // the read in flight: issued, read by TMEM
-    wire   byp  = tq_n == 2'd0;                   // the queue empty: TMEM sees the issued beat
-    wire   iss  = ea_q && ((|lb.ren) || (|lb.wen));
-    wire   pop  = !byp && t_gnt;
-    wire   push = iss && !(byp && t_gnt);
-    wire [1:0] tq_nn = tq_n + 2'(push) - 2'(pop);
-    wire   rd_iss_n  = ea_q ? (|lb.ren) : rd_iss;
-    wire   rd_done_n = ea_q ? ((|lb.ren) && byp && t_gnt)
-                            : (rd_done || (rd_iss && pop && (|tqb[tq_h].ren)));
-    assign ea = ea_q;
-    assign tb = byp ? (ea_q ? lb : '0) : tqb[tq_h];
-    always_ff @(posedge clk) begin
-      if (push) tqb[tq_h ^ tq_n[0]] <= lb;
+    typedef struct packed {
+      logic [LANES-1:0]       wen;
+      logic [LANES-1:0][31:0] waddr;
+      logic [LANES-1:0][31:0] wdata;
+    } wbeat_t;
+    wbeat_t     s [3];                           // the waiting writes, a ring
+    wbeat_t     hd;                              // its head
+    logic [1:0] tq_h, tl;                        // the head's slot, the tail's (0..2)
+    (* max_fanout = 64 *) logic room_q, tq_z, lost_q;
+    logic       rq_any;                          // a read in the request register (|rq_en)
+    (* max_fanout = 128 *) wire ea_t = room_q && !lost_q && (tq_z || !rq_any);
+    wire        rd   = room_q && !lost_q && tq_z;  // the request register's read happens now
+    wire        iw   = ea_t && (|tw_en);           // writes issued
+    wire        take = tq_z && t_gnt;              // ... and taken as issued
+    wire        pop  = !tq_z && t_gnt;
+    wire        push = iw && !take;
+    wire [1:0]  tq_nn = tq_n + 2'(push) - 2'(pop);
+    assign ea = ea_t;
+    assign tl = (32'(tq_h) + 32'(tq_n) >= 3) ? 2'(32'(tq_h) + 32'(tq_n) - 3) : tq_h + tq_n;
+    assign hd = s[tq_h];
+    assign t_ren = rq_en & {LANES{rd}};
+    assign t_wen = tq_z ? (ea_t ? tw_en : '0) : hd.wen;
+    assign t_waddr = tq_z ? tw_ad : hd.waddr;
+    assign t_wdata = tq_z ? tw_d : hd.wdata;
+    for (genvar i = 0; i < 3; i++) begin : g_s
+      always_ff @(posedge clk)
+        if (tq_n != 2'd3 && tl == 2'(i)) s[i] <= '{wen: tw_en, waddr: tw_ad, wdata: tw_d};
+    end
+    always_ff @(posedge clk)
       if (rst) begin
-        tq_n <= '0; tq_h <= 1'b0; rd_iss <= 1'b0; rd_done <= 1'b0; ea_q <= 1'b0;
+        tq_n <= '0; tq_h <= '0; tq_z <= 1'b1; room_q <= 1'b0; lost_q <= 1'b0; rq_any <= 1'b0;
       end else begin
         tq_n <= tq_nn;
-        tq_h <= tq_h ^ pop;
-        rd_iss <= rd_iss_n;
-        rd_done <= rd_done_n;
-        ea_q <= (tq_nn <= 2'd1) && (!rd_iss_n || (rd_done_n && !t_lost));
+        tq_z <= tq_nn == 2'd0;
+        if (pop) tq_h <= (tq_h == 2'd2) ? 2'd0 : tq_h + 2'd1;
+        room_q <= 3'(tq_n) + 3'(iw) <= 3'd2;
+        lost_q <= t_lost;
+        if (ea_t) rq_any <= |t_ren_c;
       end
-    end
 `ifndef SYNTHESIS
-    // TMEM's replay flag, as the MXU sees it (t_lost registered)
-    logic rpv_q;
-    always_ff @(posedge clk) rpv_q <= !rst && t_lost;
+    bit rst_seen;                                // (registers start arbitrary)
+    initial rst_seen = 1'b0;
+    always @(posedge clk) if (rst) rst_seen <= 1'b1;
     always @(posedge clk)
-      if (!rst) begin
-        if (push && tq_n == 2'd2) $fatal(1, "otpu_mxu: TMEM beat queue overflow");
-        if (ea_q && rd_iss && !(rd_done && !rpv_q))
-          $fatal(1, "otpu_mxu: advance before the read's word is there");
-        if (push && (|lb.ren) && tq_n != 2'd0 && (|tqb[tq_h].ren))
-          $fatal(1, "otpu_mxu: two reads in flight");
+      if (!rst && rst_seen) begin
+        if (push && tq_n == 2'd3) $fatal(1, "otpu_mxu: TMEM write queue overflow");
+        if (rq_any != (|rq_en)) $fatal(1, "otpu_mxu: rq_any is not the request register's");
+        if (tq_z != (tq_n == 2'd0)) $fatal(1, "otpu_mxu: tq_z is not the queue's");
+        if ((|t_ren) && !tq_z) $fatal(1, "otpu_mxu: a read passes a waiting write");
+        // TMEM loses only a read the MXU asked this cycle or its replay
+        if (t_lost && !(|t_ren) && !lost_q) $fatal(1, "otpu_mxu: TMEM lost a read not asked");
       end
 `endif
   end else begin : g_ng
     assign ea = t_gnt;
-    assign tb = lb;
-    assign tq_n = '0;
+    assign t_ren = rq_en, t_wen = tw_en, t_waddr = tw_ad, t_wdata = tw_d;
+    assign tq_n = '0;              // (a lost read: the slice holds the grant for its replay)
   end
 
   // ASCALE factors: alpha takes the words every cycle they are there (al_st 3), not only at the
-  // grant that moves al_st on. TMEM holds the MXU's read data until its next grant (r1's xo takes
-  // it there too) and al_i moves only with the grant, so after that grant alpha is what it was;
-  // alpha is read (alr) only with the grant, and no ASCALE row is in r0 while it loads (drain_go
+  // advance that moves al_st on. TMEM holds the MXU's read data until its next read (r1's xo
+  // takes it there too; TQ: a lost read's lanes are wrong for a cycle, and the replay's word is
+  // there by the advance) and al_i moves only with the advance, so after it alpha is what it was;
+  // alpha is read (alr) only with the advance, and no ASCALE row is in r0 while it loads (drain_go
   // waits for al_st 2). Its MCOLS x 32 enables are off the grant's fan-out (the m8 card at a 150
   // MHz equivalent: 90 of the grant net's 127 failing endpoints). One write per entry (a constant
   // index): a variable-index write of several lanes makes Vivado try, and crash while
