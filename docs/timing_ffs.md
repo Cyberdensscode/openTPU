@@ -37,7 +37,8 @@ cut the MXU from TMEM, within 1% of the cycles) the MXU's TMEM interface.
   its writes, from a ring of three, and the epilogue advances on four flip-flops. The five
   co-simulations move by at most +0.004%. At the 150 MHz equivalent: core -0.202 -> **-0.057
   ns**, failing endpoints 820 -> 141, TNS -40 -> -2.5 ns, the clock crossings positive, ~145 ->
-  **~149 MHz**. A first version that queued the read with the writes behind a registered advance
+  **~149 MHz**; at 133.33 MHz the card meets timing with Vivado's default implementation (core
+  +0.012 ns, every clock positive). A first version that queued the read with the writes behind a registered advance
   was worse (-0.489 ns): the grant's fanout only moved, onto 118 replicas, and the queue put a
   LUT RAM read in front of TMEM's read address.
 - **On the ASIC the gain is in the flow, not the RTL.** The card's timing repair never ran: CTS's
@@ -439,7 +440,16 @@ the pumped RAMs' addresses +0.108 ns, -0.122 in b_t6_150; into the VPU's hold no
 and the DSP outputs (-0.057: arithmetic), the MXU's ACT RAM read control `ck` (-0.044), the
 VPU's enable copies (-0.044: 0 levels, 2,702 loads, placement), TMEM's read selection into the
 VPU's hold from the MXU's `room_q` (-0.041, 12 levels: `t_ren` is one LUT of flip-flops), the
-sequencer's start (-0.028), the quantizer (-0.026). A copy of `rpv` per bank (for the asker
+sequencer's start (-0.028), the quantizer (-0.026).
+
+**At 133.33 MHz without the production strategy** (`b_t9_def`, as `b_t6_def` in section 6):
+**timing met**, every clock: core +0.012 ns (b_t6_def -0.026 at one endpoint, the MXU's `mxm`
+into TMEM's `rpv`), clk2x +0.078 (+0.420), the crossings +0.093 / +0.025 (+0.111 / +0.066),
+`userclk1` +0.052 (+0.040), hold +0.002; 177,872 LUTs (181,260), slices 79.6% (81.0%). The card
+then closes its clock with Vivado's default implementation, without r22's ECO or the production
+strategy.
+
+A copy of `rpv` per bank (for the asker
 multiplexers, ranks, data select and lanes; TMEM's tests pass with it) was prepared for the
 `rpv` classes and is not committed: in b_t9_150 they pass.
 
