@@ -4,8 +4,9 @@ The question (2026-10-16): the card's clock is limited by route delay, not by lo
 flip-flops fix it, and what else in the flow can improve? This is the exploration's record: where
 the delay is (the FPGA card, the ASIC card), what the tools do alone, three batches of
 cycle-exact register copies (branch `worktree-timing-ffs`), FPGA builds at 133.33 MHz and at a
-150 MHz equivalent, the ASIC flow's timing repair, and (the follow-up question: reduce the
-fanout) a census of what the card's nets fan out to and the batches that cut it.
+150 MHz equivalent, the ASIC flow's timing repair, (the follow-up question: reduce the
+fanout) a census of what the card's nets fan out to and the batches that cut it, and (the third:
+cut the MXU from TMEM, within 1% of the cycles) the MXU's TMEM interface.
 
 **Short answer.**
 - **On the FPGA, flip-flops help where the long wire carries a register that is already a cycle
@@ -30,7 +31,15 @@ fanout) a census of what the card's nets fan out to and the batches that cut it.
   and late pushes off LUT RAM write enables: at the 150 MHz equivalent the failing endpoints go
   2,066 -> 820, TNS -177 -> -40 ns, the clock it reaches ~140 -> ~145 MHz, for 7.9 k fewer LUTs
   and 90 more block RAM tiles. A second level of the VPU's enable copies did not help (reverted).
-  The MXU's TMEM grant (11.3 k enables) is what is left, and it needs a protocol change.
+  The MXU's TMEM grant (11.3 k enables) was what was left.
+- **The MXU's grant is off its epilogue, at no cost in cycles** (section 7). On the card TMEM
+  replays any lost read, so the MXU's reads no longer wait for the grant; the grant takes only
+  its writes, from a ring of three, and the epilogue advances on four flip-flops. The five
+  co-simulations move by at most +0.004%. At the 150 MHz equivalent: core -0.202 -> **-0.057
+  ns**, failing endpoints 820 -> 141, TNS -40 -> -2.5 ns, the clock crossings positive, ~145 ->
+  **~149 MHz**. A first version that queued the read with the writes behind a registered advance
+  was worse (-0.489 ns): the grant's fanout only moved, onto 118 replicas, and the queue put a
+  LUT RAM read in front of TMEM's read address.
 - **On the ASIC the gain is in the flow, not the RTL.** The card's timing repair never ran: CTS's
   repair saw only ports (it runs before their clock latency is set), and the global route's
   `repair_design` does not finish on 2.5 M nets. With the global route's repair as
@@ -218,6 +227,8 @@ detailed routing has not been run on the card.
   enables in the cycle they are decided (8 levels, the worst core path of main's 150 MHz
   equivalent, -0.70 ns). A registered grant moves the decision a cycle ahead of its use: the unit
   must hold its request's data a cycle longer or take a skid buffer of the cycle's beats.
+  Section 7 does it for the MXU: its reads off the grant (TMEM replays them), its writes in a
+  ring the grant pops.
 - **Cross-unit arbitration (C).** The TMEM's read selection takes every reader's address and
   enable in the cycle they are formed (10-13 levels; the MXU's `t_raddr` / `t_ren`, the TMEM's
   `rpv`): a request register in each reader costs a cycle of read latency and the arbiter's view
@@ -336,19 +347,119 @@ popped one per granted cycle, so the requests TMEM sees stay the same cycles), o
 grant. The quantizer's enable (8,254) is on no failing path. The remaining LUT RAMs are the
 channel bridges' FIFOs (asynchronous: their reads cross clocks, so a block RAM there is a CDC
 change) and the native adapter's A response RAM (read at `ra_h + drop`, two registers' sum).
+Section 7 takes the grant off the epilogue.
 
-## 7. Next
+## 7. The MXU and TMEM: the grant off the epilogue (TQ)
+
+The question (the third): cut the MXU from TMEM's arbitration, at a cost of at most 1% of the
+cycles. The slice grants the MXU's TMEM read and write ports as one group, and the MXU's epilogue
+(the drain's lanes, the read-modify-write's fmadd and delay lines, RMAX, the ASCALE loads)
+advanced on that grant: 10,783 enables in the census, decided in the cycle they are used. On the
+card the grant is `gnt_m` (ARB_MASK, which TMEM_IMPL 3 with replays requires): every group's write
+banks against those before it, and a group held while its port replays a lost read. So the
+MXU's enables hung at the end of the other units' write requests: in b_t6_150 the VPU's write
+buffer head (`hrot`) into the MXU, 720 endpoints at -0.138 ns, and the DMA's `t_wen`, 176 at
+-0.063.
+
+**A first version (72cbb745), measured and replaced.** `ea`, the epilogue's advance, became a
+flip-flop; a beat (the read in the request register and the cycle's writes) the grant did not take
+waited in a queue of two, with a bypass when it was empty; `ea_q`'s next value came from the
+grant, the queue and `t_lost`. The co-simulations stayed within 0.05% and every test passed,
+but b_t8_150 came out worse everywhere: core -0.489 ns, 5,236 failing, TNS -858. Three things
+did it, each in the path report. The grant's fanout moved instead of going away: `ea_q`
+(`max_fanout` 128) became 118 replicas, and their D net, 120 loads, hung at the end of the
+arbitration (the grant arrives at 9.3 ns of 10.46). The queue (2 x 784 bits) became LUT RAM,
+and TMEM's read address came out of its read at `tq_h`: +1.1 ns in front of TMEM's conflict
+logic, into `lost` and on to the VPU's hold (-0.485 ns) and into the pumped RAMs' addresses
+(-0.186, 604 endpoints). And the push, from the comb write beat and the grant, enabled every
+queue flip-flop (1,643 endpoints, -0.487). The lesson: the grant may reach only a few
+flip-flops, and nothing may go in front of TMEM's read address (b_t6_150: the MXU's `t_raddr`
+into TMEM at -0.117 and +0.010 ns). With the read inside the granted beat, a read the grant does
+not take must be held, either by the request register changing on the grant (its fanout again)
+or by a multiplexer in front of the address.
+
+**The interface (9b6279fc, TQ; the slice's `MXU_TQ`: TMEM_IMPL 3 with replays).** TMEM already
+replays any port's lost read (`RPLM`; its age logic counts the MXU among the replaying askers):
+only the slice's grant had kept the MXU's reads behind the writes' arbitration. Now:
+- TMEM reads what the MXU asks, at an advance (`r_en[P_MXU]` not gated by the grant, as the
+  VPU's reads); a read that loses a RAM is replayed and the slice holds the MXU's grant for it,
+  as before. TMEM's read address is the request register itself (`rq_ad`), as release r2 built
+  it.
+- The grant takes only the writes, from a ring of three slots of flip-flops written every cycle
+  the tail is free (their enables from the counters' registers), with the writes taken as issued
+  when the ring is empty.
+- `ea = room_q && !lost_q && (tq_z || !rq_any)`, all flip-flops: the room for one more cycle's
+  writes counted without this cycle's pop (the third slot makes that cost nothing), no replay
+  pending (`lost_q`: the lost read's word comes the cycle after its replay), and with a read in
+  the request register an empty ring (a read never passes an older write; it is read with its
+  advance's own writes, as one granted beat was). The grant ends at the ring's counters, `t_lost`
+  at `lost_q`.
+
+TQ is 0 (the grant as the enable) for every other TMEM: their grant decides reads (IMPL 1's
+copies serve the port granted) or never replays them. Checks: in simulation, the ring's overflow,
+`rq_any` and `tq_z` against what they summarize, no read with a write waiting, no loss of a read
+not asked; `tests/test_target.py` pins the structure (the grant only in `take` / `pop`, `t_lost`
+only into `lost_q`, `ea`'s four inputs, `t_raddr = rq_ad`, the slots' enables, the slice's
+ungated read). test_rtl's fuzzers run the default TMEM, where TQ is 0, so the card's TMEM got
+its own sweep: test_rtl's random programs (20) and a variant heavy on MXU reads (40: MMs of a
+few shapes, three in four accumulating, VPU ops alongside) on R2_TMEM and R2_ARB, against the
+ISA model: 11,891 MXU reads, 463 of them lost and replayed, all the ISA's. test_rtl 176 passed,
+1 skipped; the other RTL groups 327 passed, 10 skipped (slow only).
+
+**Cycles** (the five co-simulations, the m8 card's uarch):
+
+| co-simulation | before (b_t6's RTL) | first version (72cbb745) | TQ (9b6279fc) |
+|---|---|---|---|
+| tile, Qwen3.5-0.8B 4 layers | 950,732 | 950,732 | 950,771 (+0.004%) |
+| Qwen3.5-0.8B decode at 544 | 2,539,392 | 2,538,200 | 2,537,235 (-0.08%) |
+| Qwen3-0.6B decode at 544 | 1,617,739 | 1,617,971 | 1,617,480 (-0.02%) |
+| Qwen3-0.6B decode at 1800 | 1,708,259 | 1,707,951 | 1,707,656 (-0.04%) |
+| Qwen3.5-35B-A3B MoE step at 544 | 4,489,345 | 4,489,345 | 4,489,345 |
+
+The epilogue no longer stops for a withheld write grant (the ring takes the writes), and a read
+waits for an empty ring instead; net, no run moves by more than +0.004% (the 1% budget was not
+needed).
+
+**FPGA at the 150 MHz equivalent** (section 3's recipe):
+
+| build | b_t6_150 (8bf19b12) | b_t8_150 (first version) | **b_t9_150 (TQ)** |
+|---|---|---|---|
+| core -> core WNS, failing, TNS | -0.202 ns, 732, -35.7 | -0.489, 5,236, -858 | **-0.057, 140, -2.5** |
+| core -> clk2x / clk2x -> core | -0.122 / -0.003 | -0.205 / -0.190 | **+0.021 / +0.065** |
+| clk2x -> clk2x | -0.050 | -0.110 | +0.050 |
+| failing endpoints, all clocks | 820 | 5,601 | **141** (1: the PCIe block's `userclk1`) |
+| endpoints within +0.2 ns | 6,400 | 12,075 | 2,509 |
+| reaches | 6.910 ns, 144.7 MHz | 7.156 ns, 139.7 MHz | **6.724 ns, 148.7 MHz** |
+| LUTs / flip-flops | 178,168 / 171,043 | 179,729 / 171,844 | 178,141 / 171,987 |
+| block RAM tiles, slices | 526.5, 86.95% | 526.5, 87.01% | 526.5, 86.94% |
+
+The grant's classes are gone, the clock crossings pass, and TMEM's `rpv` paths with them (into
+the pumped RAMs' addresses +0.108 ns, -0.122 in b_t6_150; into the VPU's hold no longer within
+0.2 ns, -0.202). What is left within 0.06 ns: the MXU's fmadd adder (`g_rmw` `u_y`, 10 levels)
+and the DSP outputs (-0.057: arithmetic), the MXU's ACT RAM read control `ck` (-0.044), the
+VPU's enable copies (-0.044: 0 levels, 2,702 loads, placement), TMEM's read selection into the
+VPU's hold from the MXU's `room_q` (-0.041, 12 levels: `t_ren` is one LUT of flip-flops), the
+sequencer's start (-0.028), the quantizer (-0.026). A copy of `rpv` per bank (for the asker
+multiplexers, ranks, data select and lanes; TMEM's tests pass with it) was prepared for the
+`rpv` classes and is not committed: in b_t9_150 they pass.
+
+## 8. Next
 
 - The FPGA: a real build above 133.33 MHz needs an even MMCM divide for CLK2X, which
   `bd_native.tcl`'s fixed 800 MHz VCO (50 MHz x 16) does not have; a VCO parameter would (850
-  MHz, M 17: core 141.7 / clk2x 283.3 MHz; 900 MHz, M 18: 150 / 300); then the protocol changes
-  below. Land the narrow copies and the fanout batches (through 8bf19b12; 0c0b16c8 is reverted)
+  MHz, M 17: core 141.7 / clk2x 283.3 MHz; 900 MHz, M 18: 150 / 300). b_t9_150 reaches ~148.7
+  MHz at the 150 MHz equivalent, so 141.7 MHz is the next real build to try. Land the narrow
+  copies, the fanout batches (through 8bf19b12; 0c0b16c8 is reverted) and the MXU's TQ (9b6279fc)
   on main for the card, and drop r22's ECO from its recipe.
 - The ASIC: run the card's flow (both hooks are its default now) through detailed routing, with
   the clock at 2.0 ns rather than a margin (the global route's 2.0 ns is on the guides'
   parasitics); put the copies behind a target parameter (FPGA on, ASIC off); at 2.0 ns the VPU's
   floating-point stages are next (a deeper `LM` / `LA` moves no logic without retiming,
   docs/asic.md).
-- The protocol changes of section 5, in the order of their endpoints at the 150 MHz equivalent:
-  the MXU's registered grant / stage enable, the TMEM read request stage, the sequencer's
-  dispatch-order queue.
+- The protocol changes of section 5: the MXU's grant is off its epilogue (section 7). At
+  b_t9_150's -0.06 ns what is left is mostly arithmetic (the MXU's fmadd adder, the DSP outputs)
+  and placement (the VPU's enable copies). TMEM's read selection into the VPU's hold is at
+  -0.041 ns from the MXU's `room_q`; if it leads again, `t_ren` can be a register of its own
+  (its next value from the grant and `t_lost`, eight flip-flops), and `rpv` a copy per bank
+  (section 7: about 30 lines in `otpu_tmem`'s IMPL 3 block). Then the sequencer's dispatch-order
+  queue.
