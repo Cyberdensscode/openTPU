@@ -584,6 +584,11 @@ module otpu_seq
   logic [VN-1:0]    vpend [WIN];              // a slot's VPU producers still outstanding
   logic [VIW-1:0]   vix [WIN];                // a VPU slot's index mod VN
   logic [VN-1:0]    v_fin;                    // the VPU's completion this cycle (index mod VN)
+  // vout at the next VPU instruction's index VMW back (wd_n + 1 mod VN), a flip-flop loaded with
+  // its next value (vout's, at wd_n's next): wc_hold, so the dispatch (c_go -> P -> R's advance
+  // -> the loop counters' enables, pc) starts at it, not at a 32:1 select of vout by wd_n (the m8
+  // card at 150 MHz: vout -> wc_hold -> c_go -> stk_rem's enables, 9 levels, -0.063 ns)
+  logic             vnx_q;
   logic [CW-1:0]    wt [WIN][NWT];
   logic [NWT-1:0]   wv [WIN];
   logic [WIN-1:0]   w_all, w_dram;            // the slot's waits (all / the stream's) are met
@@ -619,7 +624,7 @@ module otpu_seq
   always_comb begin
     v_fin = '0;
     if (udone[U_VPU]) v_fin[vix[uq[U_VPU][uq_h[U_VPU][SW-1:0]]]] = 1'b1;
-    wc_hold = WAITC && c_unit == U_VPU && vout[VIW'(wd_n[U_VPU] + 1'b1)];
+    wc_hold = WAITC && c_unit == U_VPU && vnx_q;
 `ifndef SYNTHESIS
     if (wc_vg != VMW) begin
       wc_hold = 1'b0;
@@ -629,6 +634,14 @@ module otpu_seq
     end
 `endif
   end
+`ifndef SYNTHESIS
+  bit vnx_seen;                                // a reset seen (registers start arbitrary)
+  initial vnx_seen = 1'b0;
+  always @(posedge clk) if (rst) vnx_seen <= 1'b1;
+  always @(posedge clk)
+    if (WAITC && !rst && vnx_seen && vnx_q != vout[VIW'(wd_n[U_VPU] + 1'b1)])
+      $fatal(1, "otpu_seq: vnx_q %0d is not vout[%0d]", vnx_q, VIW'(wd_n[U_VPU] + 1'b1));
+`endif
   always_comb
     for (int i = 0; i < WIN; i++) begin
       logic [NWT-1:0] ok;
@@ -899,6 +912,7 @@ module otpu_seq
       for (int u = 0; u < NUNITS; u++) begin uq_h[u] <= '0; uq_t[u] <= '0; end
       for (int u = 0; u < NUNITS; u++) begin wd_n[u] <= '0; wc_n[u] <= '0; end
       vout <= '0;
+      vnx_q <= 1'b0;
       for (int i = 0; i < WIN; i++) sdep[i] <= '0;
 `ifndef SYNTHESIS
       sdone <= '0;
@@ -1016,6 +1030,13 @@ module otpu_seq
         for (int u = 0; u < NUNITS; u++) if (udone[u] && u != U_VPU) wc_n[u] <= wc_n[u] + 1'b1;
         vout <= (vout & ~v_fin) |
                 ((c_go && c_unit == U_VPU) ? VN'(1) << wd_n[U_VPU][VIW-1:0] : '0);
+        // (a VPU dispatch sets bit wd_n and moves wd_n on: the next index's bit is wd_n + 2's)
+        begin
+          logic [VIW-1:0] i1, i2;
+          i1 = VIW'(wd_n[U_VPU] + 1'b1);
+          i2 = VIW'(wd_n[U_VPU] + 2'd2);
+          vnx_q <= (c_go && c_unit == U_VPU) ? vout[i2] && !v_fin[i2] : vout[i1] && !v_fin[i1];
+        end
         for (int i = 0; i < WIN; i++) vpend[i] <= vpend[i] & ~v_fin;
       end
       // readiness (for the profiler: when did the dependencies clear)
