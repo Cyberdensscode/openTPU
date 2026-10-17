@@ -659,7 +659,11 @@ def test_the_real_150_mhz_paths_start_at_flip_flops():
     a host port of the pumped TMEM (no bypass) selects its lanes' words by {bank, RAM}, one select
     from the RAMs' outputs with its index from flip-flops. The MXU's drained test (c_left == 0, a
     32-bit compare of a 136-load register into the drain lanes' enables, -0.080) is a flip-flop
-    (c_lz). The sequencer's command copies load on the unit's readiness, not its start decode."""
+    (c_lz). The sequencer's command copies load on the unit's readiness, not its start decode.
+    The MXU's read reaches TMEM by bank from its flip-flops (otpu_tmem PBR: rb_q / rb_a, decoded
+    before the registers), not through the lanes' bank decode in front of TMEM's compares (r150c:
+    rq_ad -> the decode -> the compares -> lost_q, 11 levels, -0.007 ns). TMEM's replay flag rpv
+    is kept once per bank (rpvb) for each bank's asker multiplexers, replay loads and data select."""
     def src(p):
         return re.sub(r"//.*", "", (ROOT / p).read_text())
     tm = src("rtl/mem/otpu_tmem.sv")
@@ -670,6 +674,18 @@ def test_the_real_150_mhz_paths_start_at_flip_flops():
     assert not re.search(r"c_left\s*[!=]=\s*0\b", mxu.split("`ifndef SYNTHESIS")[0])
     seq = src("rtl/seq/otpu_seq.sv")
     assert "wire q_en = urdy[u] && !ustart[u];" in seq
+    # the MXU's read by bank: TMEM takes a PBR port's banks as they come, the MXU gives registers
+    assert "b_en = r_ben[p];" in tm and "b_a[b] = r_bad[p][b][BW +: IW];" in tm
+    tq = mxu[mxu.index("if (TQ) begin : g_tq"):mxu.index("end else begin : g_ng")]
+    assert "assign t_rben = rb_q;" in tq and "assign t_rbad = rb_a;" in tq
+    assert re.search(r"always_ff @\(posedge clk\) if \(!rst && ea_t\) rb_a <= bk_ad\(t_raddr_c, t_ren_c\);", tq)
+    assert re.search(r"rb_q <= \(ea_t \? bk_en\(t_raddr_c, t_ren_c\) : rb_v\) &", tq)
+    sl = src("rtl/top/otpu_slice.sv")
+    assert ".PBR(MXU_TQ ? NRP'(1) << P_MXU : '0)" in sl and ".TLANES(LANES)" in sl
+    assert re.search(r"rb_t = \(.*off\[P_MXU\]\) \? '0 : mxu_rben;", sl)
+    assert '(* keep = "true" *) logic [NRP-1:0][LANES-1:0] rpvb;' in tm
+    assert "wire rpb = rlive(i) && rpvb[i][b];" in tm and "assign aa[i][b] = rpb ? rpa[i][b] : qa[i][b];" in tm
+    assert "if (!rpvb[p][b]) begin rpe[p][b] <= qe[p][b];" in tm and "if (RPL && rpvb[p][b] && rpe[p][b])" in tm
 
 
 def test_config_summary_names_the_target(no_env):

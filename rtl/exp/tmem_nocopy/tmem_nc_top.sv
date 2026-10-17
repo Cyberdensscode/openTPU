@@ -252,7 +252,7 @@ module tmem_nc_top #(
   if (VAR == 6) begin : g_p3
     otpu_tmem_pump #(.WORDS(WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .GEN_R(GEN_R),
                      .GEN_W(GEN_W), .SH_HOST(P_DMA), .SH_MASK(SH_MASK), .IMPL(0)) u_tmem (
-      .clk(ck), .clk_f(ck_f), .r_en, .r_req(rq_t), .r_addr, .r_data, .w_en, .w_req(wq_en), .w_gnt,
+      .clk(ck), .clk_f(ck_f), .r_en, .r_req(rq_t), .r_addr, .r_ben('0), .r_bad('0), .r_data, .w_en, .w_req(wq_en), .w_gnt,
       .w_addr, .w_data);
     assign tm_bx = '0;
     assign tm_bs = '0;
@@ -264,7 +264,7 @@ module tmem_nc_top #(
                 .IMPL(VAR == 0 ? 0 : 3), .PRANK(PRANK3), .NSB(NSB), .SBP(SBP), .GRP(RGRP),
                 .SBH(SBH), .RPL(VAR == 4 || VAR == 5 || VAR == 7), .RPLM(~(NRP'(1) << P_COLL)), .TOPP(P_DMA),
                 .TDP(VAR == 5 || VAR == 7), .SIDE(TM_SIDE), .GST(GST), .PMP(VAR == 7 ? 1 : 0)) u_tmem (
-      .clk(ck), .clk_f(ck_f), .r_en, .r_req(rq_t), .r_addr, .r_data, .w_en, .w_req(wq_en), .w_gnt, .w_addr,
+      .clk(ck), .clk_f(ck_f), .r_en, .r_req(rq_t), .r_addr, .r_ben('0), .r_bad('0), .r_data, .w_en, .w_req(wq_en), .w_gnt, .w_addr,
       .w_data, .blk_x(tm_bx), .blk_s(tm_bs), .lost(tm_lost), .frz(tm_frz), .dump(1'b0));
   end
 endmodule

@@ -389,6 +389,11 @@ module otpu_slice
   logic [NRP-1:0]                  tm_lost, tm_frz;               // TMEM_IMPL 3, TMEM_RPL
   logic [NRP-1:0][LANES-1:0]       rq_t;
   logic [NRP-1:0][LANES-1:0][31:0] r_addr, r_data;
+  // the MXU's read by bank (MXU_TQ: otpu_tmem PBR, from the MXU's flip-flops), held as rq_t is
+  logic [LANES-1:0]                mxu_rben, rb_t;
+  logic [LANES-1:0][31:0]          mxu_rbad;
+  logic [NRP-1:0][LANES-1:0]       r_ben;
+  logic [NRP-1:0][LANES-1:0][31:0] r_bad;
   logic [NWP-1:0][LANES-1:0]       wq_en, w_en;
   logic [NWP-1:0][LANES-1:0][31:0] w_addr, w_data;
   logic [NWP-1:0]                  w_gnt;   // each write port's grant (the DMA always writes)
@@ -401,6 +406,7 @@ module otpu_slice
   // the units (each a cycle after it forms), so both move a cycle and the order holds.
   otpu_tmem #(.WORDS(TMEM_WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .WPB(WPB),
               .GEN_R(NRP'(1) << P_MXU), .GEN_W(NWP'(1) << W_MXU),
+              .PBR(MXU_TQ ? NRP'(1) << P_MXU : '0),
               .SH_HOST(P_DMA),
               .SH_MASK((TMEM_IMPL == 2) ? '0 : (NRP'(1) << P_Q3) | (NRP'(1) << P_COLL)),
               .SID(SID), .IMPL((TMEM_IMPL == 2) ? 0 : TMEM_IMPL), .NCP(NCP), .CPY(CPY), .RQ(TMEM_RQ),
@@ -408,8 +414,12 @@ module otpu_slice
               .GRP(RGRP), .SBH(TMEM_SBH), .RPL(TMEM_RPL), .RPLM(~(NRP'(1) << P_COLL)),
               .TOPP(P_DMA), .TDP(TMEM_TDP), .SIDE(TM_SIDE), .GST(TMEM_GST),
               .PMP(TMEM_PMP), .IQ(1'b1)) u_tmem (
-    .clk, .clk_f, .r_en, .r_req(rq_t), .r_addr, .r_data, .w_en, .w_req(wq_en), .w_gnt, .w_addr,
-    .w_data, .blk_x(tm_bx), .blk_s(tm_bs), .lost(tm_lost), .frz(tm_frz), .dump);
+    .clk, .clk_f, .r_en, .r_req(rq_t), .r_addr, .r_ben, .r_bad, .r_data, .w_en, .w_req(wq_en),
+    .w_gnt, .w_addr, .w_data, .blk_x(tm_bx), .blk_s(tm_bs), .lost(tm_lost), .frz(tm_frz), .dump);
+  always_comb begin
+    r_ben = '0; r_bad = '0;
+    r_ben[P_MXU] = rb_t; r_bad[P_MXU] = mxu_rbad;
+  end
   assign coll_rdata = r_data[P_COLL];
   // the units' TMEM requests
   logic [LANES-1:0]        dma_ren, dma_wen, va_ren, vb_ren, v_wen;
@@ -499,7 +509,7 @@ module otpu_slice
     .ss_y_v, .ss_y_d, .ss_o_v, .ss_o_d);
 
   otpu_mxu #(.D(D), .MCOLS(MCOLS), .ROWS(ACT_ROWS), .DEPTH(FIFO_DEPTH), .LANES(ULANES), .IMPL(MXU_IMPL),
-             .CL(MXU_CL), .E(MXU_E), .TQ(MXU_TQ), .SID(SID)) u_mxu (
+             .CL(MXU_CL), .E(MXU_E), .TQ(MXU_TQ), .SID(SID), .TLANES(LANES)) u_mxu (
     .clk, .rst(rst_mxu), .start(ustart[U_MXU]), .go(urel), .cmd(ucmd[U_MXU]), .rdy(r_mxu), .done(d_mxu),
     .computing(mxu_pop), .pf_level(mxu_level), .pf_starve(mxu_starve), .pf_block(mxu_block),
     .pf_u(mxu_u), .pf_uv(mxu_uv),
@@ -509,7 +519,7 @@ module otpu_slice
     .b_rdata(b_rdata_i),
     .t_ren(mxu_ren), .t_raddr(mxu_raddr), .t_rdata(r_data[P_MXU][ULANES-1:0]),
     .t_wen(mxu_wen), .t_waddr(mxu_waddr), .t_wdata(mxu_wdata), .t_gnt(gnt[G_MXU]),
-    .t_lost(tm_lost[P_MXU]));
+    .t_lost(tm_lost[P_MXU]), .t_rben(mxu_rben), .t_rbad(mxu_rbad));
 
   // the quantizer's group maxes of a row (MX offsets; not ROW mode): a QACT's 4 KB (KB <=
   // ACT_BLOCKS: the ACT RAM's bound) and a QST's KB (its row in TMEM: KB <= TMEM_WORDS / D), so
@@ -726,6 +736,7 @@ module otpu_slice
     if (TMEM_IMPL == 3 && TMEM_RPL && coll_blk) off[P_COLL] = 1'b1;
     for (int p = 0; p < NRP; p++)
       rq_t[p] = ((TMEM_IMPL == 3 && !TMEM_RPL && tm_sv[p]) || off[p]) ? '0 : rq_en[p];
+    rb_t = ((TMEM_IMPL == 3 && !TMEM_RPL && tm_sv[P_MXU]) || off[P_MXU]) ? '0 : mxu_rben;
   end
   logic [NG-1:0] gs3;
   always_comb begin

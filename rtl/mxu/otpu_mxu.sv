@@ -51,6 +51,7 @@ module otpu_mxu
   parameter int ROWS  = MCOLS,   // ACT RAM rows: the most stationary rows of a command
   parameter int DEPTH = 16,
   parameter int LANES = 8,       // TMEM banks (the drain's lanes write distinct banks)
+  parameter int TLANES = LANES,  // TMEM's banks (t_rben; its lanes, at least LANES)
   parameter int IMPL  = 2,       // the dot product: 2 systolic (the only one; CFG_UARCH reports it)
   parameter int CL    = 16,      // products per cascade chain (at most D/8)
   parameter int E     = 0,       // epilogue lanes (0: MCOLS / 2, at least 1; more than MCOLS: MCOLS)
@@ -100,7 +101,11 @@ module otpu_mxu
   output logic [LANES-1:0][31:0]  t_waddr,
   output logic [LANES-1:0][31:0]  t_wdata,
   input  logic                    t_gnt,
-  input  logic                    t_lost      // TQ: this cycle's read (or its replay) lost (replayed)
+  input  logic                    t_lost,     // TQ: this cycle's read (or its replay) lost (replayed)
+  // the read by TMEM bank (TLANES banks): bank b's enable and the address of the lane reading it
+  // (t_ren / t_raddr's lanes merged per bank, as otpu_tmem's crossbar does; TQ: registers)
+  output logic [TLANES-1:0]       t_rben,
+  output logic [TLANES-1:0][31:0] t_rbad
 );
   localparam int BW = $clog2(LANES);
   localparam int PW = $clog2(DEPTH);
@@ -1262,6 +1267,24 @@ module otpu_mxu
   // read address as it was (no logic before TMEM's lane routing). The grant reaches the queue's
   // counters only. A command completes once its writes have left the queue (c_fin).
   assign t_raddr = rq_ad;
+  // a read's lanes by TMEM bank (bank b: the lane whose address's low bits are b; lanes of one
+  // read hit distinct banks or read one word, so the AND-OR merge is exact): otpu_tmem's crossbar
+  localparam int TBW = (TLANES > 1) ? $clog2(TLANES) : 1;
+  initial if (TLANES < LANES) $fatal(1, "otpu_mxu: TLANES %0d < LANES %0d", TLANES, LANES);
+  function automatic logic [TLANES-1:0] bk_en(input logic [LANES-1:0][31:0] ad,
+                                              input logic [LANES-1:0] en);
+    bk_en = '0;
+    for (int b = 0; b < TLANES; b++)
+      for (int l = 0; l < LANES; l++)
+        if (en[l] && (TLANES == 1 || ad[l][TBW-1:0] == TBW'(b))) bk_en[b] = 1'b1;
+  endfunction
+  function automatic logic [TLANES-1:0][31:0] bk_ad(input logic [LANES-1:0][31:0] ad,
+                                                    input logic [LANES-1:0] en);
+    bk_ad = '0;
+    for (int b = 0; b < TLANES; b++)
+      for (int l = 0; l < LANES; l++)
+        if (en[l] && (TLANES == 1 || ad[l][TBW-1:0] == TBW'(b))) bk_ad[b] = bk_ad[b] | ad[l];
+  endfunction
   if (TQ) begin : g_tq
     typedef struct packed {
       logic [LANES-1:0]       wen;
@@ -1290,6 +1313,17 @@ module otpu_mxu
     // lost_q: in a replay's cycle the read stays up and the slice does not read it (rpl_frz, as
     // lost_q a register of TMEM's lost); the epilogue does not advance then, and reads it after
     assign t_ren = t_ren_q;
+    // ... and by bank (t_rben / t_rbad, otpu_tmem PBR) from flip-flops too, decoded before the
+    // registers from their next values (rb_v / rb_a: the request register's banks and their
+    // lanes' addresses, loaded with rq_ad; rb_q: t_ren_q's banks), so TMEM's ranks, conflict
+    // compares and block RAM addresses start at flip-flops, not at the lanes' bank decode (r150c,
+    // the m8 card at a real 150 MHz: rq_ad -> the decode -> TMEM's compares -> lost_q, 11 levels,
+    // -0.007 ns; rq_ad and rpv -> the decode -> the pumped RAMs' read pins, +0.03 to +0.04)
+    logic [TLANES-1:0]       rb_v, rb_q;
+    logic [TLANES-1:0][31:0] rb_a;
+    assign t_rben = rb_q;
+    assign t_rbad = rb_a;
+    always_ff @(posedge clk) if (!rst && ea_t) rb_a <= bk_ad(t_raddr_c, t_ren_c);
     assign t_wen = tq_z ? (ea_t ? tw_en : '0) : hd.wen;
     assign t_waddr = tq_z ? tw_ad : hd.waddr;
     assign t_wdata = tq_z ? tw_d : hd.wdata;
@@ -1300,7 +1334,7 @@ module otpu_mxu
     always_ff @(posedge clk)
       if (rst) begin
         tq_n <= '0; tq_h <= '0; tq_z <= 1'b1; room_q <= 1'b0; lost_q <= 1'b0; rq_any <= 1'b0;
-        t_ren_q <= '0;
+        t_ren_q <= '0; rb_v <= '0; rb_q <= '0;
       end else begin
         tq_n <= tq_nn;
         tq_z <= tq_nn == 2'd0;
@@ -1309,6 +1343,9 @@ module otpu_mxu
         lost_q <= t_lost;
         if (ea_t) rq_any <= |t_ren_c;
         t_ren_q <= (ea_t ? t_ren_c : rq_en) & {LANES{3'(tq_n) + 3'(iw) <= 3'd2 && tq_nn == 2'd0}};
+        if (ea_t) rb_v <= bk_en(t_raddr_c, t_ren_c);
+        rb_q <= (ea_t ? bk_en(t_raddr_c, t_ren_c) : rb_v) &
+                {TLANES{3'(tq_n) + 3'(iw) <= 3'd2 && tq_nn == 2'd0}};
       end
 `ifndef SYNTHESIS
     bit rst_seen;                                // (registers start arbitrary)
@@ -1322,6 +1359,13 @@ module otpu_mxu
         if ((|t_ren) && !tq_z) $fatal(1, "otpu_mxu: a read passes a waiting write");
         if (t_ren_q != (rq_en & {LANES{room_q && tq_z}}))
           $fatal(1, "otpu_mxu: t_ren_q is not the request register's read");
+        // the read by bank is the request register's, decoded
+        if (rb_v != bk_en(rq_ad, rq_en)) $fatal(1, "otpu_mxu: rb_v is not the request register's banks");
+        if (rb_q != bk_en(rq_ad, t_ren_q)) $fatal(1, "otpu_mxu: rb_q is not t_ren_q's banks");
+        for (int b = 0; b < TLANES; b++)
+          if (rb_v[b] && rb_a[b] != bk_ad(rq_ad, rq_en)[b])
+            $fatal(1, "otpu_mxu: rb_a[%0d] %0h is not the request register's %0h", b, rb_a[b],
+                   bk_ad(rq_ad, rq_en)[b]);
         // TMEM loses only a read the MXU asked this cycle (and the slice took) or its replay
         if (t_lost && !((|t_ren) && rd) && !lost_q) $fatal(1, "otpu_mxu: TMEM lost a read not asked");
       end
@@ -1329,6 +1373,7 @@ module otpu_mxu
   end else begin : g_ng
     assign ea = t_gnt;
     assign t_ren = rq_en, t_wen = tw_en, t_waddr = tw_ad, t_wdata = tw_d;
+    assign t_rben = bk_en(rq_ad, rq_en), t_rbad = bk_ad(rq_ad, rq_en);
     assign tq_n = '0;              // (a lost read: the slice holds the grant for its replay)
   end
 

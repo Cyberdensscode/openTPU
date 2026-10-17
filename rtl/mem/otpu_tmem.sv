@@ -51,6 +51,8 @@ module otpu_tmem #(
   parameter int NWP   = 4,
   parameter int WPB   = 1,
   parameter logic [NRP-1:0] GEN_R = '1,   // read ports with the general crossbar
+  parameter logic [NRP-1:0] PBR   = '0,   // GEN_R ports whose unit merges its lanes by bank
+                                          //   (r_ben / r_bad: from its flip-flops, see g_preq)
   parameter logic [NWP-1:0] GEN_W = '1,   // write ports with the general crossbar (WPB = 1)
   parameter int SH_HOST = 0,              // the read port whose copy SH_MASK's ports share
   parameter logic [NRP-1:0] SH_MASK = '0, // guests on SH_HOST's copy (the arbiter lets a guest
@@ -83,6 +85,8 @@ module otpu_tmem #(
   input  logic [NRP-1:0][LANES-1:0]           r_en,     // granted reads
   input  logic [NRP-1:0][LANES-1:0]           r_req,    // requested reads (r_en before the grant)
   input  logic [NRP-1:0][LANES-1:0][31:0]     r_addr,
+  input  logic [NRP-1:0][LANES-1:0]           r_ben,    // PBR: r_req by bank (bank b's)
+  input  logic [NRP-1:0][LANES-1:0][31:0]     r_bad,    // PBR: the address of bank b's lane
   output logic [NRP-1:0][LANES-1:0][31:0]     r_data,
   input  logic [NWP-1:0][LANES-1:0]           w_en,     // granted writes
   input  logic [NWP-1:0][LANES-1:0]           w_req,    // requested writes (w_en before the grant)
@@ -275,15 +279,27 @@ module otpu_tmem #(
     // IMPL 1: a copy's bank serves the one port granted in it, so its enables are the grants
     // (RQ: the requests, the copy picks by priority)
     wire  [LANES-1:0]         rs = (IMPL == 1 && !RQ) ? r_en[p] : r_req[p];
+    // the crossbar's merge (GEN_R): per bank, the lanes that read it
+    logic [LANES-1:0]         x_en;
+    logic [LANES-1:0][IW-1:0] x_a;
+    always_comb begin
+      x_en = '0; x_a = '0;
+      for (int b = 0; b < LANES; b++)
+        for (int l = 0; l < LANES; l++)
+          if (r_addr[p][l][BW-1:0] == BW'(b) && rs[l]) begin
+            x_en[b] = 1'b1;
+            x_a[b] = x_a[b] | r_addr[p][l][BW +: IW];
+          end
+    end
     always_comb begin
       b_en = '0; b_a = '0;
-      if (GEN_R[p]) begin
-        for (int b = 0; b < LANES; b++)
-          for (int l = 0; l < LANES; l++)
-            if (r_addr[p][l][BW-1:0] == BW'(b) && rs[l]) begin
-              b_en[b] = 1'b1;
-              b_a[b] = b_a[b] | r_addr[p][l][BW +: IW];
-            end
+      if (PBR[p]) begin
+        // the unit's merge, from its flip-flops (otpu_mxu TQ: rb_q, rb_a): the crossbar's,
+        // without the lanes' bank decode in front of the ranks, the compares and the RAM pins
+        b_en = r_ben[p];
+        for (int b = 0; b < LANES; b++) b_a[b] = r_bad[p][b][BW +: IW];
+      end else if (GEN_R[p]) begin
+        b_en = x_en; b_a = x_a;
       end else begin
         logic [LANES-1:0] t;
         t = '0;
@@ -298,6 +314,21 @@ module otpu_tmem #(
     end
     assign pb_en[p] = b_en;
     assign pb_a[p] = b_a;
+`ifndef SYNTHESIS
+    // PBR: the unit's merge is the crossbar's (the banks read; their addresses where read)
+    if (PBR[p]) begin : g_pbr_chk
+      initial if (!GEN_R[p]) $fatal(1, "otpu_tmem: PBR port %0d without GEN_R", p);
+      always @(posedge clk) begin
+        if (r_ben[p] != x_en)
+          $fatal(1, "TMEM%0d: port %0d's banks %b are not its lanes' %b at %0t", SID, p, r_ben[p],
+                 x_en, $time);
+        for (int b = 0; b < LANES; b++)
+          if (x_en[b] && r_bad[p][b][BW +: IW] != x_a[b])
+            $fatal(1, "TMEM%0d: port %0d's bank %0d row %0h is not its lane's %0h at %0t", SID, p, b,
+                   r_bad[p][b][BW +: IW], x_a[b], $time);
+      end
+    end
+`endif
   end
 
 `ifndef SYNTHESIS
@@ -434,6 +465,11 @@ module otpu_tmem #(
 `endif
     // the replays: a lost read's banks, rows and lanes, registered with it
     logic [NRP-1:0]                    rpv;
+    // ... and rpv's copy per bank (rpvb: kept, each loaded with lost as rpv is): bank b's asker
+    // multiplexers, its replay registers' loads, its data select and its lane's replay take theirs,
+    // so no one register's replicas reach every bank's (r150c, the m8 card at a real 150 MHz:
+    // rpv's replica, fanout 42, into the pumped RAMs' read pins +0.041 ns, into lost_q +0.028)
+    (* keep = "true" *) logic [NRP-1:0][LANES-1:0] rpvb;
     logic [NRP-1:0][LANES-1:0]         rpe;
     logic [NRP-1:0][LANES-1:0][IW-1:0] rpa;
     logic [NRP-1:0][LANES-1:0]         rpl;
@@ -467,8 +503,13 @@ module otpu_tmem #(
       assign rp[i] = rlive(i) && rpv[i];
 `endif
       for (genvar b = 0; b < LANES; b++) begin : g_b
-        assign ae[i][b] = rp[i] ? rpe[i][b] : qe[i][b];
-        assign aa[i][b] = rp[i] ? rpa[i][b] : qa[i][b];
+`ifdef OTPU_TMEM_ABL_RPL
+        wire rpb = 1'b0;
+`else
+        wire rpb = rlive(i) && rpvb[i][b];         // rp[i], bank b's copy
+`endif
+        assign ae[i][b] = rpb ? rpe[i][b] : qe[i][b];
+        assign aa[i][b] = rpb ? rpa[i][b] : qa[i][b];
         assign asb[i][b] = sub_of(aa[i][b]);
         assign arw[i][b] = ram_row(aa[i][b]);
       end
@@ -613,10 +654,18 @@ module otpu_tmem #(
     always_ff @(posedge clk)
       for (int p = 0; p < NRP; p++) begin
         rpv[p] <= lost[p];
-        if (!rpv[p]) begin rpe[p] <= qe[p]; rpa[p] <= qa[p]; rpl[p] <= r_en[p]; end
+        for (int b = 0; b < LANES; b++) begin
+          rpvb[p][b] <= lost[p];
+          if (!rpvb[p][b]) begin rpe[p][b] <= qe[p][b]; rpa[p][b] <= qa[p][b]; rpl[p][b] <= r_en[p][b]; end
+        end
       end
 `ifndef SYNTHESIS
     initial rpv = '0;
+    initial rpvb = '0;
+    always @(posedge clk)
+      for (int p = 0; p < NRP; p++)
+        if (rpvb[p] != {LANES{rpv[p]}}) $fatal(1, "TMEM%0d: port %0d's rpv copies %b are not rpv %b", SID, p,
+                                               rpvb[p], rpv[p]);
     // the replays' premise: no write lands on a word awaiting its replay before the replay wins
     // (it would read the new word). A write landing in the cycle the replay wins is fine (the
     // RAM reads first); one landing while it loses again is not.
@@ -643,7 +692,8 @@ module otpu_tmem #(
 `endif
     assign frz = RPL ? rpv : '0;
     always_comb
-      for (int p = 0; p < NRP; p++) rpf[p] = (RPL && rpv[p]) ? rpl[p] : '0;
+      for (int p = 0; p < NRP; p++)
+        for (int l = 0; l < LANES; l++) rpf[p][l] = RPL && rpvb[p][l] && rpl[p][l];
     logic [LANES-1:0][NSB-1:0][NS-1:0][31:0] s_q;
     for (genvar b = 0; b < LANES; b++) begin : g_bank
       for (genvar k = 0; k < NSB; k++) begin : g_sub
@@ -785,7 +835,7 @@ module otpu_tmem #(
 `ifdef OTPU_TMEM_ABL_RPL
           if (1'b0) begin
 `else
-          if (RPL && rpv[p] && rpe[p][b]) begin
+          if (RPL && rpvb[p][b] && rpe[p][b]) begin
 `endif
             ss[b] <= sub_of(rpa[p][b]);
             bh[b] <= 1'b0;
