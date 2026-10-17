@@ -71,10 +71,11 @@ if {$BUILD_ID eq ""} {
   set BUILD_ID [string range $BUILD_ID 0 7]
 }
 if {![regexp {^[0-9a-fA-F]{1,8}$} $BUILD_ID]} { error "BUILD_ID $BUILD_ID: 1 to 8 hex digits" }
-# the core clock the block design makes (bd_native.tcl: CORE_MHZ rounded to the MMCM's 1/8
-# divider steps of its 800 MHz VCO), for the CORE_KHZ register
-set VCO 800
-set CORE_KHZ [expr {round($VCO * 1000.0 / (round(double($VCO) / $CORE_MHZ * 8) / 8.0))}]
+# the core clock the block design makes (bd_native.tcl: core_clock.tcl's VCO and divider for
+# CORE_MHZ and CLK2X), for the CORE_KHZ register
+source $here/core_clock.tcl
+lassign [core_mmcm $CORE_MHZ $CLK2X] VCO CORE_DIV
+set CORE_KHZ [expr {round($VCO * 1000.0 / $CORE_DIV)}]
 puts "CORE_KHZ $CORE_KHZ, BUILD_ID $BUILD_ID, MXU_IMPL $MXU_IMPL, MXU_E $MXU_E, TMEM_IMPL $TMEM_IMPL, TMEM_RQ $TMEM_RQ, PLATFORM $PLATFORM, ARCH_HASH $ARCH_HASH, TRACE_DEPTH $TRACE_DEPTH, COLL_GATHER $COLL_GATHER, TMEM_WORDS $TMEM_WORDS"
 
 create_project -force otpu $out -part xc7k480tffg1156-2

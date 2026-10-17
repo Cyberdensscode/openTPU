@@ -27,19 +27,20 @@ proc ip_vlnv {name} {
 create_bd_design otpu_bd
 current_bd_design otpu_bd
 
-# core clock: CORE_MHZ rounded to the MMCM's 1/8 divider steps of its VCO
-if {![info exists CORE_MHZ]} { set CORE_MHZ 100 }
-set VCO 800
-set CORE_DIV [expr {round(double($VCO) / $CORE_MHZ * 8) / 8.0}]
-set CORE_MHZ_ACT [format %.3f [expr {double($VCO) / $CORE_DIV}]]
-set CORE_HZ [expr {int(floor($VCO * 1.0e6 / $CORE_DIV))}]
-puts "core_clk: $CORE_MHZ_ACT MHz (MMCM divide $CORE_DIV)"
+# core clock: CORE_MHZ from the MMCM's VCO by its divider (core_clock.tcl: 800 MHz in 1/8 divider
+# steps, as the qualified images; with CLK2X, where 800 has no even divider, another VCO)
 # CLK2X (set before sourcing, default 0; create_project.tcl: 1 with the TMEM's pumped RAMs,
 # TMEM_PMP 1): core_clk2x, the MMCM's second output at twice core_clk from the same VCO, both
 # dividers integers and no phase shift, so its edges rise with core_clk's (core_clk's divider must
 # then be even). With CLK2X 0 the port is core_clk itself: the wrapper keeps one form, and the RTL
 # leaves it unused (otpu_fpga_top_*: clk_f). constraints/otpu_clk2x.tcl times the paths between them.
+if {![info exists CORE_MHZ]} { set CORE_MHZ 100 }
 if {![info exists CLK2X]} { set CLK2X 0 }
+source [file join [file dirname [info script]] core_clock.tcl]
+lassign [core_mmcm $CORE_MHZ $CLK2X] VCO CORE_DIV
+set CORE_MHZ_ACT [format %.3f [expr {double($VCO) / $CORE_DIV}]]
+set CORE_HZ [expr {int(floor($VCO * 1.0e6 / $CORE_DIV))}]
+puts "core_clk: $CORE_MHZ_ACT MHz (MMCM VCO $VCO MHz, divide $CORE_DIV)"
 if {$CLK2X && ($CORE_DIV != floor($CORE_DIV) || int($CORE_DIV) % 2)} {
   error "bd_native.tcl: CLK2X needs an even MMCM divide for core_clk, not $CORE_DIV ($CORE_MHZ_ACT MHz; 133.33: 6, 100: 8)"
 }
@@ -95,7 +96,7 @@ set_property -dict [list \
 connect_bd_net [get_bd_ports sys_clk_50] [get_bd_pins clk_wiz_0/clk_in1]
 connect_bd_net [get_bd_pins clk_wiz_0/core_clk] [get_bd_ports core_clk]
 # CLK2X: the second output, its divider half core_clk's; the MMCM's settings always overridden
-# (VCO 800 MHz), so both come from the same VCO by integer dividers
+# (core_clock.tcl's VCO), so both come from the same VCO by integer dividers
 if {$CLK2X} {
   set_property -dict [list CONFIG.NUM_OUT_CLKS {2} CONFIG.CLKOUT2_USED {true} \
     CONFIG.CLKOUT2_REQUESTED_OUT_FREQ [format %.3f [expr {$CLK2X_HZ / 1.0e6}]] \
