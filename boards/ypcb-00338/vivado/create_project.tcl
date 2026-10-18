@@ -175,6 +175,33 @@ if {[llength $margins]} {
   close $fh
   lappend late $out/otpu_margin.tcl
 }
+# OTPU_TMEM_PBLOCK (pblock ranges, e.g. CLOCKREGION_X0Y3:CLOCKREGION_X1Y4; unset: none): the TMEM
+# (u_tmem: the pumped RAMs, their pumps, the arbitration) in a hard pblock there. With the core
+# clock off the memory's 133.33 MHz the channel whose PHY rows held the pumped TMEM read ECC errors
+# under inference (docs/timing_ffs.md section 8: r150b's TMEM in rows 0-3, channel 0; r150f's in
+# rows 4-7, mostly channel 1); the PHYs sit in rows 0-2 and 5-7 of the left I/O column. Generated
+# as otpu_tmem_pblock.tcl in OUT_DIR; build.tcl requires its summary line in the run's log.
+set tpb [expr {[info exists ::env(OTPU_TMEM_PBLOCK)] ? [string trim $::env(OTPU_TMEM_PBLOCK)] : ""}]
+if {$tpb ne ""} {
+  foreach r $tpb {
+    if {![regexp {^CLOCKREGION_X\d+Y\d+:CLOCKREGION_X\d+Y\d+$} $r]} {
+      error "OTPU_TMEM_PBLOCK '$tpb': ranges CLOCKREGION_XaYb:CLOCKREGION_XcYd, space separated"
+    }
+  }
+  set fh [open $out/otpu_tmem_pblock.tcl w]
+  puts $fh "# otpu_tmem_pblock.tcl (create_project.tcl, OTPU_TMEM_PBLOCK): the TMEM in a hard pblock"
+  puts $fh "set c \[get_cells -quiet -hier -filter {NAME =~ *u_slice/u_tmem && !IS_PRIMITIVE}\]"
+  puts $fh "if {\[llength \$c\] != 1} {"
+  puts $fh "  error \"otpu_tmem_pblock.tcl: \[llength \$c\] u_slice/u_tmem cells, expected 1\""
+  puts $fh "}"
+  puts $fh "set pb \[create_pblock otpu_tmem\]"
+  puts $fh "resize_pblock \$pb -add {$tpb}"
+  puts $fh "set_property IS_SOFT false \$pb"
+  puts $fh "add_cells_to_pblock \$pb \$c"
+  puts $fh "puts \"otpu_tmem_pblock: \$c in {$tpb}\""
+  close $fh
+  lappend late $out/otpu_tmem_pblock.tcl
+}
 add_files -fileset constrs_1 -norecurse $late
 set_property SCOPED_TO_REF otpu_mem_ch [get_files $cons/otpu_mem_ch.tcl]
 set_property PROCESSING_ORDER LATE [get_files $late]

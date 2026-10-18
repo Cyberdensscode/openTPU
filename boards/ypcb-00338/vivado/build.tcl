@@ -73,6 +73,11 @@ if {![regexp {otpu_ddr_phy_place: (\d+ flops|off)} $ilog]} {
   error "otpu_ddr_phy_place.tcl did not place the PHY's flops (no summary line in impl_1/runme.log;\
          OTPU_DDR_PHY_PLACE=0 builds without it)"
 }
+# and the TMEM's pblock when OTPU_TMEM_PBLOCK asked for one (create_project.tcl)
+if {[llength [get_files -quiet -of_objects [get_filesets constrs_1] *otpu_tmem_pblock.tcl]] &&
+    ![regexp {otpu_tmem_pblock: \S+ in } $ilog]} {
+  error "otpu_tmem_pblock.tcl did not place the TMEM (no summary line in impl_1/runme.log)"
+}
 open_run impl_1
 
 # ---- the setup margins (create_project.tcl, OTPU_SETUP_MARGIN / OTPU_SYS_MARGIN): each group's
