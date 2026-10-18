@@ -279,45 +279,47 @@ module otpu_tmem #(
     // IMPL 1: a copy's bank serves the one port granted in it, so its enables are the grants
     // (RQ: the requests, the copy picks by priority)
     wire  [LANES-1:0]         rs = (IMPL == 1 && !RQ) ? r_en[p] : r_req[p];
-    // the crossbar's merge (GEN_R): per bank, the lanes that read it
+    // the port's own merge: the crossbar's (GEN_R: per bank, the lanes that read it), else the
+    // rotator's (lanes contiguous from lane 0's word: bank b is lane (b - rot)'s, one row on
+    // where the lanes wrap)
     logic [LANES-1:0]         x_en;
     logic [LANES-1:0][IW-1:0] x_a;
     always_comb begin
       x_en = '0; x_a = '0;
-      for (int b = 0; b < LANES; b++)
-        for (int l = 0; l < LANES; l++)
-          if (r_addr[p][l][BW-1:0] == BW'(b) && rs[l]) begin
-            x_en[b] = 1'b1;
-            x_a[b] = x_a[b] | r_addr[p][l][BW +: IW];
-          end
-    end
-    always_comb begin
-      b_en = '0; b_a = '0;
-      if (PBR[p]) begin
-        // the unit's merge, from its flip-flops (otpu_mxu TQ: rb_q, rb_a): the crossbar's,
-        // without the lanes' bank decode in front of the ranks, the compares and the RAM pins
-        b_en = r_ben[p];
-        for (int b = 0; b < LANES; b++) b_a[b] = r_bad[p][b][BW +: IW];
-      end else if (GEN_R[p]) begin
-        b_en = x_en; b_a = x_a;
+      if (GEN_R[p]) begin
+        for (int b = 0; b < LANES; b++)
+          for (int l = 0; l < LANES; l++)
+            if (r_addr[p][l][BW-1:0] == BW'(b) && rs[l]) begin
+              x_en[b] = 1'b1;
+              x_a[b] = x_a[b] | r_addr[p][l][BW +: IW];
+            end
       end else begin
         logic [LANES-1:0] t;
         t = '0;
-        b_en = rs;
+        x_en = rs;
         for (int k = 0; k < BW; k++)
           if (rot[k]) begin
-            t = b_en;
-            for (int l = 0; l < LANES; l++) b_en[(l + (1 << k)) % LANES] = t[l];
+            t = x_en;
+            for (int l = 0; l < LANES; l++) x_en[(l + (1 << k)) % LANES] = t[l];
           end
-        for (int b = 0; b < LANES; b++) b_a[b] = a0[BW +: IW] + IW'(BW'(b) < rot);
+        for (int b = 0; b < LANES; b++) x_a[b] = a0[BW +: IW] + IW'(BW'(b) < rot);
+      end
+    end
+    // PBR: the unit's merge, from its flip-flops (otpu_mxu TQ: rb_q / rb_a; otpu_tmem_breq's
+    // decode registered in the DMA, the VPU and the quantizer), without the lanes' merge in front
+    // of the ranks, the compares and the RAM pins
+    always_comb begin
+      b_en = x_en; b_a = x_a;
+      if (PBR[p]) begin
+        b_en = r_ben[p];
+        for (int b = 0; b < LANES; b++) b_a[b] = r_bad[p][b][BW +: IW];
       end
     end
     assign pb_en[p] = b_en;
     assign pb_a[p] = b_a;
 `ifndef SYNTHESIS
-    // PBR: the unit's merge is the crossbar's (the banks read; their addresses where read)
+    // PBR: the unit's merge is the port's own (the banks read; their rows where read)
     if (PBR[p]) begin : g_pbr_chk
-      initial if (!GEN_R[p]) $fatal(1, "otpu_tmem: PBR port %0d without GEN_R", p);
       always @(posedge clk) begin
         if (r_ben[p] != x_en)
           $fatal(1, "TMEM%0d: port %0d's banks %b are not its lanes' %b at %0t", SID, p, r_ben[p],
@@ -1081,6 +1083,38 @@ module otpu_tmem #(
     $fclose(fd);
   end
 `endif
+endmodule
+
+// A rotator port's read by TMEM bank (otpu_tmem PBR), for a unit to register beside its request:
+// the lanes are contiguous words from lane 0's (a0 + l), so bank b is lane (b - rot) mod TLANES's
+// (rot: a0's bank bits) and its word one row on where the lanes wrap (b < rot): otpu_tmem's
+// rotator decode. bad[b] is bank b's word address (its bank bits b).
+module otpu_tmem_breq #(
+  parameter int LANES  = 8,       // the unit's lanes
+  parameter int TLANES = LANES    // TMEM's banks (at least LANES, a power of 2)
+) (
+  input  logic [LANES-1:0]        en,
+  input  logic [31:0]             a0,
+  output logic [TLANES-1:0]       ben,
+  output logic [TLANES-1:0][31:0] bad
+);
+  localparam int BW = (TLANES > 1) ? $clog2(TLANES) : 1;
+  initial if (TLANES < LANES || (1 << $clog2(TLANES)) != TLANES)
+    $fatal(1, "otpu_tmem_breq: TLANES %0d (a power of 2, at least LANES %0d)", TLANES, LANES);
+  wire [BW-1:0] rot = (TLANES > 1) ? a0[BW-1:0] : '0;
+  always_comb begin
+    logic [TLANES-1:0] t;
+    t = '0;
+    ben = '0;
+    ben[LANES-1:0] = en;
+    for (int k = 0; k < BW; k++)
+      if (TLANES > 1 && rot[k]) begin
+        t = ben;
+        for (int l = 0; l < TLANES; l++) ben[(l + (1 << k)) % TLANES] = t[l];
+      end
+    for (int b = 0; b < TLANES; b++)
+      bad[b] = (TLANES > 1) ? (((a0 >> BW) + 32'(BW'(b) < rot)) << BW) | 32'(b) : a0;
+  end
 endmodule
 
 // One bank of a pumped copy: a true dual-port RAM on clk_f (= 2 x clk, aligned). Even fast edges

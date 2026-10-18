@@ -66,6 +66,9 @@ module otpu_dma
   // TMEM lanes (read port A, write port)
   output logic [LANES-1:0]        t_ren,
   output logic [LANES-1:0][31:0]  t_raddr,
+  // t_ren by TMEM bank (otpu_tmem PBR: the port's rotator merge, from flip-flops as t_ren)
+  output logic [LANES-1:0]        t_rben,
+  output logic [LANES-1:0][31:0]  t_rbad,
   input  logic [LANES-1:0][31:0]  t_rdata,
   output logic [LANES-1:0]        t_wen,
   output logic [LANES-1:0][31:0]  t_waddr,
@@ -608,13 +611,23 @@ module otpu_dma
       adv_nx = !((adv ? pa : st_pend) && (adv ? pla : pl)) || oc_st[1];
     else adv_nx = adv;
   end
+  // ... and by bank (otpu_tmem PBR): t_rbv the pending request's banks (with t_rv), t_rb_q what
+  // TMEM reads (with t_re_q), t_rbad their words (with t_raddr), the rotation decoded before the
+  // registers, so TMEM's ranks and compares start at flip-flops (r150d, the m8 card at a real 150
+  // MHz: t_re_q -> the guests' pick and the rotation -> the ranks -> a pumped bank's address, 8
+  // levels, the card's worst core -> clk2x path)
+  logic [LANES-1:0]       t_rben_c, t_rbv, t_rb_q;
+  logic [LANES-1:0][31:0] t_rbad_c;
+  otpu_tmem_breq #(.LANES(LANES)) u_tbr (.en(t_ren_c), .a0(t_raddr_c[0]), .ben(t_rben_c), .bad(t_rbad_c));
   always_ff @(posedge clk)
-    if (rst) begin t_rv <= '0; t_re_q <= '0; end
+    if (rst) begin t_rv <= '0; t_re_q <= '0; t_rbv <= '0; t_rb_q <= '0; end
     else begin
-      if (adv) begin t_rv <= t_ren_c; t_raddr <= t_raddr_c; end
+      if (adv) begin t_rv <= t_ren_c; t_raddr <= t_raddr_c; t_rbv <= t_rben_c; t_rbad <= t_rbad_c; end
       t_re_q <= adv_nx ? (adv ? t_ren_c : t_rv) : '0;
+      t_rb_q <= adv_nx ? (adv ? t_rben_c : t_rbv) : '0;
     end
   assign t_ren = t_re_q;
+  assign t_rben = t_rb_q;
 `ifndef SYNTHESIS
   // the prediction is adv, and TMEM reads the pending request exactly while adv is up
   logic adv_q;

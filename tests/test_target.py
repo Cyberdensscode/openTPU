@@ -662,11 +662,16 @@ def test_the_real_150_mhz_paths_start_at_flip_flops():
     (c_lz). The sequencer's command copies load on the unit's readiness, not its start decode.
     The MXU's read reaches TMEM by bank from its flip-flops (otpu_tmem PBR: rb_q / rb_a, decoded
     before the registers), not through the lanes' bank decode in front of TMEM's compares (r150c:
-    rq_ad -> the decode -> the compares -> lost_q, 11 levels, -0.007 ns). TMEM's replay flag rpv
-    is kept once per bank (rpvb) for each bank's asker multiplexers, replay loads and data select."""
+    rq_ad -> the decode -> the compares -> lost_q, 11 levels, -0.007 ns), and so do the DMA's,
+    the quantizer's and the VPU's (otpu_tmem_breq, the rotators' merge, registered with their
+    requests; r150d: their rotations in front of the ranks and the pumped RAMs' read pins). TMEM's
+    replay flag rpv is kept once per bank (rpvb) for each bank's asker multiplexers, replay loads
+    and data select."""
     def src(p):
         return re.sub(r"//.*", "", (ROOT / p).read_text())
     tm = src("rtl/mem/otpu_tmem.sv")
+    # the pumped bank keeps its hierarchy (otpu_clk2x.tcl names its pins); otpu_tmem_breq beside it
+    assert re.search(r'\(\* keep_hierarchy = "yes" \*\)\s*module otpu_pump_bank\b', tm)
     assert "lq[l] = pdir[p] ? pr[p][int'(bk[l]) * NSB + int'(pss[p][bk[l]])] : qb[bk[l]];" in tm
     assert "assign pdir[p] = !BYP;" in tm and "assign pr[p][b * NSB + k] = s_q[b][k][SD];" in tm
     mxu = src("rtl/mxu/otpu_mxu.sv")
@@ -681,8 +686,15 @@ def test_the_real_150_mhz_paths_start_at_flip_flops():
     assert re.search(r"always_ff @\(posedge clk\) if \(!rst && ea_t\) rb_a <= bk_ad\(t_raddr_c, t_ren_c\);", tq)
     assert re.search(r"rb_q <= \(ea_t \? bk_en\(t_raddr_c, t_ren_c\) : rb_v\) &", tq)
     sl = src("rtl/top/otpu_slice.sv")
-    assert ".PBR(MXU_TQ ? NRP'(1) << P_MXU : '0)" in sl and ".TLANES(LANES)" in sl
-    assert re.search(r"rb_t = \(.*off\[P_MXU\]\) \? '0 : mxu_rben;", sl)
+    assert ".PBR(PBR)" in sl and ".TLANES(LANES)" in sl
+    pbr = re.search(r"localparam logic \[NRP-1:0\] PBR = ([^;]*);", sl).group(1)
+    assert set(re.findall(r"P_\w+", pbr)) == {"P_MXU", "P_DMA", "P_Q", "P_Q2", "P_VA", "P_VB"}, pbr
+    assert re.search(r"r_ben\[p\] = \(.*off\[p\]\) \? '0 : rq_b\[p\];", sl)
+    for f, regs in (("rtl/dma/otpu_dma.sv", ["t_rbv <= t_rben_c", "t_rb_q <= adv_nx ? (adv ? t_rben_c : t_rbv) : '0;"]),
+                    ("rtl/vpu/otpu_vpu.sv", ["ta_ben <= ta_ben_c", "tb_bad <= tb_bad_c"]),
+                    ("rtl/vpu/otpu_quant.sv", ["t_rben <= t_rben_c", "t_rbad2 <= t_rbad2_c"])):
+        u = src(f)
+        assert "otpu_tmem_breq #(" in u and all(r in u for r in regs), f
     assert '(* keep = "true" *) logic [NRP-1:0][LANES-1:0] rpvb;' in tm
     assert "wire rpb = rlive(i) && rpvb[i][b];" in tm and "assign aa[i][b] = rpb ? rpa[i][b] : qa[i][b];" in tm
     assert "if (!rpvb[p][b]) begin rpe[p][b] <= qe[p][b];" in tm and "if (RPL && rpvb[p][b] && rpe[p][b])" in tm

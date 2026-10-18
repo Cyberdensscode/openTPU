@@ -114,6 +114,9 @@ module otpu_vpu
   output logic [LANES-1:0]        tb_en,
   output logic [LANES-1:0][31:0]  tb_addr,
   input  logic [LANES-1:0][31:0]  tb_data,
+  // ta_* / tb_* by TMEM bank (otpu_tmem PBR: the ports' rotator merge, registered with them)
+  output logic [LANES-1:0]        ta_ben, tb_ben,
+  output logic [LANES-1:0][31:0]  ta_bad, tb_bad,
   output logic [LANES-1:0]        tw_en,
   output logic [LANES-1:0][31:0]  tw_addr,
   output logic [LANES-1:0][31:0]  tw_data,
@@ -372,12 +375,18 @@ module otpu_vpu
   // address arithmetic, its lane tests and the issue checks end at the register, not at the
   // TMEM's ranks and pumped banks (r2m4: cols / ic -> the request address -> the pump banks'
   // read pins, clk -> clk2x, 55% of its TNS). The chunk (mi) waits a cycle in mi2 for it.
-  logic [LANES-1:0]       ta_en_c, tb_en_c;
-  logic [LANES-1:0][31:0] ta_addr_c, tb_addr_c;
+  // The request by bank too (ta_ben / tb_ben, otpu_tmem PBR), so TMEM's ranks and compares start
+  // at flip-flops, not at its rotation of the lanes (r150d, the m8 card at a real 150 MHz:
+  // tb_en -> the rotation -> the ranks -> a pumped bank's address, 7 levels, 5.2 ns of route)
+  logic [LANES-1:0]       ta_en_c, tb_en_c, ta_ben_c, tb_ben_c;
+  logic [LANES-1:0][31:0] ta_addr_c, tb_addr_c, ta_bad_c, tb_bad_c;
+  otpu_tmem_breq #(.LANES(LANES)) u_tab (.en(ta_en_c), .a0(ta_addr_c[0]), .ben(ta_ben_c), .bad(ta_bad_c));
+  otpu_tmem_breq #(.LANES(LANES)) u_tbb (.en(tb_en_c), .a0(tb_addr_c[0]), .ben(tb_ben_c), .bad(tb_bad_c));
   always_ff @(posedge clk)
-    if (rst) begin ta_en <= '0; tb_en <= '0; end
+    if (rst) begin ta_en <= '0; tb_en <= '0; ta_ben <= '0; tb_ben <= '0; end
     else if (en) begin
       ta_en <= ta_en_c; tb_en <= tb_en_c; ta_addr <= ta_addr_c; tb_addr <= tb_addr_c;
+      ta_ben <= ta_ben_c; tb_ben <= tb_ben_c; ta_bad <= ta_bad_c; tb_bad <= tb_bad_c;
     end
   logic [LANES-1:0] imask;
   logic             irow_last, iall_last;
