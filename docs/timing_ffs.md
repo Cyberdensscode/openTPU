@@ -559,6 +559,16 @@ maximum of each supply over each step:
   load none, its second lanes 3 and 8), and read clean on E3 and both r150h loads. The framing
   alone does not decide it (r150h's first load had misframed bits and read clean), and
   the write side did not move (channel 0's write window 703 ps on every 150 MHz load, E3 753).
+- **It is the read capture under load** (docs/litedram.md section 10, "Read taps under the core's
+  load"). LiteDRAM's BIST, which has no ECC and checks its own data per lane, read wrong beats on
+  channel 1's lanes 0 and 1 beside `perf.py lfm2` while the channel's ECC counted. It read none
+  with the core idle or running DRAM-free TMEM / VPU work. A scan of every lane's read taps under
+  an MXU + DMA load shows the windows closing from 7-9 taps to 4-6 at 150 MHz, mostly from the
+  right, and to 6-8 around the calibrated tap at 133.33 MHz. The idle centre is then a tap or two
+  right of the loaded one. `opentpu.host.loadcal` centres every lane under that load on a
+  configuration's first scrub when the core clock is not the controllers'. On three fresh r150fp
+  loads that read ECC errors under inference at the calibrated taps, the BIST beside inference
+  and the ECC over the stress and both models then read 0.
 - What 150 MHz buys, on the same runs: prefill 4% (Qwen3-0.6B 173.1 -> 180.1 tok/s, LFM2.5
   569.1 -> 595.1), decode under 1% (24.70 -> 24.76 tok/s; 66.53 -> 67.08): decode waits on the
   DRAM, which is the same 17 GB/s at either clock.

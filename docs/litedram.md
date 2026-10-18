@@ -1287,6 +1287,47 @@ All **measured**.
   region), plus a card session for the temperature sweep.
 - **Step 2:** a firmware mode, and no RTL or bitstream change.
 
+### Read taps under the core's load (2026-10-18)
+
+The calibration centres each lane's read IDELAY with the core idle, and with the core at the
+controllers' 133.33 MHz that centre holds under load. With the core at 150 MHz (the m8 card's
+r150fp, 1da7d3b9; docs/timing_ffs.md section 8) it does not: under inference four loads of five
+read ECC errors back, on the lanes of either channel.
+
+**What closes.** LiteDRAM's BIST (crossbar master 2: no ECC, its own data check per lane) read
+the last quarter of each channel over and over while the core ran:
+- with the core idle, or running TMEM and VPU work that does not touch DRAM (OUTER and RDOT on
+  three 64 x 256 tiles in a hardware loop): 0 wrong beats in 106 passes of 1 GiB per channel;
+- beside `perf.py lfm2 int8`: wrong beats on channel 1's lanes 0 and 1 (45 in 502 passes), as
+  the channel's ECC counted 25 corrected and 7 uncorrectable words. The PHY's reads go wrong for
+  every master, so the corruption is in the read capture, not in the ports.
+
+**The windows under load.** A scan of every lane's read taps with the BIST (all lanes at each tap,
+10 x 128 MiB per tap) while the core runs turnaround.py's traffic in one hardware loop (the MXU
+streaming fp4 weights, 64 KiB DMA stores and loads), against the core idle:
+
+| | idle | under the load | the load's centre against the calibrated tap |
+|---|---|---|---|
+| E3 (133.33 MHz) | 7-9 taps | 6-8 taps | the same on 14 lanes of 18 (one tap off on four) |
+| r150fp (150 MHz) | 7-9 taps | 4-6 taps | one or two taps to the left on all 18 (a second load) |
+
+At 150 MHz the right edges close by 2-3 taps and the left ones by about 1: the core's switching,
+out of step with the memory clocks, moves the capture against the data by a different amount on
+every read (at 133.33 MHz it repeats on every sys cycle: a fixed, small offset). Channel 1 lanes 0
+and 1 beside lfm2, by tap: 7 and 8 read clean, 10 (the calibrated) 4 wrong beats in 19 s, 12
+1.3 million.
+
+**The fix, `opentpu.host.loadcal`.** `center()` runs that load on the core, scans every lane under
+it, and leaves each at its window's centre there (the left of the two middles of an even window;
+a lane under 3 taps keeps its calibrated tap). `Board.scrub` runs it on a configuration's first
+scrub when the core clock (CORE_KHZ) is not the controllers' (`OTPU_LOAD_CENTER=1` / `0` forces
+it), between two passes of zeros, so neither the BIST's data (no check bits) nor the ECC errors
+of the core's reads at the scan's far taps stay behind; about 15 s. The result per lane is in the
+run directory (`<device>.loadcal.json`). With the scratch version of it on three fresh r150fp
+loads that each read ECC errors under inference at the calibrated taps, after it: 0 wrong BIST
+beats beside perf qwen3 and lfm2 (about 500 passes each), and 0 / 0 ECC on both channels over the
+turnaround stress, perf qwen3 and perf lfm2, two or three times per load.
+
 ## 11. The card's controller in simulation (2026-09-29, night)
 
 **Why.** The DDR3 bank model behind the adapter in simulation (`otpu_native_mem`'s
