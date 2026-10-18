@@ -467,7 +467,8 @@ The question (2026-10-17): build the m8 card at a real 150 MHz (not the equivale
 comfortable margins, and promote it. **The margins came (r150fp: core +0.130 ns, clk2x +0.154,
 every clock above production E3's at 133.33 MHz), but the card is not clean at 150 MHz: under
 inference its DRAM reads come back with ECC errors, corrected and uncorrectable, in every 150 MHz
-bitstream tried, while the same RTL at 133.33 MHz reads clean. Production stays on E3.**
+bitstream tried (the TMEM moved away from the PHYs included: one load clean, the next not),
+while the same RTL at 133.33 MHz reads clean. Production stays on E3.**
 
 **The clock.** `bd_native.tcl`'s fixed 800 MHz VCO has no even divider for 150 MHz with the pumped
 TMEM's core_clk2x; `core_clock.tcl` (18168e94) picks the VCO an even divider needs (150: 900 MHz /
@@ -485,6 +486,8 @@ margin, below):
 | r150d | 671b4265 | 0.15 | +0.037 | +0.043 | +0.048 / +0.002 | +0.122 | +0.012 | XDMA's write packing (64f896c9); the margin |
 | r150f | 1da7d3b9 | 0.15 | +0.033 | +0.113 | +0.099 / +0.046 | +0.106 | +0.013 | the MXU's read by bank, `rpv` per bank |
 | **r150fp** | 1da7d3b9 | 0.15 | **+0.130** | **+0.154** | +0.040 / +0.041 | +0.106 | +0.013 | r150f before the userclk1 reroute |
+| r150h | f5eb87c5 | 0.15 | -0.286 | -0.086 | +0.054 / +0.012 | +0.063 | +0.015 | the TMEM in a hard pblock, X0Y3:X1Y4 (`OTPU_TMEM_PBLOCK`, between the PHYs' rows) |
+| r150i | f5eb87c5 | 0.15, sys 0.3 | -0.167 | -0.062 | +0.074 / -0.073 | +0.278 | +0.011 | r150h's pblock, `OTPU_SYS_MARGIN` 0.3 |
 | E3 (production) | 039b34d5 | - | +0.007 | +0.019 | +0.012 / +0.041 | +0.015 | +0.018 | 133.33 MHz |
 
 - **Setup margins by clock group** (671b4265, 65f5f357): `OTPU_SETUP_MARGIN` adds that much setup
@@ -524,6 +527,8 @@ maximum of each supply over each step:
 | r150b (198e535c) | 150 | 0/0 0/0 | 17/0 0/0, 28/0 0/0 (a first load: clean) | 0.978 V |
 | r150d (671b4265) | 150 | - | 1/0 0/0, 1/0 0/0 | - |
 | r150fp (1da7d3b9) | 150 | 0/0 0/0 | 25/1 0/0, 431/1 133/10 | 0.980 V |
+| r150h (f5eb87c5), first load | 150 | 0/0 0/0 | 0/0 0/0, 0/0 0/0 (four sequences) | 0.978 V |
+| r150h, second load | 150 | 19/0 0/0 | 489/5 0/0, 15563/293 0/0 | 0.978 V |
 
 - The turnaround stress (the MXU streaming weights while the DMA stores and reloads 64 KiB
   tiles, 150-170 GB in 30 s) is clean on every bitstream; inference, both channels near their
@@ -539,6 +544,21 @@ maximum of each supply over each step:
   between LiteDRAM's encoder and its decoder: the PHY and the DRAM. With the core at 133.33 MHz
   its switching keeps one phase to the memory clocks; at 150 MHz (9/8 of them) it sweeps across
   their edges.
+- It is not where the TMEM sits. The failing channel had been the one whose PHY rows held the
+  pumped TMEM's 128 RAMs (r150b rows 0-3, channel 0; r150f rows 4-7, channel 1; the PHYs in rows
+  0-2 and 5-7 of the left I/O column), so r150h put the TMEM in a hard pblock between them
+  (X0Y3:X1Y4, f5eb87c5). It fails timing there (core -0.286, clk2x -0.086; r150i -0.167 /
+  -0.062), and on the card (2026-10-18) its first load read clean over four sequences while a
+  second load of the same bitstream read 15,563 corrected and 293 uncorrectable words on
+  channel 0, the turnaround stress included (19 corrected, the first stress failure).
+- Each load calibrates anew, and channel 0's read framing differs per load at 150 MHz. E3's
+  channel 0 reads every bit at its lane's bitslip (5, lane 1 at 4); every 150 MHz load read back
+  bits a CLK off their lane (r150h's first: lanes 5, 6 and 8, five bits; its second: lanes 4, 6
+  and 8, seven bits, and lane 2 at bitslip 6 tap 27 against 5 / 14; r150fp: lanes 4 and 8).
+  Channel 1's varies on every bitstream (E3: lane 5's bits 0, 2 and 5 at -2; r150h's first
+  load none, its second lanes 3 and 8), and read clean on E3 and both r150h loads. The framing
+  alone does not decide it (r150h's first load had misframed bits and read clean), and
+  the write side did not move (channel 0's write window 703 ps on every 150 MHz load, E3 753).
 - What 150 MHz buys, on the same runs: prefill 4% (Qwen3-0.6B 173.1 -> 180.1 tok/s, LFM2.5
   569.1 -> 595.1), decode under 1% (24.70 -> 24.76 tok/s; 66.53 -> 67.08): decode waits on the
   DRAM, which is the same 17 GB/s at either clock.
@@ -549,11 +569,13 @@ So the card's clock stays 133.33 MHz. The timing work stands as margin there: th
 ## 9. Next
 
 - The FPGA: a core faster than the memory's 133.33 MHz needs the memory interface to hold at
-  it first (section 8): find what the 150 MHz core does to the PHY (its clk2x at 300 MHz beside
-  the I/O columns, the memory clocks' jitter with the core's switching, the write window's
-  485 ps), or run the core at 133.33 MHz and spend the margin elsewhere. Land the narrow
-  copies, the fanout batches, the MXU's TQ, the reads by bank and the reroute rule on main for
-  the card at 133.33 MHz, and drop r22's ECO from its recipe.
+  it first (section 8): find what the 150 MHz core does to the PHY (not the TMEM's place,
+  r150h; channel 0's read framing per load, the memory clocks' jitter with the core's
+  switching, the write window's 485 ps warm). A test that would separate them: the PHY's BIST
+  while the core runs a long compute-only program (no DRAM), so that the core switches at 150
+  MHz while only the BIST uses the memory. Or run the core at 133.33 MHz and spend the margin
+  elsewhere. Land the narrow copies, the fanout batches, the MXU's TQ, the reads by bank and the
+  reroute rule on main for the card at 133.33 MHz, and drop r22's ECO from its recipe.
 - The ASIC: run the card's flow (both hooks are its default now) through detailed routing, with
   the clock at 2.0 ns rather than a margin (the global route's 2.0 ns is on the guides'
   parasitics); put the copies behind a target parameter (FPGA on, ASIC off); at 2.0 ns the VPU's
