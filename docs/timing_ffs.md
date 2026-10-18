@@ -6,7 +6,9 @@ the delay is (the FPGA card, the ASIC card), what the tools do alone, three batc
 cycle-exact register copies (branch `worktree-timing-ffs`), FPGA builds at 133.33 MHz and at a
 150 MHz equivalent, the ASIC flow's timing repair, (the follow-up question: reduce the
 fanout) a census of what the card's nets fan out to and the batches that cut it, and (the third:
-cut the MXU from TMEM, within 1% of the cycles) the MXU's TMEM interface.
+cut the MXU from TMEM, within 1% of the cycles) the MXU's TMEM interface, and (the fourth:
+a real 150 MHz with comfortable margins, for production) the 150 MHz builds and what the
+card's DRAM made of them.
 
 **Short answer.**
 - **On the FPGA, flip-flops help where the long wire carries a register that is already a cycle
@@ -48,6 +50,12 @@ cut the MXU from TMEM, within 1% of the cycles) the MXU's TMEM interface.
   to register (400 -> 500 MHz on the route's parasitics) in 100 s of repair; CTS's repair now runs
   after the latency (`cts_latency.tcl`: 1 real violator instead of 1,232 ports). Batch 1 (with
   the ACT RAM copy) cost the ASIC 1.2% of area and 11% of wire for 0.008 ns (section 4).
+- **A real 150 MHz closes with margin, but the card's DRAM is not clean at it** (section 8). With
+  the units' TMEM reads by bank from flip-flops and a setup margin in the flow, r150fp met 150
+  MHz with core +0.130 / clk2x +0.154 ns. On the card every 150 MHz bitstream (three placements)
+  read ECC errors back under inference, up to hundreds of uncorrectable words, where the same
+  RTL at 133.33 MHz reads clean; for 4% of prefill and under 1% of decode. The card stays at
+  133.33 MHz.
 
 ## 1. Where the delay is
 
@@ -453,14 +461,99 @@ A copy of `rpv` per bank (for the asker
 multiplexers, ranks, data select and lanes; TMEM's tests pass with it) was prepared for the
 `rpv` classes and is not committed: in b_t9_150 they pass.
 
-## 8. Next
+## 8. A real 150 MHz, and the card's DRAM
 
-- The FPGA: a real build above 133.33 MHz needs an even MMCM divide for CLK2X, which
-  `bd_native.tcl`'s fixed 800 MHz VCO (50 MHz x 16) does not have; a VCO parameter would (850
-  MHz, M 17: core 141.7 / clk2x 283.3 MHz; 900 MHz, M 18: 150 / 300). b_t9_150 reaches ~148.7
-  MHz at the 150 MHz equivalent, so 141.7 MHz is the next real build to try. Land the narrow
-  copies, the fanout batches (through 8bf19b12; 0c0b16c8 is reverted) and the MXU's TQ (9b6279fc)
-  on main for the card, and drop r22's ECO from its recipe.
+The question (2026-10-17): build the m8 card at a real 150 MHz (not the equivalent), give it
+comfortable margins, and promote it. **The margins came (r150fp: core +0.130 ns, clk2x +0.154,
+every clock above production E3's at 133.33 MHz), but the card is not clean at 150 MHz: under
+inference its DRAM reads come back with ECC errors, corrected and uncorrectable, in every 150 MHz
+bitstream tried, while the same RTL at 133.33 MHz reads clean. Production stays on E3.**
+
+**The clock.** `bd_native.tcl`'s fixed 800 MHz VCO has no even divider for 150 MHz with the pumped
+TMEM's core_clk2x; `core_clock.tcl` (18168e94) picks the VCO an even divider needs (150: 900 MHz /
+6, clk2x 300 MHz) and keeps 800 MHz where its dividers serve (133.33, 100). The memory controllers
+keep their own 133.33 MHz sys clock.
+
+**The builds** (m8, the production strategy; slacks real, ns; `MARGIN` the core group's setup
+margin, below):
+
+| build | RTL | margin | core | clk2x | userclk1 / userclk2 | crg (sys) | WHS | the change |
+|---|---|---|---|---|---|---|---|---|
+| r150a | 18168e94 | - | -0.087 | +0.006 | +0.039 / +0.035 | +0.109 | +0.028 | the clock |
+| r150b | 198e535c | - | +0.008 | +0.021 | +0.024 / +0.003 | +0.137 | +0.012 | b_t9_150's last paths (d85d6572, eb17a348) |
+| r150c | 6501e15e | - | -0.007 | +0.041 | +0.058 / +0.096 | +0.286 | +0.000 | r150a's paths: the pumped word's select (cb7b81e4), `c_lz`, `vnx_q` (2f19b650), the VPU's back end on flip-flops (6501e15e) |
+| r150d | 671b4265 | 0.15 | +0.037 | +0.043 | +0.048 / +0.002 | +0.122 | +0.012 | XDMA's write packing (64f896c9); the margin |
+| r150f | 1da7d3b9 | 0.15 | +0.033 | +0.113 | +0.099 / +0.046 | +0.106 | +0.013 | the MXU's read by bank, `rpv` per bank |
+| **r150fp** | 1da7d3b9 | 0.15 | **+0.130** | **+0.154** | +0.040 / +0.041 | +0.106 | +0.013 | r150f before the userclk1 reroute |
+| E3 (production) | 039b34d5 | - | +0.007 | +0.019 | +0.012 / +0.041 | +0.015 | +0.018 | 133.33 MHz |
+
+- **Setup margins by clock group** (671b4265, 65f5f357): `OTPU_SETUP_MARGIN` adds that much setup
+  uncertainty to every check between core_clk and core_clk2x, `OTPU_SYS_MARGIN` to the memory
+  controller's sys clock to itself, as a late implementation-only constraint (`otpu_margin.tcl`
+  in OUT_DIR); build.tcl reports each group's slack with it (SUMMARY.txt's MARGIN lines) and sets
+  it back to 0 before the reroute, the reports and the bitstream.
+- **The reads by bank** (1da7d3b9, bc7c33a2): r150c / r150d's worst classes ran from the units'
+  request registers through TMEM's merge of their lanes (the MXU's crossbar, the rotators) into
+  the ranks, the conflict compares and the pumped RAMs' read pins (8 levels, 5 ns of route). The
+  units now decode their next request to TMEM's banks before the register (`otpu_tmem_breq`; the
+  MXU's `rb_q` / `rb_a`) and TMEM takes the banks as they come (`PBR`); `rpv` is kept per bank
+  (`rpvb`). Both cycle-exact, checked every cycle in simulation. r150f closed core -> clk2x at
+  +0.13 ns real (r150d +0.014).
+- **The userclk1 reroute** (a98c51b2): its re-entrant route, run for a hold failure after
+  rerouting the PCIe block's 500 MHz nets, moves other nets, and was kept while the other clocks
+  stayed above 0: in r150f it took userclk1 +0.040 -> +0.099 and the core +0.130 -> +0.033 (the
+  sequencer's `ir` into its IMEM). A reroute is now kept only if the design's worst slack rises.
+  r150fp is r150f's routed design before it (its `pre_userclk1.dcp`, written to a bitstream as
+  the fixed rule would have).
+- **The memory PHY, statically**: every build's I/O paths are within E3's (ISERDES out, OSERDES
+  in, the output enables, which are untimed by construction: 0.4-5.5 ns of route in every build,
+  E3 included), and the ECC decoders' read data >= +0.69 ns in r150f against E3's +0.687.
+
+**The card.** r150fp's window (the r2.2 qual body with the bitstream loaded) passed the selftest
+and its scrub, then the first inference run (`perf.py qwen3 int8`) ended on an uncorrectable ECC
+error; over the fast qual channel 1 counted 1,747 corrected and 293 uncorrectable words, channel
+0 one, and token-exact runs then diverged. The window was stopped and the bitstreams compared on
+one sequence (opentpu's `~/otpu-build/bisect150/pwr.sh`, `xadc.py` beside it: scrub; idle 10
+s; the DRAM turnaround stress 30 s; `perf.py` qwen3 and lfm2 int8), with the XADC's minimum and
+maximum of each supply over each step:
+
+| bitstream | core | ECC after the stress | after qwen3 / lfm2 (ch0 ch1, corrected/uncorrectable) | VCCINT min |
+|---|---|---|---|---|
+| E3 (production, 039b34d5) | 133.33 | 0/0 0/0 | 0/0 0/0, 0/0 0/0 | 0.978 V |
+| b_t9_def (9b6279fc) | 133.33 | 0/0 0/0 | 0/0 0/0, 0/0 0/0 | 0.980 V |
+| r150b (198e535c) | 150 | 0/0 0/0 | 17/0 0/0, 28/0 0/0 (a first load: clean) | 0.978 V |
+| r150d (671b4265) | 150 | - | 1/0 0/0, 1/0 0/0 | - |
+| r150fp (1da7d3b9) | 150 | 0/0 0/0 | 25/1 0/0, 431/1 133/10 | 0.980 V |
+
+- The turnaround stress (the MXU streaming weights while the DMA stores and reloads 64 KiB
+  tiles, 150-170 GB in 30 s) is clean on every bitstream; inference, both channels near their
+  full 16 GB/s with every unit busy, is not, at 150 MHz only. The supplies sag the same (VCCINT
+  0.978-0.981 V at the XADC's ~4 us sampling) on all of them, and the die runs at 66-73 C on
+  all.
+- It is not a calibration: r150fp recalibrated warm (`memcal selfcal` after a run) still counted
+  110/9 on channel 1, and that calibration found channel 0's common write window 485 ps
+  (cold: 703 ps; E3: 753 ps). The read windows stay 9-11 taps on every bitstream.
+- It is not the RTL: b_t9_def is r150b's RTL less the 150 MHz commits, at 133.33 MHz; and
+  `otpu_mem_ch` hands LiteDRAM whole beats only (`c_wdata_we` all ones, partial writes merged
+  before), so logic upstream cannot produce a word whose check bits disagree. The errors are
+  between LiteDRAM's encoder and its decoder: the PHY and the DRAM. With the core at 133.33 MHz
+  its switching keeps one phase to the memory clocks; at 150 MHz (9/8 of them) it sweeps across
+  their edges.
+- What 150 MHz buys, on the same runs: prefill 4% (Qwen3-0.6B 173.1 -> 180.1 tok/s, LFM2.5
+  569.1 -> 595.1), decode under 1% (24.70 -> 24.76 tok/s; 66.53 -> 67.08): decode waits on the
+  DRAM, which is the same 17 GB/s at either clock.
+
+So the card's clock stays 133.33 MHz. The timing work stands as margin there: the same RTL closes
+133.33 MHz with Vivado's default implementation (b_t9_def, section 7).
+
+## 9. Next
+
+- The FPGA: a core faster than the memory's 133.33 MHz needs the memory interface to hold at
+  it first (section 8): find what the 150 MHz core does to the PHY (its clk2x at 300 MHz beside
+  the I/O columns, the memory clocks' jitter with the core's switching, the write window's
+  485 ps), or run the core at 133.33 MHz and spend the margin elsewhere. Land the narrow
+  copies, the fanout batches, the MXU's TQ, the reads by bank and the reroute rule on main for
+  the card at 133.33 MHz, and drop r22's ECO from its recipe.
 - The ASIC: run the card's flow (both hooks are its default now) through detailed routing, with
   the clock at 2.0 ns rather than a margin (the global route's 2.0 ns is on the guides'
   parasitics); put the copies behind a target parameter (FPGA on, ASIC off); at 2.0 ns the VPU's
