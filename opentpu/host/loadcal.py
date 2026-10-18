@@ -10,11 +10,16 @@ lane's window closes by 2-4 taps, mostly from the right, and at the idle centre 
 wrong beat now and then (r150fp 1da7d3b9 on the card: ECC errors under inference on four loads
 of five; at 133.33 MHz the windows close by about 1 tap around the idle centre).
 
-center() runs such a load on the core (one long hardware loop of turnaround.py's traffic: fp4
-weights through the MXU beside 64 KiB DMA stores and loads), scans every lane's read window
-meanwhile with LiteDRAM's BIST in the last quarter of each channel (all lanes at each tap in
-turn), and leaves each lane at its window's centre under the load: the left of the two middles
-of an even window, as the load closes the right edge. A lane whose window under load is
+center() runs such a load on the core (one long hardware loop: prefill's MXU work, 16 rows of
+activations against fp4 weights streamed from DRAM, beside 64 KiB DMA stores and loads), scans
+every lane's read window meanwhile with LiteDRAM's BIST in the last quarter of each channel (all
+lanes at each tap in turn), and leaves each lane at its window's centre under the load: the left
+of the two middles of an even window, as the load closes the right edge. It is the MXU's
+switching that closes them (r150fp, sums of the 18 lanes' windows, idle 138 taps: the TMEM / VPU
+alone 135, the DMA alone 128, the MXU on one row 91, on 16 rows 85, with the DMA 76), and each
+load's windows lie inside the lighter ones', so the heaviest one's centre is inside them all
+(turnaround.py's single row, the first version's load, left phi4-mini's prefill reading ECC
+errors). A lane whose window under load is
 narrower than MIN_WINDOW keeps its calibrated tap (and says so). Board.scrub runs it once per
 configuration, between two passes of zeros, when wanted_on(): the core clock is not the
 controllers' (OTPU_LOAD_CENTER=1 / 0 forces it on / off). The BIST writes without ECC check bits
@@ -40,9 +45,10 @@ REPS, MIB = 10, 128         # per tap: REPS BIST reads of MIB MiB per channel (~
 SEED = 0x0F1E2D3C4B5A6978
 LOAD_ITERS = 2_000_000      # the load's loop: minutes, ended by Board.stop after the scan
 
-# the load: turnaround.py's traffic in one hardware loop (an MM of R x H fp4 weights on port A,
-# 64 KiB DMA tiles stored and reloaded on port B)
+# the load: prefill's MXU work in one hardware loop (ROWS x H activations against R x H fp4
+# weights on port A) beside 64 KiB DMA tiles stored and reloaded on port B
 H, R, NS = 1024, 1024, 128
+ROWS = 16                   # prefill's tokens per run
 TILE = 4 * NS * NS
 
 
@@ -146,7 +152,7 @@ def _kernel():
     @ol.jit
     def load(m, n_mm: int, n_dma: int, n_iter: int):
         xs = ol.quantize(ol.load(m.x))
-        y = ol.empty([1, R])
+        y = ol.empty([m.rows, R])
         t = ol.load(m.src)
         u = ol.empty([NS * NS])
         per = -(-n_dma // n_mm)
@@ -160,21 +166,22 @@ def _kernel():
                         if k:
                             ol.load(m.dma[k - 1, :], out=u)         # and reads of the previous tile
                         k += 1
-                ol.store(m.out[i:i + 1, :], y)
+                ol.store(m.out[i * m.rows:(i + 1) * m.rows, :], y)
     return load
 
 
-def build(cfg, n_mm: int = 4, n_dma: int = 16, n_iter: int = LOAD_ITERS, seed: int = 0):
+def build(cfg, n_mm: int = 4, n_dma: int = 16, n_iter: int = LOAD_ITERS, seed: int = 0,
+          rows: int = ROWS):
     """The load's image, layout (byte offsets) and program."""
     from opentpu import quant as Q
     from opentpu.llm.qwen3 import _qdesc, _tdesc
     rb, sb = Q.row_bytes(H, "fp4", 128), Q.scale_bytes(H, "fp4", 128)
     a = {"w": 0, "ws": n_mm * R * rb}
     a["x"] = a["ws"] + n_mm * R * sb
-    a["src"] = (a["x"] + 4 * H + (1 << 20) - 1) >> 20 << 20
+    a["src"] = (a["x"] + 4 * rows * H + (1 << 20) - 1) >> 20 << 20
     a["dma"] = a["src"] + TILE
     a["out"] = a["dma"] + n_dma * TILE
-    a["prog"] = (a["out"] + 4 * n_mm * R + 4095) // 4096 * 4096
+    a["prog"] = (a["out"] + 4 * n_mm * rows * R + 4095) // 4096 * 4096
     img = np.zeros(a["prog"], np.uint8)
     rng = np.random.default_rng(seed)
     q, sc = Q.quantize_mxu(rng.standard_normal((R, H)).astype(np.float32), "fp4", 128)
@@ -183,11 +190,12 @@ def build(cfg, n_mm: int = 4, n_dma: int = 16, n_iter: int = LOAD_ITERS, seed: i
     for i in range(n_mm):
         img[a["w"] + i * q.size:a["w"] + (i + 1) * q.size] = q
         img[a["ws"] + i * sc.size:a["ws"] + (i + 1) * sc.size] = sc
-    img[a["x"]:a["x"] + 4 * H] = rng.standard_normal(H).astype(np.float32).view(np.uint8)
+    img[a["x"]:a["x"] + 4 * rows * H] = rng.standard_normal(rows * H).astype(np.float32).view(np.uint8)
     img[a["src"]:a["src"] + TILE] = rng.integers(0, 1 << 32, NS * NS, np.uint32).view(np.uint8)
     m = SimpleNamespace(w=_qdesc(a["w"], a["ws"], n_mm * R, H, 128, "fp4"),
-                        x=_tdesc(a["x"], (1, H)), src=_tdesc(a["src"], (NS * NS,)),
-                        dma=_tdesc(a["dma"], (n_dma, NS * NS)), out=_tdesc(a["out"], (n_mm, R)))
+                        x=_tdesc(a["x"], (rows, H)), src=_tdesc(a["src"], (NS * NS,)),
+                        dma=_tdesc(a["dma"], (n_dma, NS * NS)), out=_tdesc(a["out"], (n_mm * rows, R)),
+                        rows=rows)
     prog = _kernel().trace(cfg, 0, {"m": m, "n_mm": n_mm, "n_dma": n_dma,
                                     "n_iter": n_iter}).finish()
     return img, a, prog

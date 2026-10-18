@@ -50,9 +50,9 @@ def test_a_lane_narrower_than_the_minimum_keeps_its_calibrated_tap():
 
 
 def test_the_load_runs_on_the_isa_simulator():
-    """A few iterations of the load: the DMA's tiles are the source tile (it stores them and
-    reloads the one before), and the MM's rows are written."""
-    cfg = Config(S=1, DRAM_BYTES=1 << 25)
+    """A few iterations of the load (the m8 card's TMEM): the DMA's tiles are the source tile (it
+    stores them and reloads the one before), and every row of the MMs' results is written."""
+    cfg = Config(S=1, DRAM_BYTES=1 << 25, TMEM_WORDS=131072)
     img, a, prog = L.build(cfg, n_mm=2, n_dma=4, n_iter=3)
     dram = np.concatenate([img, np.zeros(cfg.DRAM_BYTES - len(img), np.uint8)])
     m = Machine(cfg, [prog], [dram]).run()
@@ -60,5 +60,5 @@ def test_the_load_runs_on_the_isa_simulator():
     src = img[a["src"]:a["src"] + L.TILE]
     for k in range(4):
         assert np.array_equal(got[a["dma"] + k * L.TILE:a["dma"] + (k + 1) * L.TILE], src)
-    out = got[a["out"]:a["out"] + 4 * 2 * L.R].view(np.float32)
-    assert np.isfinite(out).all() and np.abs(out).sum() > 0
+    out = got[a["out"]:a["out"] + 4 * 2 * L.ROWS * L.R].view(np.float32).reshape(2 * L.ROWS, L.R)
+    assert np.isfinite(out).all() and (np.abs(out).sum(1) > 0).all()

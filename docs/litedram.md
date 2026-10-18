@@ -1328,6 +1328,54 @@ loads that each read ECC errors under inference at the calibrated taps, after it
 beats beside perf qwen3 and lfm2 (about 500 passes each), and 0 / 0 ECC on both channels over the
 turnaround stress, perf qwen3 and perf lfm2, two or three times per load.
 
+**Not under prefill.** r150fp's qualification window with it (r150fpl: production's host ec87de44
+with loadcal) was clean through the selftest, the fast and E2B quals, the stresses and the MoE
+chats; then phi4-mini's heavy xl qual (a 1,400-token prompt, 16 tokens a run) read 1 corrected and
+1 uncorrectable word on channel 1 and gemma4-e4b's 5 corrected more (ECC WINDOW FAIL, no soak).
+On a fresh load the phi4-mini xl qual alone read 23 corrected / 7 uncorrectable on channel 1 in 8
+minutes, with the windows under loadcal's load before and after it within a tap of each other
+(die 65 -> 73 C): the load, not drift.
+
+**What closes them** (opentpu's `~/otpu-build/bisect150/probe2.py`: every lane's window under one
+core load at a time, 10 x 128 MiB per tap; the sum of each channel's nine lane windows, ch0 / ch1):
+
+| load | E3 (133.33) | r150fp (150) | h152 (152.38) |
+|---|---|---|---|
+| idle | 71 / 73 | 69 / 69 | 72 / 70 |
+| TMEM / VPU, no DRAM (burnbist's loop) | 68 / 72 | 68 / 67 | 69 / 68 |
+| the DMA's 64 KiB stores and loads | 68 / 68 | 61 / 67 | 63 / 67 |
+| the MXU on fp4 weights, one row | 61 / 58 | 46 / 45 | 53 / 55 |
+| the same, the weight codes zero | 67 / 68 | 62 / 55 | 62 / 61 |
+| the MXU, one row, beside the DMA (loadcal's first load) | 62 / 59 | 45 / 42 | 51 / 54 |
+| the MXU, 16 rows (prefill) | 56 / 51 | 42 / 43 | 47 / 43 |
+| the same, the weight codes zero | 66 / 62 | 55 / 49 | 55 / 54 |
+| the same, the activations zero | 63 / 60 | 55 / 56 | 55 / 58 |
+| the MXU, 16 rows, beside the DMA | 55 / 50 | 39 / 37 | 42 / 41 |
+| the same, int8 weights | - | - | 40 / 39 |
+
+- It is the MXU's switching, its DSP array with both operands moving. The TMEM and the VPU at
+  150 / 300 MHz barely move the windows, the DMA a little. The array sits on DSP columns X1-X8
+  (`otpu_mxu_place.tcl`), its column 0 one DSP column from the left I/O column that holds both
+  channels' PHYs, over the die's whole height.
+- Each load's windows lie inside the lighter ones' (the right edge closes first), so a lane
+  centred under the heaviest load is centred inside them all. `loadcal` now runs prefill's load
+  (16 rows of activations against fp4 weights, beside the DMA).
+- h152 is r150fp's routed design with its core MMCM retimed to the DDR3 bit clock: VCO 1066.67
+  MHz (50 x 64 / 3), core_clk VCO / 7 = 152.38 MHz, core_clk2x VCO / 3.5 (the two outputs swap
+  pins, CLKOUT0 being the fractional one; omarchy's `~/otpu-build/tff/h152.tcl`; with the late
+  constraints applied again core -0.013 ns, clk2x +0.011, WHS +0.013: for the card only). Every
+  core edge then keeps one phase to the read capture's edges, as at 133.33 MHz. That gives back
+  7-12 taps of the eighteen windows under the one-row MXU, 3-4 under prefill: under prefill a
+  faster core costs about 1.4 taps (110 ps) a lane on either clock.
+- Centred under prefill's load (h152), the BIST beside that load read no wrong beat at the
+  centre or a tap either side (`bermap.py`: 4.4e12 bits per channel each, 74-80 C). The heavy xl
+  quals then read channel 1 1 corrected (phi4-mini), 1 corrected (gemma4-e4b) and 0 (phi4-mini
+  again): thirty times fewer than at the first load's centres, not none. Channel 1 is the one
+  whose PHY rows hold the pumped TMEM in this placement.
+
+So under prefill the 150 MHz class keeps about 1.4 taps a lane less read window than E3, which no
+choice of taps gives back; the m8 card stays at 133.33 MHz (docs/timing_ffs.md section 8).
+
 ## 11. The card's controller in simulation (2026-09-29, night)
 
 **Why.** The DDR3 bank model behind the adapter in simulation (`otpu_native_mem`'s

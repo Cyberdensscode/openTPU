@@ -569,6 +569,18 @@ maximum of each supply over each step:
   configuration's first scrub when the core clock is not the controllers'. On three fresh r150fp
   loads that read ECC errors under inference at the calibrated taps, the BIST beside inference
   and the ECC over the stress and both models then read 0.
+- **Under prefill it is not enough** (docs/litedram.md, "Not under prefill"). r150fp's window
+  with loadcal (r150fpl) was clean until the heavy xl quals: phi4-mini's 1,400-token prompt read
+  channel 1 1 corrected / 1 uncorrectable, gemma4-e4b 5 corrected more; no soak, not promoted.
+  The windows under one core load at a time put it on the MXU's switching (the TMEM, the VPU and
+  the DMA barely move them), worst under prefill's 16 rows beside the DMA: the eighteen windows
+  sum to 76 taps at 150 MHz against E3's 105. loadcal now centres under that load (each load's
+  windows lie inside the lighter ones'), and a core clock on the DDR3 bit clock's grid (h152:
+  r150fp's routed design, its MMCM at 1066.67 / 7 = 152.38 MHz, core -0.013 ns) gives back part
+  of the one-row MXU's loss but little of prefill's (83 taps). Centred under prefill, h152's heavy
+  xl quals read 1, 1 and 0 corrected words on channel 1: thirty times fewer, not none. A faster
+  core costs about 1.4 taps (110 ps) of read window a lane under prefill, which no choice of taps
+  gives back.
 - What 150 MHz buys, on the same runs: prefill 4% (Qwen3-0.6B 173.1 -> 180.1 tok/s, LFM2.5
   569.1 -> 595.1), decode under 1% (24.70 -> 24.76 tok/s; 66.53 -> 67.08): decode waits on the
   DRAM, which is the same 17 GB/s at either clock.
@@ -578,13 +590,14 @@ So the card's clock stays 133.33 MHz. The timing work stands as margin there: th
 
 ## 9. Next
 
-- The FPGA: a core faster than the memory's 133.33 MHz needs the memory interface to hold at
-  it first (section 8): find what the 150 MHz core does to the PHY (not the TMEM's place,
-  r150h; channel 0's read framing per load, the memory clocks' jitter with the core's
-  switching, the write window's 485 ps warm). A test that would separate them: the PHY's BIST
-  while the core runs a long compute-only program (no DRAM), so that the core switches at 150
-  MHz while only the BIST uses the memory. Or run the core at 133.33 MHz and spend the margin
-  elsewhere. Land the narrow copies, the fanout batches, the MXU's TQ, the reads by bank and the
+- The FPGA: a core faster than the memory's 133.33 MHz needs about 1.4 taps (110 ps) of read
+  window a lane back under prefill (section 8). What is left to try costs a full build each, with
+  no measurement that it pays: the MXU's array away from the left I/O column (DSP columns X4-X11
+  instead of X1-X8) and the pumped TMEM out of the PHYs' rows, then closing 150 MHz again; the
+  read capture on regional clocks (BUFIO / BUFR, one MMCM per bank region) or on DQS instead of
+  the BUFG-clocked sys4x. Per-bit read delays (gating the IDELAYs' CE / LD with dly_sel_bits)
+  would add at most half a tap: the bits of a lane open within a tap of each other under load. Or
+  run the core at 133.33 MHz and spend the margin elsewhere. Land the narrow copies, the fanout batches, the MXU's TQ, the reads by bank and the
   reroute rule on main for the card at 133.33 MHz, and drop r22's ECO from its recipe.
 - The ASIC: run the card's flow (both hooks are its default now) through detailed routing, with
   the clock at 2.0 ns rather than a margin (the global route's 2.0 ns is on the guides'
