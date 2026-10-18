@@ -139,25 +139,39 @@ add_files -fileset constrs_1 -norecurse [list $cons/otpu_top_ld.xdc \
 set late [list $cons/otpu_mem_ch.tcl $cons/otpu_top_native.tcl]
 if {$CLK2X} { lappend late $cons/otpu_clk2x.tcl }
 lappend late $cons/otpu_mxu_place.tcl $cons/otpu_ddr_phy_place.tcl
-# a setup margin (OTPU_SETUP_MARGIN, ns; unset or 0: none): implementation times every setup check
-# between the core clocks (core_clk, core_clk2x) with that much more uncertainty, so a route that
-# meets it has that much slack at the real clock. Generated here (otpu_margin.tcl, in OUT_DIR);
-# build.tcl reports the core's slack with it, then removes it for the reports and the bitstream
-set SETUP_MARGIN [expr {[info exists ::env(OTPU_SETUP_MARGIN)] && $::env(OTPU_SETUP_MARGIN) ne "" ? $::env(OTPU_SETUP_MARGIN) : 0}]
-if {![string is double -strict $SETUP_MARGIN] || $SETUP_MARGIN < 0 || $SETUP_MARGIN > 1} {
-  error "OTPU_SETUP_MARGIN '$SETUP_MARGIN': a margin in ns, 0 to 1"
+# setup margins (ns; unset or 0: none): implementation times the checks named below with that much
+# more setup uncertainty, so a route that meets them has that much slack at the real clocks.
+# OTPU_SETUP_MARGIN: every check between the core clocks (core_clk, core_clk2x). OTPU_SYS_MARGIN:
+# LiteDRAM's sys clock to itself (the controllers, the PHY's read data into the ECC decoders),
+# which carries no uncertainty of its own (otpu_litedram.xdc's are on the ld MMCMs' clock pairs:
+# not here, as build.tcl sets these back to 0). Generated here (otpu_margin.tcl in OUT_DIR, one
+# "# margin NAME {FROM} {TO} NS" line a group); build.tcl reports each group's worst slack with
+# it, then removes it for the reports and the bitstream
+set margins {}
+foreach {knob name from to} {
+  OTPU_SETUP_MARGIN core {core_clk_otpu_bd_clk_wiz_0_0 core_clk2x_otpu_bd_clk_wiz_0_0}
+                         {core_clk_otpu_bd_clk_wiz_0_0 core_clk2x_otpu_bd_clk_wiz_0_0}
+  OTPU_SYS_MARGIN   sys  {crg_s7mmcm_clkout} {crg_s7mmcm_clkout}
+} {
+  set m [expr {[info exists ::env($knob)] && $::env($knob) ne "" ? $::env($knob) : 0}]
+  if {![string is double -strict $m] || $m < 0 || $m > 1} { error "$knob '$m': a margin in ns, 0 to 1" }
+  if {$m > 0} { lappend margins [list $name $from $to $m] }
 }
-if {$SETUP_MARGIN > 0} {
+if {[llength $margins]} {
   set fh [open $out/otpu_margin.tcl w]
-  puts $fh "# otpu_margin.tcl (create_project.tcl, OTPU_SETUP_MARGIN): +$SETUP_MARGIN ns setup uncertainty"
-  puts $fh "# on every check between the core clocks (implementation only; build.tcl removes it)"
-  puts $fh "set otpu_m_c \[list \[get_clocks -quiet core_clk_otpu_bd_clk_wiz_0_0\] \[get_clocks -quiet core_clk2x_otpu_bd_clk_wiz_0_0\]\]"
-  puts $fh "if {\[llength \[join \$otpu_m_c\]\] == 2} {"
-  puts $fh "  foreach a \$otpu_m_c { foreach b \$otpu_m_c { set_clock_uncertainty -setup -from \$a -to \$b $SETUP_MARGIN } }"
-  puts $fh "  puts \"otpu_margin.tcl: setup margin $SETUP_MARGIN ns on the core clocks\""
-  puts $fh "} else {"
-  puts $fh "  puts \"CRITICAL WARNING: \\\[otpu_margin.tcl\\\] core clocks not found (\$otpu_m_c): no setup margin\""
+  puts $fh "# otpu_margin.tcl (create_project.tcl, OTPU_SETUP_MARGIN / OTPU_SYS_MARGIN): more setup uncertainty"
+  puts $fh "# on the checks of each group (implementation only; build.tcl removes it)"
+  foreach g $margins { puts $fh "# margin [lindex $g 0] {[lindex $g 1]} {[lindex $g 2]} [lindex $g 3]" }
+  puts $fh "proc otpu_margin_set {name from to m} {"
+  puts $fh "  set f \[get_clocks -quiet \$from\]; set t \[get_clocks -quiet \$to\]"
+  puts $fh "  if {\[llength \$f\] != \[llength \$from\] || \[llength \$t\] != \[llength \$to\]} {"
+  puts $fh "    puts \"CRITICAL WARNING: \\\[otpu_margin.tcl\\\] \$name: clocks not found (\$from -> \$to): no setup margin\""
+  puts $fh "    return"
+  puts $fh "  }"
+  puts $fh "  foreach a \$f { foreach b \$t { set_clock_uncertainty -setup -from \$a -to \$b \$m } }"
+  puts $fh "  puts \"otpu_margin.tcl: setup margin \$m ns on \$name (\$from -> \$to)\""
   puts $fh "}"
+  foreach g $margins { puts $fh "otpu_margin_set [lindex $g 0] {[lindex $g 1]} {[lindex $g 2]} [lindex $g 3]" }
   close $fh
   lappend late $out/otpu_margin.tcl
 }
