@@ -1433,6 +1433,12 @@ load; the load before had it at tap 13 with 4.
   gemma4-e4b's and phi4-mini's again then read 0 / 0 on both channels.
 - **What it cannot move.** A lane calibrated at bitslip 0 whose lower eye is a bitslip below (the
   second window's channel 0 lane 4: bitslip 0, tap 20, 4 taps under load) keeps its eye.
+- **The second window and the promotion.** With the search (production's host ec87de44 with
+  loadcal 6b8d9d4c and 1c4b3bf8) r150o's second window read ECC 0 / 0 on both channels in every
+  qual (156 reads, the heavy xl quals included) and over the 5 h soak (20 quals, 1,161 reads).
+  r150o is production since 2026-10-19 (E3 production-prev). On the promotion's load the search
+  moved channel 1 lanes 6 and 7 a bitslip down (taps 14 -> 2) and the windows under prefill
+  beside the DMA summed 94 taps, every lane 4 or more (E3: 105, its narrowest 4).
 
 ## 11. The card's controller in simulation (2026-09-29, night)
 

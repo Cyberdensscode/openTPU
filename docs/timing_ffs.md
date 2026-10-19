@@ -50,12 +50,15 @@ card's DRAM made of them.
   to register (400 -> 500 MHz on the route's parasitics) in 100 s of repair; CTS's repair now runs
   after the latency (`cts_latency.tcl`: 1 real violator instead of 1,232 ports). Batch 1 (with
   the ACT RAM copy) cost the ASIC 1.2% of area and 11% of wire for 0.008 ns (section 4).
-- **A real 150 MHz closes with margin, but the card's DRAM is not clean at it** (section 8). With
-  the units' TMEM reads by bank from flip-flops and a setup margin in the flow, r150fp met 150
-  MHz with core +0.130 / clk2x +0.154 ns. On the card every 150 MHz bitstream (three placements)
-  read ECC errors back under inference, up to hundreds of uncorrectable words, where the same
-  RTL at 133.33 MHz reads clean; for 4% of prefill and under 1% of decode. The card stays at
-  133.33 MHz.
+- **A real 150 MHz closes with margin, and the card runs at it since 2026-10-19** (section 8).
+  With the units' TMEM reads by bank from flip-flops and a setup margin in the flow, r150fp met
+  150 MHz with core +0.130 / clk2x +0.154 ns. On the card every 150 MHz bitstream with the MXU's
+  array on DSP X1-X8 read ECC errors back under inference, up to hundreds of uncorrectable
+  words, where the same RTL at 133.33 MHz reads clean: the array's switching beside the DDR3
+  PHYs closes their read windows. With the array on X3-X10 (r150o, core +0.079 ns) and the read
+  taps chosen under prefill's load, each lane's eye included (`opentpu.host.loadcal`), its
+  deploy window and 5 h soak read no corrected word, and r150o is production; for 4% of prefill
+  and under 1% of decode.
 
 ## 1. Where the delay is
 
@@ -465,10 +468,13 @@ multiplexers, ranks, data select and lanes; TMEM's tests pass with it) was prepa
 
 The question (2026-10-17): build the m8 card at a real 150 MHz (not the equivalent), give it
 comfortable margins, and promote it. **The margins came (r150fp: core +0.130 ns, clk2x +0.154,
-every clock above production E3's at 133.33 MHz), but the card is not clean at 150 MHz: under
-inference its DRAM reads come back with ECC errors, corrected and uncorrectable, in every 150 MHz
-bitstream tried (the TMEM moved away from the PHYs included: one load clean, the next not),
-while the same RTL at 133.33 MHz reads clean. Production stays on E3.**
+every clock above production E3's at 133.33 MHz), but at first the card was not clean at 150
+MHz: under inference its DRAM reads came back with ECC errors, corrected and uncorrectable, in
+every 150 MHz bitstream with the MXU's array on DSP X1-X8 (the TMEM moved away from the PHYs
+included: one load clean, the next not), while the same RTL at 133.33 MHz reads clean. The
+array's switching closes the PHYs' read windows. r150o (2026-10-19: the array on X3-X10, core
++0.079 ns) with the read taps chosen under prefill's load, each lane's eye included, read no
+corrected word in its deploy window and 5 h soak, and is production.**
 
 **The clock.** `bd_native.tcl`'s fixed 800 MHz VCO has no even divider for 150 MHz with the pumped
 TMEM's core_clk2x; `core_clock.tcl` (18168e94) picks the VCO an even divider needs (150: 900 MHz /
@@ -625,24 +631,35 @@ maximum of each supply over each step:
 
   `OTPU_PLACE_DIRECTIVE` (build.tcl) sets the placer's directive alone and keeps the rest of the
   production strategy.
+- **r150o on the card** (2026-10-19; docs/litedram.md "Each lane's eye under load"). Its first
+  deploy window read 56 corrected words on channel 1 (every token right, no soak): that load's
+  calibration had put channel 1 lane 6 at tap 26, with 2 taps under prefill. loadcal now chooses
+  each lane's eye under load as well as its tap (1c4b3bf8: the lane's read bitslip and the one
+  either side). The second window, on production's host ec87de44 with loadcal 6b8d9d4c and
+  1c4b3bf8, read ECC 0 / 0 on both channels in every qual (156 reads: the fast qual, E2B, the
+  chats, MoE, the stresses, the heavy xl quals) and in the 5 h soak (20 quals, 1,161 reads).
+  Promoted the same day (opentpu's `deploy_r150o_1da7d3b9`; E3 production-prev): the
+  promotion's own load windows under prefill beside the DMA summed 94 taps, every lane 4 or more
+  (E3 105, its narrowest lane 4).
 - What 150 MHz buys, on the same runs: prefill 4% (Qwen3-0.6B 173.1 -> 180.1 tok/s, LFM2.5
   569.1 -> 595.1), decode under 1% (24.70 -> 24.76 tok/s; 66.53 -> 67.08): decode waits on the
   DRAM, which is the same 17 GB/s at either clock.
 
-So the card's clock stays 133.33 MHz. The timing work stands as margin there: the same RTL closes
-133.33 MHz with Vivado's default implementation (b_t9_def, section 7).
+So the card's clock is 150 MHz since 2026-10-19 (r150o). The same RTL also closes 133.33 MHz with
+Vivado's default implementation (b_t9_def, section 7).
 
 ## 9. Next
 
-- The FPGA: a core faster than the memory's 133.33 MHz needs about 1.4 taps (110 ps) of read
-  window a lane back under prefill (section 8). What is left to try costs a full build each, with
-  no measurement that it pays: the MXU's array away from the left I/O column (DSP columns X4-X11
-  instead of X1-X8) and the pumped TMEM out of the PHYs' rows, then closing 150 MHz again; the
-  read capture on regional clocks (BUFIO / BUFR, one MMCM per bank region) or on DQS instead of
-  the BUFG-clocked sys4x. Per-bit read delays (gating the IDELAYs' CE / LD with dly_sel_bits)
-  would add at most half a tap: the bits of a lane open within a tap of each other under load. Or
-  run the core at 133.33 MHz and spend the margin elsewhere. Land the narrow copies, the fanout batches, the MXU's TQ, the reads by bank and the
-  reroute rule on main for the card at 133.33 MHz, and drop r22's ECO from its recipe.
+- The FPGA: r150o's windows under prefill sum 94 taps against E3's 105. Its weakest lane is one the
+  eye search cannot move: a lane calibrated at bitslip 0 whose lower eye is a bitslip below (the
+  second window's channel 0 lane 4: bitslip 0, tap 20, 4 taps under load). The calibration itself
+  (the core's CPU's and ddrcal's) could take the eye nearest the delay line's start rather than the
+  first of equals. The DRAM's Rtt_Nom off (MR1 0x2, Rtt_WR kept: the DRAM terminating during writes
+  only) is untried. X4-X11 (r150m, 98 taps) does not close 150 MHz with any placer directive
+  screened; the read capture on regional clocks (BUFIO / BUFR, one MMCM per bank region) or on DQS
+  instead of the BUFG-clocked sys4x would take a PHY change. Per-bit read delays (gating the
+  IDELAYs' CE / LD with dly_sel_bits) would add at most half a tap: the bits of a lane open within a
+  tap of each other under load.
 - The ASIC: run the card's flow (both hooks are its default now) through detailed routing, with
   the clock at 2.0 ns rather than a margin (the global route's 2.0 ns is on the guides'
   parasitics); put the copies behind a target parameter (FPGA on, ASIC off); at 2.0 ns the VPU's
