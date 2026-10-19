@@ -52,6 +52,9 @@
 # - DSP48_X0..X11 sit at tile X 9 14 29 34 49 54 69 74 89 94 105 117, 160 sites each.
 # - RAMB36_X0..X11 sit at tile X 6 17 26 37 46 57 66 77 86 97 108 114, 80 sites each.
 # - RAMB36 row r is level with DSP rows 2r and 2r+1.
+# - Beside the PCIe block RAMB36_X11 has no rows 40..44 (75 sites), and the XDMA's PCIe RAMs hold
+#   RAMB36_X10Y40, Y41, Y43 and Y44 (its IP's LOCs). A RAM of ours that would land on a missing
+#   site or one another cell holds takes the free row nearest it (OTPU_MXU_BRAM_COLS with 10, 11).
 
 namespace eval ::otpu_mxu_place {
   # part prefix, MCOLS, DSP site columns, block RAM site columns, weight RAMs' block RAM column.
@@ -157,6 +160,7 @@ proc ::otpu_mxu_place::ram {cell x r nrow} {
       if {$rr < 0 || $rr >= $nrow} { continue }
       set s36 RAMB36_X${x}Y$rr
       set s18 [list RAMB18_X${x}Y[expr {2 * $rr}] RAMB18_X${x}Y[expr {2 * $rr + 1}]]
+      if {[get_sites -quiet $s36] eq ""} { continue }
       if {$t eq "RAMB36E1"} {
         if {![info exists used($s36)] && ![info exists used([lindex $s18 0])] && ![info exists used([lindex $s18 1])]} {
           loc $cell $s36; return
@@ -253,6 +257,13 @@ proc ::otpu_mxu_place::run {} {
   }
   # ---- the ACT RAM: column j's memory beside it, piece p (bytes p*D/NP ..) level with its PEs
   set act [file dirname $pre]/u_act
+  # the block RAM sites other cells hold (not ours, should this run twice on one netlist)
+  set nheld 0
+  foreach c [get_cells -quiet -hier -filter {REF_NAME =~ RAMB*}] {
+    if {[string match $pre/* $c] || [string match $act/* $c]} { continue }
+    set s [get_property LOC $c]
+    if {$s ne ""} { set used($s) $c; incr nheld }
+  }
   set nact 0
   for {set j 0} {$j < $mc} {incr j} {
     set x [lindex $bcols $j]
@@ -347,7 +358,8 @@ proc ::otpu_mxu_place::run {} {
   puts "otpu_mxu_place: MCOLS $mc x D $d PEs ($heads chains) and [llength $ce(0)] column-end DSPs a column on\
         DSP48_X{$dcols} rows $base..[expr {$base + $h - 1}], the column ends ($cem) from row [expr {$base + $split}];\
         $nact ACT RAMs on RAMB36_X{$bcols};\
-        $n weight RAMs on RAMB36_X$wcol ($wdesc) ([llength $lines] LOCs[expr {$rec ne "" ? ", $rec" : ""}])"
+        $n weight RAMs on RAMB36_X$wcol ($wdesc) ([llength $lines] LOCs[expr {$rec ne "" ? ", $rec" : ""}];\
+        $nheld block RAM sites other cells hold)"
 }
 
 ::otpu_mxu_place::run

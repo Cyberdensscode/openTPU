@@ -181,26 +181,30 @@ if {[llength $margins]} {
 # under inference (docs/timing_ffs.md section 8: r150b's TMEM in rows 0-3, channel 0; r150f's in
 # rows 4-7, mostly channel 1); the PHYs sit in rows 0-2 and 5-7 of the left I/O column. Generated
 # as otpu_tmem_pblock.tcl in OUT_DIR; build.tcl requires its summary line in the run's log.
-set tpb [expr {[info exists ::env(OTPU_TMEM_PBLOCK)] ? [string trim $::env(OTPU_TMEM_PBLOCK)] : ""}]
-if {$tpb ne ""} {
+# OTPU_XDMA_PBLOCK, the same for the XDMA (u_bd's xdma_0, e.g. CLOCKREGION_X1Y3:CLOCKREGION_X1Y6
+# around the PCIe block at X1Y4): with the MXU array right of DSP X1-X8 the placer moved most of the
+# XDMA to X0Y5-Y7 (r150m: userclk2 -0.176 ns); as otpu_xdma_pblock.tcl.
+foreach {knob name pat} {OTPU_TMEM_PBLOCK tmem *u_slice/u_tmem OTPU_XDMA_PBLOCK xdma *otpu_bd_i/xdma_0} {
+  set tpb [expr {[info exists ::env($knob)] ? [string trim $::env($knob)] : ""}]
+  if {$tpb eq ""} { continue }
   foreach r $tpb {
     if {![regexp {^CLOCKREGION_X\d+Y\d+:CLOCKREGION_X\d+Y\d+$} $r]} {
-      error "OTPU_TMEM_PBLOCK '$tpb': ranges CLOCKREGION_XaYb:CLOCKREGION_XcYd, space separated"
+      error "$knob '$tpb': ranges CLOCKREGION_XaYb:CLOCKREGION_XcYd, space separated"
     }
   }
-  set fh [open $out/otpu_tmem_pblock.tcl w]
-  puts $fh "# otpu_tmem_pblock.tcl (create_project.tcl, OTPU_TMEM_PBLOCK): the TMEM in a hard pblock"
-  puts $fh "set c \[get_cells -quiet -hier -filter {NAME =~ *u_slice/u_tmem && !IS_PRIMITIVE}\]"
+  set fh [open $out/otpu_${name}_pblock.tcl w]
+  puts $fh "# otpu_${name}_pblock.tcl (create_project.tcl, $knob): $pat in a hard pblock"
+  puts $fh "set c \[get_cells -quiet -hier -filter {NAME =~ $pat && !IS_PRIMITIVE}\]"
   puts $fh "if {\[llength \$c\] != 1} {"
-  puts $fh "  error \"otpu_tmem_pblock.tcl: \[llength \$c\] u_slice/u_tmem cells, expected 1\""
+  puts $fh "  error \"otpu_${name}_pblock.tcl: \[llength \$c\] $pat cells, expected 1\""
   puts $fh "}"
-  puts $fh "set pb \[create_pblock otpu_tmem\]"
+  puts $fh "set pb \[create_pblock otpu_$name\]"
   puts $fh "resize_pblock \$pb -add {$tpb}"
   puts $fh "set_property IS_SOFT false \$pb"
   puts $fh "add_cells_to_pblock \$pb \$c"
-  puts $fh "puts \"otpu_tmem_pblock: \$c in {$tpb}\""
+  puts $fh "puts \"otpu_${name}_pblock: \$c in {$tpb}\""
   close $fh
-  lappend late $out/otpu_tmem_pblock.tcl
+  lappend late $out/otpu_${name}_pblock.tcl
 }
 add_files -fileset constrs_1 -norecurse $late
 set_property SCOPED_TO_REF otpu_mem_ch [get_files $cons/otpu_mem_ch.tcl]

@@ -56,6 +56,14 @@ if {!$impl_only} {
 
 # ---- implementation to the routed design
 if {$strategy ne ""} { set_property strategy $strategy [get_runs impl_1] }
+# OTPU_PLACE_DIRECTIVE (e.g. ExtraPostPlacementOpt; unset: the strategy's): the placer's directive
+# alone, the rest of the strategy kept (the MXU's array on DSP X3-X10 closed with it, not with
+# ExtraTimingOpt)
+if {[info exists ::env(OTPU_PLACE_DIRECTIVE)] && [string trim $::env(OTPU_PLACE_DIRECTIVE)] ne ""} {
+  set_property STEPS.PLACE_DESIGN.ARGS.DIRECTIVE [string trim $::env(OTPU_PLACE_DIRECTIVE)] [get_runs impl_1]
+}
+puts "impl_1: place_design -directive [get_property STEPS.PLACE_DESIGN.ARGS.DIRECTIVE [get_runs impl_1]],\
+  phys_opt_design -directive [get_property STEPS.PHYS_OPT_DESIGN.ARGS.DIRECTIVE [get_runs impl_1]]"
 if {!$fast} { set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.IS_ENABLED true [get_runs impl_1] }
 reset_run impl_1
 launch_runs impl_1 -jobs $jobs
@@ -73,10 +81,12 @@ if {![regexp {otpu_ddr_phy_place: (\d+ flops|off)} $ilog]} {
   error "otpu_ddr_phy_place.tcl did not place the PHY's flops (no summary line in impl_1/runme.log;\
          OTPU_DDR_PHY_PLACE=0 builds without it)"
 }
-# and the TMEM's pblock when OTPU_TMEM_PBLOCK asked for one (create_project.tcl)
-if {[llength [get_files -quiet -of_objects [get_filesets constrs_1] *otpu_tmem_pblock.tcl]] &&
-    ![regexp {otpu_tmem_pblock: \S+ in } $ilog]} {
-  error "otpu_tmem_pblock.tcl did not place the TMEM (no summary line in impl_1/runme.log)"
+# and the TMEM's / XDMA's pblock when OTPU_TMEM_PBLOCK / OTPU_XDMA_PBLOCK asked for one (create_project.tcl)
+foreach name {tmem xdma} {
+  if {[llength [get_files -quiet -of_objects [get_filesets constrs_1] *otpu_${name}_pblock.tcl]] &&
+      ![regexp "otpu_${name}_pblock: \\S+ in " $ilog]} {
+    error "otpu_${name}_pblock.tcl did not place its cell (no summary line in impl_1/runme.log)"
+  }
 }
 open_run impl_1
 
