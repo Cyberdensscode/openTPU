@@ -488,6 +488,9 @@ margin, below):
 | **r150fp** | 1da7d3b9 | 0.15 | **+0.130** | **+0.154** | +0.040 / +0.041 | +0.106 | +0.013 | r150f before the userclk1 reroute |
 | r150h | f5eb87c5 | 0.15 | -0.286 | -0.086 | +0.054 / +0.012 | +0.063 | +0.015 | the TMEM in a hard pblock, X0Y3:X1Y4 (`OTPU_TMEM_PBLOCK`, between the PHYs' rows) |
 | r150i | f5eb87c5 | 0.15, sys 0.3 | -0.167 | -0.062 | +0.074 / -0.073 | +0.278 | +0.011 | r150h's pblock, `OTPU_SYS_MARGIN` 0.3 |
+| r150m | 1da7d3b9 | 0.15 | -0.686 | -0.447 | +0.049 / -0.176 | +0.187 | +0.016 | the MXU's array on DSP X4-X11 (`OTPU_MXU_DSP_COLS`), away from the PHYs |
+| **r150n** | 1da7d3b9 | 0.15 | **+0.066** | **+0.124** | +0.016 / +0.008 | +0.054 | +0.001 | the array on DSP X2-X9 |
+| **r150o** | 1da7d3b9 | 0.15 | **+0.079** | **+0.151** | +0.032 / +0.023 | +0.208 | +0.019 | the array on DSP X3-X10, the placer's ExtraPostPlacementOpt (`OTPU_PLACE_DIRECTIVE`) |
 | E3 (production) | 039b34d5 | - | +0.007 | +0.019 | +0.012 / +0.041 | +0.015 | +0.018 | 133.33 MHz |
 
 - **Setup margins by clock group** (671b4265, 65f5f357): `OTPU_SETUP_MARGIN` adds that much setup
@@ -578,9 +581,48 @@ maximum of each supply over each step:
   windows lie inside the lighter ones'), and a core clock on the DDR3 bit clock's grid (h152:
   r150fp's routed design, its MMCM at 1066.67 / 7 = 152.38 MHz, core -0.013 ns) gives back part
   of the one-row MXU's loss but little of prefill's (83 taps). Centred under prefill, h152's heavy
-  xl quals read 1, 1 and 0 corrected words on channel 1: thirty times fewer, not none. A faster
-  core costs about 1.4 taps (110 ps) of read window a lane under prefill, which no choice of taps
-  gives back.
+  xl quals read 1, 1 and 0 corrected words on channel 1: thirty times fewer, not none. With the
+  array on X1-X8, a faster core costs about 1.4 taps (110 ps) of read window a lane under prefill,
+  which no choice of taps gives back.
+- **The array's place decides it** (2026-10-18; docs/litedram.md "The array's place"). On X1-X8
+  the array's column 0 is one DSP column from the left I/O column. Five of its eight columns sit
+  in clock region X0 (DSP X0-X5), the PHYs' half of the die.
+  - **Moving it.** `OTPU_MXU_DSP_COLS`, `OTPU_MXU_BRAM_COLS` and `OTPU_MXU_WRAM_COL` move the
+    array. `otpu_mxu_place.tcl` now skips the block RAM sites that are missing beside the PCIe
+    block (RAMB36_X11Y40-44) and those other cells hold (the XDMA's RAMB36_X10Y40/41/43/44).
+  - **What prefill costs.** The read window that prefill beside the DMA takes from idle (sum over
+    the 18 lanes): X1-X8 62 taps, X2-X9 (r150n) 50, X4-X11 (r150m) 35; E3 at 133.33 MHz 39.
+  - **The heavy xl quals.** Centred under prefill, r150m and r150n both read ECC 0 / 0.
+  - **X4-X11 fails timing.** r150m does not close 150 MHz. About 200 DSPs outside the array (the
+    VPU's 86, the quantizer's 64, the MXU's own ~50) do not fit the rows the array leaves free in
+    X4-X11. They land on X0-X3 beside the PHYs, away from their logic: the VPU's and the
+    quantizer's own paths fail by 1-2 ns. A hard pblock that keeps the XDMA beside the PCIe
+    block (`OTPU_XDMA_PBLOCK`; the placer had moved it to X0Y5-Y7) makes it worse.
+- **Placement screens** (omarchy's `~/otpu-build/tff/screen/`). Each screen starts from r150m's
+  opt checkpoint, re-places the array and runs the build's place_design and phys_opt_design
+  (about 20 minutes, no route). The estimate after phys_opt (with the 0.15 ns margin) predicts the
+  route:
+  - r150fp's -0.221 ns / TNS -35 met timing after the route;
+  - r150m's -1.182 / -2,779 failed;
+  - X2-X9's -0.105 / -29 became r150n's +0.066 real;
+  - X3-X10's -0.053 / -2.8 with ExtraPostPlacementOpt became r150o's +0.079 real.
+
+  | the array | the placer | core | clk2x | userclk2 | TNS |
+  |---|---|---|---|---|---|
+  | X1-X8 (r150fp) | ExtraTimingOpt | -0.221 | -0.061 | +0.120 | -35 |
+  | X4-X11 (r150m) | ExtraTimingOpt | -1.182 | -0.936 | -0.359 | -2,779 |
+  | X4-X11 on rows 23-159, the XDMA in X1Y3:X1Y6 | ExtraTimingOpt | -2.673 | -1.741 | +0.107 | -5,964 |
+  | X4-X11 on rows 0-136, the same | ExtraTimingOpt | -2.068 | -1.364 | +0.095 | -6,612 |
+  | X3-X10 | ExtraTimingOpt | -0.375 | -0.197 | +0.008 | -354 |
+  | X3-X10 | EarlyBlockPlacement | -0.229 | -0.075 | -0.163 | -63 |
+  | X3-X10 | ExtraNetDelay_high | -0.305 | -0.238 | +0.004 | -261 |
+  | X3-X10 | AltSpreadLogic_high | -0.278 | -0.200 | -0.141 | -156 |
+  | **X3-X10** | **ExtraPostPlacementOpt** | **-0.053** | **0.000** | +0.008 | **-2.8** |
+  | X2-X9 (r150n) | ExtraTimingOpt | -0.105 | -0.056 | -0.148 | -29 |
+  | X2-X9, the XDMA in X1Y3:X1Y6 | ExtraTimingOpt | -0.738 | -0.390 | +0.002 | -587 |
+
+  `OTPU_PLACE_DIRECTIVE` (build.tcl) sets the placer's directive alone and keeps the rest of the
+  production strategy.
 - What 150 MHz buys, on the same runs: prefill 4% (Qwen3-0.6B 173.1 -> 180.1 tok/s, LFM2.5
   569.1 -> 595.1), decode under 1% (24.70 -> 24.76 tok/s; 66.53 -> 67.08): decode waits on the
   DRAM, which is the same 17 GB/s at either clock.
