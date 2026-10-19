@@ -178,6 +178,10 @@ per-unit clock gating instead of the stall enable on thousands of flip-flops.
   ports' worst went from -2.19 ns (port B's write data) as the SDC was to -0.25 ns, the outputs'
   TNS from -2180 to -31 ns, and no input path fails either way; with the TMEM in the corner port
   B's write data went from -2.47 to -0.52 ns and its ready input (`b_rdy`) from +0.13 to -0.16.
+  ORFS runs `POST_CTS_TCL` after the CTS step's own `repair_timing`, so that repair still saw the
+  ideal view: on main's card every one of its 1232 violators was a port, it gave up after 125 s and
+  left the registers' paths alone. `asic/nangate45/cts_latency.tcl` (`PRE_CTS_TCL`) has the repair
+  source `io_latency.tcl` first (docs/timing_ffs.md section 4).
 - **The regression must simulate the change.** openTPU's tests simulate `tb_top` / `otpu_top`, not
   `otpu_asic_top`; a change only in the ASIC top is never tested. Put it behind a parameter of the
   shared module and turn it on through the target.

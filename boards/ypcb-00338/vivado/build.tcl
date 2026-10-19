@@ -56,6 +56,14 @@ if {!$impl_only} {
 
 # ---- implementation to the routed design
 if {$strategy ne ""} { set_property strategy $strategy [get_runs impl_1] }
+# OTPU_PLACE_DIRECTIVE (e.g. ExtraPostPlacementOpt; unset: the strategy's): the placer's directive
+# alone, the rest of the strategy kept (the MXU's array on DSP X3-X10 closed with it, not with
+# ExtraTimingOpt)
+if {[info exists ::env(OTPU_PLACE_DIRECTIVE)] && [string trim $::env(OTPU_PLACE_DIRECTIVE)] ne ""} {
+  set_property STEPS.PLACE_DESIGN.ARGS.DIRECTIVE [string trim $::env(OTPU_PLACE_DIRECTIVE)] [get_runs impl_1]
+}
+puts "impl_1: place_design -directive [get_property STEPS.PLACE_DESIGN.ARGS.DIRECTIVE [get_runs impl_1]],\
+  phys_opt_design -directive [get_property STEPS.PHYS_OPT_DESIGN.ARGS.DIRECTIVE [get_runs impl_1]]"
 if {!$fast} { set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.IS_ENABLED true [get_runs impl_1] }
 reset_run impl_1
 launch_runs impl_1 -jobs $jobs
@@ -73,7 +81,32 @@ if {![regexp {otpu_ddr_phy_place: (\d+ flops|off)} $ilog]} {
   error "otpu_ddr_phy_place.tcl did not place the PHY's flops (no summary line in impl_1/runme.log;\
          OTPU_DDR_PHY_PLACE=0 builds without it)"
 }
+# and the TMEM's / XDMA's pblock when OTPU_TMEM_PBLOCK / OTPU_XDMA_PBLOCK asked for one (create_project.tcl)
+foreach name {tmem xdma} {
+  if {[llength [get_files -quiet -of_objects [get_filesets constrs_1] *otpu_${name}_pblock.tcl]] &&
+      ![regexp "otpu_${name}_pblock: \\S+ in " $ilog]} {
+    error "otpu_${name}_pblock.tcl did not place its cell (no summary line in impl_1/runme.log)"
+  }
+}
 open_run impl_1
+
+# ---- the setup margins (create_project.tcl, OTPU_SETUP_MARGIN / OTPU_SYS_MARGIN): each group's
+# worst setup slack with its margin (the route's target), then without it for everything below
+set margin_lines {}
+set mf [get_files -quiet -of_objects [get_filesets constrs_1] *otpu_margin.tcl]
+if {$mf ne ""} {
+  set fh [open $mf]; set mt [read $fh]; close $fh
+  set groups [regexp -all -inline -line {^# margin (\S+) \{([^\}]*)\} \{([^\}]*)\} ([0-9.]+)$} $mt]
+  if {![llength $groups]} { error "otpu_margin.tcl: no margin lines in $mf" }
+  foreach {- name from to m} $groups {
+    set f [get_clocks $from]; set t [get_clocks $to]
+    set mp [lindex [get_timing_paths -quiet -setup -max_paths 1 -nworst 1 -from $f -to $t] 0]
+    set ms [expr {$mp eq "" ? "n/a" : [get_property SLACK $mp]}]
+    foreach a $f { foreach b $t { set_clock_uncertainty -setup -from $a -to $b 0 } }
+    lappend margin_lines [format "MARGIN %s %s ns (otpu_margin.tcl): the worst setup slack with it %s ns" $name $m $ms]
+  }
+  foreach l $margin_lines { puts $l }
+}
 
 # ---- PCIe Gen2: the PCIe block's 500 MHz paths into its own block RAMs (userclk1_reroute.tcl)
 source $here/userclk1_reroute.tcl
@@ -104,6 +137,7 @@ set fh [open $out/reports/SUMMARY.txt w]
 set wns [get_property SLACK [lindex [get_timing_paths -max_paths 1 -nworst 1 -setup] 0]]
 set whs [get_property SLACK [lindex [get_timing_paths -max_paths 1 -nworst 1 -hold] 0]]
 puts $fh "WNS $wns ns   WHS $whs ns"
+foreach l $margin_lines { puts $fh $l }
 # the XADC's ADC clock: DCLK / the divider in INIT_42[15:8] (bd_native.tcl DCLK_FREQUENCY), at
 # most 26 MHz (DS182)
 foreach x [get_cells -quiet -hierarchical -filter {REF_NAME == XADC}] {

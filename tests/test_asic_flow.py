@@ -84,6 +84,10 @@ def test_card_places_the_mxu_macros_by_column():
     m = re.search(r"^export FASTROUTE_TCL = (\S+)$", card, re.M)
     assert m and Path(m.group(1)).exists() and "metal4-" in Path(m.group(1)).read_text()
     assert "TMEM_GAP_UM" not in small and "FASTROUTE_TCL" not in small
+    # the global route's repair as repair_timing only (repair_design does not finish on the card)
+    m = re.search(r"^export PRE_GLOBAL_ROUTE_TCL = (\S+)$", card, re.M)
+    assert m and "proc ::repair_design_helper" in Path(m.group(1)).read_text()
+    assert "PRE_GLOBAL_ROUTE_TCL" not in small
 
 
 def test_ports_are_latency_neutral_after_cts():
@@ -95,6 +99,11 @@ def test_ports_are_latency_neutral_after_cts():
         tcl = Path(m.group(1)).read_text()
         assert "set_clock_latency -source" in tcl and "[get_clocks vclk]" in tcl
         assert "set_clock_latency" not in flow.sdc(p)
+        # ... before the CTS step's repair_timing (ORFS runs POST_CTS_TCL after it)
+        m = re.search(r"^export PRE_CTS_TCL = (\S+)$", flow.config_mk(p, []), re.M)
+        assert m and Path(m.group(1)).name == "cts_latency.tcl"
+        pre = Path(m.group(1)).read_text()
+        assert "rename ::repair_timing_helper" in pre and "io_latency.tcl" in pre
 
 
 def test_sdc_asks_the_targets_clock():

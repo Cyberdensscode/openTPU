@@ -974,20 +974,30 @@ class Board:
         after power-up the check bits are random: a read of a 64-byte beat never written since is
         an uncorrectable error, which hangs the read (a DMA timeout, or a stuck accelerator) instead
         of failing it. Zeros everywhere (~6 s at Gen1 x8), then SCRATCH = DRAM_INIT, which a new
-        bitstream resets. Only the card: the simulated boards have no ECC. True when it scrubbed."""
+        bitstream resets. Only the card: the simulated boards have no ECC. True when it scrubbed.
+        The first scrub of a configuration whose core clock is not its controllers' also centres
+        the read taps under the core's load (loadcal.center, ~40 s), between two passes of
+        zeros."""
         if not getattr(self.t, "ecc", False):
             return False
-        if not force and self.t.reg_read(R.R_SCRATCH) == R.DRAM_INIT:
+        first = self.t.reg_read(R.R_SCRATCH) != R.DRAM_INIT
+        if not force and not first:
             return False
         c = (self._info or self.info())["cfg"]  # every slice's channels, what a slice addresses
         nch, size = (c["S"] * c["channels"], c["channel_bytes"]) if c else (2, CH_BYTES)
         z = placed(64 << 20, 0)             # zeros, placed: no bounce copies
-        for ch in range(nch):
-            for off in range(0, size, len(z)):
-                self.t.mem_write(ch, off, z)
+
+        def zeros():
+            for ch in range(nch):
+                for off in range(0, size, len(z)):
+                    self.t.mem_write(ch, off, z)
+        zeros()
+        from opentpu.host import ddr4, loadcal, memcal
+        if first and loadcal.wanted_on(self):
+            loadcal.center(self, log=lambda m: print(m, file=sys.stderr))
+            zeros()                         # the BIST's region and the load's, with check bits
         # the ECC counters (STATUS ECC_DED) from here on: a read of a beat not yet written (an
         # earlier run's, a tool's) counted its random check bits as uncorrectable
-        from opentpu.host import ddr4, memcal
         memcal.ecc(self.t, clear=True)
         ddr4.ecc(self.t, clear=True)
         self.t.reg_write(R.R_SCRATCH, R.DRAM_INIT)

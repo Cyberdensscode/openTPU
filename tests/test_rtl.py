@@ -152,13 +152,18 @@ def _kinds(kinds: list, cfg: Config, gather: bool | None) -> list:
     return kinds
 
 
-def _random_program(rng, cfg: Config, n_ops=40, t0: int = 0, gather: bool | None = None):
+def _random_program(rng, cfg: Config, n_ops=40, t0: int = 0, gather: bool | None = None,
+                    kinds: list | None = None, acc_p: float | None = None):
     """A valid, hazard-free random program. The same program runs on every slice (so the
     collectives line up); the slices differ by their DRAM contents. t0: its TMEM words from
     there (every TMEM address the program names is t0 or more). gather: GATHERs among its
-    instructions (None: where the simulation's collective unit runs them, _kinds)."""
+    instructions (None: where the simulation's collective unit runs them, _kinds). kinds: the
+    instruction kinds to draw from (None: the default mix); acc_p: an MM's chance to accumulate
+    into an earlier MM's output (ACC: the MXU reads TMEM), taking that output's M and N (None:
+    half the MMs whose shape an earlier output has, drawn as before)."""
     D = cfg.D
-    kinds = _kinds(["vop", "vop", "vop", "qact_mm", "qst", "ldst", "loop", "gather"], cfg, gather)
+    kinds = _kinds(kinds or ["vop", "vop", "vop", "qact_mm", "qst", "ldst", "loop", "gather"], cfg,
+                   gather)
     prog = [I.ld(DATA, t0, 4096)]
     src = [(t0, 4096)]                # TMEM regions holding finite "input" data
     nxt = t0 + 4096                   # fresh TMEM destinations (never read by VOPs again)
@@ -197,15 +202,21 @@ def _random_program(rng, cfg: Config, n_ops=40, t0: int = 0, gather: bool | None
             prog.append(I.vop(func, dst, a, b, rows, cols, drs, ars, brs, bmode, imm))
         elif kind == "qact_mm":
             M, KB = int(rng.integers(1, cfg.act_rows + 1)), int(rng.integers(1, 5))
+            want = None                           # acc_p: the earlier output it accumulates into
+            if acc_p is not None and mm_outs and rng.random() < acc_p:
+                want = mm_outs[int(rng.integers(len(mm_outs)))]
+                M = want[1]
+                KB = min(KB, max(1, (4096 // M - 3) // D))
             ab = int(rng.integers(0, cfg.ACT_BLOCKS - KB + 1))
             srs = KB * D + int(rng.integers(0, 4))
             M = min(M, 4096 // srs)               # D = 128: the rows fit the input region
+            assert want is None or M == want[1]
             cs = pick_src(KB * D) if rng.integers(3) == 0 else None
             rsc = pick_src(M) if rng.integers(3) == 0 else None
-            dup = 2 * M <= cfg.MCOLS and rng.integers(3) == 0
+            dup = 2 * M <= cfg.MCOLS and rng.integers(3) == 0 and want is None
             prog.append(I.qact(pick_src(M * srs), M, ab, KB, srs, row=bool(rng.integers(2)),
                                cscale=cs, rscale=rsc, dup=dup))
-            N = int(rng.integers(1, 24))
+            N = int(rng.integers(1, 24)) if want is None else want[2]
             wf = _wf(rng)
             # with DUP the MM reads the copies too (2M rows), or pairs them (PAIR, 4-bit: rows
             # M..2M-1 must be row j's copies, one Sa a row)
@@ -218,7 +229,9 @@ def _random_program(rng, cfg: Config, n_ops=40, t0: int = 0, gather: bool | None
             unit = bool(rng.integers(2))
             ssa, srs_s, k0, rsc_ = _mx_scales(rng, wf, N, KB, pair, unit)
             reuse = [o for o in mm_outs if o[1:] == (M, N)]
-            if reuse and rng.integers(2):
+            if want is not None:
+                out, acc = want[0], True
+            elif reuse and rng.integers(2):
                 out, acc = reuse[0][0], True
             else:
                 out, acc = fresh(M * N + M), False
@@ -350,6 +363,31 @@ def test_one_copy_tmem_of_128k_words(have_verilator, mcols, rows, seed):
                                  max_cycles=1_000_000)
     assert np.array_equal(drams[0], m.slices[0].dram)
     assert np.array_equal(tmems[0], m.slices[0].tmem)
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_mxu_reads_on_the_card_tmem(have_verilator, seed, tmp_path, monkeypatch):
+    """The MXU's TMEM reads (ACC, ASCALE) on the m8 card's TMEM (R2_TMEM at 128K words, MCOLS 8:
+    the MXU's TQ, its read by bank from its flip-flops, otpu_tmem PBR) beside the VPU's, the
+    quantizer's and the DMA's reads: programs mostly of MMs that accumulate into earlier outputs,
+    so the MXU's reads lose RAMs and replay (in 5 of the 6 seeds). The results are the ISA's, and
+    the MXU read (TMEMSTAT's rd, port 0)."""
+    log = tmp_path / "tmemstat.log"
+    monkeypatch.setenv("OTPU_TMEMSTAT_LOG", str(log))
+    rng = np.random.default_rng(9000 + seed)
+    cfg = Config(S=1, MCOLS=8, ACT_ROWS=16, TMEM_WORDS=1 << 17)
+    prog = _random_program(rng, cfg, n_ops=60, gather=False, acc_p=0.9,
+                           kinds=["vop", "vop", "qact_mm", "qact_mm", "qact_mm", "qst", "ldst"])
+    assert sum(i.op == I.MM and bool(i.flags & I.F_ACC) for i in prog) >= 4
+    imgs = _images(rng, 1)
+    m = Machine(cfg, [prog], [i.copy() for i in imgs]).run()
+    drams, tmems, _ = rtlsim.run(cfg, [prog], [i.copy() for i in imgs],
+                                 uarch={**rtlsim.BOARD_UARCH, **R2_TMEM, **R2_ARB},
+                                 max_cycles=1_000_000)
+    assert np.array_equal(tmems[0], m.slices[0].tmem)
+    assert np.array_equal(drams[0], m.slices[0].dram)
+    st = re.search(r"TMEMSTAT .* rd= ?(\d+),[\d,]+ rpl= ?(\d+),", log.read_text())
+    assert st and int(st[1]) > 0, log.read_text()
 
 
 def held_collective_program(out: int = SCRATCH) -> list:

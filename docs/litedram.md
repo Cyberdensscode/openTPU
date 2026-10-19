@@ -1287,6 +1287,159 @@ All **measured**.
   region), plus a card session for the temperature sweep.
 - **Step 2:** a firmware mode, and no RTL or bitstream change.
 
+### Read taps under the core's load (2026-10-18)
+
+The calibration centres each lane's read IDELAY with the core idle, and with the core at the
+controllers' 133.33 MHz that centre holds under load. With the core at 150 MHz (the m8 card's
+r150fp, 1da7d3b9; docs/timing_ffs.md section 8) it does not: under inference four loads of five
+read ECC errors back, on the lanes of either channel.
+
+**What closes.** LiteDRAM's BIST (crossbar master 2: no ECC, its own data check per lane) read
+the last quarter of each channel over and over while the core ran:
+- with the core idle, or running TMEM and VPU work that does not touch DRAM (OUTER and RDOT on
+  three 64 x 256 tiles in a hardware loop): 0 wrong beats in 106 passes of 1 GiB per channel;
+- beside `perf.py lfm2 int8`: wrong beats on channel 1's lanes 0 and 1 (45 in 502 passes), as
+  the channel's ECC counted 25 corrected and 7 uncorrectable words. The PHY's reads go wrong for
+  every master, so the corruption is in the read capture, not in the ports.
+
+**The windows under load.** A scan of every lane's read taps with the BIST (all lanes at each tap,
+10 x 128 MiB per tap) while the core runs turnaround.py's traffic in one hardware loop (the MXU
+streaming fp4 weights, 64 KiB DMA stores and loads), against the core idle:
+
+| | idle | under the load | the load's centre against the calibrated tap |
+|---|---|---|---|
+| E3 (133.33 MHz) | 7-9 taps | 6-8 taps | the same on 14 lanes of 18 (one tap off on four) |
+| r150fp (150 MHz) | 7-9 taps | 4-6 taps | one or two taps to the left on all 18 (a second load) |
+
+At 150 MHz the right edges close by 2-3 taps and the left ones by about 1: the core's switching,
+out of step with the memory clocks, moves the capture against the data by a different amount on
+every read (at 133.33 MHz it repeats on every sys cycle: a fixed, small offset). Channel 1 lanes 0
+and 1 beside lfm2, by tap: 7 and 8 read clean, 10 (the calibrated) 4 wrong beats in 19 s, 12
+1.3 million.
+
+**The fix, `opentpu.host.loadcal`.** `center()` runs that load on the core, scans every lane under
+it, and leaves each at its window's centre there (the left of the two middles of an even window;
+a lane under 3 taps keeps its calibrated tap). `Board.scrub` runs it on a configuration's first
+scrub when the core clock (CORE_KHZ) is not the controllers' (`OTPU_LOAD_CENTER=1` / `0` forces
+it), between two passes of zeros, so neither the BIST's data (no check bits) nor the ECC errors
+of the core's reads at the scan's far taps stay behind; about 15 s (30 s with the eye search,
+below). The result per lane is in the
+run directory (`<device>.loadcal.json`). With the scratch version of it on three fresh r150fp
+loads that each read ECC errors under inference at the calibrated taps, after it: 0 wrong BIST
+beats beside perf qwen3 and lfm2 (about 500 passes each), and 0 / 0 ECC on both channels over the
+turnaround stress, perf qwen3 and perf lfm2, two or three times per load.
+
+**Not under prefill.** r150fp's qualification window with it (r150fpl: production's host ec87de44
+with loadcal) was clean through the selftest, the fast and E2B quals, the stresses and the MoE
+chats; then phi4-mini's heavy xl qual (a 1,400-token prompt, 16 tokens a run) read 1 corrected and
+1 uncorrectable word on channel 1 and gemma4-e4b's 5 corrected more (ECC WINDOW FAIL, no soak).
+On a fresh load the phi4-mini xl qual alone read 23 corrected / 7 uncorrectable on channel 1 in 8
+minutes, with the windows under loadcal's load before and after it within a tap of each other
+(die 65 -> 73 C): the load, not drift.
+
+**What closes them** (opentpu's `~/otpu-build/bisect150/probe2.py`: every lane's window under one
+core load at a time, 10 x 128 MiB per tap; the sum of each channel's nine lane windows, ch0 / ch1):
+
+| load | E3 (133.33) | r150fp (150) | h152 (152.38) |
+|---|---|---|---|
+| idle | 71 / 73 | 69 / 69 | 72 / 70 |
+| TMEM / VPU, no DRAM (burnbist's loop) | 68 / 72 | 68 / 67 | 69 / 68 |
+| the DMA's 64 KiB stores and loads | 68 / 68 | 61 / 67 | 63 / 67 |
+| the MXU on fp4 weights, one row | 61 / 58 | 46 / 45 | 53 / 55 |
+| the same, the weight codes zero | 67 / 68 | 62 / 55 | 62 / 61 |
+| the MXU, one row, beside the DMA (loadcal's first load) | 62 / 59 | 45 / 42 | 51 / 54 |
+| the MXU, 16 rows (prefill) | 56 / 51 | 42 / 43 | 47 / 43 |
+| the same, the weight codes zero | 66 / 62 | 55 / 49 | 55 / 54 |
+| the same, the activations zero | 63 / 60 | 55 / 56 | 55 / 58 |
+| the MXU, 16 rows, beside the DMA | 55 / 50 | 39 / 37 | 42 / 41 |
+| the same, int8 weights | - | - | 40 / 39 |
+
+- It is the MXU's switching, its DSP array with both operands moving. The TMEM and the VPU at
+  150 / 300 MHz barely move the windows, the DMA a little. The array sits on DSP columns X1-X8
+  (`otpu_mxu_place.tcl`), its column 0 one DSP column from the left I/O column that holds both
+  channels' PHYs, over the die's whole height.
+- Each load's windows lie inside the lighter ones' (the right edge closes first), so a lane
+  centred under the heaviest load is centred inside them all. `loadcal` now runs prefill's load
+  (16 rows of activations against fp4 weights, beside the DMA).
+- h152 is r150fp's routed design with its core MMCM retimed to the DDR3 bit clock: VCO 1066.67
+  MHz (50 x 64 / 3), core_clk VCO / 7 = 152.38 MHz, core_clk2x VCO / 3.5 (the two outputs swap
+  pins, CLKOUT0 being the fractional one; omarchy's `~/otpu-build/tff/h152.tcl`; with the late
+  constraints applied again core -0.013 ns, clk2x +0.011, WHS +0.013: for the card only). Every
+  core edge then keeps one phase to the read capture's edges, as at 133.33 MHz. That gives back
+  7-12 taps of the eighteen windows under the one-row MXU, 3-4 under prefill: under prefill a
+  faster core costs about 1.4 taps (110 ps) a lane on either clock.
+- Centred under prefill's load (h152), the BIST beside that load read no wrong beat at the
+  centre or a tap either side (`bermap.py`: 4.4e12 bits per channel each, 74-80 C). The heavy xl
+  quals then read channel 1 1 corrected (phi4-mini), 1 corrected (gemma4-e4b) and 0 (phi4-mini
+  again): thirty times fewer than at the first load's centres, not none. Channel 1 is the one
+  whose PHY rows hold the pumped TMEM in this placement.
+
+So under prefill, with the array on X1-X8, the 150 MHz class keeps about 1.4 taps a lane less
+read window than E3, which no choice of taps gives back.
+
+**The array's place** (2026-10-18). The array was moved right, away from the left I/O column, on
+r150fp's RTL and settings (`OTPU_MXU_DSP_COLS` / `OTPU_MXU_BRAM_COLS`, the weight RAMs on the block
+RAM column left of them, `OTPU_MXU_WRAM_COL`; docs/timing_ffs.md section 8). These are the sums of
+the eighteen windows (`probe2.py`):
+
+| load | E3 (133.33, X1-X8) | r150fp (X1-X8) | r150n (X2-X9) | r150o (X3-X10) | r150m (X4-X11) |
+|---|---|---|---|---|---|
+| idle | 144 | 138 | 134 | 137 | 133 |
+| the DMA | 136 | 128 | 123 | 129 | 127 |
+| the MXU, one row | 119 | 91 | 99 | 101 | 107 |
+| the same, beside the DMA | 121 | 87 | 97 | 99 | 102 |
+| the MXU, 16 rows (prefill) | 107 | 85 | 91 | 95 | 106 |
+| the same, beside the DMA | 105 | 76 | 84 | 88 | 98 |
+| its narrowest lane (window, taps left / right of the tap in use) | 4, -2+1 | | 2, -1+0 | 4, -1+2 | 3, -1+1 |
+
+- **Columns in clock region X0.** What prefill beside the DMA takes from idle follows how many of
+  the array's columns sit in clock region X0 (DSP X0-X5, the PHYs' half of the die):
+  - five (X1-X8): 62 taps;
+  - four (X2-X9): 50;
+  - three (X3-X10, placed with ExtraPostPlacementOpt): 49;
+  - two (X4-X11): 35;
+  - E3, five at 133.33 MHz: 39.
+- **The heavy xl quals.** Centred under prefill (loadcal 6b8d9d4c), r150m and r150n each read
+  0 / 0 on both channels through phi4-mini's xl qual, gemma4-e4b's and phi4-mini's again
+  (`bisect150/xlpf.sh`). r150n read clean with channel 0's lane 7 at a 1-tap window under
+  loadcal's load (kept at its calibrated tap). h152 (X1-X8 at 152.38) read 1, 1 and 0.
+- **Timing.** X4-X11 does not close 150 MHz (r150m: core -0.686 ns). About 200 DSPs outside the
+  array (the VPU's 86, the quantizer's 64, the MXU's own ~50) do not fit the rows the array leaves
+  free in X4-X11. They land beside the PHYs, away from their logic. X2-X9 closes it (r150n: core
+  +0.066), and X3-X10 does with the placer's ExtraPostPlacementOpt (r150o: core +0.079;
+  `OTPU_PLACE_DIRECTIVE`).
+- **The narrowest lane.** Every lane of r150o keeps a tap or more on each side of its tap under
+  prefill beside the DMA, as E3's narrowest does; r150n's channel 0 lane 7 keeps none on one side.
+
+**Each lane's eye under load** (2026-10-19). r150o's first qualification window (production's host
+with loadcal 6b8d9d4c) read 56 corrected words on channel 1 (0 uncorrectable, every token right;
+ECC WINDOW FAIL, no soak), most of them in the heavy xl quals; its xl quals on the load before had
+read 0 / 0. That load's calibration had put channel 1 lane 6 at tap 26, with 2 taps under loadcal's
+load; the load before had it at tap 13 with 4.
+- **Far along the delay line.** The same data reads right a bit time (~12 taps) along the IDELAY at
+  the next read bitslip, and the two eyes are about as wide idle. The calibration takes the widest
+  idle window over the bitslips (the first of equals), so the eye a lane gets differs from load to
+  load. Under load the narrowest lanes have been the ones far along the line: under prefill beside
+  the DMA, E3's narrowest lane sat at tap 20, r150m's at 21, r150n's at 20 (window 2) and the
+  failing load's at 26.
+- **The search (loadcal 1c4b3bf8).** loadcal also scans with every lane's bitslip one either side
+  (a lane whose bitslip or a bit's would leave 0..7 stays) and each lane takes the widest window
+  under load, the lowest tap of equals; about 30 s in all. `OTPU_LOAD_SLIPS=0` scans the
+  calibrated bitslips only.
+- **On the card** (r150o, one load, its CPU's calibration): with the calibrated bitslips the
+  windows under prefill beside the DMA summed 89 taps (channel 1 41, its lane 7 at tap 14 with 3,
+  -1+1); with the search channel 0 lane 0 and channel 1 lanes 6 and 7 moved from taps 15, 13 and 14
+  to 2, and the sum was 94 (channel 1 46, every lane 5 or more, -2+2). phi4-mini's xl qual,
+  gemma4-e4b's and phi4-mini's again then read 0 / 0 on both channels.
+- **What it cannot move.** A lane calibrated at bitslip 0 whose lower eye is a bitslip below (the
+  second window's channel 0 lane 4: bitslip 0, tap 20, 4 taps under load) keeps its eye.
+- **The second window and the promotion.** With the search (production's host ec87de44 with
+  loadcal 6b8d9d4c and 1c4b3bf8) r150o's second window read ECC 0 / 0 on both channels in every
+  qual (156 reads, the heavy xl quals included) and over the 5 h soak (20 quals, 1,161 reads).
+  r150o is production since 2026-10-19 (E3 production-prev). On the promotion's load the search
+  moved channel 1 lanes 6 and 7 a bitslip down (taps 14 -> 2) and the windows under prefill
+  beside the DMA summed 94 taps, every lane 4 or more (E3: 105, its narrowest 4).
+
 ## 11. The card's controller in simulation (2026-09-29, night)
 
 **Why.** The DDR3 bank model behind the adapter in simulation (`otpu_native_mem`'s

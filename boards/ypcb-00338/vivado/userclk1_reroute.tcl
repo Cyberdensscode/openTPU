@@ -7,9 +7,11 @@
 # (route_design -auto_delay), which can overshoot into hold (7b1cc919's checkpoint: the RX block
 # RAM's DIPBDIP from -0.045 / +0.187 ns setup / hold to +0.295 / -0.032); a hold failure then gets
 # a re-entrant route_design (there: +0.118 / +0.107, userclk1 +0.033 / +0.018, 10 minutes). The
-# result is kept only if userclk1's worst slack improves, every net is routed and neither the other
-# clocks' setup nor any hold gets worse below zero. Otherwise, or on an error, the routed design
-# is reopened from the checkpoint written before.
+# result is kept only if userclk1's worst slack improves, every net is routed, the design's worst
+# setup slack (every clock) improves and no hold gets worse below zero. Otherwise, or on an error,
+# the routed design is reopened from the checkpoint written before. (The re-entrant route moves
+# other nets: r150f's took userclk1 +0.040 -> +0.099 and the core's worst, the sequencer's
+# instruction into its IMEM, +0.130 -> +0.033; the rule then was the other clocks' worst above 0.)
 proc otpu_ws {args} {
   set p [lindex [get_timing_paths -quiet -max_paths 1 -nworst 1 {*}$args] 0]
   if {$p eq ""} { return 1e9 }
@@ -48,7 +50,8 @@ if {$gen eq "2" && [llength $uc1] == 1} {   ;# (bd_native.tcl's default)
       set open [llength [filter $nets {ROUTE_STATUS != ROUTED}]]
       puts "userclk1 rerouted: userclk1 $u0 -> $u1, other clocks $o0 -> $o1, hold $h0 -> $h1 ns,\
             $open nets not routed"
-      set keep [expr {$u1 > $u0 && $open == 0 && ($o1 >= $o0 || $o1 >= 0) && ($h1 >= $h0 || $h1 >= 0)}]
+      set keep [expr {$u1 > $u0 && $open == 0 && min($u1, $o1) > min($u0, $o0) &&
+                      ($h1 >= $h0 || $h1 >= 0)}]
     } msg]} {
       puts "CRITICAL WARNING: userclk1 reroute failed: $msg"
     }

@@ -40,7 +40,7 @@ module tb_tmem #(parameter int IMPL = 0, parameter int NSB = 4, parameter int SB
               .NCP(NCP), .CPY(CPY), .NSB(NSB), .SBP(SBP), .PRANK({3'd2, 3'd1, 3'd0}),
               .GRP(GRP), .SBH(SBH), .RPL(RPL), .TOPP(0), .TDP(TDP), .SIDE(3'b100), .GST(GST),
               .SH_HOST(0), .SH_MASK(GST ? 3'b100 : 3'b000), .PMP(PMP), .IQ(IQ)) dut (
-    .clk, .clk_f, .r_en, .r_req, .r_addr, .r_data, .w_en, .w_req, .w_gnt, .w_addr, .w_data,
+    .clk, .clk_f, .r_en, .r_req, .r_addr, .r_ben('0), .r_bad('0), .r_data, .w_en, .w_req, .w_gnt, .w_addr, .w_data,
     .blk_x, .blk_s, .lost, .frz, .dump(1'b0));
 
   logic [31:0] ref_mem [WORDS];

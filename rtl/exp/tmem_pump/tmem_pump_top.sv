@@ -97,20 +97,20 @@ module tmem_pump_top #(
     otpu_tmem #(.WORDS(WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .WPB(1), .GEN_R(GEN_R),
                 .GEN_W(GEN_W), .SH_HOST(P_DMA), .SH_MASK(VAR == 0 ? SH_MASK : '0), .SID(0),
                 .IMPL(VAR), .NCP(3), .CPY(CPY3)) u_tmem (
-      .clk(clk_s), .clk_f(1'b0), .r_en, .r_req, .r_addr, .r_data, .w_en, .w_req, .w_gnt, .w_addr,
+      .clk(clk_s), .clk_f(1'b0), .r_en, .r_req, .r_addr, .r_ben('0), .r_bad('0), .r_data, .w_en, .w_req, .w_gnt, .w_addr,
       .w_data, .dump(1'b0));
   end else if (VAR == 5) begin : g_pumpk
     otpu_tmem_pump #(.WORDS(WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .GEN_R(GEN_R),
                      .GEN_W(GEN_W), .SH_HOST(P_DMA), .SH_MASK('0), .IMPL(1), .NCP(2 * PK - 1),
                      .CPY(PK == 3 ? CPY5 : CPY7), .STYLE(STYLE), .K(PK), .CASC(CASC)) u_tmem (
-      .clk(clk_s), .clk_f, .r_en, .r_req, .r_addr, .r_data, .w_en, .w_req, .w_gnt, .w_addr,
+      .clk(clk_s), .clk_f, .r_en, .r_req, .r_addr, .r_ben('0), .r_bad('0), .r_data, .w_en, .w_req, .w_gnt, .w_addr,
       .w_data);
   end else begin : g_pump
     otpu_tmem_pump #(.WORDS(WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .GEN_R(GEN_R),
                      .GEN_W(GEN_W), .SH_HOST(P_DMA), .SH_MASK(VAR == 2 ? SH_MASK : '0),
                      .IMPL(VAR == 2 ? 0 : 1), .NCP(VAR == 3 ? 4 : 2),
                      .CPY(VAR == 3 ? CPY4 : CPYB), .STYLE(STYLE)) u_tmem (
-      .clk(clk_s), .clk_f, .r_en, .r_req, .r_addr, .r_data, .w_en, .w_req, .w_gnt, .w_addr,
+      .clk(clk_s), .clk_f, .r_en, .r_req, .r_addr, .r_ben('0), .r_bad('0), .r_data, .w_en, .w_req, .w_gnt, .w_addr,
       .w_data);
   end
 endmodule

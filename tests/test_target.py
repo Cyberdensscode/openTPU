@@ -509,6 +509,197 @@ def test_the_vpu_lanes_take_ss_act_from_their_copies():
     assert raw(vpu.replace(a, "assign rsa[l] = (SE && ss_act)")) == {"g_red": ["ss_act"]}
 
 
+def test_the_long_wire_drivers_are_copies_per_consumer():
+    """A register whose loads spread over the die pays its route (r22's m8 at 133.33 MHz: 88% of
+    the near-critical core delay, half the paths at most one LUT): the drivers that fanned out so
+    have a copy per consumer group, each loaded with the same next value (cycle-exact), kept
+    (identical flip-flops would merge). The VPU's enable per lane (g_enl: no lane loop, tail unit
+    or composite lane reads the one en), the fill index per lane (g_sfi), the MXU's decoded scale
+    per column (g_bd), the pumped TMEM's write stage per RAM (g_pmp g_sl) and, with wait counts,
+    the sequencer's command store write per unit (g_cmd g_wq: a cycle late). The MXU's result
+    FIFO needs none: a block RAM read ahead (test below). Wide data stays one register: the ACT
+    RAM's write stage
+    (wbe, wd) a copy per column cost the m8 card 9 k LUTs and 9.5 k flip-flops and a congested
+    corner (docs/timing_ffs.md section 3); its pieces copy only their address and select."""
+    def src(p):
+        return re.sub(r"//.*", "", (ROOT / p).read_text())
+    kept = r'\(\*\s*keep_hierarchy\s*=\s*"yes"\s*\*\)\s*otpu_delay\b'
+    bare_en = r"(?<![.\w])en(?![\w(\[])"
+    vpu, tail, comp = (src("rtl/vpu/otpu_vpu.sv"), src("rtl/vpu/otpu_se_tail.sv"),
+                       src("rtl/vpu/otpu_se_comp.sv"))
+    loops = _lane_loops(vpu)
+    for n in ("g_cbuf", "g_lane", "g_slane", "g_red"):
+        assert not re.search(bare_en, loops[n]) and "en_l[l]" in loops[n], n
+    assert len(re.findall(kept, loops["g_enl"])) == 1 and len(re.findall(kept, loops["g_sfi"])) == 1
+    assert re.search(r"\.cen\(en_l\)", vpu) and re.search(r"\.en_l\b", vpu)
+    tl = _lane_loops(tail)
+    assert "cen[l]" in tl["g_u"] and "cen[l]" in tl["g_lq"] and "fi[l]" in tl["g_buf"]
+    assert not re.search(r"\bue\b", tail) and not re.search(r"\[fi\]", tail)
+    cl = _lane_loops(comp)
+    assert "en_l[l]" in cl["g_lane"] and not re.search(bare_en, cl["g_lane"])
+    mxu = src("rtl/mxu/otpu_mxu.sv")
+    assert re.search(r"begin\s*:\s*g_bd\s*" + kept, mxu)
+    assert "dhi1[j].s[g]" in mxu and "vhi1[j]" in mxu and not re.search(r"\bdhi1\.s\b", mxu)
+    assert re.search(r"begin\s*:\s*g_rfm.*?otpu_ram_1r1w_ra\b.*?\.ra_n\(RFW'\(rf_qn", mxu, re.S)
+    act = src("rtl/mem/otpu_actram.sv")
+    head, row = act.split("begin : g_row", 1)
+    assert re.search(r"logic \[D\*8-1:0\]\s+wd;", head) and not re.search(r"\bwd\s*;", row.split("end")[0])
+    assert re.search(r"wb <= w_idx_h\[DW \+: BW\];", row) and "wsel <= wsel_n[j];" in row
+    tm = src("rtl/mem/otpu_tmem.sv")
+    pmp = tm[tm.index("begin : g_pmp"):tm.index("begin : g_ram")]
+    sl = pmp[pmp.index("begin : g_sl"):]
+    assert "otpu_pump_bank" in sl and re.search(r"\.wv\(sv\)", sl) and re.search(r"\.wa\(sa\)", sl)
+    seq = src("rtl/seq/otpu_seq.sv")
+    cmd = seq[seq.index("begin : g_cmd"):]
+    assert re.search(r"if \(WAITC\) begin\s*:\s*g_wq\s*" + kept, cmd)
+    assert re.search(r"if \(we\) m\[wa\] <= WAITC \? c_cmd_w : c_cmd;", cmd)
+    assert not re.search(r"m\[free_slot\]", seq)
+
+
+def test_the_widest_lut_rams_are_block_rams_read_ahead():
+    """A LUT RAM puts every address bit on each of its cells (6 data bits a RAM32M), so a wide one
+    is a fanout of thousands per bit: on r22-era m8 the DMA's gather (39,424 address pins), the B
+    response FIFO (38,528) and the MXU's result FIFO (37,632) were the most of any memories. They
+    are otpu_ram_1r1w_ra (rtl/tech: a block RAM read at the address's next value, the same cycles
+    as the asynchronous read; flip-flops on the ASIC), read ahead at their pointer's next value,
+    and the per-RAM copies of their write addresses that the LUT RAMs needed are gone."""
+    def src(p):
+        return re.sub(r"//.*", "", (ROOT / p).read_text())
+    ra = r"otpu_ram_1r1w_ra\s*#\([^;]*?\.ra_n\((\w+)"
+    dma = src("rtl/dma/otpu_dma.sv")
+    gb = dma[dma.index("begin : g_gb"):]
+    assert re.search(ra, gb).group(1) == "gh_n" and "logic [31:0] gb [NGC]" not in dma
+    assert re.search(r"assign gh_n = ", dma) and not re.search(r"gb_wa \[SPC\]\[W\]", dma)
+    nd = src("rtl/mem/otpu_native_dram.sv")
+    assert re.search(ra, nd[nd.index("begin : g_rb"):]).group(1) == "rb_hn"
+    assert "rb_tq" not in nd and not re.search(r"\brbm\s*\[", nd)
+    mxu = src("rtl/mxu/otpu_mxu.sv")
+    rfm = mxu[mxu.index("begin : g_rfm"):]
+    assert re.search(ra, rfm) and "begin : g_s" not in rfm.split("end\n  always_ff")[0]
+    for fam in ("generic", "asic"):
+        assert "module otpu_ram_1r1w_ra" in src(f"rtl/tech/{fam}/otpu_tech_ram.sv"), fam
+    # the native adapter's SW queue data and fill data (11,980 address pins each), at qw_f's next
+    g_mem = nd[nd.index("begin : g_mem"):nd.index("assign ra_head")]
+    assert [m for m in re.findall(ra, g_mem) if m != "rb_hn"] == ["qw_fn"] * 2
+    assert not re.search(r"\b(qwd|wrm)\s*\[", nd)
+
+
+def test_late_pushes_reach_no_lut_ram_write_enable():
+    """A queue whose LUT RAM is written on its push puts the push, which comes late (the end of a
+    grant or of the native adapter's write issue: 9 to 12 levels on the card), on every cell's
+    write enable (hundreds). The native adapter's A queue (qam) writes its tail every cycle (2 QD
+    slots, as its B queue's qbm), and the in-order channel FIFOs (otpu_afifo OOO 0: u_aq, u_ad,
+    u_xq, u_xd) write the tail slot every cycle there is room (wready: the pointers' registers);
+    a push only moves the tail. And the MXU's ASCALE factors (alpha), registers that hold a value
+    rather than a pipeline stage, load off the TMEM grant's fan-out."""
+    def src(p):
+        return re.sub(r"//.*", "", (ROOT / p).read_text())
+    nd = src("rtl/mem/otpu_native_dram.sv")
+    assert re.search(r"qam \[2 \* QD\];", nd)
+    assert re.search(r"always_ff @\(posedge clk\) qam\[", nd)
+    af = src("rtl/shell/otpu_afifo.sv")
+    assert "if (OOO ? wput : wready) mem[waddr] <= wdata;" in af
+    mxu = src("rtl/mxu/otpu_mxu.sv")
+    load = mxu[mxu.index("if (!rst && al_st == 2'd3)"):]
+    assert "alpha[j] <= t_rdata" in load.split("`ifndef SYNTHESIS")[0]
+    assert "t_gnt" not in mxu[mxu.index("if (!rst && al_st == 2'd3)") - 40:
+                              mxu.index("if (!rst && al_st == 2'd3)")]
+
+
+def test_the_mxu_epilogue_advances_on_flip_flops():
+    """The MXU's TMEM grant, the end of the slice's arbitration, was the epilogue's enable (the
+    drain's lanes, the read-modify-write, RMAX, the ASCALE loads: on the m8 card ~11.3 k enables,
+    the MXU's worst paths at a 150 MHz equivalent). With TQ (the slice's MXU_TQ: TMEM_IMPL 3 with
+    replays) TMEM reads what the MXU asks (a lost read is replayed, as the VPU's), the grant only
+    takes the writes from a queue (g_tq), and the epilogue advances on ea, a function of flip-flops
+    the grant and t_lost reach only through their next values. A first version (72cbb745) kept the
+    read in the granted beat: the grant and t_lost fanned out to ea's 118 replicas, the read
+    address came out of the queue's LUT RAM, and a push enabled every slot's flip-flops (b_t8_150:
+    -0.49 ns). So: TMEM's read address is the request register, the slots load from registers'
+    conditions, and the grant reaches the queue's counters only. TQ 0 keeps the grant as the
+    enable (g_ng)."""
+    def src(p):
+        return re.sub(r"//.*", "", (ROOT / p).read_text())
+    mxu = src("rtl/mxu/otpu_mxu.sv")
+    tq = mxu[mxu.index("if (TQ) begin : g_tq"):mxu.index("end else begin : g_ng")]
+    ng = mxu[mxu.index("end else begin : g_ng"):]
+    ng = ng[:ng.index("\n  end\n")]
+    rest = mxu.replace(tq, "").replace(ng, "")
+    # the grant reaches the port declaration and nothing else outside the TMEM interface
+    assert re.findall(r"\bt_gnt\b", rest) == ["t_gnt"], re.findall(r".*\bt_gnt\b.*", rest)
+    assert "assign ea = t_gnt;" in ng and "assign t_raddr = rq_ad;" in rest
+    # in g_tq the grant only takes or pops writes, t_lost only reaches lost_q, and ea is flip-flops'
+    def wires(sig):
+        return {re.match(r"\s*wire\s+(?:\[[^]]*\]\s*)?(\w+)", l).group(1)
+                for l in tq.splitlines() if re.search(rf"\b{sig}\b", l) and re.match(r"\s*wire\b", l)}
+    assert wires("t_gnt") == {"take", "pop"}, wires("t_gnt")
+    assert re.findall(r".*\bt_lost\b.*", tq.split("`ifndef SYNTHESIS")[0]) == ["        lost_q <= t_lost;"]
+    ea = re.search(r"\(\*\s*max_fanout\s*=\s*\d+\s*\*\)\s*wire ea_t = ([^;]*);", tq).group(1)
+    assert set(re.findall(r"\w+", ea)) == {"room_q", "lost_q", "tq_z", "rq_any"}, ea
+    assert "assign ea = ea_t;" in tq and "assign t_ren = t_ren_q;" in tq
+    # TMEM's read enable a register, its next value off t_lost (the slice masks a replay's cycle)
+    assert re.search(r"t_ren_q <= \(ea_t \? t_ren_c : rq_en\) & ", tq)
+    # the queue's slots: flip-flops written from the counters' registers, never on a push
+    gs = tq[tq.index("begin : g_s"):]
+    gs = gs[:gs.index("\n    end\n")]
+    assert re.search(r"if \(tq_n != 2'd3 && tl == 2'\(i\)\) s\[i\] <=", gs)
+    assert not re.search(r"\b(push|t_gnt|ea_t|ea)\b", gs) and "s[" not in tq.replace(gs, "").replace(
+        "assign hd = s[tq_h];", "")
+    sl = src("rtl/top/otpu_slice.sv")
+    assert re.search(r"localparam bit MXU_TQ = TMEM_IMPL == 3 && TMEM_RPL;", sl)
+    assert ".TQ(MXU_TQ)" in sl and re.search(r"\.t_lost\(tm_lost\[P_MXU\]\)", sl)
+    assert "if (!MXU_TQ) r_en[P_MXU] = '0;" in sl
+    assert "if (MXU_TQ && rpl_frz[G_MXU]) r_en[P_MXU] = '0;" in sl
+
+
+def test_the_real_150_mhz_paths_start_at_flip_flops():
+    """The m8 card at a real 150 MHz (r150a): the pumped TMEM's word into the units' capture
+    registers is a full core cycle from a clk2x block RAM (multicycle), and it went through the
+    bank's RAM select, the lane's bank select and the hold (4 levels, 3.9 ns of route, -0.112 ns):
+    a host port of the pumped TMEM (no bypass) selects its lanes' words by {bank, RAM}, one select
+    from the RAMs' outputs with its index from flip-flops. The MXU's drained test (c_left == 0, a
+    32-bit compare of a 136-load register into the drain lanes' enables, -0.080) is a flip-flop
+    (c_lz). The sequencer's command copies load on the unit's readiness, not its start decode.
+    The MXU's read reaches TMEM by bank from its flip-flops (otpu_tmem PBR: rb_q / rb_a, decoded
+    before the registers), not through the lanes' bank decode in front of TMEM's compares (r150c:
+    rq_ad -> the decode -> the compares -> lost_q, 11 levels, -0.007 ns), and so do the DMA's,
+    the quantizer's and the VPU's (otpu_tmem_breq, the rotators' merge, registered with their
+    requests; r150d: their rotations in front of the ranks and the pumped RAMs' read pins). TMEM's
+    replay flag rpv is kept once per bank (rpvb) for each bank's asker multiplexers, replay loads
+    and data select."""
+    def src(p):
+        return re.sub(r"//.*", "", (ROOT / p).read_text())
+    tm = src("rtl/mem/otpu_tmem.sv")
+    # the pumped bank keeps its hierarchy (otpu_clk2x.tcl names its pins); otpu_tmem_breq beside it
+    assert re.search(r'\(\* keep_hierarchy = "yes" \*\)\s*module otpu_pump_bank\b', tm)
+    assert "lq[l] = pdir[p] ? pr[p][int'(bk[l]) * NSB + int'(pss[p][bk[l]])] : qb[bk[l]];" in tm
+    assert "assign pdir[p] = !BYP;" in tm and "assign pr[p][b * NSB + k] = s_q[b][k][SD];" in tm
+    mxu = src("rtl/mxu/otpu_mxu.sv")
+    assert "wire more     = p_act && !c_lz;" in mxu and "(pn || c_lz)" in mxu
+    assert not re.search(r"c_left\s*[!=]=\s*0\b", mxu.split("`ifndef SYNTHESIS")[0])
+    seq = src("rtl/seq/otpu_seq.sv")
+    assert "wire q_en = urdy[u] && !ustart[u];" in seq
+    # the MXU's read by bank: TMEM takes a PBR port's banks as they come, the MXU gives registers
+    assert "b_en = r_ben[p];" in tm and "b_a[b] = r_bad[p][b][BW +: IW];" in tm
+    tq = mxu[mxu.index("if (TQ) begin : g_tq"):mxu.index("end else begin : g_ng")]
+    assert "assign t_rben = rb_q;" in tq and "assign t_rbad = rb_a;" in tq
+    assert re.search(r"always_ff @\(posedge clk\) if \(!rst && ea_t\) rb_a <= bk_ad\(t_raddr_c, t_ren_c\);", tq)
+    assert re.search(r"rb_q <= \(ea_t \? bk_en\(t_raddr_c, t_ren_c\) : rb_v\) &", tq)
+    sl = src("rtl/top/otpu_slice.sv")
+    assert ".PBR(PBR)" in sl and ".TLANES(LANES)" in sl
+    pbr = re.search(r"localparam logic \[NRP-1:0\] PBR = ([^;]*);", sl).group(1)
+    assert set(re.findall(r"P_\w+", pbr)) == {"P_MXU", "P_DMA", "P_Q", "P_Q2", "P_VA", "P_VB"}, pbr
+    assert re.search(r"r_ben\[p\] = \(.*off\[p\]\) \? '0 : rq_b\[p\];", sl)
+    for f, regs in (("rtl/dma/otpu_dma.sv", ["t_rbv <= t_rben_c", "t_rb_q <= adv_nx ? (adv ? t_rben_c : t_rbv) : '0;"]),
+                    ("rtl/vpu/otpu_vpu.sv", ["ta_ben <= ta_ben_c", "tb_bad <= tb_bad_c"]),
+                    ("rtl/vpu/otpu_quant.sv", ["t_rben <= t_rben_c", "t_rbad2 <= t_rbad2_c"])):
+        u = src(f)
+        assert "otpu_tmem_breq #(" in u and all(r in u for r in regs), f
+    assert '(* keep = "true" *) logic [NRP-1:0][LANES-1:0] rpvb;' in tm
+    assert "wire rpb = rlive(i) && rpvb[i][b];" in tm and "assign aa[i][b] = rpb ? rpa[i][b] : qa[i][b];" in tm
+    assert "if (!rpvb[p][b]) begin rpe[p][b] <= qe[p][b];" in tm and "if (RPL && rpvb[p][b] && rpe[p][b])" in tm
+
+
 def test_config_summary_names_the_target(no_env):
     from opentpu.host.board import config_summary
     kw = dict(devname=None, ddr_mts=1066, pair=True, dstep=True, stream=True)

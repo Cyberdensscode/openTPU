@@ -594,7 +594,9 @@ class FakeCsr:
     its write range. With `groups` (a WL7DDRPHY channel), a group 1 lane's step is the DQS
     step plus group 1's offset (7 steps per 1/8 VCO in the modelled DRP registers). BOFF[m, i]:
     DQ bit i of lane m reads right at RB[m] + BOFF instead (its ISERDES framed a CLK off); its
-    read bitslip is its own when the CSR map has ddrphy_dly_sel_bits."""
+    read bitslip is its own when the CSR map has ddrphy_dly_sel_bits. EYES[m]: lane m's other
+    eyes, (bitslip, lo, hi) each (the same data a bit time along the IDELAY at the next bitslip;
+    none unless a test adds them)."""
     def __init__(self, build, nm=9, seed=1, groups=None, ps_moves_ck=False):
         self.regs = csr_map(Path(build) / "csr.csv")
         rnd = random.Random(seed)
@@ -609,6 +611,7 @@ class FakeCsr:
         self.sel, self.wb, self.rd = 0, [0] * nm, [0] * nm
         self.rbb = [[0] * 8 for _ in range(nm)]     # read bitslip per DQ bit
         self.BOFF = {}
+        self.EYES = {}
         self.wr = {}
         self.steps = 0
         self.groups = groups or [0] * nm
@@ -629,8 +632,9 @@ class FakeCsr:
         return [r[0] for r in self.rbb]
 
     def bit_ok(self, m, i):
-        return (self.rbb[m][i] == (self.RB[m] + self.BOFF.get((m, i), 0)) % 8
-                and self.LO[m] <= self.rd[m] <= self.HI[m] and self.wb[m] == self.WB[m]
+        eye = any(self.rbb[m][i] == (b + self.BOFF.get((m, i), 0)) % 8 and lo <= self.rd[m] <= hi
+                  for b, lo, hi in [(self.RB[m], self.LO[m], self.HI[m]), *self.EYES.get(m, ())])
+        return (eye and self.wb[m] == self.WB[m]
                 and self.WLO[m] <= self.step_of(m) % 112 <= self.WHI[m])
 
     def w(self, name, v):

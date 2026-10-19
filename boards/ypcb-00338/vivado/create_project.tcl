@@ -71,10 +71,11 @@ if {$BUILD_ID eq ""} {
   set BUILD_ID [string range $BUILD_ID 0 7]
 }
 if {![regexp {^[0-9a-fA-F]{1,8}$} $BUILD_ID]} { error "BUILD_ID $BUILD_ID: 1 to 8 hex digits" }
-# the core clock the block design makes (bd_native.tcl: CORE_MHZ rounded to the MMCM's 1/8
-# divider steps of its 800 MHz VCO), for the CORE_KHZ register
-set VCO 800
-set CORE_KHZ [expr {round($VCO * 1000.0 / (round(double($VCO) / $CORE_MHZ * 8) / 8.0))}]
+# the core clock the block design makes (bd_native.tcl: core_clock.tcl's VCO and divider for
+# CORE_MHZ and CLK2X), for the CORE_KHZ register
+source $here/core_clock.tcl
+lassign [core_mmcm $CORE_MHZ $CLK2X] VCO CORE_DIV
+set CORE_KHZ [expr {round($VCO * 1000.0 / $CORE_DIV)}]
 puts "CORE_KHZ $CORE_KHZ, BUILD_ID $BUILD_ID, MXU_IMPL $MXU_IMPL, MXU_E $MXU_E, TMEM_IMPL $TMEM_IMPL, TMEM_RQ $TMEM_RQ, PLATFORM $PLATFORM, ARCH_HASH $ARCH_HASH, TRACE_DEPTH $TRACE_DEPTH, COLL_GATHER $COLL_GATHER, TMEM_WORDS $TMEM_WORDS"
 
 create_project -force otpu $out -part xc7k480tffg1156-2
@@ -138,6 +139,73 @@ add_files -fileset constrs_1 -norecurse [list $cons/otpu_top_ld.xdc \
 set late [list $cons/otpu_mem_ch.tcl $cons/otpu_top_native.tcl]
 if {$CLK2X} { lappend late $cons/otpu_clk2x.tcl }
 lappend late $cons/otpu_mxu_place.tcl $cons/otpu_ddr_phy_place.tcl
+# setup margins (ns; unset or 0: none): implementation times the checks named below with that much
+# more setup uncertainty, so a route that meets them has that much slack at the real clocks.
+# OTPU_SETUP_MARGIN: every check between the core clocks (core_clk, core_clk2x). OTPU_SYS_MARGIN:
+# LiteDRAM's sys clock to itself (the controllers, the PHY's read data into the ECC decoders),
+# which carries no uncertainty of its own (otpu_litedram.xdc's are on the ld MMCMs' clock pairs:
+# not here, as build.tcl sets these back to 0). Generated here (otpu_margin.tcl in OUT_DIR, one
+# "# margin NAME {FROM} {TO} NS" line a group); build.tcl reports each group's worst slack with
+# it, then removes it for the reports and the bitstream
+set margins {}
+foreach {knob name from to} {
+  OTPU_SETUP_MARGIN core {core_clk_otpu_bd_clk_wiz_0_0 core_clk2x_otpu_bd_clk_wiz_0_0}
+                         {core_clk_otpu_bd_clk_wiz_0_0 core_clk2x_otpu_bd_clk_wiz_0_0}
+  OTPU_SYS_MARGIN   sys  {crg_s7mmcm_clkout} {crg_s7mmcm_clkout}
+} {
+  set m [expr {[info exists ::env($knob)] && $::env($knob) ne "" ? $::env($knob) : 0}]
+  if {![string is double -strict $m] || $m < 0 || $m > 1} { error "$knob '$m': a margin in ns, 0 to 1" }
+  if {$m > 0} { lappend margins [list $name $from $to $m] }
+}
+if {[llength $margins]} {
+  set fh [open $out/otpu_margin.tcl w]
+  puts $fh "# otpu_margin.tcl (create_project.tcl, OTPU_SETUP_MARGIN / OTPU_SYS_MARGIN): more setup uncertainty"
+  puts $fh "# on the checks of each group (implementation only; build.tcl removes it)"
+  foreach g $margins { puts $fh "# margin [lindex $g 0] {[lindex $g 1]} {[lindex $g 2]} [lindex $g 3]" }
+  puts $fh "proc otpu_margin_set {name from to m} {"
+  puts $fh "  set f \[get_clocks -quiet \$from\]; set t \[get_clocks -quiet \$to\]"
+  puts $fh "  if {\[llength \$f\] != \[llength \$from\] || \[llength \$t\] != \[llength \$to\]} {"
+  puts $fh "    puts \"CRITICAL WARNING: \\\[otpu_margin.tcl\\\] \$name: clocks not found (\$from -> \$to): no setup margin\""
+  puts $fh "    return"
+  puts $fh "  }"
+  puts $fh "  foreach a \$f { foreach b \$t { set_clock_uncertainty -setup -from \$a -to \$b \$m } }"
+  puts $fh "  puts \"otpu_margin.tcl: setup margin \$m ns on \$name (\$from -> \$to)\""
+  puts $fh "}"
+  foreach g $margins { puts $fh "otpu_margin_set [lindex $g 0] {[lindex $g 1]} {[lindex $g 2]} [lindex $g 3]" }
+  close $fh
+  lappend late $out/otpu_margin.tcl
+}
+# OTPU_TMEM_PBLOCK (pblock ranges, e.g. CLOCKREGION_X0Y3:CLOCKREGION_X1Y4; unset: none): the TMEM
+# (u_tmem: the pumped RAMs, their pumps, the arbitration) in a hard pblock there. With the core
+# clock off the memory's 133.33 MHz the channel whose PHY rows held the pumped TMEM read ECC errors
+# under inference (docs/timing_ffs.md section 8: r150b's TMEM in rows 0-3, channel 0; r150f's in
+# rows 4-7, mostly channel 1); the PHYs sit in rows 0-2 and 5-7 of the left I/O column. Generated
+# as otpu_tmem_pblock.tcl in OUT_DIR; build.tcl requires its summary line in the run's log.
+# OTPU_XDMA_PBLOCK, the same for the XDMA (u_bd's xdma_0, e.g. CLOCKREGION_X1Y3:CLOCKREGION_X1Y6
+# around the PCIe block at X1Y4): with the MXU array right of DSP X1-X8 the placer moved most of the
+# XDMA to X0Y5-Y7 (r150m: userclk2 -0.176 ns); as otpu_xdma_pblock.tcl.
+foreach {knob name pat} {OTPU_TMEM_PBLOCK tmem *u_slice/u_tmem OTPU_XDMA_PBLOCK xdma *otpu_bd_i/xdma_0} {
+  set tpb [expr {[info exists ::env($knob)] ? [string trim $::env($knob)] : ""}]
+  if {$tpb eq ""} { continue }
+  foreach r $tpb {
+    if {![regexp {^CLOCKREGION_X\d+Y\d+:CLOCKREGION_X\d+Y\d+$} $r]} {
+      error "$knob '$tpb': ranges CLOCKREGION_XaYb:CLOCKREGION_XcYd, space separated"
+    }
+  }
+  set fh [open $out/otpu_${name}_pblock.tcl w]
+  puts $fh "# otpu_${name}_pblock.tcl (create_project.tcl, $knob): $pat in a hard pblock"
+  puts $fh "set c \[get_cells -quiet -hier -filter {NAME =~ $pat && !IS_PRIMITIVE}\]"
+  puts $fh "if {\[llength \$c\] != 1} {"
+  puts $fh "  error \"otpu_${name}_pblock.tcl: \[llength \$c\] $pat cells, expected 1\""
+  puts $fh "}"
+  puts $fh "set pb \[create_pblock otpu_$name\]"
+  puts $fh "resize_pblock \$pb -add {$tpb}"
+  puts $fh "set_property IS_SOFT false \$pb"
+  puts $fh "add_cells_to_pblock \$pb \$c"
+  puts $fh "puts \"otpu_${name}_pblock: \$c in {$tpb}\""
+  close $fh
+  lappend late $out/otpu_${name}_pblock.tcl
+}
 add_files -fileset constrs_1 -norecurse $late
 set_property SCOPED_TO_REF otpu_mem_ch [get_files $cons/otpu_mem_ch.tcl]
 set_property PROCESSING_ORDER LATE [get_files $late]
