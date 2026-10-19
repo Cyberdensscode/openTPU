@@ -976,7 +976,7 @@ class Board:
         of failing it. Zeros everywhere (~6 s at Gen1 x8), then SCRATCH = DRAM_INIT, which a new
         bitstream resets. Only the card: the simulated boards have no ECC. True when it scrubbed.
         The first scrub of a configuration whose core clock is not its controllers' also centres
-        the read taps under the core's load (loadcal.center, ~15 s), between two passes of
+        the read taps under the core's load (loadcal.center, ~40 s), between two passes of
         zeros."""
         if not getattr(self.t, "ecc", False):
             return False
