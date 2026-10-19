@@ -613,6 +613,8 @@ maximum of each supply over each step:
   | X4-X11 (r150m) | ExtraTimingOpt | -1.182 | -0.936 | -0.359 | -2,779 |
   | X4-X11 on rows 23-159, the XDMA in X1Y3:X1Y6 | ExtraTimingOpt | -2.673 | -1.741 | +0.107 | -5,964 |
   | X4-X11 on rows 0-136, the same | ExtraTimingOpt | -2.068 | -1.364 | +0.095 | -6,612 |
+  | X4-X11 | ExtraPostPlacementOpt | -1.907 | -1.475 | +0.042 | -3,189 |
+  | X4-X11 on rows 23-159 | ExtraPostPlacementOpt | -1.553 | -0.619 | +0.078 | -2,168 |
   | X3-X10 | ExtraTimingOpt | -0.375 | -0.197 | +0.008 | -354 |
   | X3-X10 | EarlyBlockPlacement | -0.229 | -0.075 | -0.163 | -63 |
   | X3-X10 | ExtraNetDelay_high | -0.305 | -0.238 | +0.004 | -261 |
