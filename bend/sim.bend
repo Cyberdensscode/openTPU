@@ -1275,7 +1275,7 @@ def q1.v(r: Array<U32> & U32, x: Array<U32>, +amax: U32, +gm: U32, +c: U32, +n: 
   (t, +v) = r
   q1.st(Array.get(U32, t, ((cs + c : U32) .&. tm : U32)), x, v, amax, gm, c, n, g, rv, f)
 
-# pass 1 from element c of the row at TMEM word src
+# pass 1 from element c of the row at TMEM word src (f: QACT's flags; QST's are none of these)
 def q1(nn: Nat, st: Qr, +src: U32, +c: U32, +n: U32, +g: U32, +rv: U32, +f: U32, +cs: U32,
   +tm: U32) -> Qr:
   match nn:
@@ -1559,8 +1559,8 @@ def qs.row(st: Q3, +o: Qs, +row: U32) -> Q3:
   match st:
     case Q3{t, d, x}:
       match o:
-        case Qs{+src, +srs, rows, kb, +f, +n, +g, ng, +tm, dst, drs, es, ne, sdst, sw, msk}:
-          qs.p2(q1(U32.to_nat(n), Qr{t, x, 0, 0}, (src + row * srs : U32), 0, n, g, 0, f, 0, tm),
+        case Qs{+src, +srs, rows, kb, f, +n, +g, ng, +tm, dst, drs, es, ne, sdst, sw, msk}:
+          qs.p2(q1(U32.to_nat(n), Qr{t, x, 0, 0}, (src + row * srs : U32), 0, n, g, 0, 0, 0, tm),
             d, o, row)
 
 def qs.rows(nn: Nat, st: Q3, +o: Qs, +row: U32) -> Q3:

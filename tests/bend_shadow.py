@@ -18,7 +18,7 @@ import pytest
 
 from opentpu import isa as I
 from opentpu import isasim
-from opentpu.bend_sim import CTRL, DRAM, ERRORS, TMEM, BendMachine
+from opentpu.bend_sim import CTRL, DRAM, ERRORS, TMEM, BendMachine, words_of
 
 TODO = {int(x, 0) for x in os.environ.get("OTPU_BEND_TODO", "").split(",") if x}
 # the words of isasim's message that name each Bend error (default: ERRORS' whole text)
@@ -126,6 +126,11 @@ def _shadow_run(self, max_steps: int = 10_000_000):
     if b.chains != self.chains:
         bad.append(f"chains {self.chains} vs {b.chains}")
     _log(dict(rec, outcome="MISMATCH" if bad else "same", diff=bad[:6]))
+    if bad and os.environ.get("OTPU_BEND_DUMP"):
+        import pickle
+        with open(os.environ["OTPU_BEND_DUMP"], "wb") as f:   # the run, to replay
+            pickle.dump({"cfg": cfg, "progs": [words_of(p) for p in progs],
+                         "args": list(self.args or []), "snap": snap}, f)
     if bad:
         raise AssertionError("bend: " + "; ".join(bad[:6]))
     return self
