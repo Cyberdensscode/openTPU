@@ -337,6 +337,9 @@ def Laws.log2_eight():
 def Laws.log2_one():
   {==}
 
+def Laws.log2_sqrt2():
+  {==}
+
 def Laws.log2_zero():
   {==}
 

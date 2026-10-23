@@ -218,6 +218,11 @@ law log2_eight:
 law log2_one:
   {F.log2(1065353216) == 0 : U32}
 
+# the significand at sqrt(2)'s (3FB504F3) takes the lower range: log2 0.49999994 (3EFFFFFE);
+# taken as 1.414.., it would be 0.5 (the boundary's >= as >)
+law log2_sqrt2:
+  {F.log2(1068827891) == 1056964606 : U32}
+
 law log2_zero:
   {F.log2(0) == 4286578688 : U32}
 
