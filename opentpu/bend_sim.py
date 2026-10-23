@@ -28,6 +28,7 @@ QUIT, INIT, DATA, LOAD, RUN, HOST = 0, 1, 2, 3, 4, 5
 DRAM, TMEM, ACT, CTRL = 0, 1, 2, 3
 IMEM = 4096                         # IMEM's first control word (sim.bend IMEM)
 RUNNING, DONE, HOSTS, ERROR = 0, 1, 2, 3
+POLL = 3                            # a slice's STATE polling a WAITW (sim.bend STATE)
 CHUNK = 1 << 28                     # bytes a DATA command moves at most
 
 # the slice's control words 16..39 as RUN returns them (sim.bend)
@@ -96,9 +97,68 @@ class BendError(SimError):
         self.code, self.sid = code, sid
 
 
+class _Bytes:
+    """A slice's DRAM bytes as isasim's Slice.dram reads them (d[a:b], d[a]), from the server."""
+
+    def __init__(self, m: "BendMachine", sid: int):
+        self.m, self.sid = m, sid
+
+    def __len__(self) -> int:
+        return self.m.cfg.DRAM_BYTES
+
+    def __getitem__(self, k):
+        if isinstance(k, slice):
+            a, b, step = k.indices(len(self))
+            if step != 1:
+                raise IndexError("a Bend slice's DRAM reads contiguous bytes")
+            return self.m.get(self.sid, DRAM, a, max(0, b - a))
+        return self.m.get(self.sid, DRAM, int(k), 1)[0]
+
+
+class _Words(_Bytes):
+    """Its DRAM's 32-bit words (isasim's Slice.m32[i])."""
+
+    def __len__(self) -> int:
+        return self.m.cfg.DRAM_BYTES // 4
+
+    def __getitem__(self, i):
+        return self.m.get(self.sid, DRAM, 4 * int(i), 4).view(np.uint32)[0]
+
+
+class BendSlice:
+    """One slice of a BendMachine as isasim's Slice shows itself to a WAITW host or a test: the
+    WAITW it polls, its registers and its DRAM (words and bytes), read from the server."""
+
+    def __init__(self, m: "BendMachine", sid: int):
+        self.m, self.sid = m, sid
+        self.m32, self.dram = _Words(m, sid), _Bytes(m, sid)
+
+    @property
+    def polling(self) -> I.Instr | None:
+        c = self.m.ctrl[self.sid]
+        if int(c[STATE]) != POLL or not self.m.programs:
+            return None
+        pc = int(c[PC])
+        return I.Instr.decode(self.m.programs[self.sid][8 * pc:8 * pc + 8])
+
+    def reg(self, r: int) -> int:
+        if r == 0:
+            return 0
+        if self.sid not in self.m.regs:     # (fixed while the machine waits on its host)
+            self.m.regs[self.sid] = self.m.get(self.sid, CTRL, 0, 64).view(np.uint32)
+        return int(self.m.regs[self.sid][r])
+
+    def holds(self, ins: I.Instr) -> bool:
+        """isasim's Slice.holds: whether WAITW ins's condition holds on its DRAM word now."""
+        a = (self.reg(ins.ra) + ins.w[0]) & 0xFFFFFFFF
+        return I.waitw_holds(int(self.m32[a // 4]), self.reg(ins.rc) + ins.w[2], ins.flags & 3,
+                             ins.w[3])
+
+
 class BendMachine:
     """isasim.Machine's state in the server: S slices' DRAM, TMEM, ACT RAM and control words.
-    run() raises SimError as isasim does (the message from the error's code)."""
+    run() raises SimError as isasim does (the message from the error's code); slices shows
+    each slice as isasim's do to a WAITW host (polling, reg, holds, m32, dram)."""
 
     def __init__(self, cfg: Config, threads: int | None = None, binary: Path | None = None):
         self.cfg = cfg
@@ -138,6 +198,9 @@ class BendMachine:
         self.host = None                               # WAITW's host, as isasim.Machine.host
         self.chains = 0
         self.ctrl = np.zeros((cfg.S, 24), np.uint32)
+        self.programs: list = []                       # each slice's program's words
+        self.regs: dict = {}                           # registers read while the host acts
+        self.slices = [BendSlice(self, s) for s in range(cfg.S)]
 
     # ---------------------------------------------------------------- the pipes
     def _cmd(self, words, data: bytes | memoryview | None = None) -> None:
@@ -233,8 +296,8 @@ class BendMachine:
         if len(a) > 8:
             raise ValueError("at most 8 run arguments")
         a += [0] * (8 - len(a))
-        for s, p in enumerate(programs):
-            w = words_of(p)
+        self.programs = [words_of(p) for p in programs]
+        for s, w in enumerate(self.programs):
             self._cmd([LOAD, s, len(w) // 8] + a, w.tobytes())
         return self
 
@@ -242,16 +305,17 @@ class BendMachine:
         r = self._reply()
         n = int(r[3])
         self.ctrl = np.frombuffer(self._get(96 * n), np.uint32).reshape(n, 24).copy()
+        self.regs = {}
         return r
 
     def run(self, max_steps: int = 0) -> "BendMachine":
         self._cmd([RUN, int(self.seq_mxu)])
         r = self._status()
         while r[0] == HOSTS:
+            # every slice that can run polls a WAITW: the host acts once (isasim.Machine.run),
+            # then the polling slices read their words again
             if self.host is not None:
-                for _ in range(1 << 20):
-                    if not self.host(self):
-                        break
+                self.host(self)
             self._cmd([HOST, int(self.seq_mxu)])
             r = self._status()
         if r[0] == ERROR:
@@ -287,6 +351,21 @@ class BendBackend:
                 self.write(s, 0, m)
         self.host = None                    # the Engine's poll (offloaded experts' server)
 
+    @property
+    def host(self):
+        return self._poll
+
+    @host.setter
+    def host(self, poll) -> None:
+        """The Engine's poll: the machine's WAITW host polls with it as IsaBackend's does
+        (qwen3._isa_host: until a polling slice's WAITW holds or it has nothing left to do)."""
+        self._poll = poll
+        if poll is None:
+            self.machine.host = None
+        else:
+            from .llm.qwen3 import _isa_host
+            self.machine.host = _isa_host(poll)
+
     def write(self, s: int, addr: int, data: np.ndarray) -> None:
         self.machine.put(s, DRAM, addr, np.ascontiguousarray(data).view(np.uint8).reshape(-1))
 
@@ -295,7 +374,6 @@ class BendBackend:
 
     def run(self, programs: list, args=None) -> dict:
         m = self.machine
-        m.host = None if self.host is None else (lambda _m: self.host())
         m.load(programs, args).run()
         return {"instructions": m.icounts}
 

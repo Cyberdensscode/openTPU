@@ -43,7 +43,19 @@ def Laws.lfu_fits():
 def Laws.layer_sweep():
   {==}
 
-def Laws.skew_misses():
+def Laws.skew_static():
+  {==}
+
+def Laws.skew_lru():
+  {==}
+
+def Laws.skew_lru_layer():
+  {==}
+
+def Laws.skew_lfu():
+  {==}
+
+def Laws.skew_opt():
   {==}
 
 def Laws.opt_bound():

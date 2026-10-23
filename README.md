@@ -342,6 +342,8 @@ the card went from 0.052 (build 84989047, before K smoothing) to 0.012.
 2. [`opentpu/kernels`](opentpu/kernels) and [docs/compiler.md](docs/compiler.md): how a kernel
    becomes instructions.
 3. [`opentpu/isasim.py`](opentpu/isasim.py): the simulator, which is the spec.
+   [docs/bend.md](docs/bend.md): the same simulator in Bend, with laws about its arithmetic
+   and 10-15x isasim's speed.
 4. [`rtl/`](rtl): the hardware, starting from [`rtl/top/otpu_top.sv`](rtl/top/otpu_top.sv).
 5. [docs/lfm2.md](docs/lfm2.md), [docs/qwen35.md](docs/qwen35.md), [docs/llama.md](docs/llama.md),
    [docs/benchmarks.md](docs/benchmarks.md): whole models and where their cycles go.

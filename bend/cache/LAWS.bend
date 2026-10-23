@@ -71,9 +71,21 @@ def skew(+pol: U32, ws: List<U32>, +nw: U32) -> U32:
   sum(C.misses(C.lay(pol, 4, 6, 2, 2, 8, 4, nw), [0, 1, 4, 5, 0, 2, 4, 6, 1, 0, 5, 4, 3, 0, 7,
     4, 0, 1, 4, 6, 2, 0, 4, 5], ws, [6, 3, 2, 1, 6, 3, 2, 1]))
 
-law skew_misses:
-  {[skew(0, [0, 4, 1, 5], 4), skew(1, [0, 4, 1, 5], 4), skew(2, [0, 4, 1, 5, 2, 6, 3, 7], 8),
-    skew(3, [0, 4, 1, 5], 4), skew(4, [0, 4, 1, 5], 4)] == [6, 10, 10, 9, 8] : List<U32>}
+# (a law a policy: one replay each, within the fuel of --verdict's kernel)
+law skew_static:
+  {skew(0, [0, 4, 1, 5], 4) == 6 : U32}
+
+law skew_lru:
+  {skew(1, [0, 4, 1, 5], 4) == 10 : U32}
+
+law skew_lru_layer:
+  {skew(2, [0, 4, 1, 5, 2, 6, 3, 7], 8) == 10 : U32}
+
+law skew_lfu:
+  {skew(3, [0, 4, 1, 5], 4) == 9 : U32}
+
+law skew_opt:
+  {skew(4, [0, 4, 1, 5], 4) == 8 : U32}
 
 # Belady's bound: OPT misses no more than the caches that take every miss in (lru, lru_layer,
 # lfu); static, which takes none in, is not one of them and misses fewer here

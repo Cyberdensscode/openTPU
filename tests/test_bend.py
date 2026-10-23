@@ -324,6 +324,54 @@ def test_mxu_seq_par(m_rows, n, kb, wf):
     b.seq_mxu = False
 
 
+# ------------------------------------------------------------------------------- WAITW's host
+
+
+@needs_server
+def test_waitw_host():
+    """The host's turn as isasim's: called once each time every slice that can run polls, it
+    sees the same slices (the WAITW each polls, whether it holds, the registers, DRAM words)
+    and the machine reads each polled word again after it."""
+    from opentpu.bend_sim import DRAM
+    cfg = Config(S=2, D=8, MCOLS=1, ACT_BLOCKS=1, TMEM_WORDS=64, DRAM_BYTES=256,
+                 IMEM_WORDS=64)
+    progs = [[I.li(1, 16), I.waitw(8, 5, 3, I.C_GE, ra=1), I.halt()],
+             [I.li(2, 1), I.waitw(0, 7, 0, I.C_EQ, rc=2), I.halt()]]
+
+    def host(write, log):
+        def turn(m):
+            # as qwen3._isa_host: act until a polling slice's WAITW holds; slice 0's word goes
+            # 1, 2, 3 (holds) in the first turn, slice 1's to 1 in the second
+            for _ in range(8):
+                log.append([(s.sid, s.reg(1), s.reg(2), int(s.m32[6]), int(s.m32[0]))
+                            + ((s.polling.op, s.polling.w[0], s.holds(s.polling))
+                               if s.polling is not None else ()) for s in m.slices])
+                if any(s.holds(s.polling) for s in m.slices if s.polling is not None):
+                    return
+                if m.slices[0].polling is not None:
+                    write(m, 0, 24, int(m.slices[0].m32[6]) + 1)
+                else:
+                    write(m, 1, 0, 1)
+        return turn
+
+    ref: list = []
+    mach = Machine(cfg, progs, [None, None])
+    mach.host = host(lambda m, s, a, v: m.slices[s].m32.__setitem__(a // 4, v), ref)
+    mach.run()
+    got: list = []
+    b = BS._server(cfg)
+    for s in range(2):
+        b.put(s, DRAM, 0, np.zeros(cfg.DRAM_BYTES, np.uint8))
+    b.host = host(lambda m, s, a, v: m.put(s, DRAM, a, np.array([v], np.uint32)), got)
+    try:
+        b.load(progs).run()
+    finally:
+        b.host = None
+    assert len(ref) == 6 and got == ref
+    assert [int(b.tmem(s)[t]) for s, t in ((0, 5), (1, 7))] == \
+        [int(mach.slices[0].tmem[5]), int(mach.slices[1].tmem[7])] == [3, 1]
+
+
 # ------------------------------------------------------------------------------- the expert cache
 
 
