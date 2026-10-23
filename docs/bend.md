@@ -4,13 +4,13 @@ Status: **branch `bend-sim`, 2026-10-23.** Two of openTPU's Python simulators ar
 2 ([bend-lang.com](https://bend-lang.com), 2.0.38): the ISA simulator (`opentpu/isasim.py`,
 with the fp32 arithmetic of `opentpu/fp32.py`) and the expert cache's replays
 (`tools/offload/cachesim.py`'s `simulate`). Both give the Python's results bit for bit. Laws
-state what they must satisfy, and proofs that Bend's checker accepts back the laws.
+state what they must satisfy, and Bend's checker accepts a proof of each.
 Differential runs against the Python check everything else. Times are on the Mac (Apple M5,
 4 performance + 6 efficiency cores), except where hwe-bench (Linux, 20 cores, shared) is named.
 
 ## 1. Summary
 
-| What | Python | Bend (all cores) | Speedup | Bend, one thread | Checked |
+| What | Python | Bend | Speedup | Bend, one thread | Checked |
 |---|---|---|---|---|---|
 | ISA sim, Qwen3-0.6B decode (s/token) | 1.339 | 0.089 | **15.0x** | 0.181 (7.4x) | logits bit-identical |
 | ISA sim, Qwen3-0.6B prefill (16 tokens) | 9.75 s | 0.94 s | **10.4x** | 2.32 s (4.2x) | logits bit-identical |
@@ -21,13 +21,22 @@ Differential runs against the Python check everything else. Times are on the Mac
 | Expert-cache sweep, Gemma 4 26B (200 replays) | 29.3 s | 0.51 s | **58x** | 1.66 s (18x) | identical |
 | Expert-cache sweep, LFM2.5-8B (200 replays) | 12.7 s | 0.20 s | **65x** | 0.71 s (18x) | identical |
 
-- **Laws:** 89 about the fp32 arithmetic and the machine's words (10 of them for every 32-bit
-  word), 7 about whole programs, and 16 about the cache. All of them check. The 89 word laws
-  check again in BendTT's kernel, which has a proof in Lean, and so do 12 of the 16 cache laws.
-- **Differential runs:** 18,786 isasim runs from the test suites were run again on the Bend
-  machine, and every one ended in the same state. Another 862,910 fp32 vectors, 2,600 random
-  STREAM programs and 935 random cache replays also agree. The MoE tests pass with Bend as their
-  backend, host hooks included.
+The Bend column is the ISA simulator at 4 threads (its best), and the cache sweep at the
+runtime's default thread count (all cores). Section 6 has every thread count.
+
+- **Laws:**
+  - 79 about the fp32 arithmetic and the machine's words, with 10 lemmas. 19 of these 89 hold
+    for every word or control array, proved by case splits and induction on the word's bits.
+  - 7 about whole programs.
+  - 15 about the cache, with 1 lemma.
+
+  All of them check. The 89 word laws check again in BendTT's kernel, which has a proof in
+  Lean, and so do 12 of the 15 cache laws.
+- **Differential runs:** 15,463 isasim runs from 18 test files ran again on the Bend machine.
+  15,444 ended in the same state and 19 on the same error. 5 more differed only in the
+  shadow's count of HALT CHAINs, a harness artifact (section 5). Another 862,910 fp32
+  vectors, 2,300 random STREAM programs and 935 random cache replays also agree. The MoE tests
+  pass with Bend as their backend, host hooks included.
 - **Bugs found in the Python:**
   - isasim's unary STREAM ops read an operand they do not use (81ac39dd).
   - cachesim's `lfu` held up to k − 1 experts more than its slots (8259401f). docs/offload.md
@@ -119,9 +128,11 @@ isasim's NumPy, against 8.3x for the sequential one.
 - **Layout.** A replay's layout (slots, tokens, layers, k, experts, the warm list) is one
   record.
 - **Policies.**
-  - `lfu` and `lru_layer` keep their victims in a binary heap of three-word entries.
-  - `lru` keeps a queue with stamps.
-  - `opt` first computes each request's next use, in one backward pass.
+  - `lru` and `lru_layer` keep queues of (expert, stamp) pairs: one queue for `lru`, one per
+    layer for `lru_layer`. An entry is current while its stamp is its expert's.
+  - `lfu` and `opt` keep their victims in a binary heap of three-word entries. `lfu`'s are
+    (count, step, expert); `opt`'s put the furthest next use on top, after a backward pass
+    has found each request's next use.
 - **The sweep.** Each replay gets its own copy of the shared arrays (`Array.clone`). The halves
   of the job list are forked, so 200 replays run on every core.
 - **The CLI.** `tools/offload/cachesim.py --bend` runs the sweep on Bend. It has no prediction
@@ -137,8 +148,9 @@ isasim's NumPy, against 8.3x for the sequential one.
 | `opentpu/profile.py`, `hwtrace.py`, `lens.py`, `opentpu/waits.py` | They read and analyze traces. The time goes to IO and NumPy, not to simulation. |
 | `tools/tile_model.py`, `tools/scoreboard.py` | These are closed-form cost models that already run in milliseconds. |
 | `tools/scoreboard_cosim.py`, `tools/moe_prefill_cosim.py` | They drive rtlsim. |
-| `cachesim.py`'s `lfu_layer` and prefetch, `tools/offload/lesim.py` | Decayed use is float64, and its ties would have to match Python's floats bit for bit. |
-| `tools/offload/em_slotsim.py` | It could reuse `cache.bend`'s LRU. A candidate for later. |
+| `cachesim.py`'s `lfu_layer` and prefetch, `tools/offload/lesim.py` | Decayed use is a chain of float64 log2 and exp2, which Bend's 32-bit floats do not reproduce. |
+| `tools/offload/em_slotsim.py` | Both models' traces take 2.4 s in Python, so starting a process and the file IO would be most of a port's time. |
+| the board model (`SimTransport`, test_board's `*_board_model`) | It is the RTL under Verilator. |
 
 ## 4. Laws
 
@@ -158,8 +170,10 @@ go down to Base's `Word(32n)`, and lemmas prove the bit facts by induction on th
 - `ftz_idem`, `canon_idem`: flushing to zero and canonicalizing are idempotent;
 - `fabs_sign`: |x| has no sign bit;
 - `fmax_self`, `fmin_self`: the max and the min of a word with itself are the word;
-- `r0_stays_zero`: writing R0 leaves it 0, whatever the control array;
-- `waitw_eq`, `waitw_ne`, `waitw_ge`: WAITW's compare is isa.py's `waitw_holds`;
+- `r0_stays_zero`: writing R0 leaves every control array as it was;
+- `waitw_eq`, `waitw_ne`, `waitw_ge`: WAITW's three compares, for every word, reference and
+  mask, are isa.py's `waitw_holds` (GE: the masked word minus the reference, signed, is not
+  negative);
 - `max_self` (the cache).
 
 **The IEEE-754 corners,** each value derived by hand and equal to fp32.py's:
@@ -194,7 +208,7 @@ TMEM, DRAM, instruction count and state that isasim gives for the same program.
 - `opt_bound`: OPT misses no more than any policy that takes every miss in. Static takes no
   misses in, and here it beats OPT.
 
-**How strong are they?** I made 15 mutants of `fp32.bend` and `word.bend` by hand. The laws
+**How strong are they?** Of 15 hand-made mutants of `fp32.bend` and `word.bend`, the laws
 caught 14. The one left swaps the operands of an add at equal magnitudes, which gives the same
 result: it is equivalent to the original. One earlier survivor was a mul with a broken sticky
 bit; it led to the `mul_sticky` law. Another, log2's boundary `>=` changed to `>`, led to
@@ -214,23 +228,31 @@ all three proof files on every run.
 
   | Where | Suites | Runs identical | Same error | Skipped (host hook) | Mismatch |
   |---|---|---|---|---|---|
-  | Mac | test_qwen3 | 1,102 | | 5 | 0 |
+  | Mac | test_qwen3 (sequential MXU) | 1,049 | | 5 | 0 |
+  | Mac | test_qwen3 (parallel MXU) | 1,102 | | 5 | 0 |
   | Mac | test_isa, test_kernels, test_mx, test_stream, test_vops, test_gemma4 | 275 | 18 | 68 | 0 |
   | hwe-bench A | test_qwen35, test_qwen35_moe, test_lfm2, test_lfm2_moe | 2,908 | | 10,994 | 0 |
-  | hwe-bench B | test_prefill, test_prefill_gemma4, test_llama, test_gemma4, test_gemma4_moe, test_tiled, test_waits, test_chatkv | 8,186 | 1 | 10,275 | 2 (harness) |
+  | hwe-bench B | test_prefill, test_prefill_gemma4, test_llama, test_gemma4, test_gemma4_moe, test_tiled, test_waits, test_chatkv | 10,110 | 1 | 10,275 | 5 (harness) |
+  | Mac | B's five mismatching tests again, with the fix | 531 | | 68 | 0 |
 
-  B's two mismatches are gemma4's PLE-on-host tests, where the shadow summed HALT CHAINs over
-  several runs (fixed in 97ee4630; on the Mac, after the fix, those runs are identical). The
-  "same error" runs end on the same error in both: an RLD outside its bound, bad addresses and
-  so on. hwe-bench's suites also passed under the shadow; A had 199 passed and 3 skipped.
+  B's five mismatches differ only in the count of HALT CHAINs (7 vs 0, 9 vs 0). They come
+  from two of gemma4's PLE-on-host tests and three of chatkv's MTP rollback tests. isasim
+  counts chains across runs, and hwe-bench's copy of the shadow compared that total with one
+  run's count (fixed in 97ee4630). With the fix, the same five tests pass on the Mac and all
+  531 of their runs are identical. The
+  "same error" runs come from tests that check isasim's errors (an RLD outside its bound, bad
+  addresses and the like), and both machines stop on the same one. Under the shadow, A's tests had 199 passed and 3 skipped. B's had 361 passed and 1 skipped;
+  its 5 failures are the five above, failed by the shadow's mismatch.
 - **`pytest -p bend_backend`** (`tests/bend_backend.py`): every Engine that would run on isasim
-  runs on the Bend machine, host hooks included: the MoE models' expert server, the beat-by-beat
-  link, Gemma 4's PLE rows. Each test then checks its own references. test_lfm2_moe and
-  test_qwen35_moe: 85 passed and 1 failed, in 460 s. The failure is
-  `test_device_follows_hf_and_routes_on_the_card`: its median cosine to HF is 0.9968 against a
-  threshold of 0.997, and it fails the same way on isasim on the Mac (an environment issue). The host's turn is isasim's:
-  polls until a waiting WAITW holds. Polling until nothing is left to do gave the hint tests
-  different promotion counts.
+  runs on the Bend machine instead, host hooks included. Each test then checks its own
+  references. On test_lfm2_moe and test_qwen35_moe, with the MoE expert server and the
+  beat-by-beat link (`tests/beat_link.py`) as hooks, 85 passed and 1 failed, in 460 s.
+  - The failure is `test_device_follows_hf_and_routes_on_the_card`. Its median cosine to HF
+    is 0.9968 against a threshold of 0.997, and it fails the same way on isasim on the Mac (an
+    environment issue).
+  - The host's turn is isasim's: it polls until a waiting WAITW holds. An earlier version
+    polled until nothing was left to do, and that gave the hint tests different promotion
+    counts.
 - **`tests/test_bend.py`**:
   - the three proof files, and the word proofs under `--verdict`;
   - `@unsafe` kept out of fp32, word, sim, machine and cache;
@@ -269,7 +291,7 @@ thread count is the runtime's choice.
 | | decode / token | 0.527 | 0.070 (7.5x) | 0.038 (13.9x) | 0.035 (15.1x) | 0.040 (13.2x) | 0.042 (12.5x) |
 
 - **Where it comes from.** A decode step is many small instructions. isasim pays Python's
-  dispatch for each one, so decode gains more (12-15x) than prefill (8-10x), whose MMs isasim
+  dispatch for each one, so decode gains more (12-15x) than prefill (6-10x), whose MMs isasim
   already runs in NumPy.
 - **Four threads is the knee.** Past it, the M5's efficiency cores and Bend's scheduler give
   nothing more. The scheduler hands each task to a core once, so a fork-join tree is only as
@@ -277,7 +299,7 @@ thread count is the runtime's choice.
 - **The shadow's suite times.** On the Mac, test_qwen3's 1,102 runs took 316.1 s on isasim and
   23.9 s on Bend (13.2x). On hwe-bench, the server was built before the parallel MXU and ran
   with 4 threads on a shared host (load 5-11). There the suites' runs took 885 vs 224 s (A,
-  4.0x) and 2,658 vs 793 s (B, 3.4x). DSTEP's tests: 39.9 vs 6.9 s.
+  4.0x) and 3,224 vs 1,015 s (B, 3.2x). DSTEP's tests: 39.9 vs 6.9 s.
 
 **The expert cache.** The full sweep of offload's router traces covers 4 texts of 2,048 tokens
 × 10 sizes (`--frac`) × 5 policies, 200 replays a model. Each text is warmed from the other
@@ -331,5 +353,5 @@ otpu-chat --backend bend ...                  # (also otpu-serve, validate.py, c
   trip for each WAITW read.
 - **Scaling.** Beyond four threads the runtime gains nothing on these workloads. A finer split
   of the VPU's rows, like the MXU's, is the next lever for prefill.
-- **More simulators.** `em_slotsim`'s LRU fits `cache.bend`. `lfu_layer` needs its decayed use
-  in fixed point, with Python's ties reproduced.
+- **More simulators.** `lfu_layer`, and with it `lesim`, needs its decayed use in fixed point,
+  with Python's ties reproduced.
