@@ -10,13 +10,15 @@
 #   3 LOAD   slice, instructions, the 8 run arguments; the program's words follow
 #   4 RUN    the machine runs until every slice halts (DONE), the host's turn (HOST) or an
 #            error; the reply: 16 words (state, the machine's error, its slice), then each
-#            slice's control words 16..39 (pc, ICOUNT, state, error, ...: sim.bend)
+#            slice's control words 16..39 (pc, ICOUNT, state, error, ...: sim.bend). Word 1:
+#            the MXU, 0 the parallel one (simpar.bend), 1 the sequential (sim.bend's mm.seq)
 #   5 HOST   the host has had its turn: the polling slices read again, and the run goes on;
-#            the reply as RUN's
+#            the reply as RUN's (word 1 as RUN's)
 import Base
 import ./fp32.bend as F
 import ./sim.bend as S
 import ./machine.bend as M
+import ./simpar.bend as P
 
 def Srv.hdr() -> IO(U32):
   import "./srv.c"
@@ -36,9 +38,6 @@ def Srv.put(i: U32, v: U32) -> IO(Unit):
 def Srv.flush() -> IO(Unit):
   import "./srv.c"
 
-# the MXU the server runs
-def mxu(s: S.Sl, +i: S.Ins) -> S.Sl:
-  S.mm.seq(s, i)
 
 # ------------------------------------------------------------------------------- slices
 
@@ -208,17 +207,34 @@ def reply(m: M.Mc) -> IO(M.Mc):
 
 # ------------------------------------------------------------------------------- the loop
 
+# RUN (host 0) or HOST (host 1) with the sequential MXU (seq) or the parallel one
+def cmd.go(seq: Bool, host: Bool, m: M.Mc) -> IO(M.Mc):
+  match seq host:
+    case True{} True{}:
+      reply(M.run.host(~(s => i => S.mm.seq(s, i)), m))
+    case True{} False{}:
+      reply(M.run(~(s => i => S.mm.seq(s, i)), m))
+    case False{} True{}:
+      reply(M.run.host(~(s => i => P.mm.par(s, i)), m))
+    case False{} False{}:
+      reply(M.run(~(s => i => P.mm.par(s, i)), m))
+
+def cmd.rh(m: M.Mc, +op: U32) -> IO(M.Mc):
+  do IO<M.Mc>:
+    +q : U32 <- Srv.arg(1)
+    cmd.go(U32.is_eq(q, 1), U32.is_eq(op, 5), m)
+
 def cmd.h(z: Bool, m: M.Mc) -> IO(M.Mc):
   match z:
     case True{}:
-      reply(M.run.host(~(s => i => mxu(s, i)), m))
+      cmd.rh(m, 5)
     case False{}:
       IO.pure(M.Mc, m)
 
 def cmd.r(z: Bool, m: M.Mc, +op: U32) -> IO(M.Mc):
   match z:
     case True{}:
-      reply(M.run(~(s => i => mxu(s, i)), m))
+      cmd.rh(m, 4)
     case False{}:
       cmd.h(U32.is_eq(op, 5), m)
 

@@ -3162,33 +3162,35 @@ def mm.ns(n: Nat, st: Mx, +o: Mk, +j: U32, +nn: U32, +sj: U32, +alpha: U32) -> M
     case 1n+p:
       mm.ns(p, mm.n1(st, o, j, nn, sj, alpha), o, j, (nn + 1 : U32), sj, alpha)
 
-def mm.j3(r: Array<U32> & U32, d: Array<U32>, a: Array<U32>, x: Array<U32>, +o: Mk, +j: U32,
-  +n: U32, +sj: U32) -> Mx:
+def mm.j3(~ns: U32 -> Mx -> Mk -> U32 -> U32 -> U32 -> Mx,
+  r: Array<U32> & U32, d: Array<U32>, a: Array<U32>,
+  x: Array<U32>, +o: Mk, +j: U32, +n: U32, +sj: U32) -> Mx:
   (t, +alpha) = r
-  mm.ns(U32.to_nat(n), Mx{d, a, t, x}, o, j, 0, sj, alpha)
+  ns(n, Mx{d, a, t, x}, o, j, sj, alpha)
 
-def mm.j2(r: Array<U32> & U32, d: Array<U32>, t: Array<U32>, x: Array<U32>, +o: Mk, +j: U32,
-  +ti: U32, +n: U32, +wf: U32) -> Mx:
+def mm.j2(~ns: U32 -> Mx -> Mk -> U32 -> U32 -> U32 -> Mx,
+  r: Array<U32> & U32, d: Array<U32>, t: Array<U32>,
+  x: Array<U32>, +o: Mk, +j: U32, +ti: U32, +n: U32, +wf: U32) -> Mx:
   (a, +saj) = r
-  mm.j3(Array.get(U32, t, ti), d, a, x, o, j, n,
+  mm.j3(~ns, Array.get(U32, t, ti), d, a, x, o, j, n,
     F.mul(saj, ((127 - mm.w(wf) : U32) << 23n : U32)))
 
 # row j: Sa[j] * 2^-W and alpha[j] (any word when not ASCALE), then its outputs
-def mm.j1(st: Mx, +o: Mk, +j: U32) -> Mx:
+def mm.j1(~ns: U32 -> Mx -> Mk -> U32 -> U32 -> U32 -> Mx, st: Mx, +o: Mk, +j: U32) -> Mx:
   match st:
     case Mx{d, a, t, x}:
       match o:
         case Mk{sa, rs, +ssa, srs, out, ors, +n, kb, k0, m, +ab, f, +wf, dd, +nab, ado, +aso,
           msk, +tm}:
-          mm.j2(Array.get(U32, a, (aso + j * nab + ab : U32)), d, t, x, o, j,
+          mm.j2(~ns, Array.get(U32, a, (aso + j * nab + ab : U32)), d, t, x, o, j,
             ((ssa + j : U32) .&. tm : U32), n, wf)
 
-def mm.js(n: Nat, st: Mx, +o: Mk, +j: U32) -> Mx:
+def mm.js(~ns: U32 -> Mx -> Mk -> U32 -> U32 -> U32 -> Mx, n: Nat, st: Mx, +o: Mk, +j: U32) -> Mx:
   match n:
     case 0n:
       st
     case 1n+p:
-      mm.js(p, mm.j1(st, o, j), o, (j + 1 : U32))
+      mm.js(~ns, p, mm.j1(~ns, st, o, j), o, (j + 1 : U32))
 
 # the scratch's rows to TMEM, row j's N words to out + j * ors
 def mm.wr(n: Nat, st: Array<U32> & Array<U32>, +j: U32, +nn: U32, +out: U32, +ors: U32) ->
@@ -3255,13 +3257,10 @@ def mm.go2(st: Mx, c: Array<U32>, h: Array<U32>, +k: Cf, +o: Mk) -> Sl:
           msk, tm}:
           mm.rmax(mm.wr(U32.to_nat(m), (x, t), 0, n, out, ors), c, a, d, h, k, o)
 
-def mm.go(s: Sl, +o: Mk) -> Sl:
+def mm.go(~rw: Mx -> Mk -> Mx, s: Sl, +o: Mk) -> Sl:
   match s:
     case Sl{c, t, a, d, h, x, +k}:
-      match o:
-        case Mk{sa, rs, ssa, srs, out, ors, n, kb, k0, +m, ab, f, wf, dd, nab, ado, aso, msk,
-          tm}:
-          mm.go2(mm.js(U32.to_nat(m), Mx{d, a, t, x}, o, 0), c, h, k, o)
+      mm.go2(rw(Mx{d, a, t, x}, o), c, h, k, o)
 
 def mm.fl(s: Sl, +e: U32) -> Sl:
   match s:
@@ -3270,7 +3269,8 @@ def mm.fl(s: Sl, +e: U32) -> Sl:
 
 # 27 the rows' Sa differ, 7 alpha's (ASCALE) or the outputs' TMEM range, 42 more outputs than
 # the scratch holds (2^22: a limit of this simulator, not of the ISA)
-def mm.t2(z: Bool, ok: Bool, room: Bool, s: Sl, +o: Mk) -> Sl:
+def mm.t2(~rw: Mx -> Mk -> Mx,
+  z: Bool, ok: Bool, room: Bool, s: Sl, +o: Mk) -> Sl:
   match z:
     case True{}:
       mm.fl(s, 27)
@@ -3279,68 +3279,72 @@ def mm.t2(z: Bool, ok: Bool, room: Bool, s: Sl, +o: Mk) -> Sl:
         case True{}:
           match room:
             case True{}:
-              mm.go(s, o)
+              mm.go(~rw, s, o)
             case False{}:
               mm.fl(s, 42)
         case False{}:
           mm.fl(s, 7)
 
-def mm.e27(r: Array<U32> & U32, c: Array<U32>, t: Array<U32>, d: Array<U32>, h: Array<U32>,
-  x: Array<U32>, +k: Cf, +o: Mk) -> Sl:
+def mm.e27(~rw: Mx -> Mk -> Mx,
+  r: Array<U32> & U32, c: Array<U32>, t: Array<U32>,
+  d: Array<U32>, h: Array<U32>, x: Array<U32>, +k: Cf, +o: Mk) -> Sl:
   (a, +z) = r
   match o:
     case Mk{sa, rs, +ssa, srs, +out, +ors, +n, kb, k0, +m, ab, +f, wf, dd, nab, ado, aso, msk,
       +tm}:
-      mm.t2(U32.is_ne(z, 0), (U32.is_eq((f .&. 8 : U32), 0) || rng(ssa, m, 1, 1, 0, tm))
+      mm.t2(~rw, U32.is_ne(z, 0), (U32.is_eq((f .&. 8 : U32), 0) || rng(ssa, m, 1, 1, 0, tm))
         && rng(out, m, ors, n, 1, tm), ((m * n : U32) <= 4194304 : U32), Sl{c, t, a, d, h, x, k},
         o)
 
-def mm.e3(s: Sl, +o: Mk) -> Sl:
+def mm.e3(~rw: Mx -> Mk -> Mx, s: Sl, +o: Mk) -> Sl:
   match s:
     case Sl{c, t, a, d, h, x, +k}:
       match o:
         case Mk{sa, rs, ssa, srs, out, ors, n, +kb, k0, +m, +ab, +f, wf, dd, +nab, ado, +aso,
           msk, tm}:
           +r = F.sel(U32.is_ne((f .&. 64 : U32), 0), (2 * m : U32), m)
-          mm.e27(sa.scan(U32.to_nat((r * kb : U32)), (a, 0), 0, kb, m, aso, nab, ab), c, t, d, h,
-            x, k, o)
+          mm.e27(~rw, sa.scan(U32.to_nat((r * kb : U32)), (a, 0), 0, kb, m, aso, nab, ab), c,
+            t, d, h, x, k, o)
 
-def mm.e26c(z: Bool, s: Sl, +o: Mk) -> Sl:
+def mm.e26c(~rw: Mx -> Mk -> Mx, z: Bool, s: Sl, +o: Mk) -> Sl:
   match z:
     case True{}:
       mm.fl(s, 26)
     case False{}:
-      mm.e3(s, o)
+      mm.e3(~rw, s, o)
 
-def mm.e26b(r: Array<U32> & U32, c: Array<U32>, t: Array<U32>, a: Array<U32>, h: Array<U32>,
-  x: Array<U32>, +k: Cf, +o: Mk) -> Sl:
+def mm.e26b(~rw: Mx -> Mk -> Mx,
+  r: Array<U32> & U32, c: Array<U32>, t: Array<U32>,
+  a: Array<U32>, h: Array<U32>, x: Array<U32>, +k: Cf, +o: Mk) -> Sl:
   (d, +z) = r
-  mm.e26c(U32.is_ne((z .&. 2155905152 : U32), 0), Sl{c, t, a, d, h, x, k}, o)
+  mm.e26c(~rw, U32.is_ne((z .&. 2155905152 : U32), 0), Sl{c, t, a, d, h, x, k}, o)
 
 # 26 an NVFP4 scale byte with the sign bit set (NVFP4 without UNIT: every block's bytes)
-def mm.e26(z: Bool, s: Sl, +o: Mk) -> Sl:
+def mm.e26(~rw: Mx -> Mk -> Mx, z: Bool, s: Sl, +o: Mk) -> Sl:
   match z s:
     case True{} Sl{c, t, a, d, h, x, +k}:
       match o:
         case Mk{sa, rs, +ssa, +srs, out, ors, +n, +kb, +k0, m, ab, f, wf, dd, nab, ado, aso,
           msk, tm}:
-          mm.e26b(nv.scan(U32.to_nat((n * kb : U32)), (d, 0), 0, kb, ssa, srs, k0), c, t, a, h,
+          mm.e26b(~rw, nv.scan(U32.to_nat((n * kb : U32)), (d, 0), 0, kb, ssa, srs, k0), c, t, a, h,
             x, k, o)
     case False{} s:
-      mm.e3(s, o)
+      mm.e3(~rw, s, o)
 
-def mm.e2(z: Bool, s: Sl, +o: Mk, +e: U32) -> Sl:
+def mm.e2(~rw: Mx -> Mk -> Mx, z: Bool, s: Sl, +o: Mk,
+  +e: U32) -> Sl:
   match z:
     case True{}:
       match o:
         case Mk{sa, rs, ssa, srs, out, ors, n, kb, k0, m, ab, +f, +wf, dd, nab, ado, aso, msk,
           tm}:
-          mm.e26(U32.is_eq(wf, 3) && U32.is_eq((f .&. 1 : U32), 0), s, o)
+          mm.e26(~rw, U32.is_eq(wf, 3) && U32.is_eq((f .&. 1 : U32), 0), s, o)
     case False{}:
       mm.fl(s, e)
 
-# MM, the sequential MXU (the ~mm of the step and run loops)
-def mm.seq(s: Sl, +i: Ins) -> Sl:
+# MM with its rows computed by ~rw(st, o) (mm.rows in order, or bend/simpar.bend's halves in
+# parallel)
+def mm.ck(~rw: Mx -> Mk -> Mx, s: Sl, +i: Ins) -> Sl:
   match s:
     case Sl{c, t, a, d, h, x, +k}:
       match i:
@@ -3353,4 +3357,15 @@ def mm.seq(s: Sl, +i: Ins) -> Sl:
             (Cf.dbm1(k) >> 2n : U32), (Cf.tw(k) - 1 : U32)} : Mk}
           +e1 = mm.chk(o, k)
           +e = F.sel(U32.is_eq(e1, 0), mm.schk(o, k), e1)
-          mm.e2(U32.is_eq(e, 0), Sl{c, t, a, d, h, x, k}, o, e)
+          mm.e2(~rw, U32.is_eq(e, 0), Sl{c, t, a, d, h, x, k}, o, e)
+
+# the M rows from 0, row j's outputs by ~ns(n, st, o, j, sj, alpha) (its n outputs from 0)
+def mm.rows(~ns: U32 -> Mx -> Mk -> U32 -> U32 -> U32 -> Mx, st: Mx, +o: Mk) -> Mx:
+  match o:
+    case Mk{sa, rs, ssa, srs, out, ors, n, kb, k0, +m, ab, f, wf, dd, nab, ado, aso, msk, tm}:
+      mm.js(~ns, U32.to_nat(m), st, o, 0)
+
+# MM, the sequential MXU (the ~mm of the step and run loops)
+def mm.seq(s: Sl, +i: Ins) -> Sl:
+  mm.ck(~(st => o => mm.rows(~(n => st2 => o2 => j => sj => al => mm.ns(U32.to_nat(n), st2,
+    o2, j, 0, sj, al)), st, o)), s, i)

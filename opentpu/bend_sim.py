@@ -113,6 +113,9 @@ class BendMachine:
         # bend); OTPU_BEND_THREADS: the runtime's threads (default: the runtime's choice)
         binary = binary or Path(os.environ.get("OTPU_BEND_BIN", "") or build())
         threads = threads or int(os.environ.get("OTPU_BEND_THREADS", "0")) or None
+        # the MXU: each row's outputs in parallel (bend/simpar.bend), or in order (sim.bend's
+        # mm.seq) with seq_mxu or OTPU_BEND_SEQ=1; the results are the same
+        self.seq_mxu = os.environ.get("OTPU_BEND_SEQ", "") == "1"
         ci, co = os.pipe()                             # commands: host -> server
         ri, ro = os.pipe()                             # replies: server -> host
         env = dict(os.environ, BEND_NO_TELEMETRY="1", OTPU_BEND_IN=str(ci),
@@ -242,14 +245,14 @@ class BendMachine:
         return r
 
     def run(self, max_steps: int = 0) -> "BendMachine":
-        self._cmd([RUN])
+        self._cmd([RUN, int(self.seq_mxu)])
         r = self._status()
         while r[0] == HOSTS:
             if self.host is not None:
                 for _ in range(1 << 20):
                     if not self.host(self):
                         break
-            self._cmd([HOST])
+            self._cmd([HOST, int(self.seq_mxu)])
             r = self._status()
         if r[0] == ERROR:
             self._raise(int(r[1]), int(r[2]))
