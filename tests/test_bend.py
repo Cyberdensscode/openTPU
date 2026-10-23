@@ -80,6 +80,76 @@ def test_pure(path):
     assert "ALL PROOFS CHECK" in out, out
 
 
+# ------------------------------------------------------------------------------- fp32
+
+
+def fp32_reference(op: int, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """opentpu/fp32.py's result words for bend/test/fpvec.bend's op codes."""
+    from opentpu import fp32 as R
+    fa, fb = a.view(np.float32), b.view(np.float32)
+    w = lambda x: np.asarray(x, np.float32).view(np.uint32)        # noqa: E731
+    if op in (0, 1, 2):
+        return w((R.add, R.sub, R.mul)[op](fa, fb))
+    if op == 13:
+        return w(R.fmax(fa, fb))
+    if op == 14:
+        return w(R.fmin(fa, fb))
+    if op in (5, 6, 7, 12):
+        return w({5: R.exp2, 6: R.recip, 7: R.rsqrt, 12: R.log2}[op](fa))
+    if op == 8:
+        return w(R.i2f(a.view(np.int32)))
+    if op == 9:
+        return R.q8(fa).view(np.uint8).astype(np.uint32)
+    if op == 10:
+        return R.gt(fa, fb).astype(np.uint32)
+    if op == 11:
+        return w(R.fabs(fa))
+    if op == 15:
+        return np.array([I.f2i(int(x)) for x in a], np.uint32)
+    if op == 17:
+        return R.mx_offset(fa, fb).astype(np.uint32)
+    return w(R.ftz(fa))
+
+
+@needs_bend
+def test_fp32_vectors(tmp_path):
+    """fp32.bend against opentpu/fp32.py, op by op, on random words with the special ones mixed
+    in (bend/test/fpvec.bend, built with bend -o)."""
+    from opentpu import fp32 as R
+    exe = ROOT / "build" / "fpvec"
+    src = ROOT / "bend" / "test" / "fpvec.bend"
+    deps = [src, ROOT / "bend" / "fp32.bend", ROOT / "bend" / "host.bend", ROOT / "bend" / "host.c"]
+    if not exe.exists() or exe.stat().st_mtime < max(p.stat().st_mtime for p in deps):
+        exe.parent.mkdir(exist_ok=True)
+        subprocess.run([str(BEND), str(src), "-o", str(exe)], check=True, timeout=600,
+                       env=dict(os.environ, BEND_NO_TELEMETRY="1"))
+    rng = np.random.default_rng(7)
+    n = 4096
+    ops, refs, vec = [], [], []
+    for op in (0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17):
+        a, b = words(rng, n), words(rng, n)
+        if op == 8:
+            a = rng.integers(0, 1 << 32, n, dtype=np.uint64).astype(np.uint32)
+        if op == 17:                                   # 0 <= a <= amax, flushed
+            a = R.fabs(a.view(np.float32)).view(np.uint32)
+            b = R.fabs(b.view(np.float32)).view(np.uint32)
+            a, b = np.minimum(a, b), np.maximum(a, b)
+            a[(a & 0x7F800000) == 0x7F800000] = 0
+            b[(b & 0x7F800000) == 0x7F800000] = 0x7F7FFFFF
+        vec.append(np.stack([np.full(n, op, np.uint32), a, b, np.zeros(n, np.uint32)], 1))
+        refs.append(fp32_reference(op, a, b))
+        ops.append(op)
+    v = np.concatenate(vec).reshape(-1)
+    head = np.zeros(4, np.uint32)
+    head[0] = v.size // 4
+    np.concatenate([head, v]).astype(np.uint32).tofile(tmp_path / "vec.bin")
+    subprocess.run([str(exe)], cwd=tmp_path, check=True, timeout=600)
+    got = np.fromfile(tmp_path / "out.bin", np.uint32).reshape(len(ops), n)
+    bad = {op: int((got[k] != refs[k]).sum()) for k, op in enumerate(ops)
+           if not np.array_equal(got[k], refs[k])}
+    assert not bad, f"mismatching vectors per op: {bad}"
+
+
 # ------------------------------------------------------------------------------- VPU
 
 
