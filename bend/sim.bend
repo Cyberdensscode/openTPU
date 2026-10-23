@@ -3,9 +3,9 @@
 #
 # Everything here is pure and terminating: LAWS.bend states facts about it and PROOF.bend
 # proves them. The MXU's MM is a template parameter (~mm) of the step and the run loops:
-# mm.seq below is the sequential one; simpar.bend's splits the output columns over the cores
-# (it shares the read-only arrays through Base's @unsafe Array.fork, so it stays out of the
-# proofs).
+# mm.seq below is the sequential one; simpar.bend's splits the rows and each row's outputs over
+# the cores (it shares the read-only arrays through Base's @unsafe Array.fork, so it stays out
+# of the proofs).
 #
 # Bend has no hex literals: the constants are decimal, their hex in the comments.
 import Base
