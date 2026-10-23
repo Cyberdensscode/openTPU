@@ -23,7 +23,7 @@ from opentpu.bend_sim import CTRL, DRAM, ERRORS, TMEM, BendMachine, words_of
 TODO = {int(x, 0) for x in os.environ.get("OTPU_BEND_TODO", "").split(",") if x}
 # the words of isasim's message that name each Bend error (default: ERRORS' whole text)
 KEY = {8: "outside its bound", 14: "HALT CHAIN", 13: "never holds", 24: "multiples of",
-       37: "DSTEP", 38: "STREAM"}
+       38: "STREAM"}
 _orig_run = isasim.Machine.run
 _bend: dict = {}                     # the server for the last Config
 _test = {"id": ""}

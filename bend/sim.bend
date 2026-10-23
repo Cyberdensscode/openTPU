@@ -1646,10 +1646,190 @@ def x.qst(s: Sl, +i: Ins) -> Sl:
           +e = qs.chk(o, k)
           qs.e(U32.is_eq(e, 0), Sl{c, t, a, d, h, x, k}, o, e)
 
-# (placeholders until their units are written)
-def x.dstep(s: Sl, +i: Ins) -> Sl:
-  ex.bad(s, i)
+# DSTEP (docs/isa.md "DSTEP"; isasim Slice._dstep): one Gated DeltaNet head step on a state S
+# of rows x cols fp32 in DRAM from byte d (DZERO: +0, not read): kv = S k, dd = (v - kv * e) *
+# beta, S = outer(S, e, dd, k) (S * e + dd k, fp32.outer), o = S q; the sums are VOP RDOT's (64
+# interleaved partials from +0, then the folding tree). q and k (TMEM qk, qk + cols), v, e
+# (T[g]) and beta (T[g + gs]) are read first; the state is written back, then o to T[o..].
+#   the scratch: x[0..64) the partials, q from 64 (k after it), v at 576, o at 832, the state
+#   from 2048
 
+def ds.p3(r: Array<U32> & U32, +j: U32, +u: U32) -> Array<U32>:
+  (x, +p) = r
+  x[j] <- F.add(p, u)
+
+def ds.p2(r: Array<U32> & U32, +j: U32, +sv: U32) -> Array<U32>:
+  (x, +vv) = r
+  ds.p3(Array.get(U32, x, j), j, F.mul(sv, vv))
+
+def ds.p1(r: Array<U32> & U32, +vi: U32, +j: U32) -> Array<U32>:
+  (x, +sv) = r
+  ds.p2(Array.get(U32, x, vi), j, sv)
+
+def ds.dot(n: Nat, x: Array<U32>, +si: U32, +vi: U32, +q: U32) -> Array<U32>:
+  match n:
+    case 0n:
+      x
+    case 1n+p:
+      ds.dot(p, ds.p1(Array.get(U32, x, si), vi, (q .&. 63 : U32)), (si + 1 : U32), (vi + 1 : U32),
+        (q + 1 : U32))
+
+# RDOT of the scratch's n words at si with those at vi (n a multiple of 64: no padding)
+def ds.rdot(x: Array<U32>, +si: U32, +vi: U32, +n: U32) -> Array<U32> & U32:
+  Array.get(U32, tree(6n, ds.dot(U32.to_nat(n), fill(64n, x, 0, 0), si, vi, 0), 32), 0)
+
+def ds.u2(r: Array<U32> & U32, +i: U32, +sv: U32, +e: U32, +dd: U32) -> Array<U32>:
+  (x, +kv) = r
+  x[i] <- F.outer(sv, e, dd, kv)
+
+def ds.u1(r: Array<U32> & U32, +i: U32, +ki: U32, +e: U32, +dd: U32) -> Array<U32>:
+  (x, +sv) = r
+  ds.u2(Array.get(U32, x, ki), i, sv, e, dd)
+
+def ds.upd(n: Nat, x: Array<U32>, +i: U32, +ki: U32, +e: U32, +dd: U32) -> Array<U32>:
+  match n:
+    case 0n:
+      x
+    case 1n+p:
+      ds.upd(p, ds.u1(Array.get(U32, x, i), i, ki, e, dd), (i + 1 : U32), (ki + 1 : U32), e, dd)
+
+def ds.row3(r: Array<U32> & U32, +oi: U32) -> Array<U32>:
+  (x, +o) = r
+  x[oi] <- o
+
+def ds.row2(r: Array<U32> & U32, +si: U32, +cols: U32, +vr: U32, +e: U32, +beta: U32,
+  +oi: U32) -> Array<U32>:
+  (x, +kv) = r
+  ds.row3(ds.rdot(ds.upd(U32.to_nat(cols), x, si, (64 + cols : U32), e,
+    F.mul(F.sub(vr, F.mul(kv, e)), beta)), si, 64, cols), oi)
+
+def ds.row1(r: Array<U32> & U32, +si: U32, +cols: U32, +e: U32, +beta: U32, +oi: U32) ->
+  Array<U32>:
+  (x, +vr) = r
+  ds.row2(ds.rdot(x, si, (64 + cols : U32), cols), si, cols, vr, e, beta, oi)
+
+def ds.rows(n: Nat, x: Array<U32>, +r: U32, +cols: U32, +e: U32, +beta: U32) -> Array<U32>:
+  match n:
+    case 0n:
+      x
+    case 1n+p:
+      ds.rows(p, ds.row1(Array.get(U32, x, (576 + r : U32)), (2048 + r * cols : U32), cols, e,
+        beta, (832 + r : U32)), (r + 1 : U32), cols, e, beta)
+
+# the operands: the state's DRAM word, q / k's, v's, e's and o's TMEM words, gs, rows, cols,
+# DZERO
+type Dg is Data:
+  Dg{dw: U32, qk: U32, v: U32, g: U32, o: U32, gs: U32, rows: U32, cols: U32, zero: U32}
+
+def ds.fin(r: Array<U32> & Array<U32>, c: Array<U32>, a: Array<U32>, d: Array<U32>,
+  h: Array<U32>, +k: Cf) -> Sl:
+  (x, t) = r
+  Sl{c, t, a, d, h, x, k}
+
+# o to TMEM (its range: error 7, after the state is written, as isasim's)
+def ds.done(z: Bool, x: Array<U32>, t: Array<U32>, c: Array<U32>, a: Array<U32>,
+  d: Array<U32>, h: Array<U32>, +k: Cf, +o: U32, +rows: U32) -> Sl:
+  match z:
+    case True{}:
+      ds.fin(cp(U32.to_nat(rows), (x, t), 832, o), c, a, d, h, k)
+    case False{}:
+      Sl{fail(c, 7, o), t, a, d, h, x, k}
+
+def ds.go4(r: Array<U32> & Array<U32>, c: Array<U32>, t: Array<U32>, a: Array<U32>,
+  h: Array<U32>, +k: Cf, +g: Dg) -> Sl:
+  (x, d) = r
+  match g:
+    case Dg{dw, qk, v, gg, +o, gs, +rows, cols, zero}:
+      ds.done(rng(o, rows, 1, 1, 0, (Cf.tw(k) - 1 : U32)), x, t, c, a, d, h, k, o, rows)
+
+# the rows, then the state back to DRAM
+def ds.go3(x: Array<U32>, d: Array<U32>, c: Array<U32>, t: Array<U32>, a: Array<U32>,
+  h: Array<U32>, +k: Cf, +g: Dg, +e: U32, +beta: U32) -> Sl:
+  match g:
+    case Dg{+dw, qk, v, gg, o, gs, +rows, +cols, zero}:
+      ds.go4(cp(U32.to_nat((rows * cols : U32)), (ds.rows(U32.to_nat(rows), x, 0, cols, e, beta),
+        d), 2048, dw), c, t, a, h, k, g)
+
+def ds.go2b(r: Array<U32> & Array<U32>, c: Array<U32>, t: Array<U32>, a: Array<U32>,
+  h: Array<U32>, +k: Cf, +g: Dg, +e: U32, +beta: U32) -> Sl:
+  (d, x) = r
+  ds.go3(x, d, c, t, a, h, k, g, e, beta)
+
+# the state: +0 (DZERO) or DRAM's
+def ds.go2(z: Bool, x: Array<U32>, d: Array<U32>, c: Array<U32>, t: Array<U32>,
+  a: Array<U32>, h: Array<U32>, +k: Cf, +g: Dg, +e: U32, +beta: U32) -> Sl:
+  match z:
+    case True{}:
+      match g:
+        case Dg{dw, qk, v, gg, o, gs, +rows, +cols, zero}:
+          ds.go3(fill(U32.to_nat((rows * cols : U32)), x, 2048, 0), d, c, t, a, h, k, g, e, beta)
+    case False{}:
+      match g:
+        case Dg{+dw, qk, v, gg, o, gs, +rows, +cols, zero}:
+          ds.go2b(cp(U32.to_nat((rows * cols : U32)), (d, x), dw, 2048), c, t, a, h, k, g, e,
+            beta)
+
+def ds.eb2(r: Array<U32> & U32, x: Array<U32>, c: Array<U32>, a: Array<U32>, d: Array<U32>,
+  h: Array<U32>, +k: Cf, +g: Dg, +e: U32) -> Sl:
+  (t, +beta) = r
+  match g:
+    case Dg{dw, qk, v, gg, o, gs, rows, cols, +zero}:
+      ds.go2(U32.is_ne(zero, 0), x, d, c, t, a, h, k, g, e, beta)
+
+def ds.eb1(r: Array<U32> & U32, x: Array<U32>, c: Array<U32>, a: Array<U32>, d: Array<U32>,
+  h: Array<U32>, +k: Cf, +g: Dg) -> Sl:
+  (t, +e) = r
+  match g:
+    case Dg{dw, qk, v, +gg, o, +gs, rows, cols, zero}:
+      ds.eb2(Array.get(U32, t, (gg + gs : U32)), x, c, a, d, h, k, g, e)
+
+def ds.ld2(r: Array<U32> & Array<U32>, c: Array<U32>, a: Array<U32>, d: Array<U32>,
+  h: Array<U32>, +k: Cf, +g: Dg) -> Sl:
+  (t, x) = r
+  match g:
+    case Dg{dw, qk, v, +gg, o, gs, rows, cols, zero}:
+      ds.eb1(Array.get(U32, t, gg), x, c, a, d, h, k, g)
+
+# q and k, then v, into the scratch
+def ds.ld(r: Array<U32> & Array<U32>, c: Array<U32>, a: Array<U32>, d: Array<U32>,
+  h: Array<U32>, +k: Cf, +g: Dg) -> Sl:
+  (t, x) = r
+  match g:
+    case Dg{dw, qk, +v, gg, o, gs, +rows, cols, zero}:
+      ds.ld2(cp(U32.to_nat(rows), (t, x), v, 576), c, a, d, h, k, g)
+
+def ds.e(z: Bool, s: Sl, +g: Dg, +e: U32) -> Sl:
+  match z s:
+    case True{} Sl{c, t, a, d, h, x, +k}:
+      match g:
+        case Dg{dw, +qk, v, gg, o, gs, rows, +cols, zero}:
+          ds.ld(cp(U32.to_nat((2 * cols : U32)), (t, x), qk, 64), c, a, d, h, k, g)
+    case False{} Sl{c, t, a, d, h, x, k}:
+      Sl{fail(c, e, 0), t, a, d, h, x, k}
+
+# DSTEP's checks: 37 rows 1..256 and cols 64, 128, 192 or 256, 43 the state's alignment (D
+# bytes), 7 q, k, v, e or beta past TMEM, 6 the state past DRAM's end
+def x.dstep(s: Sl, +i: Ins) -> Sl:
+  match s:
+    case Sl{c, t, a, d, h, x, +k}:
+      match i:
+        case Ins{+w0, +w1, +w2, +w3, +w4, +w5, +w6, +w7, +va, +vb, +vc, vd}:
+          +rows = (w4 .&. 65535 : U32)
+          +cols = (w4 >> 16n : U32)
+          +dd = (va + w1 : U32)
+          +qk = (vb + w2 : U32)
+          +v = (vc + w3 : U32)
+          +tm = (Cf.tw(k) - 1 : U32)
+          +e = F.sel(U32.is_eq(rows, 0) || (rows > 256 : U32) || U32.is_ne((cols % 64 : U32), 0)
+            || U32.is_eq(cols, 0) || (cols > 256 : U32), 37,
+            F.sel(U32.is_ne((dd % Cf.d(k) : U32), 0), 43,
+            F.sel(Bool.not(rng(qk, (2 * cols : U32), 1, 1, 0, tm)) || Bool.not(rng(v, rows, 1, 1,
+              0, tm)) || (w5 > tm : U32) || Bool.not(rng(w5, 2, w7, 1, 0, tm)), 7,
+            F.sel(Bool.not(rng(dd, (rows * cols : U32), 4, 4, 1, Cf.dbm1(k))), 6, 0))))
+          ds.e(U32.is_eq(e, 0), Sl{c, t, a, d, h, x, k},
+            {Dg{(dd >> 2n : U32), qk, v, w5, w6, w7, rows, cols, (fl(w0) .&. 1 : U32)} : Dg}, e)
+
+# (placeholders until their units are written)
 def x.stream(s: Sl, +i: Ins) -> Sl:
   ex.bad(s, i)
 
