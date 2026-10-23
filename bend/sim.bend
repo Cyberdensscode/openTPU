@@ -390,7 +390,7 @@ def adv.sp(r: Array<U32> & U32, +pc: U32) -> Array<U32>:
 
 def adv.pc(r: Array<U32> & U32) -> Array<U32>:
   (c, +pc) = r
-  adv.sp(Array.get(U32, c, 16), pc)
+  adv.sp(Array.get(U32, c, 22), pc)
 
 def adv(c: Array<U32>) -> Array<U32>:
   adv.pc(Array.get(U32, c, 16))
@@ -1245,13 +1245,408 @@ def ex.bad(s: Sl, +i: Ins) -> Sl:
     case Sl{c, t, a, d, h, x, k}:
       Sl{fail(c, 2, op(Ins.w0(i))), t, a, d, h, x, k}
 
-# (placeholders until their units are written)
+# ------------------------------------------------------------------------------- quantizer
+
+# docs/isa.md "Quantization" (isasim Slice._quant_rows, fp32.quantize_mx), a row of n values
+# at a time: pass 1 puts the row's values (QACT RSCALE: times T[rscale + r], CSCALE: times
+# T[cscale + q]), flushed, in x[0..n) and each group of g its max |x| bits at x[n + q/g], and
+# keeps the row's amax; pass 2 turns the groups' maxima into inv * 2^d at x[n + q/g] and d at
+# x[n + ng + q/g] (d 0 in ROW mode); then q = q8(x * (inv * 2^d)), S = amax * 1/127 and
+# inv = 127 * recip(amax) (both 0 for amax 0).
+
+# pass 1's arrays, the row's amax and the group's max so far
+type Qr is Type:
+  Qr{t: Array<U32>, x: Array<U32>, amax: U32, gm: U32}
+
+def q1.st(r: Array<U32> & U32, x: Array<U32>, +v: U32, +amax: U32, +gm: U32, +c: U32, +n: U32,
+  +g: U32, +rv: U32, +f: U32) -> Qr:
+  (t, +cv) = r
+  +v1 = F.sel(U32.is_ne((f .&. 4 : U32), 0), F.mul(v, rv), v)
+  +v2 = F.ftz(F.sel(U32.is_ne((f .&. 2 : U32), 0), F.mul(v1, cv), v1))
+  +ab = (v2 .&. 2147483647 : U32)
+  +g0 = F.sel(U32.is_eq((c % g : U32), 0), 0, gm)
+  +gm2 = F.sel((ab > g0 : U32), ab, g0)
+  x[c] <- v2
+  Qr{t, Array.set(U32, x, (n + U32.div(c, g) : U32), gm2), F.sel((ab > amax : U32), ab, amax),
+    gm2}
+
+def q1.v(r: Array<U32> & U32, x: Array<U32>, +amax: U32, +gm: U32, +c: U32, +n: U32, +g: U32,
+  +rv: U32, +f: U32, +cs: U32, +tm: U32) -> Qr:
+  (t, +v) = r
+  q1.st(Array.get(U32, t, ((cs + c : U32) .&. tm : U32)), x, v, amax, gm, c, n, g, rv, f)
+
+# pass 1 from element c of the row at TMEM word src
+def q1(nn: Nat, st: Qr, +src: U32, +c: U32, +n: U32, +g: U32, +rv: U32, +f: U32, +cs: U32,
+  +tm: U32) -> Qr:
+  match nn:
+    case 0n:
+      st
+    case 1n+p:
+      match st:
+        case Qr{t, x, +amax, +gm}:
+          q1(p, q1.v(Array.get(U32, t, (src + c : U32)), x, amax, gm, c, n, g, rv, f, cs, tm),
+            src, (c + 1 : U32), n, g, rv, f, cs, tm)
+
+# S and inv of a row's amax
+def q.s(+amax: U32) -> U32:
+  F.sel(U32.is_eq(amax, 0), 0, F.mul(amax, 1006699012))
+
+def q.inv(+amax: U32) -> U32:
+  F.sel(U32.is_eq(amax, 0), 0, F.mul(1123942400, F.recip(amax)))
+
+def q2.g(r: Array<U32> & U32, +i: U32, +ng: U32, +amax: U32, +inv: U32, +row: Bool) ->
+  Array<U32>:
+  (x, +gmax) = r
+  +d = F.sel(row, 0, F.mx_offset(gmax, amax))
+  x[i] <- F.mul(inv, ((127 + d : U32) << 23n : U32))
+  x[(i + ng : U32)] <- d
+
+# pass 2 from group i (x index): inv * 2^d and d
+def q2(nn: Nat, x: Array<U32>, +i: U32, +ng: U32, +amax: U32, +inv: U32, +row: Bool) ->
+  Array<U32>:
+  match nn:
+    case 0n:
+      x
+    case 1n+p:
+      q2(p, q2.g(Array.get(U32, x, i), i, ng, amax, inv, row), (i + 1 : U32), ng, amax, inv,
+        row)
+
+# element c's q (a byte) or'ed into w at byte i
+def qp.e(r: Array<U32> & U32, +invg: U32, +w: U32, +i: U32) -> Array<U32> & U32:
+  (x, +v) = r
+  (x, (w .|. F.shl((F.q8(F.mul(v, invg)) .&. 255 : U32), (8 * i : U32)) : U32))
+
+# the n elements from c (at most 4, one group) as a word of q bytes
+def qp(nn: Nat, st: Array<U32> & U32, +c: U32, +invg: U32, +i: U32) -> Array<U32> & U32:
+  match nn:
+    case 0n:
+      st
+    case 1n+p:
+      (x, +w) = st
+      qp(p, qp.e(Array.get(U32, x, c), invg, w, i), (c + 1 : U32), invg, (i + 1 : U32))
+
+# the quantizer's arrays: TMEM and the scratch, and the ACT RAM (QACT) or DRAM (QST)
+type Q3 is Type:
+  Q3{t: Array<U32>, m: Array<U32>, x: Array<U32>}
+
+# --- QACT
+
+# QACT's operands: rows from TMEM word src (row stride srs), KB blocks into ACT block ab, the
+# flags, the row's n = KB * D values in ng groups of g, TMEM's mask, the ACT RAM's row words,
+# blocks, Sa's and the offsets' first words, the RSCALE / CSCALE words, and the rows' second
+# copy (DUP: rows on; else 0, the same rows written twice)
+type Qa is Data:
+  Qa{src: U32, srs: U32, rows: U32, kb: U32, ab: U32, f: U32, n: U32, g: U32, ng: U32,
+     tm: U32, rw: U32, nab: U32, aso: U32, ado: U32, rsc: U32, cs: U32, dup: U32, dd: U32}
+
+def qa.wd2(r: Array<U32> & U32, a: Array<U32>, +ai: U32, +ai2: U32) -> Array<U32> & Array<U32>:
+  (x, +w) = r
+  a[ai] <- w
+  (x, Array.set(U32, a, ai2, w))
+
+def qa.wd(r: Array<U32> & U32, a: Array<U32>, +c: U32, +ai: U32, +ai2: U32) ->
+  Array<U32> & Array<U32>:
+  (x, +invg) = r
+  qa.wd2(qp(4n, (x, 0), c, invg, 0), a, ai, ai2)
+
+# the row's q words into the ACT RAM from word ai (and ai2)
+def qa.ws(nn: Nat, st: Array<U32> & Array<U32>, +c: U32, +n: U32, +g: U32, +ai: U32,
+  +ai2: U32) -> Array<U32> & Array<U32>:
+  match nn:
+    case 0n:
+      st
+    case 1n+p:
+      (x, a) = st
+      qa.ws(p, qa.wd(Array.get(U32, x, (n + U32.div(c, g) : U32)), a, c, ai, ai2),
+        (c + 4 : U32), n, g, (ai + 1 : U32), (ai2 + 1 : U32))
+
+def qa.fin(r: Array<U32> & Array<U32>, t: Array<U32>) -> Q3:
+  (x, a) = r
+  Q3{t, a, x}
+
+# row r's S and offsets (the second copy too)
+def qa.sc(r: Array<U32> & Array<U32>, t: Array<U32>, +o: Qa, +row: U32, +s: U32) -> Q3:
+  (x, a) = r
+  match o:
+    case Qa{src, srs, rows, +kb, +ab, f, +n, g, +ng, tm, rw, +nab, +aso, +ado, rsc, cs, +dup,
+      dd}:
+      +b = (row * nab + ab : U32)
+      +b2 = ((row + dup : U32) * nab + ab : U32)
+      a2 = fill(U32.to_nat(kb), fill(U32.to_nat(kb), a, (aso + b : U32), s), (aso + b2 : U32),
+        s)
+      qa.fin(cp(U32.to_nat(ng), cp(U32.to_nat(ng), (x, a2), (n + ng : U32), (ado + 4 * b : U32)),
+        (n + ng : U32), (ado + 4 * b2 : U32)), t)
+
+def qa.p2(st: Qr, a: Array<U32>, +o: Qa, +row: U32) -> Q3:
+  match st:
+    case Qr{t, x, +amax, gm}:
+      match o:
+        case Qa{src, srs, rows, kb, +ab, +f, +n, +g, +ng, tm, +rw, nab, aso, ado, rsc, cs,
+          +dup, +dd}:
+          x2 = q2(U32.to_nat(ng), x, n, ng, amax, q.inv(amax), U32.is_ne((f .&. 1 : U32), 0))
+          +ai = (row * rw + (ab * dd >> 2n : U32) : U32)
+          qa.sc(qa.ws(U32.to_nat((n >> 2n : U32)), (x2, a), 0, n, g, ai,
+            (ai + dup * rw : U32)), t, o, row, q.s(amax))
+
+def qa.rv(r: Array<U32> & U32, a: Array<U32>, x: Array<U32>, +o: Qa, +row: U32) -> Q3:
+  (t, +rv) = r
+  match o:
+    case Qa{+src, +srs, rows, kb, ab, +f, +n, +g, ng, +tm, rw, nab, aso, ado, rsc, +cs, dup,
+      dd}:
+      qa.p2(q1(U32.to_nat(n), Qr{t, x, 0, 0}, (src + row * srs : U32), 0, n, g, rv, f, cs, tm),
+        a, o, row)
+
+def qa.row(st: Q3, +o: Qa, +row: U32) -> Q3:
+  match st:
+    case Q3{t, a, x}:
+      match o:
+        case Qa{src, srs, rows, kb, ab, f, n, g, ng, +tm, rw, nab, aso, ado, +rsc, cs, dup,
+          dd}:
+          qa.rv(Array.get(U32, t, ((rsc + row : U32) .&. tm : U32)), a, x, o, row)
+
+def qa.rows(nn: Nat, st: Q3, +o: Qa, +row: U32) -> Q3:
+  match nn:
+    case 0n:
+      st
+    case 1n+p:
+      qa.rows(p, qa.row(st, o, row), o, (row + 1 : U32))
+
+def qa.done(st: Q3, c: Array<U32>, d: Array<U32>, h: Array<U32>, +k: Cf) -> Sl:
+  match st:
+    case Q3{t, a, x}:
+      Sl{c, t, a, d, h, x, k}
+
+def qa.go(z: Bool, s: Sl, +o: Qa) -> Sl:
+  match z s:
+    case True{} Sl{c, t, a, d, h, x, k}:
+      match o:
+        case Qa{src, srs, +rows, kb, ab, f, n, g, ng, tm, rw, nab, aso, ado, rsc, cs, dup, dd}:
+          qa.done(qa.rows(U32.to_nat(rows), Q3{t, a, x}, o, 0), c, d, h, k)
+    case False{} s:
+      s
+
+# QACT's checks: 28 the ACT RAM's rows or blocks, 7 the rows' (RSCALE's, CSCALE's) TMEM words,
+# 42 a row longer than the scratch holds; none when a row is empty
+def qa.chk(+o: Qa, +k: Cf) -> U32:
+  match o:
+    case Qa{+src, +srs, +rows, +kb, +ab, +f, +n, g, +ng, +tm, rw, nab, aso, ado, +rsc, +cs,
+      dup, dd}:
+      +dupf = U32.is_ne((f .&. 8 : U32), 0)
+      +big = F.sel(dupf, F.b2u(((2 * rows : U32) > Cf.mcols(k) : U32)),
+        F.b2u((rows > Cf.ar(k) : U32)))
+      +none = U32.is_eq(rows, 0) || U32.is_eq(kb, 0)
+      F.sel(U32.is_ne(big, 0) || ((ab + kb : U32) > Cf.ab(k) : U32), 28,
+      F.sel(none, 0,
+      F.sel(Bool.not(rng(src, rows, srs, n, 1, tm))
+        || (U32.is_ne((f .&. 4 : U32), 0) && Bool.not(rng(rsc, rows, 1, 1, 0, tm)))
+        || (U32.is_ne((f .&. 2 : U32), 0) && Bool.not(rng(cs, n, 1, 1, 0, tm))), 7,
+      F.sel(((n + 2 * ng : U32) > 4194304 : U32) || (kb > 65535 : U32), 42, 0))))
+
+def qa.e(z: Bool, s: Sl, +o: Qa, +e: U32) -> Sl:
+  match z s:
+    case True{} s:
+      match o:
+        case Qa{src, srs, +rows, +kb, ab, f, n, g, ng, tm, rw, nab, aso, ado, rsc, cs, dup,
+          dd}:
+          qa.go(U32.is_ne(rows, 0) && U32.is_ne(kb, 0), s, o)
+    case False{} Sl{c, t, a, d, h, x, k}:
+      Sl{fail(c, e, 0), t, a, d, h, x, k}
+
+# QACT: rows of TMEM quantized into the ACT RAM (groups of D/4, ROW: one S, d 0); DUP: also
+# into rows rows..2*rows-1
 def x.qact(s: Sl, +i: Ins) -> Sl:
-  ex.bad(s, i)
+  match s:
+    case Sl{c, t, a, d, h, x, +k}:
+      match i:
+        case Ins{+w0, +w1, +w2, +w3, +w4, +w5, w6, w7, +va, vb, vc, vd}:
+          +f = fl(w0)
+          +dd = Cf.d(k)
+          +rows = (w2 .&. 255 : U32)
+          +kb = (w2 >> 16n : U32)
+          +n = (kb * dd : U32)
+          +g = (dd >> 2n : U32)
+          +o = {Qa{(va + w1 : U32), w3, rows, kb, ((w2 >> 8n : U32) .&. 255 : U32), f, n, g,
+            (4 * kb : U32), (Cf.tw(k) - 1 : U32), ((Cf.ab(k) * dd : U32) >> 2n : U32), Cf.ab(k),
+            Cf.aso(k), Cf.ado(k), w5, w4, F.sel(U32.is_ne((f .&. 8 : U32), 0), rows, 0), dd}
+            : Qa}
+          +e = qa.chk(o, k)
+          qa.e(U32.is_eq(e, 0), Sl{c, t, a, d, h, x, k}, o, e)
 
+# --- QST
+
+# QST's operands: rows from TMEM word src (stride srs) quantized (groups of D: a d a block) to
+# DRAM bytes dst + r * drs + e * es (e < ne: HALF the row's first half), the scale rows from
+# sdst (sw bytes each: S, then the KB bytes d padded to words; ROW: S alone)
+type Qs is Data:
+  Qs{src: U32, srs: U32, rows: U32, kb: U32, f: U32, n: U32, g: U32, ng: U32, tm: U32,
+     dst: U32, drs: U32, es: U32, ne: U32, sdst: U32, sw: U32, msk: U32}
+
+def qs.b(r: Array<U32> & U32, +wi: U32, +bs: U32, +q: U32) -> Array<U32>:
+  (d, +w) = r
+  d[wi] <- put8(w, bs, q)
+
+def qs.e1(r: Array<U32> & U32, d: Array<U32>, +invg: U32, +b: U32) -> Array<U32> & Array<U32>:
+  (x, +v) = r
+  +wi = (b >> 2n : U32)
+  (x, qs.b(Array.get(U32, d, wi), wi, (b .&. 3 : U32), (F.q8(F.mul(v, invg)) .&. 255 : U32)))
+
+def qs.e0(r: Array<U32> & U32, d: Array<U32>, +e: U32, +b: U32) -> Array<U32> & Array<U32>:
+  (x, +invg) = r
+  qs.e1(Array.get(U32, x, e), d, invg, b)
+
+# the row's bytes from element e, at DRAM byte b on (step es)
+def qs.es(nn: Nat, st: Array<U32> & Array<U32>, +e: U32, +b: U32, +es: U32, +n: U32, +g: U32) ->
+  Array<U32> & Array<U32>:
+  match nn:
+    case 0n:
+      st
+    case 1n+p:
+      (x, d) = st
+      qs.es(p, qs.e0(Array.get(U32, x, (n + U32.div(e, g) : U32)), d, e, b), (e + 1 : U32),
+        (b + es : U32), es, n, g)
+
+def qs.db(r: Array<U32> & U32, +w: U32, +i: U32, +lim: U32, +sh: U32) -> Array<U32> & U32:
+  (x, +v) = r
+  (x, (w .|. F.sel((i < lim : U32), F.shl(v, sh), 0) : U32))
+
+# a word of the d bytes from x index i (those from lim on are 0)
+def qs.dw(nn: Nat, st: Array<U32> & U32, +i: U32, +lim: U32, +sh: U32) -> Array<U32> & U32:
+  match nn:
+    case 0n:
+      st
+    case 1n+p:
+      (x, +w) = st
+      qs.dw(p, qs.db(Array.get(U32, x, i), w, i, lim, sh), (i + 1 : U32), lim, (sh + 8 : U32))
+
+def qs.dput(r: Array<U32> & U32, d: Array<U32>, +wi: U32) -> Array<U32> & Array<U32>:
+  (x, +w) = r
+  (x, Array.set(U32, d, wi, w))
+
+# the d words from x index i to DRAM word wi on
+def qs.ds(nn: Nat, st: Array<U32> & Array<U32>, +i: U32, +lim: U32, +wi: U32) ->
+  Array<U32> & Array<U32>:
+  match nn:
+    case 0n:
+      st
+    case 1n+p:
+      (x, d) = st
+      qs.ds(p, qs.dput(qs.dw(4n, (x, 0), i, lim, 0), d, wi), (i + 4 : U32), lim, (wi + 1 : U32))
+
+def qs.fin(r: Array<U32> & Array<U32>, t: Array<U32>) -> Q3:
+  (x, d) = r
+  Q3{t, d, x}
+
+# the row's scale row at DRAM word si: S, then nw words of the d bytes (x index i on)
+def qs.sr(r: Array<U32> & Array<U32>, t: Array<U32>, +si: U32, +s: U32, +nw: U32, +i: U32,
+  +kb: U32) -> Q3:
+  (x, d) = r
+  qs.fin(qs.ds(U32.to_nat(nw), (x, Array.set(U32, d, si, s)), i, (i + kb : U32),
+    (si + 1 : U32)), t)
+
+def qs.p2(st: Qr, d: Array<U32>, +o: Qs, +row: U32) -> Q3:
+  match st:
+    case Qr{t, x, +amax, gm}:
+      match o:
+        case Qs{src, srs, rows, +kb, +f, +n, +g, +ng, tm, +dst, +drs, +es, +ne, +sdst, +sw,
+          msk}:
+          +rowm = U32.is_ne((f .&. 1 : U32), 0)
+          x2 = q2(U32.to_nat(ng), x, n, ng, amax, q.inv(amax), rowm)
+          qs.sr(qs.es(U32.to_nat(ne), (x2, d), 0, (dst + row * drs : U32), es, n, g), t,
+            ((sdst + row * sw : U32) >> 2n : U32), q.s(amax),
+            F.sel(rowm, 0, ((kb + 3 : U32) >> 2n : U32)), (n + ng : U32), kb)
+
+def qs.row(st: Q3, +o: Qs, +row: U32) -> Q3:
+  match st:
+    case Q3{t, d, x}:
+      match o:
+        case Qs{+src, +srs, rows, kb, +f, +n, +g, ng, +tm, dst, drs, es, ne, sdst, sw, msk}:
+          qs.p2(q1(U32.to_nat(n), Qr{t, x, 0, 0}, (src + row * srs : U32), 0, n, g, 0, f, 0, tm),
+            d, o, row)
+
+def qs.rows(nn: Nat, st: Q3, +o: Qs, +row: U32) -> Q3:
+  match nn:
+    case 0n:
+      st
+    case 1n+p:
+      qs.rows(p, qs.row(st, o, row), o, (row + 1 : U32))
+
+# whether a row's data bytes base + e * es (e < ne, all in DRAM) meet the scale rows' bytes
+# lo..hi
+def qs.hit(+base: U32, +es: U32, +ne: U32, +lo: U32, +hi: U32) -> Bool:
+  +gap = (lo - base : U32)
+  +q = U32.div(gap, F.sel(U32.is_eq(es, 0), 1, es))
+  +em = (q + F.b2u(U32.is_ne((gap % F.sel(U32.is_eq(es, 0), 1, es) : U32), 0)) : U32)
+  (base <= hi : U32) && ((base >= lo : U32)
+    || (U32.is_ne(es, 0) && (em < ne : U32) && ((base + em * es : U32) <= hi : U32)))
+
+def qs.ov(nn: Nat, +row: U32, +o: Qs, +z: Bool) -> Bool:
+  match nn:
+    case 0n:
+      z
+    case 1n+p:
+      match o:
+        case Qs{src, srs, +rows, kb, f, n, g, ng, tm, +dst, +drs, +es, +ne, +sdst, +sw, msk}:
+          qs.ov(p, (row + 1 : U32), o, z || qs.hit((dst + row * drs : U32), es, ne, sdst,
+            (sdst + rows * sw - 1 : U32)))
+
+# QST's checks: 29 HALF without ROW, 7 the rows' TMEM words, 30 a data byte past DRAM's end,
+# 31 the scale rows' alignment or range, 32 the data and scale bytes overlap, 42 a row longer
+# than the scratch holds; none when a row is empty
+def qs.chk(+o: Qs, +k: Cf) -> U32:
+  match o:
+    case Qs{+src, +srs, +rows, +kb, +f, +n, g, +ng, +tm, +dst, +drs, +es, +ne, +sdst, +sw, msk}:
+      +db = Cf.dbm1(k)
+      F.sel(U32.is_ne((f .&. 2 : U32), 0) && U32.is_eq((f .&. 1 : U32), 0), 29,
+      F.sel(U32.is_eq(rows, 0) || U32.is_eq(kb, 0), 0,
+      F.sel(Bool.not(rng(src, rows, srs, n, 1, tm)), 7,
+      F.sel(Bool.not(rng(dst, rows, drs, ne, es, db)), 30,
+      F.sel(U32.is_ne((sdst .&. 3 : U32), 0) || Bool.not(rng(sdst, rows, sw, sw, 1, db)), 31,
+      F.sel(qs.ov(U32.to_nat(rows), 0, o, False{}), 32,
+      F.sel(((n + 2 * ng + 4 : U32) > 4194304 : U32) || (kb > 32767 : U32), 42, 0)))))))
+
+def qs.done(st: Q3, c: Array<U32>, a: Array<U32>, h: Array<U32>, +k: Cf) -> Sl:
+  match st:
+    case Q3{t, d, x}:
+      Sl{c, t, a, d, h, x, k}
+
+def qs.go(z: Bool, s: Sl, +o: Qs) -> Sl:
+  match z s:
+    case True{} Sl{c, t, a, d, h, x, k}:
+      match o:
+        case Qs{src, srs, +rows, kb, f, n, g, ng, tm, dst, drs, es, ne, sdst, sw, msk}:
+          qs.done(qs.rows(U32.to_nat(rows), Q3{t, d, x}, o, 0), c, a, h, k)
+    case False{} s:
+      s
+
+def qs.e(z: Bool, s: Sl, +o: Qs, +e: U32) -> Sl:
+  match z s:
+    case True{} s:
+      match o:
+        case Qs{src, srs, +rows, +kb, f, n, g, ng, tm, dst, drs, es, ne, sdst, sw, msk}:
+          qs.go(U32.is_ne(rows, 0) && U32.is_ne(kb, 0), s, o)
+    case False{} Sl{c, t, a, d, h, x, k}:
+      Sl{fail(c, e, 0), t, a, d, h, x, k}
+
+# QST: rows of TMEM quantized to DRAM (int8 rows and their scale rows: docs/isa.md "QST")
 def x.qst(s: Sl, +i: Ins) -> Sl:
-  ex.bad(s, i)
+  match s:
+    case Sl{c, t, a, d, h, x, +k}:
+      match i:
+        case Ins{+w0, +w1, +w2, +w3, +w4, +w5, +w6, +w7, +va, +vb, +vc, vd}:
+          +f = fl(w0)
+          +dd = Cf.d(k)
+          +kb = (w4 >> 16n : U32)
+          +n = (kb * dd : U32)
+          +rowm = U32.is_ne((f .&. 1 : U32), 0)
+          +o = {Qs{(va + w1 : U32), w5, (w4 .&. 65535 : U32), kb, f, n, dd, kb,
+            (Cf.tw(k) - 1 : U32), (vb + w2 : U32), w6, w7,
+            F.sel(U32.is_ne((f .&. 2 : U32), 0), (n >> 1n : U32), n), (vc + w3 : U32),
+            F.sel(rowm, 4, (4 + 4 * ((kb + 3 : U32) >> 2n : U32) : U32)),
+            (Cf.dbm1(k) >> 2n : U32)} : Qs}
+          +e = qs.chk(o, k)
+          qs.e(U32.is_eq(e, 0), Sl{c, t, a, d, h, x, k}, o, e)
 
+# (placeholders until their units are written)
 def x.dstep(s: Sl, +i: Ins) -> Sl:
   ex.bad(s, i)
 
@@ -1498,3 +1893,560 @@ def Cf.with_sid(+k: Cf, +j: U32) -> Cf:
 # (until the MXU is written)
 def mm.todo(s: Sl, +i: Ins) -> Sl:
   ex.bad(s, i)
+
+# ------------------------------------------------------------------------------- MXU
+
+# MM (docs/isa.md "MM"; isasim Slice._mm): out[j][n] = Sw[n] * (Sa[j] * 2^-W) * acc, acc the
+# exact sum over the K-blocks and their groups (4, NVFP4 8) of (m << (W - dw - da)) * c, c the
+# group's dot product of ACT row j's int8 elements (PAIR: the odd blocks from row j + M) and
+# the weights (int8; int4 or E2M1 codes), dw and m the weights' scale record's (int8: a dw
+# byte a block; int4 / fp4: a word a block, dw and four 6-bit m; NVFP4: an E4M3 byte a group;
+# UNIT, RSC: dw 0, m 1), da the ACT block's offsets; a group whose shift is negative drops.
+# acc is a 64-bit integer (hi, lo), rounded to fp32 once. ACC adds the old value, ASCALE
+# (with UNIT and ACC) old * alpha[j] + y, alpha at TMEM ssa; RMAX writes each row's max to
+# out + M * ors + j after the rows. Every output is computed (its old value read) into the
+# scratch before any is written, as isasim's.
+
+# an MM's operands and the slice's geometry: the streamed weights from DRAM byte sa (row
+# stride rs), the scale rows from ssa (stride srs), the outputs from TMEM word out (row stride
+# ors), N outputs, KB K-blocks (the scale rows' from k0), M rows from ACT block ab, the flags
+# and the weights' format wf; D, the ACT RAM's blocks nab, its offsets' and Sa's first words,
+# DRAM's last word and TMEM's last word (both masks: their sizes are powers of two)
+type Mk is Data:
+  Mk{sa: U32, rs: U32, ssa: U32, srs: U32, out: U32, ors: U32, n: U32, kb: U32, k0: U32,
+     m: U32, ab: U32, f: U32, wf: U32, dd: U32, nab: U32, ado: U32, aso: U32, msk: U32,
+     tm: U32}
+
+# the window W: int8 16, int4 / fp4 11, NVFP4 13
+def mm.w(+wf: U32) -> U32:
+  F.sel(U32.is_eq(wf, 0), 16, F.sel(U32.is_eq(wf, 3), 13, 11))
+
+# streamed bytes a K-block
+def mm.bpb(+wf: U32, +d: U32) -> U32:
+  F.sel(U32.is_eq(wf, 0), d, (d >> 1n : U32))
+
+# the operands' checks in isasim's order (0: none): 15 N or KB 0, 16 the ACT rows or blocks,
+# 17 RMAX / ASCALE with M > MCOLS, 18 PAIR's 2M > MCOLS, 19 PAIR with int8, 20 PAIR with an
+# odd k0, 21 RSC with NVFP4, 22 ASCALE without UNIT and ACC, 23 the streamed rows' alignment
+# or range
+def mm.chk(+o: Mk, +k: Cf) -> U32:
+  match o:
+    case Mk{+sa, +rs, ssa, srs, out, ors, +n, +kb, +k0, +m, +ab, +f, +wf, +dd, +nab, ado,
+      aso, msk, tm}:
+      +pair = U32.is_ne((f .&. 64 : U32), 0)
+      +r = F.sel(pair, (2 * m : U32), m)
+      +len = (U32.div(((kb * mm.bpb(wf, dd) : U32) + dd - 1 : U32), dd) * dd : U32)
+      F.sel(U32.is_eq(n, 0) || U32.is_eq(kb, 0), 15,
+      F.sel(U32.is_eq(r, 0) || (r > Cf.ar(k) : U32) || ((ab + kb : U32) > nab : U32), 16,
+      F.sel((m > Cf.mcols(k) : U32) && U32.is_ne((f .&. 12 : U32), 0), 17,
+      F.sel(pair && (r > Cf.mcols(k) : U32), 18,
+      F.sel(pair && U32.is_eq(wf, 0), 19,
+      F.sel(pair && U32.is_ne((k0 .&. 1 : U32), 0), 20,
+      F.sel(U32.is_ne((f .&. 128 : U32), 0) && U32.is_eq(wf, 3), 21,
+      F.sel(U32.is_ne((f .&. 8 : U32), 0) && U32.is_ne((f .&. 3 : U32), 3), 22,
+      F.sel(U32.is_ne((sa % dd : U32), 0) || U32.is_ne((rs % dd : U32), 0)
+        || Bool.not(rng(sa, n, rs, len, 1, Cf.dbm1(k))), 23, 0)))))))))
+
+# the scale rows' checks (isasim Slice._mx_scales; UNIT has none): 24 their alignment, 6 a
+# row's Sw (int4 / fp4: a block's word) past DRAM's end, 25 int8's or NVFP4's bytes past it
+def mm.schk(+o: Mk, +k: Cf) -> U32:
+  match o:
+    case Mk{sa, rs, +ssa, +srs, out, ors, +n, +kb, +k0, m, ab, +f, +wf, dd, nab, ado, aso,
+      msk, tm}:
+      +rsc = U32.is_ne((f .&. 128 : U32), 0)
+      +al = F.sel(U32.is_eq(wf, 3), 16,
+        F.sel((U32.is_eq(wf, 1) || U32.is_eq(wf, 2)) && Bool.not(rsc), 8, 4))
+      +db = Cf.dbm1(k)
+      +kn = (k0 + kb : U32)
+      F.sel(U32.is_ne((f .&. 1 : U32), 0), 0,
+      F.sel(U32.is_ne((ssa % al : U32), 0) || U32.is_ne((srs % al : U32), 0), 24,
+      F.sel(Bool.not(rng(ssa, n, srs, 4, 1, db)), 6,
+      F.sel(rsc, 0,
+      F.sel(U32.is_eq(wf, 0), F.sel(rng(ssa, n, srs, (4 + kn : U32), 1, db), 0, 25),
+      F.sel((wf < 3 : U32), F.sel(rng(ssa, n, srs, (4 * kn + 8 : U32), 1, db), 0, 6),
+        F.sel(rng(ssa, n, srs, (8 * kn + 16 : U32), 1, db), 0, 25)))))))
+
+# NVFP4's scale bytes with the sign bit set (error 26): the OR of every block's two words
+def nv.b(r: Array<U32> & U32, +z: U32) -> Array<U32> & U32:
+  (d, +v) = r
+  (d, (z .|. v : U32))
+
+def nv.a(r: Array<U32> & U32, +i: U32, +z: U32) -> Array<U32> & U32:
+  (d, +v) = r
+  nv.b(Array.get(U32, d, (i + 1 : U32)), (z .|. v : U32))
+
+def nv.scan(n: Nat, st: Array<U32> & U32, +q: U32, +kb: U32, +ssa: U32, +srs: U32,
+  +k0: U32) -> Array<U32> & U32:
+  match n:
+    case 0n:
+      st
+    case 1n+p:
+      (d, +z) = st
+      +i = ((ssa + U32.div(q, kb) * srs + 16 + 8 * (k0 + (q % kb : U32) : U32) : U32) >> 2n
+        : U32)
+      nv.scan(p, nv.a(Array.get(U32, d, i), i, z), (q + 1 : U32), kb, ssa, srs, k0)
+
+# whether every block of the R ACT rows read holds row (r mod M)'s first block's Sa (error 27
+# if not: the rows came from more than one QACT)
+def sa.v(r: Array<U32> & U32, +ref: U32, +z: U32) -> Array<U32> & U32:
+  (a, +v) = r
+  (a, (z .|. F.b2u(U32.is_ne(v, ref)) : U32))
+
+def sa.r(r: Array<U32> & U32, +vi: U32, +z: U32) -> Array<U32> & U32:
+  (a, +ref) = r
+  sa.v(Array.get(U32, a, vi), ref, z)
+
+def sa.scan(n: Nat, st: Array<U32> & U32, +q: U32, +kb: U32, +m: U32, +aso: U32, +nab: U32,
+  +ab: U32) -> Array<U32> & U32:
+  match n:
+    case 0n:
+      st
+    case 1n+p:
+      (a, +z) = st
+      +rr = U32.div(q, kb)
+      sa.scan(p, sa.r(Array.get(U32, a, (aso + (rr % m : U32) * nab + ab : U32)),
+        (aso + rr * nab + ab + (q % kb : U32) : U32), z), (q + 1 : U32), kb, m, aso, nab, ab)
+
+# --- the dot products
+
+# the dot product loops' arrays and sum
+type Da is Type:
+  Da{d: Array<U32>, a: Array<U32>, c: U32}
+
+# four int8 pairs
+def mac4(+w: U32, +v: U32) -> U32:
+  ((sx8((w .&. 255 : U32)) * sx8((v .&. 255 : U32)) : U32)
+    + (sx8(((w >> 8n : U32) .&. 255 : U32)) * sx8(((v >> 8n : U32) .&. 255 : U32)) : U32)
+    + (sx8(((w >> 16n : U32) .&. 255 : U32)) * sx8(((v >> 16n : U32) .&. 255 : U32)) : U32)
+    + (sar(w, 24) * sar(v, 24) : U32) : U32)
+
+def d8.a(r: Array<U32> & U32, d: Array<U32>, +w: U32, +c: U32) -> Da:
+  (a, +v) = r
+  Da{d, a, (c + mac4(w, v) : U32)}
+
+def d8.w(r: Array<U32> & U32, a: Array<U32>, +ai: U32, +c: U32) -> Da:
+  (d, +w) = r
+  d8.a(Array.get(U32, a, ai), d, w, c)
+
+def d8.st(st: Da, +wi: U32, +ai: U32) -> Da:
+  match st:
+    case Da{d, a, +c}:
+      d8.w(Array.get(U32, d, wi), a, ai, c)
+
+# n words of int8 weights from DRAM word wi with n words of int8 elements from ACT word ai
+def dot8(n: Nat, st: Da, +wi: U32, +ai: U32) -> Da:
+  match n:
+    case 0n:
+      st
+    case 1n+p:
+      dot8(p, d8.st(st, wi, ai), (wi + 1 : U32), (ai + 1 : U32))
+
+# the 4-bit codes' values: int4 two's complement; E2M1 (0, 1, 2, 3, 4, 6, 8, 12 and the sign:
+# 0xC8643210 the magnitudes' nibbles)
+def dec.i4(+c: U32) -> U32:
+  ((c .^. 8 : U32) - 8 : U32)
+
+def dec.f4(+c: U32) -> U32:
+  +mag = ((3362009616 >> U32.to_nat(((c .&. 7 : U32) * 4 : U32)) : U32) .&. 15 : U32)
+  F.sel(U32.is_eq((c .&. 8 : U32), 0), mag, (0 - mag : U32))
+
+# four 4-bit codes (w's low 16 bits, the first in the low nibble) with four int8 elements
+def mac4n(~dec: U32 -> U32, +w: U32, +v: U32) -> U32:
+  ((dec((w .&. 15 : U32)) * sx8((v .&. 255 : U32)) : U32)
+    + (dec(((w >> 4n : U32) .&. 15 : U32)) * sx8(((v >> 8n : U32) .&. 255 : U32)) : U32)
+    + (dec(((w >> 8n : U32) .&. 15 : U32)) * sx8(((v >> 16n : U32) .&. 255 : U32)) : U32)
+    + (dec(((w >> 12n : U32) .&. 15 : U32)) * sar(v, 24) : U32) : U32)
+
+def d4.a(~dec: U32 -> U32, r: Array<U32> & U32, d: Array<U32>, +w: U32, +c: U32) -> Da:
+  (a, +v) = r
+  Da{d, a, (c + mac4n(~dec, w, v) : U32)}
+
+def d4.w(~dec: U32 -> U32, r: Array<U32> & U32, a: Array<U32>, +ai: U32, +q: U32, +c: U32) ->
+  Da:
+  (d, +w) = r
+  d4.a(~dec, Array.get(U32, a, ai), d,
+    F.sel(U32.is_eq((q .&. 1 : U32), 0), w, (w >> 16n : U32)), c)
+
+def d4.st(~dec: U32 -> U32, st: Da, +wi: U32, +ai: U32, +q: U32) -> Da:
+  match st:
+    case Da{d, a, +c}:
+      d4.w(~dec, Array.get(U32, d, (wi + (q >> 1n : U32) : U32)), a, ai, q, c)
+
+# n words of int8 elements from ACT word ai, the block's word q of them on, with their codes
+# (eight a word: word q / 2's half q mod 2 from the block's DRAM word wi)
+def dot4(~dec: U32 -> U32, n: Nat, st: Da, +wi: U32, +ai: U32, +q: U32) -> Da:
+  match n:
+    case 0n:
+      st
+    case 1n+p:
+      dot4(~dec, p, d4.st(~dec, st, wi, ai, q), wi, (ai + 1 : U32), (q + 1 : U32))
+
+# a group's dot product: int8 (gw words), int4 or E2M1 (gw ACT words) from the block's words
+def mg.c(z: Bool, y: Bool, d: Array<U32>, a: Array<U32>, +wi: U32, +ai: U32, +q: U32,
+  +gw: U32) -> Da:
+  match z:
+    case True{}:
+      dot8(U32.to_nat(gw), Da{d, a, 0}, (wi + q : U32), (ai + q : U32))
+    case False{}:
+      match y:
+        case True{}:
+          dot4(~(c => dec.i4(c)), U32.to_nat(gw), Da{d, a, 0}, wi, (ai + q : U32), q)
+        case False{}:
+          dot4(~(c => dec.f4(c)), U32.to_nat(gw), Da{d, a, 0}, wi, (ai + q : U32), q)
+
+# --- a block's scale record and the sum
+
+# md 0: int8's dw, byte bsel of w0, m 1; 1: the int4 / fp4 word w0 (dw its low byte, group
+# g's m bits 8 + 6g on); 2: NVFP4's eight E4M3 bytes w0, w1 (dw = 15 - max(E, 1), m = 8 + M
+# for E > 0, else M); 3: UNIT, RSC (dw 0, m 1)
+type Bs is Data:
+  Bs{md: U32, w0: U32, w1: U32, bsel: U32}
+
+def bs.e4(+w0: U32, +w1: U32, +g: U32) -> U32:
+  byte(F.sel((g < 4 : U32), w0, w1), (g .&. 3 : U32))
+
+def bs.dw(+b: Bs, +g: U32) -> U32:
+  match b:
+    case Bs{+md, +w0, +w1, +bsel}:
+      +ex = ((bs.e4(w0, w1, g) >> 3n : U32) .&. 15 : U32)
+      F.sel(U32.is_eq(md, 0), byte(w0, bsel),
+      F.sel(U32.is_eq(md, 1), (w0 .&. 255 : U32),
+      F.sel(U32.is_eq(md, 2), (15 - F.sel((ex > 1 : U32), ex, 1) : U32), 0)))
+
+def bs.m(+b: Bs, +g: U32) -> U32:
+  match b:
+    case Bs{+md, +w0, +w1, +bsel}:
+      +e = bs.e4(w0, w1, g)
+      +mt = (e .&. 7 : U32)
+      F.sel(U32.is_eq(md, 1), (F.shr(w0, (8 + 6 * g : U32)) .&. 63 : U32),
+      F.sel(U32.is_eq(md, 2), F.sel((e >= 8 : U32), (8 + mt : U32), mt), 1))
+
+# the sum's arrays and its 64-bit value
+type Ms is Type:
+  Ms{d: Array<U32>, a: Array<U32>, hi: U32, lo: U32}
+
+# (hi, lo) += (c * m) << (w - dw - da), nothing if dw + da > w
+def mg.add(r: Da, +hi: U32, +lo: U32, +dw: U32, +m: U32, +da: U32, +w: U32) -> Ms:
+  match r:
+    case Da{d, a, +c}:
+      +ok = ((dw + da : U32) <= w : U32)
+      +sh = (w - dw - da : U32)
+      +p = (c * m : U32)
+      +plo = F.sel(ok, F.shl(p, sh), 0)
+      +phi = F.sel(ok, sar(p, (32 - sh : U32)), 0)
+      +lo2 = (lo + plo : U32)
+      Ms{d, a, (hi + phi + F.b2u((lo2 < lo : U32)) : U32), lo2}
+
+def mg.da(r: Array<U32> & U32, d: Array<U32>, +hi: U32, +lo: U32, +wf: U32, +gw: U32,
+  +wi: U32, +ai: U32, +b: Bs, +w: U32, +g: U32) -> Ms:
+  (a, +da) = r
+  mg.add(mg.c(U32.is_eq(wf, 0), U32.is_eq(wf, 1), d, a, wi, ai, (g * gw : U32), gw), hi, lo,
+    bs.dw(b, g), bs.m(b, g), da, w)
+
+# the block's groups from g: gsh 1 for NVFP4's eight (two to an ACT offset), else 0
+def mm.gs(n: Nat, st: Ms, +wf: U32, +gw: U32, +wi: U32, +ai: U32, +doff: U32, +b: Bs,
+  +w: U32, +g: U32, +gsh: U32) -> Ms:
+  match n:
+    case 0n:
+      st
+    case 1n+p:
+      match st:
+        case Ms{d, a, +hi, +lo}:
+          mm.gs(p, mg.da(Array.get(U32, a, (doff + F.shr(g, gsh) : U32)), d, hi, lo, wf, gw,
+            wi, ai, b, w, g), wf, gw, wi, ai, doff, b, w, (g + 1 : U32), gsh)
+
+def mm.kb2(r: Array<U32> & U32, a: Array<U32>, +hi: U32, +lo: U32, +w0: U32, +md: U32,
+  +bsel: U32, +wf: U32, +gw: U32, +wi: U32, +ai: U32, +doff: U32) -> Ms:
+  (d, +w1) = r
+  +ng = F.sel(U32.is_eq(wf, 3), 8, 4)
+  mm.gs(U32.to_nat(ng), Ms{d, a, hi, lo}, wf, gw, wi, ai, doff, Bs{md, w0, w1, bsel},
+    mm.w(wf), 0, F.sel(U32.is_eq(wf, 3), 1, 0))
+
+def mm.kb1(r: Array<U32> & U32, a: Array<U32>, +hi: U32, +lo: U32, +ib: U32, +md: U32,
+  +bsel: U32, +wf: U32, +gw: U32, +wi: U32, +ai: U32, +doff: U32) -> Ms:
+  (d, +w0) = r
+  mm.kb2(Array.get(U32, d, ib), a, hi, lo, w0, md, bsel, wf, gw, wi, ai, doff)
+
+# K-block kk of output (j, nn): its weights' and ACT row's words, its scale record, its groups
+def mm.kb(st: Ms, +o: Mk, +j: U32, +nn: U32, +kk: U32) -> Ms:
+  match st:
+    case Ms{d, a, +hi, +lo}:
+      match o:
+        case Mk{+sa, +rs, +ssa, +srs, out, ors, n, kb, +k0, +m, +ab, +f, +wf, +dd, +nab,
+          +ado, aso, +msk, tm}:
+          +odd = U32.is_ne((f .&. 64 : U32), 0) && U32.is_ne((kk .&. 1 : U32), 0)
+          +r = (j + F.sel(odd, m, 0) : U32)
+          +base = (ssa + nn * srs : U32)
+          +kq = (k0 + kk : U32)
+          +md = F.sel(U32.is_ne((f .&. 129 : U32), 0), 3,
+            F.sel(U32.is_eq(wf, 0), 0, F.sel(U32.is_eq(wf, 3), 2, 1)))
+          +ba = F.sel(U32.is_eq(md, 0), (base + 4 + kq : U32),
+            F.sel(U32.is_eq(md, 1), (base + 8 + 4 * kq : U32), (base + 16 + 8 * kq : U32)))
+          +ia = ((ba >> 2n : U32) .&. msk : U32)
+          +gw = F.sel(U32.is_eq(wf, 0), (dd >> 4n : U32),
+            U32.div(dd, (4 * F.sel(U32.is_eq(wf, 3), 8, 4) : U32)))
+          mm.kb1(Array.get(U32, d, ia), a, hi, lo, ((ia + 1 : U32) .&. msk : U32), md,
+            (ba .&. 3 : U32), wf, gw,
+            (((sa + nn * rs : U32) >> 2n : U32) + kk * (mm.bpb(wf, dd) >> 2n : U32) : U32),
+            (r * (nab * dd >> 2n : U32) + ((ab + kk : U32) * dd >> 2n : U32) : U32),
+            (ado + (r * nab + ab + kk : U32) * 4 : U32))
+
+def mm.ks(n: Nat, st: Ms, +o: Mk, +j: U32, +nn: U32, +kk: U32) -> Ms:
+  match n:
+    case 0n:
+      st
+    case 1n+p:
+      mm.ks(p, mm.kb(st, o, j, nn, kk), o, j, nn, (kk + 1 : U32))
+
+# --- the outputs
+
+# the arrays an MM reads and writes
+type Mx is Type:
+  Mx{d: Array<U32>, a: Array<U32>, t: Array<U32>, x: Array<U32>}
+
+def mm.y2(r: Array<U32> & U32, d: Array<U32>, a: Array<U32>, x: Array<U32>, +y0: U32,
+  +f: U32, +alpha: U32, +xi: U32) -> Mx:
+  (t, +old) = r
+  +y = F.sel(U32.is_ne((f .&. 8 : U32), 0), F.add(F.mul(old, alpha), y0),
+    F.sel(U32.is_ne((f .&. 2 : U32), 0), F.add(old, y0), y0))
+  Mx{d, a, t, Array.set(U32, x, xi, y)}
+
+def mm.y(st: Ms, t: Array<U32>, x: Array<U32>, +sw: U32, +sj: U32, +f: U32, +alpha: U32,
+  +ti: U32, +xi: U32) -> Mx:
+  match st:
+    case Ms{d, a, +hi, +lo}:
+      mm.y2(Array.get(U32, t, ti), d, a, x, F.mul(F.mul(F.i2f64(hi, lo), sw), sj), f, alpha,
+        xi)
+
+def mm.sw(r: Array<U32> & U32, a: Array<U32>, t: Array<U32>, x: Array<U32>, +o: Mk, +j: U32,
+  +nn: U32, +sj: U32, +alpha: U32) -> Mx:
+  (d, +w) = r
+  match o:
+    case Mk{sa, rs, ssa, srs, +out, +ors, +n, +kb, k0, m, ab, +f, wf, dd, nab, ado, aso, msk,
+      tm}:
+      mm.y(mm.ks(U32.to_nat(kb), Ms{d, a, 0, 0}, o, j, nn, 0), t, x,
+        F.sel(U32.is_ne((f .&. 1 : U32), 0), 1065353216, w), sj, f, alpha,
+        (out + j * ors + nn : U32), (j * n + nn : U32))
+
+def mm.n1(st: Mx, +o: Mk, +j: U32, +nn: U32, +sj: U32, +alpha: U32) -> Mx:
+  match st:
+    case Mx{d, a, t, x}:
+      match o:
+        case Mk{sa, rs, +ssa, +srs, out, ors, n, kb, k0, m, ab, f, wf, dd, nab, ado, aso,
+          +msk, tm}:
+          mm.sw(Array.get(U32, d, (((ssa + nn * srs : U32) >> 2n : U32) .&. msk : U32)), a, t,
+            x, o, j, nn, sj, alpha)
+
+# row j's outputs from nn
+def mm.ns(n: Nat, st: Mx, +o: Mk, +j: U32, +nn: U32, +sj: U32, +alpha: U32) -> Mx:
+  match n:
+    case 0n:
+      st
+    case 1n+p:
+      mm.ns(p, mm.n1(st, o, j, nn, sj, alpha), o, j, (nn + 1 : U32), sj, alpha)
+
+def mm.j3(r: Array<U32> & U32, d: Array<U32>, a: Array<U32>, x: Array<U32>, +o: Mk, +j: U32,
+  +n: U32, +sj: U32) -> Mx:
+  (t, +alpha) = r
+  mm.ns(U32.to_nat(n), Mx{d, a, t, x}, o, j, 0, sj, alpha)
+
+def mm.j2(r: Array<U32> & U32, d: Array<U32>, t: Array<U32>, x: Array<U32>, +o: Mk, +j: U32,
+  +ti: U32, +n: U32, +wf: U32) -> Mx:
+  (a, +saj) = r
+  mm.j3(Array.get(U32, t, ti), d, a, x, o, j, n,
+    F.mul(saj, ((127 - mm.w(wf) : U32) << 23n : U32)))
+
+# row j: Sa[j] * 2^-W and alpha[j] (any word when not ASCALE), then its outputs
+def mm.j1(st: Mx, +o: Mk, +j: U32) -> Mx:
+  match st:
+    case Mx{d, a, t, x}:
+      match o:
+        case Mk{sa, rs, +ssa, srs, out, ors, +n, kb, k0, m, +ab, f, +wf, dd, +nab, ado, +aso,
+          msk, +tm}:
+          mm.j2(Array.get(U32, a, (aso + j * nab + ab : U32)), d, t, x, o, j,
+            ((ssa + j : U32) .&. tm : U32), n, wf)
+
+def mm.js(n: Nat, st: Mx, +o: Mk, +j: U32) -> Mx:
+  match n:
+    case 0n:
+      st
+    case 1n+p:
+      mm.js(p, mm.j1(st, o, j), o, (j + 1 : U32))
+
+# the scratch's rows to TMEM, row j's N words to out + j * ors
+def mm.wr(n: Nat, st: Array<U32> & Array<U32>, +j: U32, +nn: U32, +out: U32, +ors: U32) ->
+  Array<U32> & Array<U32>:
+  match n:
+    case 0n:
+      st
+    case 1n+p:
+      mm.wr(p, cp(U32.to_nat(nn), st, (j * nn : U32), (out + j * ors : U32)), (j + 1 : U32),
+        nn, out, ors)
+
+# RMAX: each row's max (the total order, from the smallest key's word) to TMEM
+def rm.step(r: Array<U32> & U32, +mx: U32) -> Array<U32> & U32:
+  (x, +v) = r
+  (x, F.fmax(mx, v))
+
+def rm.row(n: Nat, st: Array<U32> & U32, +i: U32) -> Array<U32> & U32:
+  match n:
+    case 0n:
+      st
+    case 1n+p:
+      (x, +mx) = st
+      rm.row(p, rm.step(Array.get(U32, x, i), mx), (i + 1 : U32))
+
+def rm.put(r: Array<U32> & U32, t: Array<U32>, +ti: U32) -> Array<U32> & Array<U32>:
+  (x, +mx) = r
+  (x, Array.set(U32, t, ti, mx))
+
+def rm.js(n: Nat, st: Array<U32> & Array<U32>, +j: U32, +nn: U32, +base: U32) ->
+  Array<U32> & Array<U32>:
+  match n:
+    case 0n:
+      st
+    case 1n+p:
+      (x, t) = st
+      rm.js(p, rm.put(rm.row(U32.to_nat(nn), (x, 4294967295), (j * nn : U32)), t,
+        (base + j : U32)), (j + 1 : U32), nn, base)
+
+# --- MM
+
+def mm.fin(r: Array<U32> & Array<U32>, c: Array<U32>, a: Array<U32>, d: Array<U32>,
+  h: Array<U32>, +k: Cf) -> Sl:
+  (x, t) = r
+  Sl{c, t, a, d, h, x, k}
+
+def mm.rm2(z: Bool, x: Array<U32>, t: Array<U32>, c: Array<U32>, a: Array<U32>,
+  d: Array<U32>, h: Array<U32>, +k: Cf, +out: U32, +ors: U32, +n: U32, +m: U32) -> Sl:
+  match z:
+    case True{}:
+      mm.fin(rm.js(U32.to_nat(m), (x, t), 0, n, (out + m * ors : U32)), c, a, d, h, k)
+    case False{}:
+      Sl{fail(c, 7, out), t, a, d, h, x, k}
+
+def mm.rm1(z: Bool, x: Array<U32>, t: Array<U32>, c: Array<U32>, a: Array<U32>,
+  d: Array<U32>, h: Array<U32>, +k: Cf, +out: U32, +ors: U32, +n: U32, +m: U32) -> Sl:
+  match z:
+    case True{}:
+      Sl{c, t, a, d, h, x, k}
+    case False{}:
+      mm.rm2(rng(out, (m + 1 : U32), ors, m, 1, (Cf.tw(k) - 1 : U32)), x, t, c, a, d, h, k, out,
+        ors, n, m)
+
+# RMAX after the rows are written (isasim writes them first too): its words' range, error 7
+def mm.rmax(r: Array<U32> & Array<U32>, c: Array<U32>, a: Array<U32>, d: Array<U32>,
+  h: Array<U32>, +k: Cf, +o: Mk) -> Sl:
+  (x, t) = r
+  match o:
+    case Mk{sa, rs, ssa, srs, +out, +ors, +n, kb, k0, +m, ab, +f, wf, dd, nab, ado, aso, msk,
+      tm}:
+      mm.rm1(U32.is_eq((f .&. 4 : U32), 0), x, t, c, a, d, h, k, out, ors, n, m)
+
+def mm.go2(st: Mx, c: Array<U32>, h: Array<U32>, +k: Cf, +o: Mk) -> Sl:
+  match st:
+    case Mx{d, a, t, x}:
+      match o:
+        case Mk{sa, rs, ssa, srs, +out, +ors, +n, kb, k0, +m, ab, f, wf, dd, nab, ado, aso,
+          msk, tm}:
+          mm.rmax(mm.wr(U32.to_nat(m), (x, t), 0, n, out, ors), c, a, d, h, k, o)
+
+def mm.go(s: Sl, +o: Mk) -> Sl:
+  match s:
+    case Sl{c, t, a, d, h, x, +k}:
+      match o:
+        case Mk{sa, rs, ssa, srs, out, ors, n, kb, k0, +m, ab, f, wf, dd, nab, ado, aso, msk,
+          tm}:
+          mm.go2(mm.js(U32.to_nat(m), Mx{d, a, t, x}, o, 0), c, h, k, o)
+
+def mm.fl(s: Sl, +e: U32) -> Sl:
+  match s:
+    case Sl{c, t, a, d, h, x, k}:
+      Sl{fail(c, e, 0), t, a, d, h, x, k}
+
+# 27 the rows' Sa differ, 7 alpha's (ASCALE) or the outputs' TMEM range, 42 more outputs than
+# the scratch holds (2^22: a limit of this simulator, not of the ISA)
+def mm.t2(z: Bool, ok: Bool, room: Bool, s: Sl, +o: Mk) -> Sl:
+  match z:
+    case True{}:
+      mm.fl(s, 27)
+    case False{}:
+      match ok:
+        case True{}:
+          match room:
+            case True{}:
+              mm.go(s, o)
+            case False{}:
+              mm.fl(s, 42)
+        case False{}:
+          mm.fl(s, 7)
+
+def mm.e27(r: Array<U32> & U32, c: Array<U32>, t: Array<U32>, d: Array<U32>, h: Array<U32>,
+  x: Array<U32>, +k: Cf, +o: Mk) -> Sl:
+  (a, +z) = r
+  match o:
+    case Mk{sa, rs, +ssa, srs, +out, +ors, +n, kb, k0, +m, ab, +f, wf, dd, nab, ado, aso, msk,
+      +tm}:
+      mm.t2(U32.is_ne(z, 0), (U32.is_eq((f .&. 8 : U32), 0) || rng(ssa, m, 1, 1, 0, tm))
+        && rng(out, m, ors, n, 1, tm), ((m * n : U32) <= 4194304 : U32), Sl{c, t, a, d, h, x, k},
+        o)
+
+def mm.e3(s: Sl, +o: Mk) -> Sl:
+  match s:
+    case Sl{c, t, a, d, h, x, +k}:
+      match o:
+        case Mk{sa, rs, ssa, srs, out, ors, n, +kb, k0, +m, +ab, +f, wf, dd, +nab, ado, +aso,
+          msk, tm}:
+          +r = F.sel(U32.is_ne((f .&. 64 : U32), 0), (2 * m : U32), m)
+          mm.e27(sa.scan(U32.to_nat((r * kb : U32)), (a, 0), 0, kb, m, aso, nab, ab), c, t, d, h,
+            x, k, o)
+
+def mm.e26c(z: Bool, s: Sl, +o: Mk) -> Sl:
+  match z:
+    case True{}:
+      mm.fl(s, 26)
+    case False{}:
+      mm.e3(s, o)
+
+def mm.e26b(r: Array<U32> & U32, c: Array<U32>, t: Array<U32>, a: Array<U32>, h: Array<U32>,
+  x: Array<U32>, +k: Cf, +o: Mk) -> Sl:
+  (d, +z) = r
+  mm.e26c(U32.is_ne((z .&. 2155905152 : U32), 0), Sl{c, t, a, d, h, x, k}, o)
+
+# 26 an NVFP4 scale byte with the sign bit set (NVFP4 without UNIT: every block's bytes)
+def mm.e26(z: Bool, s: Sl, +o: Mk) -> Sl:
+  match z s:
+    case True{} Sl{c, t, a, d, h, x, +k}:
+      match o:
+        case Mk{sa, rs, +ssa, +srs, out, ors, +n, +kb, +k0, m, ab, f, wf, dd, nab, ado, aso,
+          msk, tm}:
+          mm.e26b(nv.scan(U32.to_nat((n * kb : U32)), (d, 0), 0, kb, ssa, srs, k0), c, t, a, h,
+            x, k, o)
+    case False{} s:
+      mm.e3(s, o)
+
+def mm.e2(z: Bool, s: Sl, +o: Mk, +e: U32) -> Sl:
+  match z:
+    case True{}:
+      match o:
+        case Mk{sa, rs, ssa, srs, out, ors, n, kb, k0, m, ab, +f, +wf, dd, nab, ado, aso, msk,
+          tm}:
+          mm.e26(U32.is_eq(wf, 3) && U32.is_eq((f .&. 1 : U32), 0), s, o)
+    case False{}:
+      mm.fl(s, e)
+
+# MM, the sequential MXU (the ~mm of the step and run loops)
+def mm.seq(s: Sl, +i: Ins) -> Sl:
+  match s:
+    case Sl{c, t, a, d, h, x, +k}:
+      match i:
+        case Ins{+w0, +w1, +w2, +w3, +w4, +w5, +w6, +w7, +va, +vb, +vc, vd}:
+          +f = fl(w0)
+          +o = {Mk{(va + w1 : U32), w5, (vb + w2 : U32), w7, (vc + w3 : U32),
+            (w6 .&. 65535 : U32), (w4 .&. 65535 : U32), ((w4 >> 16n : U32) .&. 255 : U32),
+            (w4 >> 24n : U32), ((w6 >> 16n : U32) .&. 255 : U32), (w6 >> 24n : U32), f,
+            ((f >> 4n : U32) .&. 3 : U32), Cf.d(k), Cf.ab(k), Cf.ado(k), Cf.aso(k),
+            (Cf.dbm1(k) >> 2n : U32), (Cf.tw(k) - 1 : U32)} : Mk}
+          +e1 = mm.chk(o, k)
+          +e = F.sel(U32.is_eq(e1, 0), mm.schk(o, k), e1)
+          mm.e2(U32.is_eq(e, 0), Sl{c, t, a, d, h, x, k}, o, e)

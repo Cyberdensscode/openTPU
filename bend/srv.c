@@ -1,5 +1,5 @@
 // The Bend ISA simulator's server effects (bend/server.bend): the command pipe from the host
-// (fd 3) and the reply pipe to it (fd 4), with the bulk data read straight into and written
+// (fd 3, or OTPU_BEND_IN) and the reply pipe to it (fd 4, or OTPU_BEND_OUT), with the bulk data read straight into and written
 // straight out of Array<U32> buffers (opentpu/bend_sim.py drives it).
 //
 // These use the runtime's internals (heap_alloc, term_blk, blk_loc: Bend 2.0.38's
@@ -9,9 +9,13 @@
 
 #include <unistd.h>
 #include <errno.h>
+#include <stdlib.h>
+#include <string.h>
 
 static u32 srv_h[16];        // the last command's header
 static u32 srv_r[16];        // the reply header being built
+static int srv_in = 3;       // the command pipe (OTPU_BEND_IN)
+static int srv_out = 4;      // the reply pipe (OTPU_BEND_OUT)
 
 static int srv_full(int fd, void* p, u64 n, int wr) {
   char* q = (char*)p;
@@ -32,7 +36,7 @@ static int srv_full(int fd, void* p, u64 n, int wr) {
 
 // the next command's 16 header words; its word 0 (0, QUIT, at the pipe's end)
 Term srv_hdr_run(Env e, Term* f, IoWork* w) {
-  if (srv_full(3, srv_h, sizeof srv_h, 0) != 0) {
+  if (srv_full(srv_in, srv_h, sizeof srv_h, 0) != 0) {
     memset(srv_h, 0, sizeof srv_h);
   }
   return (Term)srv_h[0];
@@ -58,7 +62,7 @@ Term srv_io_run(Env e, Term* f, IoWork* w) {
   u64 off = (u32)f[2];
   u64 n = (u32)f[3];
   char* p = (char*)(e.mem + blk_loc(e.mem, a)) + off;
-  if (srv_full(dir ? 4 : 3, p, n, dir) != 0) {
+  if (srv_full(dir ? srv_out : srv_in, p, n, dir) != 0) {
     _exit(3);
   }
   return a;
@@ -71,7 +75,7 @@ Term srv_put_run(Env e, Term* f, IoWork* w) {
 
 // the reply header, then cleared for the next
 Term srv_flush_run(Env e, Term* f, IoWork* w) {
-  if (srv_full(4, srv_r, sizeof srv_r, 1) != 0) {
+  if (srv_full(srv_out, srv_r, sizeof srv_r, 1) != 0) {
     _exit(3);
   }
   memset(srv_r, 0, sizeof srv_r);
@@ -79,6 +83,14 @@ Term srv_flush_run(Env e, Term* f, IoWork* w) {
 }
 
 static void __attribute__((constructor)) srv_use(void) {
+  const char* i = getenv("OTPU_BEND_IN");
+  const char* o = getenv("OTPU_BEND_OUT");
+  if (i) {
+    srv_in = atoi(i);
+  }
+  if (o) {
+    srv_out = atoi(o);
+  }
   io_eff(CID(Srv.hdr), srv_hdr_run);
   io_eff(CID(Srv.arg), srv_arg_run);
   io_eff(CID(Srv.mk), srv_mk_run);

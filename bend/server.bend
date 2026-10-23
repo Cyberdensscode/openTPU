@@ -38,7 +38,7 @@ def Srv.flush() -> IO(Unit):
 
 # the MXU the server runs
 def mxu(s: S.Sl, +i: S.Ins) -> S.Sl:
-  S.mm.todo(s, i)
+  S.mm.seq(s, i)
 
 # ------------------------------------------------------------------------------- slices
 
