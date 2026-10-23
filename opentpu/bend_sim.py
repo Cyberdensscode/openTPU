@@ -109,7 +109,10 @@ class BendMachine:
         self.aso = rows * ab * D // 4                  # Sa per (row, block)
         self.ado = self.aso + rows * ab                # offsets per (row, block, sub-block)
         self.act_words = self.ado + rows * ab * Q.NSUB
-        binary = binary or build()
+        # OTPU_BEND_BIN: a server built elsewhere (bend -o x.c, then clang on a host without
+        # bend); OTPU_BEND_THREADS: the runtime's threads (default: the runtime's choice)
+        binary = binary or Path(os.environ.get("OTPU_BEND_BIN", "") or build())
+        threads = threads or int(os.environ.get("OTPU_BEND_THREADS", "0")) or None
         ci, co = os.pipe()                             # commands: host -> server
         ri, ro = os.pipe()                             # replies: server -> host
         env = dict(os.environ, BEND_NO_TELEMETRY="1", OTPU_BEND_IN=str(ci),
