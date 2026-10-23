@@ -1829,9 +1829,746 @@ def x.dstep(s: Sl, +i: Ins) -> Sl:
           ds.e(U32.is_eq(e, 0), Sl{c, t, a, d, h, x, k},
             {Dg{(dd >> 2n : U32), qk, v, w5, w6, w7, rows, cols, (fl(w0) .&. 1 : U32)} : Dg}, e)
 
-# (placeholders until their units are written)
+# a row's max (VOP RMAX's total order, from the smallest key's word): MM's RMAX, STREAM's A_MAX
+def rm.step(r: Array<U32> & U32, +mx: U32) -> Array<U32> & U32:
+  (x, +v) = r
+  (x, F.fmax(mx, v))
+
+def rm.row(n: Nat, st: Array<U32> & U32, +i: U32) -> Array<U32> & U32:
+  match n:
+    case 0n:
+      st
+    case 1n+p:
+      (x, +mx) = st
+      rm.row(p, rm.step(Array.get(U32, x, i), mx), (i + 1 : U32))
+
+# --- STREAM (docs/stream.md; isasim Slice._stream): the rows S[r] of a stream (DRAM words or
+# TMEM, +0 with SZERO) pass, under a descriptor of TMEM words, REDUCE A (A = isum_64(S[r] *
+# opA), opA a column slot, S itself or a constant; or the row's max), the SCALAR ops over
+# r0..r7, A, X[r], K0..K3, +0, +1 (r4..r7 start as K0..K3 where rinit has their bit, the
+# registers carry from row to row), MAP U (Y = S | S*G + D*B | S*G | S + D*B, D = r[d_reg]) and
+# Q (O[r] = isum_64(Y * Q), Q a slot or Y; or O[r] = r[o_reg]); the row written back is Y
+# (out_p2: Y * slot q). The slots, constants and row scalars are read first, O and the saved
+# r4..r7 (rsave) are written last, and every check is made before anything is written.
+#
+# The rows run one at a time, each read before it is written: isasim's order where the source
+# and destination meet, and the same result where they do not. A TMEM stream written in place
+# whose rows overlap one another (stride < cols) is read whole before any row is written in
+# isasim: those rows' Y wait in the scratch and are written after the last row.
+#
+# The scratch: the partials x[0..64), r0..r7 at 64, K0..K3 at 72, the descriptor's payloads
+# from 80 (its ops from 85), O from 128, X from 4224, the slots from 8320 (slot i at 8320 +
+# i * cols), the row S at 24704, Y at 28800, the waiting rows from 32896.
+
+def sq.ok(+w: U32) -> Bool:
+  U32.is_eq(((w >> 23n : U32) .&. 255 : U32), 128)
+
+# a float-safe word's 24-bit payload (isa._payload): the sign bit over the 23 mantissa bits
+def sq.pl(+w: U32) -> U32:
+  (((w >> 31n : U32) << 23n : U32) .|. (w .&. 8388607 : U32) : U32)
+
+def sq.fs1(r: Array<U32> & U32, +i: U32, +bad: U32) -> Array<U32> & U32:
+  (x, +w) = r
+  (Array.set(U32, x, i, sq.pl(w)), (bad .|. F.b2u(Bool.not(sq.ok(w))) : U32))
+
+# the n words from x[i] to payloads; 1 when one of them is not float-safe
+def sq.fs(n: Nat, st: Array<U32> & U32, +i: U32) -> Array<U32> & U32:
+  match n:
+    case 0n:
+      st
+    case 1n+p:
+      (x, +bad) = st
+      sq.fs(p, sq.fs1(Array.get(U32, x, i), i, bad), (i + 1 : U32))
+
+def sq.bits(+w: U32, +k: U32, +n: U32) -> U32:
+  (F.shr(w, k) .&. (F.shl(1, n) - 1 : U32) : U32)
+
+# an operand's reads: K0..K3 (bits 4..7), X (bit 1)
+def sq.opnd(+c: U32) -> U32:
+  F.sel(((c >= 10 : U32) && (c <= 13 : U32)), F.shl(16, (c - 10 : U32)),
+    F.sel(U32.is_eq(c, 9), 2, 0))
+
+# an op: bit 0 when it is past EXP2SUB, its operands' reads (b only for a binary op)
+def sq.op1(r: Array<U32> & U32, +f: U32) -> Array<U32> & U32:
+  (x, +p) = r
+  +op = (p .&. 15 : U32)
+  +rb = F.sel(((op >= 5 : U32) && (op <= 9 : U32)), 0, sq.opnd(sq.bits(p, 11, 4)))
+  (x, (((f .|. F.b2u((op > 10 : U32)) : U32) .|. sq.opnd(sq.bits(p, 7, 4)) : U32) .|. rb : U32))
+
+def sq.ops(n: Nat, st: Array<U32> & U32, +i: U32) -> Array<U32> & U32:
+  match n:
+    case 0n:
+      st
+    case 1n+p:
+      (x, +f) = st
+      sq.ops(p, sq.op1(Array.get(U32, x, i), f), (i + 1 : U32))
+
+# the number of slots or constants from 0 to the highest one in m's bits 0..3
+def sq.top(+m: U32) -> U32:
+  F.sel(U32.is_ne((m .&. 8 : U32), 0), 4, F.sel(U32.is_ne((m .&. 4 : U32), 0), 3,
+    F.sel(U32.is_ne((m .&. 2 : U32), 0), 2, (m .&. 1 : U32))))
+
+# --- the rows
+
+# the row loop's operands: cols, the descriptor's c1 and c2, the source's and destination's
+# first word and row stride (DRAM words or TMEM), the mode (bit 0 S = +0, 1 the source is TMEM,
+# 2 the destination is TMEM, 3 no destination, 4 the rows wait in the scratch)
+type Sr is Data:
+  Sr{cols: U32, c1: U32, c2: U32, src: U32, ss: U32, dst: U32, ds: U32, md: U32}
+
+def sq.lt(r: Array<U32> & Array<U32>, c: Array<U32>, a: Array<U32>, d: Array<U32>,
+  h: Array<U32>, +k: Cf) -> Sl:
+  (t, x) = r
+  Sl{c, t, a, d, h, x, k}
+
+def sq.ld(r: Array<U32> & Array<U32>, c: Array<U32>, t: Array<U32>, a: Array<U32>,
+  h: Array<U32>, +k: Cf) -> Sl:
+  (d, x) = r
+  Sl{c, t, a, d, h, x, k}
+
+def sq.st(r: Array<U32> & Array<U32>, c: Array<U32>, a: Array<U32>, d: Array<U32>,
+  h: Array<U32>, +k: Cf) -> Sl:
+  (x, t) = r
+  Sl{c, t, a, d, h, x, k}
+
+def sq.sd(r: Array<U32> & Array<U32>, c: Array<U32>, t: Array<U32>, a: Array<U32>,
+  h: Array<U32>, +k: Cf) -> Sl:
+  (x, d) = r
+  Sl{c, t, a, d, h, x, k}
+
+# row r of the stream to S: +0, TMEM's or DRAM's
+def sq.load(z: Bool, s: Sl, y: Bool, +m: Sr, +r: U32) -> Sl:
+  match z s:
+    case True{} Sl{c, t, a, d, h, x, +k}:
+      match m:
+        case Sr{+cols, c1, c2, src, ss, dst, ds, md}:
+          Sl{c, t, a, d, h, fill(U32.to_nat(cols), x, 24704, 0), k}
+    case False{} Sl{c, t, a, d, h, x, +k}:
+      match y m:
+        case True{} Sr{+cols, c1, c2, +src, +ss, dst, ds, md}:
+          sq.lt(cp(U32.to_nat(cols), (t, x), (src + r * ss : U32), 24704), c, a, d, h, k)
+        case False{} Sr{+cols, c1, c2, +src, +ss, dst, ds, md}:
+          sq.ld(cp(U32.to_nat(cols), (d, x), (src + r * ss : U32), 24704), c, t, a, h, k)
+
+# Y to the destination: none, the scratch (the rows wait), TMEM or DRAM
+def sq.store(z: Bool, s: Sl, y: Bool, +m: Sr, w: Bool, +r: U32) -> Sl:
+  match z s:
+    case True{} Sl{c, t, a, d, h, x, k}:
+      Sl{c, t, a, d, h, x, k}
+    case False{} Sl{c, t, a, d, h, x, +k}:
+      match y m:
+        case True{} Sr{+cols, c1, c2, src, ss, dst, ds, md}:
+          Sl{c, t, a, d, h, cp1(U32.to_nat(cols), x, 28800, (32896 + r * cols : U32)), k}
+        case False{} Sr{+cols, c1, c2, src, ss, +dst, +ds, md}:
+          match w:
+            case True{}:
+              sq.st(cp(U32.to_nat(cols), (x, t), 28800, (dst + r * ds : U32)), c, a, d, h, k)
+            case False{}:
+              sq.sd(cp(U32.to_nat(cols), (x, d), 28800, (dst + r * ds : U32)), c, t, a, h, k)
+
+# the row's sums: the partials (from +0), the terms s[c] * v[c] (v the words from vi, or the
+# scalar k when vs is 0), the +0 padding, the tree (fp32.rdot)
+def sq.t2(r: Array<U32> & U32, +j: U32, +u: U32) -> Array<U32>:
+  (x, +p) = r
+  x[j] <- F.add(p, u)
+
+def sq.t1(r: Array<U32> & U32, +sv: U32, +j: U32, +vs: U32, +k: U32) -> Array<U32>:
+  (x, +v) = r
+  sq.t2(Array.get(U32, x, j), j, F.mul(sv, F.sel(U32.is_eq(vs, 0), k, v)))
+
+def sq.t0(r: Array<U32> & U32, +vi: U32, +j: U32, +vs: U32, +k: U32) -> Array<U32>:
+  (x, +sv) = r
+  sq.t1(Array.get(U32, x, vi), sv, j, vs, k)
+
+def sq.cols(n: Nat, x: Array<U32>, +si: U32, +vi: U32, +vs: U32, +k: U32, +q: U32) ->
+  Array<U32>:
+  match n:
+    case 0n:
+      x
+    case 1n+p:
+      sq.cols(p, sq.t0(Array.get(U32, x, si), vi, (q .&. 63 : U32), vs, k), (si + 1 : U32),
+        (vi + vs : U32), vs, k, (q + 1 : U32))
+
+def sq.sum(x: Array<U32>, +si: U32, +vi: U32, +vs: U32, +k: U32, +n: U32) ->
+  Array<U32> & U32:
+  Array.get(U32, tree(6n, pad(U32.to_nat(((64 - (n .&. 63 : U32) : U32) .&. 63 : U32)),
+    sq.cols(U32.to_nat(n), fill(64n, x, 0, 0), si, vi, vs, k, 0), n), 32), 0)
+
+# A_SLOT, A_SELF, A_CONST: the row's dot with slot a_idx, itself or K[a_idx]
+def sq.ak(r: Array<U32> & U32, +c1: U32, +cols: U32) -> Array<U32> & U32:
+  (x, +kv) = r
+  +aop = sq.bits(c1, 1, 2)
+  sq.sum(x, 24704, F.sel(U32.is_eq(aop, 0), (8320 + sq.bits(c1, 3, 2) * cols : U32), 24704),
+    F.b2u(U32.is_ne(aop, 2)), kv, cols)
+
+# A: +0 when off; the row's max (VOP RMAX's total order); its dot
+def sq.a(z: Bool, y: Bool, x: Array<U32>, +c1: U32, +cols: U32) -> Array<U32> & U32:
+  match z:
+    case True{}:
+      match y:
+        case True{}:
+          rm.row(U32.to_nat(cols), (x, 4294967295), 24704)
+        case False{}:
+          sq.ak(Array.get(U32, x, (72 + sq.bits(c1, 3, 2) : U32)), c1, cols)
+    case False{}:
+      (x, 0)
+
+# --- SCALAR: dst = op(a, b), each op evaluating only its own function
+def sq.f10(+p: U32, +q: U32) -> U32:
+  F.exp2(F.sub(p, q))
+
+def sq.f9(z: Bool, +op: U32, +p: U32, +q: U32) -> U32:
+  match z:
+    case True{}:
+      F.log2(p)
+    case False{}:
+      sq.f10(p, q)
+
+def sq.f8(z: Bool, +op: U32, +p: U32, +q: U32) -> U32:
+  match z:
+    case True{}:
+      F.exp2(p)
+    case False{}:
+      sq.f9(U32.is_eq(op, 9), op, p, q)
+
+def sq.f7(z: Bool, +op: U32, +p: U32, +q: U32) -> U32:
+  match z:
+    case True{}:
+      F.recip(p)
+    case False{}:
+      sq.f8(U32.is_eq(op, 8), op, p, q)
+
+def sq.f6(z: Bool, +op: U32, +p: U32, +q: U32) -> U32:
+  match z:
+    case True{}:
+      F.rsqrt(p)
+    case False{}:
+      sq.f7(U32.is_eq(op, 7), op, p, q)
+
+def sq.f5(z: Bool, +op: U32, +p: U32, +q: U32) -> U32:
+  match z:
+    case True{}:
+      F.ftz(p)
+    case False{}:
+      sq.f6(U32.is_eq(op, 6), op, p, q)
+
+def sq.f4(z: Bool, +op: U32, +p: U32, +q: U32) -> U32:
+  match z:
+    case True{}:
+      F.fmin(p, q)
+    case False{}:
+      sq.f5(U32.is_eq(op, 5), op, p, q)
+
+def sq.f3(z: Bool, +op: U32, +p: U32, +q: U32) -> U32:
+  match z:
+    case True{}:
+      F.fmax(p, q)
+    case False{}:
+      sq.f4(U32.is_eq(op, 4), op, p, q)
+
+def sq.f2(z: Bool, +op: U32, +p: U32, +q: U32) -> U32:
+  match z:
+    case True{}:
+      F.mul(p, q)
+    case False{}:
+      sq.f3(U32.is_eq(op, 3), op, p, q)
+
+def sq.f1(z: Bool, +op: U32, +p: U32, +q: U32) -> U32:
+  match z:
+    case True{}:
+      F.sub(p, q)
+    case False{}:
+      sq.f2(U32.is_eq(op, 2), op, p, q)
+
+def sq.f(z: Bool, +op: U32, +p: U32, +q: U32) -> U32:
+  match z:
+    case True{}:
+      F.add(p, q)
+    case False{}:
+      sq.f1(U32.is_eq(op, 1), op, p, q)
+
+# an operand's value from its word in the scratch: r0..r7, A, X[r], K0..K3, +0, +1
+def sq.val(r: Array<U32> & U32, +a: U32, +xv: U32, +c: U32) -> Array<U32> & U32:
+  (x, +v) = r
+  (x, F.sel((c < 8 : U32), v, F.sel(U32.is_eq(c, 8), a, F.sel(U32.is_eq(c, 9), xv,
+    F.sel((c < 14 : U32), v, F.sel(U32.is_eq(c, 14), 0, 1065353216))))))
+
+def sq.get(x: Array<U32>, +a: U32, +xv: U32, +c: U32) -> Array<U32> & U32:
+  sq.val(Array.get(U32, x, F.sel((c < 8 : U32), (64 + c : U32), (62 + (c .&. 15 : U32) : U32))),
+    a, xv, c)
+
+def sq.ob(r: Array<U32> & U32, +op: U32, +dst: U32, +pa: U32) -> Array<U32>:
+  (x, +pb) = r
+  x[(64 + dst : U32)] <- sq.f(U32.is_eq(op, 0), op, pa, pb)
+
+def sq.oa(r: Array<U32> & U32, +a: U32, +xv: U32, +op: U32, +dst: U32, +cb: U32) ->
+  Array<U32>:
+  (x, +pa) = r
+  sq.ob(sq.get(x, a, xv, cb), op, dst, pa)
+
+def sq.op(r: Array<U32> & U32, +a: U32, +xv: U32) -> Array<U32>:
+  (x, +p) = r
+  sq.oa(sq.get(x, a, xv, sq.bits(p, 7, 4)), a, xv, (p .&. 15 : U32), sq.bits(p, 4, 3),
+    sq.bits(p, 11, 4))
+
+# the scalar ops from op i on, for a row with A = a and X[r] = xv
+def sq.sc(n: Nat, x: Array<U32>, +i: U32, +a: U32, +xv: U32) -> Array<U32>:
+  match n:
+    case 0n:
+      x
+    case 1n+p:
+      sq.sc(p, sq.op(Array.get(U32, x, (85 + i : U32)), a, xv), (i + 1 : U32), a, xv)
+
+# --- MAP U: Y[c] from S[c], G and B (a slot's word or the row's scalar)
+def sq.u(z: Bool, y: Bool, w: Bool, +sv: U32, +g: U32, +dv: U32, +b: U32) -> U32:
+  match z:
+    case True{}:
+      F.ftz(sv)
+    case False{}:
+      match y:
+        case True{}:
+          F.outer(sv, g, dv, b)
+        case False{}:
+          match w:
+            case True{}:
+              F.mul(sv, g)
+            case False{}:
+              F.add(sv, F.mul(dv, b))
+
+# a row's registers after its scalar ops: D, G's and B's scalars, O's register
+type Rg is Data:
+  Rg{dv: U32, gv: U32, bv: U32, ov: U32}
+
+def sq.ub(r: Array<U32> & U32, +yi: U32, +sv: U32, +g: U32, +um: U32, +bsl: U32, +gg: Rg) ->
+  Array<U32>:
+  (x, +bc) = r
+  match gg:
+    case Rg{+dv, gv, +bv, ov}:
+      x[yi] <- sq.u(U32.is_eq(um, 0), U32.is_eq(um, 1), U32.is_eq(um, 2), sv, g, dv,
+        F.sel(U32.is_ne(bsl, 0), bc, bv))
+
+def sq.ug(r: Array<U32> & U32, +yi: U32, +sv: U32, +gsl: U32, +um: U32, +bi: U32, +bsl: U32,
+  +gg: Rg) -> Array<U32>:
+  (x, +gc) = r
+  match gg:
+    case Rg{dv, +gv, bv, ov}:
+      sq.ub(Array.get(U32, x, bi), yi, sv, F.sel(U32.is_ne(gsl, 0), gc, gv), um, bsl, gg)
+
+def sq.us(r: Array<U32> & U32, +yi: U32, +gi: U32, +gsl: U32, +um: U32, +bi: U32, +bsl: U32,
+  +gg: Rg) -> Array<U32>:
+  (x, +sv) = r
+  sq.ug(Array.get(U32, x, gi), yi, sv, gsl, um, bi, bsl, gg)
+
+# Y[q..] from S at 24704 + q, G's slot at gi + q (its scalar when gsl is 0), B's at bi + q
+def sq.map(n: Nat, x: Array<U32>, +q: U32, +gi: U32, +gsl: U32, +um: U32, +bi: U32, +bsl: U32,
+  +gg: Rg) -> Array<U32>:
+  match n:
+    case 0n:
+      x
+    case 1n+p:
+      sq.map(p, sq.us(Array.get(U32, x, (24704 + q : U32)), (28800 + q : U32), (gi + q : U32),
+        gsl, um, (bi + q : U32), bsl, gg), (q + 1 : U32), gi, gsl, um, bi, bsl, gg)
+
+# out_p2: Y[c] *= slot q's word
+def sq.p2c(r: Array<U32> & U32, +yi: U32, +qv: U32) -> Array<U32>:
+  (x, +y) = r
+  x[yi] <- F.mul(y, qv)
+
+def sq.p2q(r: Array<U32> & U32, +yi: U32) -> Array<U32>:
+  (x, +qv) = r
+  sq.p2c(Array.get(U32, x, yi), yi, qv)
+
+def sq.p2(n: Nat, x: Array<U32>, +yi: U32, +qi: U32) -> Array<U32>:
+  match n:
+    case 0n:
+      x
+    case 1n+p:
+      sq.p2(p, sq.p2q(Array.get(U32, x, qi), yi), (yi + 1 : U32), (qi + 1 : U32))
+
+def sq.put(r: Array<U32> & U32, +oi: U32) -> Array<U32>:
+  (x, +o) = r
+  x[oi] <- o
+
+# O[r] to the scratch: Q's dot (q_en, Q slot q_idx or Y itself with q_self), the register
+def sq.o(z: Bool, y: Bool, x: Array<U32>, +c1: U32, +c2: U32, +cols: U32, +ov: U32,
+  +r: U32) -> Array<U32>:
+  match z:
+    case True{}:
+      sq.put(sq.sum(x, 28800, F.sel(U32.is_ne(sq.bits(c2, 12, 1), 0), 28800,
+        (8320 + sq.bits(c1, 21, 2) * cols : U32)), 1, 0, cols), (128 + r : U32))
+    case False{}:
+      match y:
+        case True{}:
+          x[(128 + r : U32)] <- ov
+        case False{}:
+          x
+
+# Y, O and out_p2 for the row
+def sq.y(+m: Sr, +row: U32, r: Array<U32> & Rg) -> Array<U32>:
+  match m:
+    case Sr{+cols, +c1, +c2, src, ss, dst, ds, md}:
+      (x, +gg) = r
+      match gg:
+        case Rg{dv, gv, bv, +ov}:
+          +gsrc = sq.bits(c1, 7, 2)
+          sq.p2(U32.to_nat(F.sel(U32.is_ne(sq.bits(c1, 23, 1), 0), cols, 0)),
+            sq.o(U32.is_ne(sq.bits(c1, 20, 1), 0), U32.is_ne(sq.bits(c2, 13, 1), 0),
+              sq.map(U32.to_nat(cols), x, 0, (8320 + sq.bits(c1, 9, 3) * cols : U32),
+                F.b2u(U32.is_eq(gsrc, 1)), sq.bits(c1, 5, 2),
+                (8320 + sq.bits(c1, 14, 3) * cols : U32),
+                F.b2u(U32.is_eq(sq.bits(c1, 12, 2), 0)), gg), c1, c2, cols, ov, row), 28800,
+            (8320 + sq.bits(c1, 21, 2) * cols : U32))
+
+# the row's scalars after its ops: D = r[d_reg]; G r[g_idx], K[g_idx] or 1.0; B K[b_idx] or
+# r[b_idx]; O's r[o_reg]
+def sq.r6(r: Array<U32> & U32, +dv: U32, +gv: U32, +bsrc: U32, +br: U32, +ov: U32) ->
+  Array<U32> & Rg:
+  (x, +kb) = r
+  (x, Rg{dv, gv, F.sel(U32.is_eq(bsrc, 1), kb, br), ov})
+
+def sq.r5(r: Array<U32> & U32, +c1: U32, +dv: U32, +gr: U32, +br: U32, +ov: U32) ->
+  Array<U32> & Rg:
+  (x, +kg) = r
+  +gsrc = sq.bits(c1, 7, 2)
+  sq.r6(Array.get(U32, x, (72 + sq.bits(c1, 14, 2) : U32)), dv,
+    F.sel(U32.is_eq(gsrc, 0), gr, F.sel(U32.is_eq(gsrc, 2), kg, 1065353216)),
+    sq.bits(c1, 12, 2), br, ov)
+
+def sq.r4(r: Array<U32> & U32, +c1: U32, +dv: U32, +gr: U32, +br: U32) -> Array<U32> & Rg:
+  (x, +ov) = r
+  sq.r5(Array.get(U32, x, (72 + sq.bits(c1, 9, 2) : U32)), c1, dv, gr, br, ov)
+
+def sq.r3(r: Array<U32> & U32, +c1: U32, +c2: U32, +dv: U32, +gr: U32) -> Array<U32> & Rg:
+  (x, +br) = r
+  sq.r4(Array.get(U32, x, (64 + sq.bits(c2, 14, 3) : U32)), c1, dv, gr, br)
+
+def sq.r2(r: Array<U32> & U32, +c1: U32, +c2: U32, +dv: U32) -> Array<U32> & Rg:
+  (x, +gr) = r
+  sq.r3(Array.get(U32, x, (64 + sq.bits(c1, 14, 3) : U32)), c1, c2, dv, gr)
+
+def sq.r1(r: Array<U32> & U32, +c1: U32, +c2: U32) -> Array<U32> & Rg:
+  (x, +dv) = r
+  sq.r2(Array.get(U32, x, (64 + sq.bits(c1, 9, 3) : U32)), c1, c2, dv)
+
+def sq.regs(x: Array<U32>, +c1: U32, +c2: U32) -> Array<U32> & Rg:
+  sq.r1(Array.get(U32, x, (64 + sq.bits(c1, 17, 3) : U32)), c1, c2)
+
+# the row in the scratch: A, the scalar ops (X[r] from 4224 + r), Y, O
+def sq.rx2(r: Array<U32> & U32, +m: Sr, +row: U32, +a: U32) -> Array<U32>:
+  (x, +xv) = r
+  match m:
+    case Sr{cols, +c1, +c2, src, ss, dst, ds, md}:
+      sq.y(m, row, sq.regs(sq.sc(U32.to_nat((c2 .&. 15 : U32)), x, 0, a, xv), c1, c2))
+
+def sq.rx1(r: Array<U32> & U32, +m: Sr, +row: U32) -> Array<U32>:
+  (x, +a) = r
+  sq.rx2(Array.get(U32, x, (4224 + row : U32)), m, row, a)
+
+def sq.mid(s: Sl, +m: Sr, +row: U32) -> Sl:
+  match s m:
+    case Sl{c, t, a, d, h, x, +k} Sr{+cols, +c1, c2, src, ss, dst, ds, md}:
+      Sl{c, t, a, d, h, sq.rx1(sq.a(U32.is_ne(sq.bits(c1, 0, 1), 0),
+        U32.is_eq(sq.bits(c1, 1, 2), 3), x, c1, cols), m, row), k}
+
+def sq.row(s: Sl, +m: Sr, +r: U32) -> Sl:
+  match m:
+    case Sr{cols, c1, c2, src, ss, dst, ds, +md}:
+      sq.store(U32.is_ne(sq.bits(md, 3, 1), 0), sq.mid(sq.load(U32.is_ne(sq.bits(md, 0, 1), 0),
+        s, U32.is_ne(sq.bits(md, 1, 1), 0), m, r), m, r), U32.is_ne(sq.bits(md, 4, 1), 0), m,
+        U32.is_ne(sq.bits(md, 2, 1), 0), r)
+
+def sq.rows(n: Nat, s: Sl, +m: Sr, +r: U32) -> Sl:
+  match n:
+    case 0n:
+      s
+    case 1n+p:
+      sq.rows(p, sq.row(s, m, r), m, (r + 1 : U32))
+
+# --- the inputs and the last writes
+
+def sq.k1(r: Array<U32> & U32, x: Array<U32>, +i: U32) -> Array<U32> & Array<U32>:
+  (t, +v) = r
+  (t, Array.set(U32, x, i, v))
+
+def sq.kj(z: Bool, t: Array<U32>, x: Array<U32>, +j: U32, +ka: U32, +ks: U32) ->
+  Array<U32> & Array<U32>:
+  match z:
+    case True{}:
+      sq.k1(Array.get(U32, t, (ka + j * ks : U32)), x, (72 + j : U32))
+    case False{}:
+      (t, x)
+
+# the constants in m's bits to K0..K3
+def sq.ks(n: Nat, st: Array<U32> & Array<U32>, +j: U32, +m: U32, +ka: U32, +ks: U32) ->
+  Array<U32> & Array<U32>:
+  match n:
+    case 0n:
+      st
+    case 1n+p:
+      (t, x) = st
+      sq.ks(p, sq.kj(U32.is_ne(sq.bits(m, j, 1), 0), t, x, j, ka, ks), (j + 1 : U32), m, ka, ks)
+
+def sq.ri1(r: Array<U32> & U32, +j: U32, +on: U32) -> Array<U32>:
+  (x, +v) = r
+  x[(68 + j : U32)] <- F.sel(U32.is_ne(on, 0), v, 0)
+
+# r4..r7: K0..K3 where rinit has their bit, else +0
+def sq.ri(n: Nat, x: Array<U32>, +j: U32, +m: U32) -> Array<U32>:
+  match n:
+    case 0n:
+      x
+    case 1n+p:
+      sq.ri(p, sq.ri1(Array.get(U32, x, (72 + j : U32)), j, sq.bits(m, j, 1)), (j + 1 : U32), m)
+
+def sq.sv1(r: Array<U32> & U32, t: Array<U32>, +i: U32) -> Array<U32> & Array<U32>:
+  (x, +v) = r
+  (x, Array.set(U32, t, i, v))
+
+def sq.svj(z: Bool, x: Array<U32>, t: Array<U32>, +j: U32, +ka: U32, +ks: U32) ->
+  Array<U32> & Array<U32>:
+  match z:
+    case True{}:
+      sq.sv1(Array.get(U32, x, (68 + j : U32)), t, (ka + j * ks : U32))
+    case False{}:
+      (x, t)
+
+# rsave: r4..r7 in m's bits to K0..K3's words
+def sq.sv(n: Nat, st: Array<U32> & Array<U32>, +j: U32, +m: U32, +ka: U32, +ks: U32) ->
+  Array<U32> & Array<U32>:
+  match n:
+    case 0n:
+      st
+    case 1n+p:
+      (x, t) = st
+      sq.sv(p, sq.svj(U32.is_ne(sq.bits(m, j, 1), 0), x, t, j, ka, ks), (j + 1 : U32), m, ka, ks)
+
+# the waiting rows to TMEM, row r's cols words to dst + r * ds
+def sq.wr(n: Nat, st: Array<U32> & Array<U32>, +r: U32, +cols: U32, +dst: U32, +ds: U32) ->
+  Array<U32> & Array<U32>:
+  match n:
+    case 0n:
+      st
+    case 1n+p:
+      sq.wr(p, cp(U32.to_nat(cols), st, (32896 + r * cols : U32), (dst + r * ds : U32)),
+        (r + 1 : U32), cols, dst, ds)
+
+# the operands: rows, cols, the descriptor's c1, c2 and strides word, src and dst, the slots'
+# vec, X's xa, the constants' ka and stride ks, O's out, the flags, the ops' reads (bit 0 a bad
+# op, 1 X, 4..7 K0..K3; bit 8 a bad descriptor)
+type Sm is Data:
+  Sm{rows: U32, cols: U32, c1: U32, c2: U32, p4: U32, src: U32, dst: U32, vec: U32, xa: U32,
+     ka: U32, ks: U32, out: U32, f: U32, of: U32}
+
+# the slots read (a bit each): A's, G's, B's, Q's (q_en without q_self, or out_p2)
+def sq.sm(+c1: U32) -> U32:
+  +um = sq.bits(c1, 5, 2)
+  (F.sel(U32.is_ne(sq.bits(c1, 0, 1), 0) && U32.is_eq(sq.bits(c1, 1, 2), 0),
+    F.shl(1, sq.bits(c1, 3, 2)), 0)
+  .|. F.sel((U32.is_eq(um, 1) || U32.is_eq(um, 2)) && U32.is_eq(sq.bits(c1, 7, 2), 1),
+    F.shl(1, sq.bits(c1, 9, 3)), 0)
+  .|. F.sel((U32.is_eq(um, 1) || U32.is_eq(um, 3)) && U32.is_eq(sq.bits(c1, 12, 2), 0),
+    F.shl(1, sq.bits(c1, 14, 3)), 0) : U32)
+
+def sq.sq(+c1: U32, +c2: U32) -> U32:
+  F.sel((U32.is_ne(sq.bits(c1, 20, 1), 0) && U32.is_eq(sq.bits(c2, 12, 1), 0))
+    || U32.is_ne(sq.bits(c1, 23, 1), 0), F.shl(1, sq.bits(c1, 21, 2)), 0)
+
+# the constants read: rinit's, the ops' operands', A's, G's, B's
+def sq.km(+c1: U32, +c2: U32, +of: U32) -> U32:
+  +um = sq.bits(c1, 5, 2)
+  (sq.bits(c2, 4, 4) .|. sq.bits(of, 4, 4)
+  .|. F.sel(U32.is_ne(sq.bits(c1, 0, 1), 0) && U32.is_eq(sq.bits(c1, 1, 2), 2),
+    F.shl(1, sq.bits(c1, 3, 2)), 0)
+  .|. F.sel((U32.is_eq(um, 1) || U32.is_eq(um, 2)) && U32.is_eq(sq.bits(c1, 7, 2), 2),
+    F.shl(1, sq.bits(c1, 9, 3)), 0)
+  .|. F.sel((U32.is_eq(um, 1) || U32.is_eq(um, 3)) && U32.is_eq(sq.bits(c1, 12, 2), 1),
+    F.shl(1, sq.bits(c1, 14, 3)), 0) : U32)
+
+# a row stride: the descriptor's, 0 meaning cols
+def sq.rs(+v: U32, +cols: U32) -> U32:
+  F.sel(U32.is_eq(v, 0), cols, v)
+
+# whether the rows wait in the scratch: a TMEM stream in place whose rows overlap
+def sq.stg(+rows: U32, +cols: U32, +p4: U32, +src: U32, +dst: U32, +f: U32) -> U32:
+  +srs = sq.rs(sq.bits(p4, 0, 12), cols)
+  F.b2u(U32.is_eq((f .&. 15 : U32), 6) && U32.is_eq(src, dst)
+    && U32.is_eq(srs, sq.rs(sq.bits(p4, 12, 12), cols)) && (srs < cols : U32) && (rows > 1 : U32))
+
+# STREAM's checks in isasim's order: 38 the descriptor (not float-safe, fewer words than its
+# ops), rows or cols 0, q_en with o_reg_en, a bad op, a slot or constant index past 3; 7 the
+# slots, constants or X past TMEM; 38 a DRAM stream not DRAM-chunk aligned; 6 a DRAM stream
+# past DRAM; 7 a TMEM source past TMEM; 38 a bad B source; 7 a TMEM destination past TMEM; 42
+# waiting rows past the scratch; 7 O or the saved registers past TMEM
+def sq.chk(+m: Sm, +k: Cf) -> U32:
+  match m:
+    case Sm{+rows, +cols, +c1, +c2, +p4, +src, +dst, +vec, +xa, +ka, +ks, +out, +f, +of}:
+      +tm = (Cf.tw(k) - 1 : U32)
+      +um = sq.bits(c1, 5, 2)
+      +ug = U32.is_eq(um, 1) || U32.is_eq(um, 2)
+      +ub = U32.is_eq(um, 1) || U32.is_eq(um, 3)
+      +gsrc = sq.bits(c1, 7, 2)
+      +bsrc = sq.bits(c1, 12, 2)
+      +oo = U32.is_ne(sq.bits(c1, 20, 1), 0) || U32.is_ne(sq.bits(c2, 13, 1), 0)
+      +nsl = sq.top((sq.sm(c1) .|. sq.sq(c1, c2) : U32))
+      +nk = sq.top(sq.km(c1, c2, of))
+      +nrs = sq.top(sq.bits(c2, 8, 4))
+      +sz = (f .&. 1 : U32)
+      +st = sq.bits(f, 1, 1)
+      +dt = sq.bits(f, 2, 1)
+      +nd = sq.bits(f, 3, 1)
+      +sdr = U32.is_eq(st, 0) && U32.is_eq(sz, 0)
+      +ddr = U32.is_eq(dt, 0) && U32.is_eq(nd, 0)
+      F.sel(U32.is_ne(sq.bits(of, 8, 1), 0) || U32.is_eq(rows, 0) || U32.is_eq(cols, 0)
+        || (U32.is_ne(sq.bits(c1, 20, 1), 0) && U32.is_ne(sq.bits(c2, 13, 1), 0))
+        || U32.is_ne(sq.bits(of, 0, 1), 0)
+        || (ug && (U32.is_eq(gsrc, 1) || U32.is_eq(gsrc, 2)) && (sq.bits(c1, 9, 3) >= 4 : U32))
+        || (ub && (bsrc < 2 : U32) && (sq.bits(c1, 14, 3) >= 4 : U32)), 38,
+      F.sel(((nsl > 0 : U32) && Bool.not(rng(vec, (nsl * cols : U32), 1, 1, 0, tm)))
+        || ((nk > 0 : U32) && Bool.not(rng(ka, nk, ks, 1, 0, tm)))
+        || (U32.is_ne(sq.bits(of, 1, 1), 0) && Bool.not(rng(xa, rows, 1, 1, 0, tm))), 7,
+      F.sel((sdr && U32.is_ne((src % Cf.d(k) : U32), 0))
+        || (ddr && U32.is_ne((dst % Cf.d(k) : U32), 0)), 38,
+      F.sel((sdr && Bool.not(rng(src, (rows * cols : U32), 4, 4, 1, Cf.dbm1(k))))
+        || (ddr && Bool.not(rng(dst, (rows * cols : U32), 4, 4, 1, Cf.dbm1(k)))), 6,
+      F.sel(U32.is_ne(st, 0) && U32.is_eq(sz, 0)
+        && Bool.not(rng(src, rows, sq.rs(sq.bits(p4, 0, 12), cols), cols, 1, tm)), 7,
+      F.sel(ub && U32.is_eq(bsrc, 3), 38,
+      F.sel(U32.is_ne(dt, 0) && U32.is_eq(nd, 0)
+        && Bool.not(rng(dst, rows, sq.rs(sq.bits(p4, 12, 12), cols), cols, 1, tm)), 7,
+      F.sel(U32.is_ne(sq.stg(rows, cols, p4, src, dst, f), 0)
+        && ((rows * cols : U32) > 4161408 : U32), 42,
+      F.sel((oo && Bool.not(rng(out, rows, 1, 1, 0, tm)))
+        || ((nrs > 0 : U32) && Bool.not(rng(ka, nrs, ks, 1, 0, tm))), 7, 0)))))))))
+
+# the rows done: the waiting rows, O, the saved registers
+def sq.e3(r: Array<U32> & Array<U32>, c: Array<U32>, a: Array<U32>, d: Array<U32>,
+  h: Array<U32>, +k: Cf, +m: Sm) -> Sl:
+  match m:
+    case Sm{rows, cols, c1, +c2, p4, src, dst, vec, xa, +ka, +ks, out, f, of}:
+      sq.st(sq.sv(4n, r, 0, sq.bits(c2, 8, 4), ka, ks), c, a, d, h, k)
+
+def sq.e2(r: Array<U32> & Array<U32>, c: Array<U32>, a: Array<U32>, d: Array<U32>,
+  h: Array<U32>, +k: Cf, +m: Sm) -> Sl:
+  match m:
+    case Sm{+rows, cols, +c1, +c2, p4, src, dst, vec, xa, ka, ks, +out, f, of}:
+      sq.e3(cp(U32.to_nat(F.sel(U32.is_ne(sq.bits(c1, 20, 1), 0)
+        || U32.is_ne(sq.bits(c2, 13, 1), 0), rows, 0)), r, 128, out), c, a, d, h, k, m)
+
+def sq.e1(s: Sl, +m: Sm) -> Sl:
+  match s m:
+    case Sl{c, t, a, d, h, x, +k} Sm{+rows, +cols, c1, c2, +p4, +src, +dst, vec, xa, ka, ks, out,
+      +f, of}:
+      sq.e2(sq.wr(U32.to_nat(F.sel(U32.is_ne(sq.stg(rows, cols, p4, src, dst, f), 0), rows, 0)),
+        (x, t), 0, cols, dst, sq.rs(sq.bits(p4, 12, 12), cols)), c, a, d, h, k, m)
+
+# the inputs in the scratch (the slots, then K0..K3, then X, then r0..r7), the rows
+def sq.in3(r: Array<U32> & Array<U32>, c: Array<U32>, a: Array<U32>, d: Array<U32>,
+  h: Array<U32>, +k: Cf, +m: Sm) -> Sl:
+  (t, x) = r
+  match m:
+    case Sm{+rows, +cols, +c1, +c2, +p4, +src, +dst, vec, xa, ka, ks, out, +f, of}:
+      +st = sq.bits(f, 1, 1)
+      +dt = sq.bits(f, 2, 1)
+      +sr = {Sr{cols, c1, c2, F.sel(U32.is_ne(st, 0), src, (src >> 2n : U32)),
+        F.sel(U32.is_ne(st, 0), sq.rs(sq.bits(p4, 0, 12), cols), cols),
+        F.sel(U32.is_ne(dt, 0), dst, (dst >> 2n : U32)),
+        F.sel(U32.is_ne(dt, 0), sq.rs(sq.bits(p4, 12, 12), cols), cols),
+        ((f .&. 15 : U32) .|. (sq.stg(rows, cols, p4, src, dst, f) << 4n : U32) : U32)} : Sr}
+      sq.e1(sq.rows(U32.to_nat(rows), Sl{c, t, a, d, h, sq.ri(4n, fill(4n, x, 64, 0), 0,
+        sq.bits(c2, 4, 4)), k}, sr, 0), m)
+
+def sq.in2(r: Array<U32> & Array<U32>, c: Array<U32>, a: Array<U32>, d: Array<U32>,
+  h: Array<U32>, +k: Cf, +m: Sm) -> Sl:
+  match m:
+    case Sm{+rows, cols, c1, c2, p4, src, dst, vec, +xa, ka, ks, out, f, +of}:
+      sq.in3(cp(U32.to_nat(F.sel(U32.is_ne(sq.bits(of, 1, 1), 0), rows, 0)), r, xa, 4224), c,
+        a, d, h, k, m)
+
+def sq.in1(r: Array<U32> & Array<U32>, c: Array<U32>, a: Array<U32>, d: Array<U32>,
+  h: Array<U32>, +k: Cf, +m: Sm) -> Sl:
+  match m:
+    case Sm{rows, cols, +c1, +c2, p4, src, dst, vec, xa, +ka, +ks, out, f, +of}:
+      sq.in2(sq.ks(4n, r, 0, sq.km(c1, c2, of), ka, ks), c, a, d, h, k, m)
+
+def sq.go(z: Bool, s: Sl, +m: Sm, +e: U32) -> Sl:
+  match z s:
+    case True{} Sl{c, t, a, d, h, x, +k}:
+      match m:
+        case Sm{rows, +cols, +c1, +c2, p4, src, dst, +vec, xa, ka, ks, out, f, of}:
+          sq.in1(cp(U32.to_nat((sq.top((sq.sm(c1) .|. sq.sq(c1, c2) : U32)) * cols : U32)),
+            (t, x), vec, 8320), c, a, d, h, k, m)
+    case False{} Sl{c, t, a, d, h, x, k}:
+      Sl{fail(c, e, 0), t, a, d, h, x, k}
+
+# the descriptor: its first five words' payloads, then its ops'; a bad one sets of's bit 8
+def sq.d9(r: Array<U32> & U32, c: Array<U32>, t: Array<U32>, a: Array<U32>, d: Array<U32>,
+  h: Array<U32>, +k: Cf, +i: Ins, +e: U32, +p0: U32, +c1: U32, +c2: U32, +p4: U32) -> Sl:
+  (x, +of) = r
+  match i:
+    case Ins{+w0, +w1, +w2, +w3, +w4, +w5, +w6, +w7, +va, +vb, +vc, +vd}:
+      +m = {Sm{(p0 .&. 4095 : U32), (p0 >> 12n : U32), c1, c2, p4, (va + w2 : U32),
+        (va + w3 : U32), (vb + w4 : U32), (vc + w5 : U32), (vd + w6 : U32), (w1 >> 16n : U32),
+        w7, fl(w0), (of .|. (e << 8n : U32) : U32)} : Sm}
+      +er = sq.chk(m, k)
+      sq.go(U32.is_eq(er, 0), Sl{c, t, a, d, h, x, k}, m, er)
+
+def sq.d8(r: Array<U32> & U32, c: Array<U32>, t: Array<U32>, a: Array<U32>, d: Array<U32>,
+  h: Array<U32>, +k: Cf, +i: Ins, +e: U32, +p0: U32, +c1: U32, +c2: U32) -> Sl:
+  (x, +p4) = r
+  sq.d9(sq.ops(U32.to_nat((c2 .&. 15 : U32)), (x, 0), 85), c, t, a, d, h, k, i, e, p0, c1, c2,
+    p4)
+
+def sq.d7(r: Array<U32> & U32, c: Array<U32>, t: Array<U32>, a: Array<U32>, d: Array<U32>,
+  h: Array<U32>, +k: Cf, +i: Ins, +e: U32, +p0: U32, +c1: U32) -> Sl:
+  (x, +c2) = r
+  sq.d8(Array.get(U32, x, 84), c, t, a, d, h, k, i, e, p0, c1, c2)
+
+def sq.d6(r: Array<U32> & U32, c: Array<U32>, t: Array<U32>, a: Array<U32>, d: Array<U32>,
+  h: Array<U32>, +k: Cf, +i: Ins, +e: U32, +p0: U32) -> Sl:
+  (x, +c1) = r
+  sq.d7(Array.get(U32, x, 82), c, t, a, d, h, k, i, e, p0, c1)
+
+def sq.d5(r: Array<U32> & U32, c: Array<U32>, t: Array<U32>, a: Array<U32>, d: Array<U32>,
+  h: Array<U32>, +k: Cf, +i: Ins, +e: U32) -> Sl:
+  (x, +p0) = r
+  sq.d6(Array.get(U32, x, 81), c, t, a, d, h, k, i, e, p0)
+
+def sq.d4(r: Array<U32> & U32, c: Array<U32>, t: Array<U32>, a: Array<U32>, d: Array<U32>,
+  h: Array<U32>, +k: Cf, +i: Ins, +e: U32) -> Sl:
+  (x, +bad) = r
+  sq.d5(Array.get(U32, x, 80), c, t, a, d, h, k, i, (e .|. bad : U32))
+
+# fewer than five words before TMEM's end, a word not float-safe, fewer words than the ops
+def sq.d3(r: Array<U32> & U32, c: Array<U32>, t: Array<U32>, a: Array<U32>, d: Array<U32>,
+  h: Array<U32>, +k: Cf, +i: Ins, +nav: U32, +bad: U32) -> Sl:
+  (x, +c2) = r
+  +n = (c2 .&. 15 : U32)
+  sq.d4(sq.fs(U32.to_nat(n), (x, 0), 85), c, t, a, d, h, k, i,
+    F.b2u((nav < 5 : U32) || U32.is_ne(bad, 0) || ((5 + n : U32) > nav : U32)))
+
+def sq.d2(r: Array<U32> & U32, c: Array<U32>, t: Array<U32>, a: Array<U32>, d: Array<U32>,
+  h: Array<U32>, +k: Cf, +i: Ins, +nav: U32) -> Sl:
+  (x, +bad) = r
+  sq.d3(Array.get(U32, x, 82), c, t, a, d, h, k, i, nav, bad)
+
+def sq.d1(r: Array<U32> & Array<U32>, c: Array<U32>, a: Array<U32>, d: Array<U32>,
+  h: Array<U32>, +k: Cf, +i: Ins, +nav: U32) -> Sl:
+  (t, x) = r
+  sq.d2(sq.fs(5n, (x, 0), 80), c, t, a, d, h, k, i, nav)
+
+def sq.w1(+i: Ins) -> U32:
+  match i:
+    case Ins{w0, +w1, w2, w3, w4, w5, w6, w7, va, vb, vc, vd}:
+      w1
+
+# the descriptor's words before TMEM's end (at most 20) to the scratch
 def x.stream(s: Sl, +i: Ins) -> Sl:
-  ex.bad(s, i)
+  match s:
+    case Sl{c, t, a, d, h, x, +k}:
+      +at = (sq.w1(i) .&. 65535 : U32)
+      +tw = Cf.tw(k)
+      +nav = F.sel((at >= tw : U32), 0, F.sel(((tw - at : U32) > 20 : U32), 20, (tw - at : U32)))
+      sq.d1(cp(U32.to_nat(nav), (t, x), at, 80), c, a, d, h, k, i, nav)
 
 # the instructions after which the slice goes on to the next pc, by opcode (most frequent
 # first): VOP, MM, QACT, LD, QST, ST, ADDI, LI, RLD, NOP, DSTEP, STREAM
@@ -2462,19 +3199,6 @@ def mm.wr(n: Nat, st: Array<U32> & Array<U32>, +j: U32, +nn: U32, +out: U32, +or
     case 1n+p:
       mm.wr(p, cp(U32.to_nat(nn), st, (j * nn : U32), (out + j * ors : U32)), (j + 1 : U32),
         nn, out, ors)
-
-# RMAX: each row's max (the total order, from the smallest key's word) to TMEM
-def rm.step(r: Array<U32> & U32, +mx: U32) -> Array<U32> & U32:
-  (x, +v) = r
-  (x, F.fmax(mx, v))
-
-def rm.row(n: Nat, st: Array<U32> & U32, +i: U32) -> Array<U32> & U32:
-  match n:
-    case 0n:
-      st
-    case 1n+p:
-      (x, +mx) = st
-      rm.row(p, rm.step(Array.get(U32, x, i), mx), (i + 1 : U32))
 
 def rm.put(r: Array<U32> & U32, t: Array<U32>, +ti: U32) -> Array<U32> & Array<U32>:
   (x, +mx) = r

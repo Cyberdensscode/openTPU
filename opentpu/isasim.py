@@ -357,7 +357,8 @@ class Slice:
 
         def scalar(A, Xr):
             for op, dst_, a, b in d.ops:
-                x, y = value(a, A, Xr), value(b, A, Xr)
+                x = value(a, A, Xr)
+                y = x if op in unary else value(b, A, Xr)     # a unary op has no b
                 regs[dst_] = {
                     I.SC_ADD: F.add, I.SC_SUB: F.sub, I.SC_MUL: F.mul, I.SC_MAX: F.fmax,
                     I.SC_MIN: F.fmin, I.SC_MOV: lambda p, q: F.ftz(p),
