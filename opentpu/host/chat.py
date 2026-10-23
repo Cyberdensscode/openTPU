@@ -947,6 +947,9 @@ def make_backend(name: str, spec, cap: int, dev: str, model: str | None = None,
     if name == "rtl":
         from opentpu.llm.rtl_backend import RtlBackend
         return RtlBackend, None
+    if name == "bend":                          # the ISA simulator in Bend (docs/bend.md)
+        from opentpu.bend_sim import bend_backend
+        return bend_backend(), None
     raise SystemExit(f"unknown backend {name}")
 
 
@@ -976,7 +979,8 @@ def panel_meta(eng, backend: str, dev: str, model: str, sp: dict, max_new: int,
     info = getattr(eng.backend, "info", None)
     meta = {"model": model, "backend": backend, "sampling": {**sp, "max_new": max_new},
             "weights": weights,
-            "device": {"board": dev, "board-sim": "Verilator board model"}.get(
+            "device": {"board": dev, "board-sim": "Verilator board model",
+                       "bend": "ISA simulator in Bend (host)"}.get(
                 backend, "ISA simulator (host)"), "dram": None,
             "short": f"{backend} {clock_mhz:g} MHz" if clock_mhz else backend}
     if getattr(eng, "server", None) is not None:        # a streamed MoE
@@ -1003,7 +1007,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="otpu-chat", description=__doc__.split("\n")[0])
     ap.add_argument("--model", default="qwen3",
                     help=f"{' or '.join(MODELS)} (models/<name>), or a checkpoint directory")
-    ap.add_argument("--backend", default="isa", choices=["isa", "board", "board-sim", "rtl"])
+    ap.add_argument("--backend", default="isa",
+                    choices=["isa", "bend", "board", "board-sim", "rtl"])
     ap.add_argument("--dev", default="/dev/xdma0", help="XDMA device prefix (--backend board)")
     ap.add_argument("--clock-mhz", type=float,
                     help="core clock, to turn device cycles into tokens/s (default: the "

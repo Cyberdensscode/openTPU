@@ -57,7 +57,7 @@ def main() -> None:
                     "design configuration")
     ap.add_argument("--wformat", default="int8", choices=["int8", "int4", "fp4", "mix"])
     ap.add_argument("--head-format", default=None, choices=["int8", "int4", "fp4"])
-    ap.add_argument("--backend", default="isa", choices=["isa", "board"],
+    ap.add_argument("--backend", default="isa", choices=["isa", "bend", "board"],
                     help="the ISA simulator, or the card (--cfg does not apply)")
     ap.add_argument("--dev", default="/dev/xdma0", help="the card's XDMA device (--backend board)")
     ap.add_argument("--resident", action="store_true",
@@ -106,6 +106,9 @@ def main() -> None:
         base = board_config() if a.cfg == "board" else pickle.loads(Path(a.cfg).read_bytes())
         cfg = sim_config(spec, cap, replace(base, DRAM_BYTES=1 << 32), wformat=a.wformat,
                          head_format=a.head_format)
+    if a.backend == "bend":                     # the ISA simulator in Bend (docs/bend.md)
+        from opentpu.bend_sim import bend_backend
+        backend = bend_backend()
     eng = Engine(spec, W, cap=cap, cfg=cfg, backend=backend, wformat=a.wformat,
                  head_format=a.head_format, resident=a.resident)
     print(f"device: {a.backend} {eng.cfg}, weights {a.wformat}, head {a.head_format or a.wformat}"

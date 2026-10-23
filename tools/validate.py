@@ -5,7 +5,7 @@ CPU with openTPU's quantization, and (--against) next to a second device.
     python3 tools/validate.py [--model qwen3|lfm2|qwen35|gemma4|DIR]
                               [--wformat int8|int4|fp4|nvfp4|mix]
                               [--head-format int8|int4|fp4|nvfp4] [--formats SPEC]
-                              [--backend isa|rtl|board] [--against isa|rtl|board|RUN.npz]
+                              [--backend isa|bend|rtl|board] [--against isa|rtl|board|RUN.npz]
                               [--cfg board|design|CFG.pkl] [--resident] [--tokens 16] [--chat]
                               [--weights-only] [--no-fp32] [--no-golden] [--min-top1 F]
                               [--kl-ratio R] [--max-kl NATS] [--save RUN.npz] [--json OUT.json]
@@ -618,6 +618,9 @@ def run_device(name: str, spec, path: Path, cap: int, prompts, a, card=None, W=N
         if name == "rtl":
             from opentpu.llm.rtl_backend import RtlBackend
             eng = Engine(spec, W, cfg=cfg, backend=RtlBackend, **kw)
+        elif name == "bend":
+            from opentpu.bend_sim import bend_backend
+            eng = Engine(spec, W, cfg=cfg, backend=bend_backend(), **kw)
         else:
             eng = Engine(spec, W, cfg=cfg, **kw)
     cfg, img = eng.cfg, image_formats(eng.image)
@@ -906,7 +909,7 @@ def _main(argv=None) -> int:
     ap.add_argument("--head-format", default=None, choices=["int8", "int4", "fp4", "nvfp4"])
     ap.add_argument("--formats", help="per-kind weight formats (OTPU_FORMATS, "
                     "opentpu/llm/formats.py), e.g. mlp=fp4")
-    ap.add_argument("--backend", default="isa", choices=["isa", "rtl", "board"])
+    ap.add_argument("--backend", default="isa", choices=["isa", "bend", "rtl", "board"])
     ap.add_argument("--against", help="a second device (isa, rtl, board) or a run saved with "
                     "--save: tokens and logits must be identical")
     ap.add_argument("--cfg", help="the simulators' configuration: board (the default, "
