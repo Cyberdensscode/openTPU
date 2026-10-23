@@ -9,7 +9,6 @@
 # bit facts by induction on the word's length.
 import Base
 import ./fp32.bend as F
-import ./sim.bend as S
 import ./LAWS.bend as Laws
 
 # ------------------------------------------------------------------------------- lemmas
@@ -422,27 +421,4 @@ def Laws.mulhi_carry():
   {==}
 
 def Laws.mulhi_mixed():
-  {==}
-
-# ------------------------------------------------------------------------------- programs
-
-def Laws.prog_scalar():
-  {==}
-
-def Laws.prog_loop():
-  {==}
-
-def Laws.prog_r0():
-  {==}
-
-def Laws.prog_end():
-  {==}
-
-def Laws.prog_vop():
-  {==}
-
-def Laws.prog_ldst():
-  {==}
-
-def Laws.prog_ldst_dram():
   {==}

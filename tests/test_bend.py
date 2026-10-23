@@ -7,6 +7,7 @@ built elsewhere) only the checker's skip. pytest -p bend_shadow runs whole suite
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -30,11 +31,16 @@ SPECIAL = np.array([0, 0x80000000, 1, 0x80000001, 0x007FFFFF, 0x7F800000, 0xFF80
                     0x00800000, 0x42F00000, 0xC2FE0000, 0x3F000000], np.uint32)
 
 
-def check(path: str) -> str:
+def check(path: str, how: str = "--check-only") -> str:
     env = dict(os.environ, BEND_NO_TELEMETRY="1")
-    r = subprocess.run([str(BEND), str(ROOT / path), "--check-only"], capture_output=True,
-                       text=True, env=env, timeout=600)
+    env["PATH"] = str(Path.home() / ".elan" / "bin") + os.pathsep + env.get("PATH", "")
+    r = subprocess.run([str(BEND), str(ROOT / path), how], capture_output=True, text=True,
+                       env=env, timeout=600)
     return r.stdout + r.stderr
+
+
+def has_lean() -> bool:
+    return (Path.home() / ".elan" / "bin" / "lean").exists() or shutil.which("lean") is not None
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -66,13 +72,24 @@ def both(m: Machine) -> str:
 
 
 @needs_bend
-def test_laws():
-    out = check("bend/PROOF.bend")
+@pytest.mark.parametrize("path", ["bend/PROOF.bend", "bend/prog/PROOF.bend"])
+def test_laws(path):
+    out = check(path)
     assert "ALL PROOFS CHECK" in out, out
 
 
 @needs_bend
-@pytest.mark.parametrize("path", ["bend/fp32.bend", "bend/sim.bend", "bend/machine.bend"])
+@pytest.mark.skipif(not has_lean(), reason="--verdict needs Lean 4 (elan)")
+def test_laws_verdict():
+    """The word laws again with BendTT's kernel, which has a proof in Lean (the program laws'
+    sim.bend does not fit the kernel's memory)."""
+    out = check("bend/PROOF.bend", "--verdict")
+    assert "ALL PROOFS CHECK" in out, out
+
+
+@needs_bend
+@pytest.mark.parametrize("path", ["bend/fp32.bend", "bend/word.bend", "bend/sim.bend",
+                                  "bend/machine.bend"])
 def test_pure(path):
     """Every def of the simulator proper is total and terminating (no @unsafe: only simpar.bend,
     the parallel MXU, and server.bend's IO use it)."""

@@ -4,6 +4,7 @@
 import Base
 import ./fp32.bend as F
 import ./sim.bend as S
+import ./word.bend as W
 
 # The slices, the GATHER buffer, and the machine's state: st RUN 0, DONE 1 (every slice
 # halted), HOST 2 (the host's turn), ERROR 3; e the machine's own error (9 a collective with
@@ -242,8 +243,8 @@ def gA.k(r: S.Sl & Gk, b: Array<U32>, +kk: U32, +geo: Gg) -> Gr:
         case Gg{+dst, +rows, +cols, +drs, +seg, +n}:
           +tl = (S.Cf.tw(k) - 1 : U32)
           +ok = U32.is_eq(rows, 0) || U32.is_eq(cols, 0)
-            || ((src <= tl : U32) && S.rng((src + cols - 1 : U32), rows, srs, 1, 0, tl)
-              && (dst <= tl : U32) && S.rng((dst + cols - 1 : U32), n, seg, rows, drs, tl))
+            || ((src <= tl : U32) && W.rng((src + cols - 1 : U32), rows, srs, 1, 0, tl)
+              && (dst <= tl : U32) && W.rng((dst + cols - 1 : U32), n, seg, rows, drs, tl))
           gth.chk(ok, S.Sl{c, t, a, d, h, x, k}, b, src, srs, (kk * rows * cols : U32), geo)
 
 # the slices (reversed), the buffer, and whether a slice stopped with an error

@@ -6,13 +6,14 @@
 # A law with `for` holds for every value of its variables: every 32-bit word, every control
 # array. The others are about named inputs, proven by evaluation in the checker: the IEEE-754
 # corners of the arithmetic (roundTiesToEven, flush to zero on inputs and outputs, the canonical
-# NaN; each value derived by hand and equal to opentpu/fp32.py's), every byte, and whole
-# programs run on a slice (the values isasim gives).
+# NaN; each value derived by hand and equal to opentpu/fp32.py's), every byte, the range check
+# at the 32-bit wrap. prog/LAWS.bend has the laws about whole programs run on a slice (they
+# import all of sim.bend, which --verdict's kernel does not fit in memory).
 #
 # Bend has no hex literals: the words are decimal, their hex or value in the comments.
 import Base
 import ./fp32.bend as F
-import ./sim.bend as S
+import ./word.bend as W
 
 # ------------------------------------------------------------------------------- fp32, every word
 
@@ -264,7 +265,7 @@ law q8_nan:
 law r0_stays_zero:
   for -c: Array<U32>
   for +v: U32
-  {S.setr(c, 0, v) == c : Array<U32>}
+  {W.setr(c, 0, v) == c : Array<U32>}
 
 # WAITW's conditions (isa.waitw_holds): EQ, NE and GE (the masked word minus ref, signed,
 # not negative)
@@ -272,26 +273,26 @@ law waitw_eq:
   for +v: U32
   for +ref: U32
   for +mask: U32
-  {S.holds(v, ref, 0, mask) == U32.is_eq((v .&. mask : U32), ref) : Bool}
+  {W.holds(v, ref, 0, mask) == U32.is_eq((v .&. mask : U32), ref) : Bool}
 
 law waitw_ne:
   for +v: U32
   for +ref: U32
   for +mask: U32
-  {S.holds(v, ref, 1, mask) == U32.is_ne((v .&. mask : U32), ref) : Bool}
+  {W.holds(v, ref, 1, mask) == U32.is_ne((v .&. mask : U32), ref) : Bool}
 
 law waitw_ge:
   for +v: U32
   for +ref: U32
   for +mask: U32
-  {S.holds(v, ref, 2, mask) == (((v .&. mask : U32) - ref : U32) < 2147483648 : U32) : Bool}
+  {W.holds(v, ref, 2, mask) == (((v .&. mask : U32) - ref : U32) < 2147483648 : U32) : Bool}
 
 # a byte's signed value: b for b < 128, b - 256 (mod 2^32) above
 def int8(+b: U32) -> U32:
   F.sel((b < 128 : U32), b, (b - 256 : U32))
 
 def sx8_ok(+b: U32) -> Bool:
-  U32.is_eq(S.sx8(b), int8(b))
+  U32.is_eq(W.sx8(b), int8(b))
 
 # p of the 2^k words base, base + 1, ..., base + 2^k - 1
 def every(~p: U32 -> Bool, +k: Nat, +base: U32) -> Bool:
@@ -308,128 +309,30 @@ law sx8_every_byte:
 # the strided range check is exact at the 32-bit wrap: the last byte is in range, a second one
 # past it is not; ends of exactly 2^32 (a sum, a product) are not
 law rng_last:
-  {S.rng(4294967295, 1, 0, 1, 0, 4294967295) == True{} : Bool}
+  {W.rng(4294967295, 1, 0, 1, 0, 4294967295) == True{} : Bool}
 
 law rng_wrap:
-  {S.rng(4294967295, 2, 1, 1, 0, 4294967295) == False{} : Bool}
+  {W.rng(4294967295, 2, 1, 1, 0, 4294967295) == False{} : Bool}
 
 law rng_sum_wrap:
-  {S.rng(0, 2, 2147483648, 2, 2147483648, 4294967295) == False{} : Bool}
+  {W.rng(0, 2, 2147483648, 2, 2147483648, 4294967295) == False{} : Bool}
 
 law rng_product_wrap:
-  {S.rng(0, 65537, 65536, 1, 0, 4294967295) == False{} : Bool}
+  {W.rng(0, 65537, 65536, 1, 0, 4294967295) == False{} : Bool}
 
 # 16 + 3 * 4 + 2 * 64 = 156: in range of 156, not of 155
 law rng_edge_in:
-  {S.rng(16, 4, 4, 3, 64, 156) == True{} : Bool}
+  {W.rng(16, 4, 4, 3, 64, 156) == True{} : Bool}
 
 law rng_edge_out:
-  {S.rng(16, 4, 4, 3, 64, 155) == False{} : Bool}
+  {W.rng(16, 4, 4, 3, 64, 155) == False{} : Bool}
 
 # the high word of 64-bit products
 law mulhi_max:
-  {S.mulhi(4294967295, 4294967295) == 4294967294 : U32}
+  {W.mulhi(4294967295, 4294967295) == 4294967294 : U32}
 
 law mulhi_carry:
-  {S.mulhi(65536, 65536) == 1 : U32}
+  {W.mulhi(65536, 65536) == 1 : U32}
 
 law mulhi_mixed:
-  {S.mulhi(12345678, 87654321) == 251958 : U32}
-
-# ------------------------------------------------------------------------------- programs
-
-# A slice of the configuration isasim.Config(S=1, D=8, MCOLS=1, ACT_BLOCKS=1, TMEM_WORDS=64,
-# DRAM_BYTES=256, IMEM_WORDS=64) running a program from pc 0, as the server loads one: the
-# instructions' words at IMEM, the program's length at PLEN.
-def cfg() -> S.Cf:
-  S.Cf{1, 8, 1, 1, 64, 255, 64, 1, 0, 0, 0, 0, 2, 3}
-
-def put(xs: List<U32>, c: Array<U32>, +i: U32) -> Array<U32>:
-  match xs:
-    case Nil{}:
-      c
-    case Con{w, t}:
-      put(t, c[i] <- w, (i + 1 : U32))
-
-def plen(c: Array<U32>, +n: U32) -> Array<U32>:
-  c[21] <- n
-
-def boot(xs: List<U32>, +n: U32) -> S.Sl:
-  S.Sl{plen(put(xs, [0 : U32*8192n], 4096), n), [0 : U32*64n], [0 : U32*64n], [0 : U32*64n],
-    [0 : U32*64n], [0 : U32*64n], cfg()}
-
-# the program xs of n instructions, run until it stops (64 instructions at most)
-def run(xs: List<U32>, +n: U32) -> S.Sl:
-  S.go(~(s => i => S.mm.seq(s, i)), 64n, S.runs(boot(xs, n)))
-
-# the word read (r's), then the words at ix
-def get.go(ix: List<U32>, r: Array<U32> & U32) -> List<U32>:
-  match ix:
-    case Nil{}:
-      (a, v) = r
-      [v]
-    case Con{+i, t}:
-      (a, v) = r
-      v <> get.go(t, Array.get(U32, a, i))
-
-# the words at ix
-def get(ix: List<U32>, a: Array<U32>) -> List<U32>:
-  match ix:
-    case Nil{}:
-      []
-    case Con{+i, t}:
-      get.go(t, Array.get(U32, a, i))
-
-# R1, R2, ICOUNT, STATE (RUN 0, HALT 1, ERROR 4), ERR
-def regs(s: S.Sl) -> List<U32>:
-  match s:
-    case S.Sl{c, t, a, d, h, x, k}:
-      get([1, 2, 17, 18, 19], c)
-
-# TMEM words
-def tmem(s: S.Sl, ix: List<U32>) -> List<U32>:
-  match s:
-    case S.Sl{c, t, a, d, h, x, k}:
-      get(ix, t)
-
-# DRAM words (four little-endian bytes each)
-def dram(s: S.Sl, ix: List<U32>) -> List<U32>:
-  match s:
-    case S.Sl{c, t, a, d, h, x, k}:
-      get(ix, d)
-
-# LI R1, 7; ADDI R2, R1, 5; HALT
-law prog_scalar:
-  {regs(run([1048578, 7, 0, 0, 0, 0, 0, 0, 2097411, 5, 0, 0, 0, 0, 0, 0,
-    1, 0, 0, 0, 0, 0, 0, 0], 3)) == [7, 12, 3, 1, 0] : List<U32>}
-
-# LI R1, 0; LOOP 1, 10 { ADDI R1, R1, 3 }; HALT: 13 instructions
-law prog_loop:
-  {regs(run([1048578, 0, 0, 0, 0, 0, 0, 0, 4, 1, 10, 0, 0, 0, 0, 0,
-    1048835, 3, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0], 4)) == [30, 0, 13, 1, 0] : List<U32>}
-
-# LI R0, 9; ADDI R1, R0, 1; HALT: R0 reads 0
-law prog_r0:
-  {regs(run([2, 9, 0, 0, 0, 0, 0, 0, 1048579, 1, 0, 0, 0, 0, 0, 0,
-    1, 0, 0, 0, 0, 0, 0, 0], 3)) == [1, 0, 3, 1, 0] : List<U32>}
-
-# LI R1, 7 and no HALT: the slice stops with error 1 (pc past the end of the program)
-law prog_end:
-  {regs(run([1048578, 7, 0, 0, 0, 0, 0, 0], 1)) == [7, 0, 1, 4, 1] : List<U32>}
-
-# VOP FILL T[0..4) = 1.5; VOP FILL T[4..8) = 2.25; VOP ADD T[8..12) = T[0..4) + T[4..8); HALT
-law prog_vop:
-  {tmem(run([48, 0, 0, 0, 262145, 4, 51183616, 1069547520, 48, 4, 0, 0, 262145, 4, 51183616,
-    1074790400, 48, 8, 0, 4, 262145, 262148, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0], 4),
-    [7, 8, 11, 12]) == [1074790400, 1081081856, 1081081856, 0] : List<U32>}
-
-# VOP FILL T[0..4) = -0.75; ST DRAM[16..32) = T[0..4); LD T[32..36) = DRAM[16..32); HALT
-law prog_ldst:
-  {tmem(run([48, 0, 0, 0, 262145, 4, 51183616, 3208642560, 17, 16, 0, 4, 0, 0, 0, 0,
-    16, 16, 32, 4, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0], 4), [31, 32, 35, 36])
-    == [0, 3208642560, 3208642560, 0] : List<U32>}
-
-law prog_ldst_dram:
-  {dram(run([48, 0, 0, 0, 262145, 4, 51183616, 3208642560, 17, 16, 0, 4, 0, 0, 0, 0,
-    16, 16, 32, 4, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0], 4), [3, 4, 7, 8])
-    == [0, 3208642560, 3208642560, 0] : List<U32>}
+  {W.mulhi(12345678, 87654321) == 251958 : U32}

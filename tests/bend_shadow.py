@@ -65,6 +65,7 @@ def _shadow_run(self, max_steps: int = 10_000_000):
         return _orig_run(self, max_steps)
     snap = [(s.dram.copy(), s.tmem.copy(), s.act.copy(), s.ascale.copy(), s.adoff.copy(),
              list(s.R)) for s in self.slices]
+    chains0 = self.chains                # isasim counts across runs, the Bend machine per run
     t0 = time.perf_counter()
     err = None
     try:
@@ -123,8 +124,8 @@ def _shadow_run(self, max_steps: int = 10_000_000):
             bad.append(f"slice {k} ACT RAM differs")
         if int(b.ctrl[k, 19]) != s.stalls:
             bad.append(f"slice {k} stalls {s.stalls} vs {int(b.ctrl[k, 19])}")
-    if b.chains != self.chains:
-        bad.append(f"chains {self.chains} vs {b.chains}")
+    if b.chains != self.chains - chains0:
+        bad.append(f"chains {self.chains - chains0} vs {b.chains}")
     _log(dict(rec, outcome="MISMATCH" if bad else "same", diff=bad[:6]))
     if bad and os.environ.get("OTPU_BEND_DUMP"):
         import pickle

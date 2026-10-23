@@ -1,7 +1,8 @@
 # The openTPU ISA in Bend (docs/isa.md): a slice's machine state and its instructions, bit for
 # bit the ISA simulator opentpu/isasim.py (tests/test_bend.py compares the two).
 #
-# Everything here is pure and terminating: LAWS.bend states facts about it and PROOF.bend
+# Everything here is pure and terminating: prog/LAWS.bend states facts about whole programs on
+# a slice, LAWS.bend about the words (word.bend, fp32.bend), and the PROOF.bend beside each
 # proves them. The MXU's MM is a template parameter (~mm) of the step and the run loops:
 # mm.seq below is the sequential one; simpar.bend's splits the rows and each row's outputs over
 # the cores (it shares the read-only arrays through Base's @unsafe Array.fork, so it stays out
@@ -10,6 +11,7 @@
 # Bend has no hex literals: the constants are decimal, their hex in the comments.
 import Base
 import ./fp32.bend as F
+import ./word.bend as W
 
 # ------------------------------------------------------------------------------- the state
 
@@ -155,49 +157,6 @@ def Cf.ado(+k: Cf) -> U32:
     case Cf{s, d, mc, ab, tw, db, iw, ar, pr, ds, st, si, ao, +ad}:
       ad
 
-# ------------------------------------------------------------------------------- words
-
-# the high word of the 64-bit product a * b
-def mulhi(+a: U32, +b: U32) -> U32:
-  +al = (a .&. 65535 : U32)
-  +ah = (a >> 16n : U32)
-  +bl = (b .&. 65535 : U32)
-  +bh = (b >> 16n : U32)
-  +lh = (al * bh : U32)
-  +hl = (ah * bl : U32)
-  +mid = (((al * bl : U32) >> 16n : U32) + (lh .&. 65535 : U32) + (hl .&. 65535 : U32) : U32)
-  ((ah * bh : U32) + (lh >> 16n : U32) + (hl >> 16n : U32) + (mid >> 16n : U32) : U32)
-
-# whether b + (n1 - 1) s1 + (n2 - 1) s2 <= last, exactly (no 32-bit wrap); n1, n2 >= 1. The
-# bound of every strided range: TMEM (last = TW - 1), DRAM bytes (DRAM_BYTES - 1)
-def rng(+b: U32, +n1: U32, +s1: U32, +n2: U32, +s2: U32, +last: U32) -> Bool:
-  +p1 = ((n1 - 1 : U32) * s1 : U32)
-  +p2 = ((n2 - 1 : U32) * s2 : U32)
-  +u = (b + p1 : U32)
-  +v = (u + p2 : U32)
-  +hi = (mulhi((n1 - 1 : U32), s1) + mulhi((n2 - 1 : U32), s2) + F.b2u((u < b : U32))
-    + F.b2u((v < u : U32)) : U32)
-  U32.is_eq(hi, 0) && (v <= last : U32)
-
-# an arithmetic shift right by k in 1..32 (32: the sign word)
-def sar(+v: U32, +k: U32) -> U32:
-  F.sel((v >= 2147483648 : U32), (F.shr((v .^. 4294967295 : U32), k) .^. 4294967295 : U32),
-    F.shr(v, k))
-
-# a byte's value as a signed word (b in 0..255)
-def sx8(+b: U32) -> U32:
-  ((b .^. 128 : U32) - 128 : U32)
-
-# byte i (0..3) of the word w
-def byte(+w: U32, +i: U32) -> U32:
-  ((w >> U32.to_nat((i * 8 : U32)) : U32) .&. 255 : U32)
-
-# w with byte i (0..3) replaced by the low byte of v
-def put8(+w: U32, +i: U32, +v: U32) -> U32:
-  +sh = U32.to_nat((i * 8 : U32))
-  ((w .&. ((255 << sh : U32) .^. 4294967295 : U32) : U32) .|. ((v .&. 255 : U32) << sh : U32)
-    : U32)
-
 # ------------------------------------------------------------------------------- arrays
 
 # a[i] += k
@@ -213,17 +172,6 @@ def fail(c: Array<U32>, +e: U32, +aux: U32) -> Array<U32>:
   c[18] <- 4
   c[19] <- e
   c[20] <- aux
-
-# R[rd] = v; R0 stays 0
-def setr.go(z: Bool, c: Array<U32>, +r: U32, +v: U32) -> Array<U32>:
-  match z:
-    case True{}:
-      c
-    case False{}:
-      c[r] <- v
-
-def setr(c: Array<U32>, +r: U32, +v: U32) -> Array<U32>:
-  setr.go(U32.is_eq(r, 0), c, r, v)
 
 # a[i] for the n words i = s, s+1, ...: (array, word)
 def cp.step(r: Array<U32> & U32, dst: Array<U32>, +j: U32) -> Array<U32> & Array<U32>:
@@ -474,22 +422,22 @@ def x.li(s: Sl, +i: Ins) -> Sl:
     case Sl{c, t, a, d, h, x, k}:
       match i:
         case Ins{+w0, +w1, w2, w3, w4, w5, w6, w7, va, vb, vc, vd}:
-          Sl{setr(c, rd(w0), w1), t, a, d, h, x, k}
+          Sl{W.setr(c, rd(w0), w1), t, a, d, h, x, k}
 
 def x.addi(s: Sl, +i: Ins) -> Sl:
   match s:
     case Sl{c, t, a, d, h, x, k}:
       match i:
         case Ins{+w0, +w1, w2, w3, w4, w5, w6, w7, +va, vb, vc, vd}:
-          Sl{setr(c, rd(w0), (va + w1 : U32)), t, a, d, h, x, k}
+          Sl{W.setr(c, rd(w0), (va + w1 : U32)), t, a, d, h, x, k}
 
 # whether the n DRAM words from byte address b are aligned and in range
 def dwords(+b: U32, +n: U32, +k: Cf) -> Bool:
-  U32.is_eq((b .&. 3 : U32), 0) && rng(b, n, 4, 1, 0, (Cf.dbm1(k) - 3 : U32))
+  U32.is_eq((b .&. 3 : U32), 0) && W.rng(b, n, 4, 1, 0, (Cf.dbm1(k) - 3 : U32))
 
 # whether the TMEM words b + r*s1 + q*s2 (r < n1, q < n2) are in range
 def twords(+b: U32, +n1: U32, +s1: U32, +n2: U32, +s2: U32, +k: Cf) -> Bool:
-  rng(b, n1, s1, n2, s2, (Cf.tw(k) - 1 : U32))
+  W.rng(b, n1, s1, n2, s2, (Cf.tw(k) - 1 : U32))
 
 # LD: T[t + q] = M32[d + 4q]; ST: the other way
 def ld.fin(r: Array<U32> & Array<U32>, c: Array<U32>, a: Array<U32>, h: Array<U32>,
@@ -540,7 +488,7 @@ def x.ldst(st: Bool, s: Sl, +i: Ins) -> Sl:
 def rld.set(z: Bool, c: Array<U32>, +r: U32, +v: U32) -> Array<U32>:
   match z:
     case True{}:
-      setr(c, r, v)
+      W.setr(c, r, v)
     case False{}:
       fail(c, 8, v)
 
@@ -616,12 +564,6 @@ def x.wait(s: Sl) -> Sl:
     case Sl{c, t, a, d, h, x, k}:
       Sl{c[18] <- 2, t, a, d, h, x, k}
 
-# WAITW's condition on the word it read (isa.waitw_holds): EQ, NE, GE (a signed difference)
-def holds(+v: U32, +ref: U32, +cmp: U32, +mask: U32) -> Bool:
-  +m = (v .&. mask : U32)
-  (U32.is_eq(cmp, 0) && U32.is_eq(m, ref)) || (U32.is_eq(cmp, 1) && U32.is_ne(m, ref))
-    || ((cmp >= 2 : U32) && ((m - ref : U32) < 2147483648 : U32))
-
 # WAITW: it holds: T[R[rb] + w2] = the word, go on (RUN); it does not: POLL (first: a step's
 # own read, which counts a stall; the machine's later reads do not)
 def ww.set(z: Bool, s: Sl, +ta: U32, +v: U32) -> Sl:
@@ -645,7 +587,7 @@ def ww.v(r: Array<U32> & U32, c: Array<U32>, t: Array<U32>, a: Array<U32>, h: Ar
   (d, +v) = r
   match i:
     case Ins{+w0, w1, +w2, +w3, +w4, w5, w6, w7, va, +vb, +vc, vd}:
-      ww.hold(holds(v, (vc + w3 : U32), (fl(w0) .&. 3 : U32), w4), Sl{c, t, a, d, h, x, k},
+      ww.hold(W.holds(v, (vc + w3 : U32), (fl(w0) .&. 3 : U32), w4), Sl{c, t, a, d, h, x, k},
         (vb + w2 : U32), v, first)
 
 def ww.dm(z: Bool, s: Sl, +ad: U32, +i: Ins, +first: U32) -> Sl:
@@ -1437,9 +1379,9 @@ def qa.chk(+o: Qa, +k: Cf) -> U32:
       +none = U32.is_eq(rows, 0) || U32.is_eq(kb, 0)
       F.sel(U32.is_ne(big, 0) || ((ab + kb : U32) > Cf.ab(k) : U32), 28,
       F.sel(none, 0,
-      F.sel(Bool.not(rng(src, rows, srs, n, 1, tm))
-        || (U32.is_ne((f .&. 4 : U32), 0) && Bool.not(rng(rsc, rows, 1, 1, 0, tm)))
-        || (U32.is_ne((f .&. 2 : U32), 0) && Bool.not(rng(cs, n, 1, 1, 0, tm))), 7,
+      F.sel(Bool.not(W.rng(src, rows, srs, n, 1, tm))
+        || (U32.is_ne((f .&. 4 : U32), 0) && Bool.not(W.rng(rsc, rows, 1, 1, 0, tm)))
+        || (U32.is_ne((f .&. 2 : U32), 0) && Bool.not(W.rng(cs, n, 1, 1, 0, tm))), 7,
       F.sel(((n + 2 * ng : U32) > 4194304 : U32) || (kb > 65535 : U32), 42, 0))))
 
 def qa.e(z: Bool, s: Sl, +o: Qa, +e: U32) -> Sl:
@@ -1483,7 +1425,7 @@ type Qs is Data:
 
 def qs.b(r: Array<U32> & U32, +wi: U32, +bs: U32, +q: U32) -> Array<U32>:
   (d, +w) = r
-  d[wi] <- put8(w, bs, q)
+  d[wi] <- W.put8(w, bs, q)
 
 def qs.e1(r: Array<U32> & U32, d: Array<U32>, +invg: U32, +b: U32) -> Array<U32> & Array<U32>:
   (x, +v) = r
@@ -1598,9 +1540,9 @@ def qs.chk(+o: Qs, +k: Cf) -> U32:
       +db = Cf.dbm1(k)
       F.sel(U32.is_ne((f .&. 2 : U32), 0) && U32.is_eq((f .&. 1 : U32), 0), 29,
       F.sel(U32.is_eq(rows, 0) || U32.is_eq(kb, 0), 0,
-      F.sel(Bool.not(rng(src, rows, srs, n, 1, tm)), 7,
-      F.sel(Bool.not(rng(dst, rows, drs, ne, es, db)), 30,
-      F.sel(U32.is_ne((sdst .&. 3 : U32), 0) || Bool.not(rng(sdst, rows, sw, sw, 1, db)), 31,
+      F.sel(Bool.not(W.rng(src, rows, srs, n, 1, tm)), 7,
+      F.sel(Bool.not(W.rng(dst, rows, drs, ne, es, db)), 30,
+      F.sel(U32.is_ne((sdst .&. 3 : U32), 0) || Bool.not(W.rng(sdst, rows, sw, sw, 1, db)), 31,
       F.sel(qs.ov(U32.to_nat(rows), 0, o, False{}), 32,
       F.sel(((n + 2 * ng + 4 : U32) > 4194304 : U32) || (kb > 32767 : U32), 42, 0)))))))
 
@@ -1740,7 +1682,7 @@ def ds.go4(r: Array<U32> & Array<U32>, c: Array<U32>, t: Array<U32>, a: Array<U3
   (x, d) = r
   match g:
     case Dg{dw, qk, v, gg, +o, gs, +rows, cols, zero}:
-      ds.done(rng(o, rows, 1, 1, 0, (Cf.tw(k) - 1 : U32)), x, t, c, a, d, h, k, o, rows)
+      ds.done(W.rng(o, rows, 1, 1, 0, (Cf.tw(k) - 1 : U32)), x, t, c, a, d, h, k, o, rows)
 
 # the rows, then the state back to DRAM
 def ds.go3(x: Array<U32>, d: Array<U32>, c: Array<U32>, t: Array<U32>, a: Array<U32>,
@@ -1823,9 +1765,9 @@ def x.dstep(s: Sl, +i: Ins) -> Sl:
           +e = F.sel(U32.is_eq(rows, 0) || (rows > 256 : U32) || U32.is_ne((cols % 64 : U32), 0)
             || U32.is_eq(cols, 0) || (cols > 256 : U32), 37,
             F.sel(U32.is_ne((dd % Cf.d(k) : U32), 0), 43,
-            F.sel(Bool.not(rng(qk, (2 * cols : U32), 1, 1, 0, tm)) || Bool.not(rng(v, rows, 1, 1,
-              0, tm)) || (w5 > tm : U32) || Bool.not(rng(w5, 2, w7, 1, 0, tm)), 7,
-            F.sel(Bool.not(rng(dd, (rows * cols : U32), 4, 4, 1, Cf.dbm1(k))), 6, 0))))
+            F.sel(Bool.not(W.rng(qk, (2 * cols : U32), 1, 1, 0, tm)) || Bool.not(W.rng(v, rows, 1, 1,
+              0, tm)) || (w5 > tm : U32) || Bool.not(W.rng(w5, 2, w7, 1, 0, tm)), 7,
+            F.sel(Bool.not(W.rng(dd, (rows * cols : U32), 4, 4, 1, Cf.dbm1(k))), 6, 0))))
           ds.e(U32.is_eq(e, 0), Sl{c, t, a, d, h, x, k},
             {Dg{(dd >> 2n : U32), qk, v, w5, w6, w7, rows, cols, (fl(w0) .&. 1 : U32)} : Dg}, e)
 
@@ -2423,22 +2365,22 @@ def sq.chk(+m: Sm, +k: Cf) -> U32:
         || U32.is_ne(sq.bits(of, 0, 1), 0)
         || (ug && (U32.is_eq(gsrc, 1) || U32.is_eq(gsrc, 2)) && (sq.bits(c1, 9, 3) >= 4 : U32))
         || (ub && (bsrc < 2 : U32) && (sq.bits(c1, 14, 3) >= 4 : U32)), 38,
-      F.sel(((nsl > 0 : U32) && Bool.not(rng(vec, (nsl * cols : U32), 1, 1, 0, tm)))
-        || ((nk > 0 : U32) && Bool.not(rng(ka, nk, ks, 1, 0, tm)))
-        || (U32.is_ne(sq.bits(of, 1, 1), 0) && Bool.not(rng(xa, rows, 1, 1, 0, tm))), 7,
+      F.sel(((nsl > 0 : U32) && Bool.not(W.rng(vec, (nsl * cols : U32), 1, 1, 0, tm)))
+        || ((nk > 0 : U32) && Bool.not(W.rng(ka, nk, ks, 1, 0, tm)))
+        || (U32.is_ne(sq.bits(of, 1, 1), 0) && Bool.not(W.rng(xa, rows, 1, 1, 0, tm))), 7,
       F.sel((sdr && U32.is_ne((src % Cf.d(k) : U32), 0))
         || (ddr && U32.is_ne((dst % Cf.d(k) : U32), 0)), 38,
-      F.sel((sdr && Bool.not(rng(src, (rows * cols : U32), 4, 4, 1, Cf.dbm1(k))))
-        || (ddr && Bool.not(rng(dst, (rows * cols : U32), 4, 4, 1, Cf.dbm1(k)))), 6,
+      F.sel((sdr && Bool.not(W.rng(src, (rows * cols : U32), 4, 4, 1, Cf.dbm1(k))))
+        || (ddr && Bool.not(W.rng(dst, (rows * cols : U32), 4, 4, 1, Cf.dbm1(k)))), 6,
       F.sel(U32.is_ne(st, 0) && U32.is_eq(sz, 0)
-        && Bool.not(rng(src, rows, sq.rs(sq.bits(p4, 0, 12), cols), cols, 1, tm)), 7,
+        && Bool.not(W.rng(src, rows, sq.rs(sq.bits(p4, 0, 12), cols), cols, 1, tm)), 7,
       F.sel(ub && U32.is_eq(bsrc, 3), 38,
       F.sel(U32.is_ne(dt, 0) && U32.is_eq(nd, 0)
-        && Bool.not(rng(dst, rows, sq.rs(sq.bits(p4, 12, 12), cols), cols, 1, tm)), 7,
+        && Bool.not(W.rng(dst, rows, sq.rs(sq.bits(p4, 12, 12), cols), cols, 1, tm)), 7,
       F.sel(U32.is_ne(sq.stg(rows, cols, p4, src, dst, f), 0)
         && ((rows * cols : U32) > 4161408 : U32), 42,
-      F.sel((oo && Bool.not(rng(out, rows, 1, 1, 0, tm)))
-        || ((nrs > 0 : U32) && Bool.not(rng(ka, nrs, ks, 1, 0, tm))), 7, 0)))))))))
+      F.sel((oo && Bool.not(W.rng(out, rows, 1, 1, 0, tm)))
+        || ((nrs > 0 : U32) && Bool.not(W.rng(ka, nrs, ks, 1, 0, tm))), 7, 0)))))))))
 
 # the rows done: the waiting rows, O, the saved registers
 def sq.e3(r: Array<U32> & Array<U32>, c: Array<U32>, a: Array<U32>, d: Array<U32>,
@@ -2862,7 +2804,7 @@ def mm.chk(+o: Mk, +k: Cf) -> U32:
       F.sel(U32.is_ne((f .&. 128 : U32), 0) && U32.is_eq(wf, 3), 21,
       F.sel(U32.is_ne((f .&. 8 : U32), 0) && U32.is_ne((f .&. 3 : U32), 3), 22,
       F.sel(U32.is_ne((sa % dd : U32), 0) || U32.is_ne((rs % dd : U32), 0)
-        || Bool.not(rng(sa, n, rs, len, 1, Cf.dbm1(k))), 23, 0)))))))))
+        || Bool.not(W.rng(sa, n, rs, len, 1, Cf.dbm1(k))), 23, 0)))))))))
 
 # the scale rows' checks (isasim Slice._mx_scales; UNIT has none): 24 their alignment, 6 a
 # row's Sw (int4 / fp4: a block's word) past DRAM's end, 25 int8's or NVFP4's bytes past it
@@ -2877,11 +2819,11 @@ def mm.schk(+o: Mk, +k: Cf) -> U32:
       +kn = (k0 + kb : U32)
       F.sel(U32.is_ne((f .&. 1 : U32), 0), 0,
       F.sel(U32.is_ne((ssa % al : U32), 0) || U32.is_ne((srs % al : U32), 0), 24,
-      F.sel(Bool.not(rng(ssa, n, srs, 4, 1, db)), 6,
+      F.sel(Bool.not(W.rng(ssa, n, srs, 4, 1, db)), 6,
       F.sel(rsc, 0,
-      F.sel(U32.is_eq(wf, 0), F.sel(rng(ssa, n, srs, (4 + kn : U32), 1, db), 0, 25),
-      F.sel((wf < 3 : U32), F.sel(rng(ssa, n, srs, (4 * kn + 8 : U32), 1, db), 0, 6),
-        F.sel(rng(ssa, n, srs, (8 * kn + 16 : U32), 1, db), 0, 25)))))))
+      F.sel(U32.is_eq(wf, 0), F.sel(W.rng(ssa, n, srs, (4 + kn : U32), 1, db), 0, 25),
+      F.sel((wf < 3 : U32), F.sel(W.rng(ssa, n, srs, (4 * kn + 8 : U32), 1, db), 0, 6),
+        F.sel(W.rng(ssa, n, srs, (8 * kn + 16 : U32), 1, db), 0, 25)))))))
 
 # NVFP4's scale bytes with the sign bit set (error 26): the OR of every block's two words
 def nv.b(r: Array<U32> & U32, +z: U32) -> Array<U32> & U32:
@@ -2932,10 +2874,10 @@ type Da is Type:
 
 # four int8 pairs
 def mac4(+w: U32, +v: U32) -> U32:
-  ((sx8((w .&. 255 : U32)) * sx8((v .&. 255 : U32)) : U32)
-    + (sx8(((w >> 8n : U32) .&. 255 : U32)) * sx8(((v >> 8n : U32) .&. 255 : U32)) : U32)
-    + (sx8(((w >> 16n : U32) .&. 255 : U32)) * sx8(((v >> 16n : U32) .&. 255 : U32)) : U32)
-    + (sar(w, 24) * sar(v, 24) : U32) : U32)
+  ((W.sx8((w .&. 255 : U32)) * W.sx8((v .&. 255 : U32)) : U32)
+    + (W.sx8(((w >> 8n : U32) .&. 255 : U32)) * W.sx8(((v >> 8n : U32) .&. 255 : U32)) : U32)
+    + (W.sx8(((w >> 16n : U32) .&. 255 : U32)) * W.sx8(((v >> 16n : U32) .&. 255 : U32)) : U32)
+    + (W.sar(w, 24) * W.sar(v, 24) : U32) : U32)
 
 def d8.a(r: Array<U32> & U32, d: Array<U32>, +w: U32, +c: U32) -> Da:
   (a, +v) = r
@@ -2969,10 +2911,10 @@ def dec.f4(+c: U32) -> U32:
 
 # four 4-bit codes (w's low 16 bits, the first in the low nibble) with four int8 elements
 def mac4n(~dec: U32 -> U32, +w: U32, +v: U32) -> U32:
-  ((dec((w .&. 15 : U32)) * sx8((v .&. 255 : U32)) : U32)
-    + (dec(((w >> 4n : U32) .&. 15 : U32)) * sx8(((v >> 8n : U32) .&. 255 : U32)) : U32)
-    + (dec(((w >> 8n : U32) .&. 15 : U32)) * sx8(((v >> 16n : U32) .&. 255 : U32)) : U32)
-    + (dec(((w >> 12n : U32) .&. 15 : U32)) * sar(v, 24) : U32) : U32)
+  ((dec((w .&. 15 : U32)) * W.sx8((v .&. 255 : U32)) : U32)
+    + (dec(((w >> 4n : U32) .&. 15 : U32)) * W.sx8(((v >> 8n : U32) .&. 255 : U32)) : U32)
+    + (dec(((w >> 8n : U32) .&. 15 : U32)) * W.sx8(((v >> 16n : U32) .&. 255 : U32)) : U32)
+    + (dec(((w >> 12n : U32) .&. 15 : U32)) * W.sar(v, 24) : U32) : U32)
 
 def d4.a(~dec: U32 -> U32, r: Array<U32> & U32, d: Array<U32>, +w: U32, +c: U32) -> Da:
   (a, +v) = r
@@ -3020,13 +2962,13 @@ type Bs is Data:
   Bs{md: U32, w0: U32, w1: U32, bsel: U32}
 
 def bs.e4(+w0: U32, +w1: U32, +g: U32) -> U32:
-  byte(F.sel((g < 4 : U32), w0, w1), (g .&. 3 : U32))
+  W.byte(F.sel((g < 4 : U32), w0, w1), (g .&. 3 : U32))
 
 def bs.dw(+b: Bs, +g: U32) -> U32:
   match b:
     case Bs{+md, +w0, +w1, +bsel}:
       +ex = ((bs.e4(w0, w1, g) >> 3n : U32) .&. 15 : U32)
-      F.sel(U32.is_eq(md, 0), byte(w0, bsel),
+      F.sel(U32.is_eq(md, 0), W.byte(w0, bsel),
       F.sel(U32.is_eq(md, 1), (w0 .&. 255 : U32),
       F.sel(U32.is_eq(md, 2), (15 - F.sel((ex > 1 : U32), ex, 1) : U32), 0)))
 
@@ -3050,7 +2992,7 @@ def mg.add(r: Da, +hi: U32, +lo: U32, +dw: U32, +m: U32, +da: U32, +w: U32) -> M
       +sh = (w - dw - da : U32)
       +p = (c * m : U32)
       +plo = F.sel(ok, F.shl(p, sh), 0)
-      +phi = F.sel(ok, sar(p, (32 - sh : U32)), 0)
+      +phi = F.sel(ok, W.sar(p, (32 - sh : U32)), 0)
       +lo2 = (lo + plo : U32)
       Ms{d, a, (hi + phi + F.b2u((lo2 < lo : U32)) : U32), lo2}
 
@@ -3237,7 +3179,7 @@ def mm.rm1(z: Bool, x: Array<U32>, t: Array<U32>, c: Array<U32>, a: Array<U32>,
     case True{}:
       Sl{c, t, a, d, h, x, k}
     case False{}:
-      mm.rm2(rng(out, (m + 1 : U32), ors, m, 1, (Cf.tw(k) - 1 : U32)), x, t, c, a, d, h, k, out,
+      mm.rm2(W.rng(out, (m + 1 : U32), ors, m, 1, (Cf.tw(k) - 1 : U32)), x, t, c, a, d, h, k, out,
         ors, n, m)
 
 # RMAX after the rows are written (isasim writes them first too): its words' range, error 7
@@ -3292,8 +3234,8 @@ def mm.e27(~rw: Mx -> Mk -> Mx,
   match o:
     case Mk{sa, rs, +ssa, srs, +out, +ors, +n, kb, k0, +m, ab, +f, wf, dd, nab, ado, aso, msk,
       +tm}:
-      mm.t2(~rw, U32.is_ne(z, 0), (U32.is_eq((f .&. 8 : U32), 0) || rng(ssa, m, 1, 1, 0, tm))
-        && rng(out, m, ors, n, 1, tm), ((m * n : U32) <= 4194304 : U32), Sl{c, t, a, d, h, x, k},
+      mm.t2(~rw, U32.is_ne(z, 0), (U32.is_eq((f .&. 8 : U32), 0) || W.rng(ssa, m, 1, 1, 0, tm))
+        && W.rng(out, m, ors, n, 1, tm), ((m * n : U32) <= 4194304 : U32), Sl{c, t, a, d, h, x, k},
         o)
 
 def mm.e3(~rw: Mx -> Mk -> Mx, s: Sl, +o: Mk) -> Sl:
