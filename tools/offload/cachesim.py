@@ -172,11 +172,10 @@ def simulate(req, C, policy, warm, prior=None, half=32.0):
                 m = [e for e in cur if e not in cache]
                 for e in cur:
                     cnt[e] = cnt.get(e, 0) + 1
-                for e in m:
-                    while len(cache) >= C:
-                        f, s, v = heapq.heappop(heap)
-                        if v in cache and cache[v] == (f, s) and v not in cur:
-                            del cache[v]
+                while heap and len(cache) + len(m) > C:     # room for the misses
+                    f, s, v = heapq.heappop(heap)
+                    if v in cache and cache[v] == (f, s) and v not in cur:
+                        del cache[v]
                 for e in cur:
                     cache[e] = (cnt[e], step)
                     heapq.heappush(heap, (cnt[e], step, e))

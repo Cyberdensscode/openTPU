@@ -214,7 +214,9 @@ policies:
 - `lru`: shared by all layers;
 - `lru_layer`: the slots split evenly over the layers;
 - `lfu_layer`: per layer too, the victim the cached expert of least decayed use (section 5.5);
-- `lfu`: counts, with the profile as a prior;
+- `lfu`: counts, with the profile as a prior (until 2026-10-23 it made room for one miss a
+  request and took them all in, up to k - 1 experts over C; the column is the fixed one's,
+  docs/bend.md);
 - `opt`: Belady, the upper bound.
 
 Every policy starts from the static set, because the host fills the card from a profile at
@@ -225,24 +227,24 @@ Hit rates, and a token's misses under the per-layer LRU (out of L x k requests):
 
 | Model | Cache | static | lru | lru_layer | lfu | opt | misses / token (lru_layer: mean, p90) |
 |:--|:--|--:|--:|--:|--:|--:|--:|
-| LFM2.5-8B-A1B | 70 slots (10%) | 0.174 | 0.000 | 0.475 | 0.223 | 0.578 | 46.2, 59 of 88 |
-| LFM2.5-8B-A1B | 141 slots (20%) | 0.321 | 0.554 | 0.586 | 0.381 | 0.768 | 36.4, 50 of 88 |
-| LFM2.5-8B-A1B | 211 slots (30%) | 0.425 | 0.691 | 0.704 | 0.504 | 0.861 | 26.0, 38 of 88 |
-| LFM2.5-8B-A1B | 352 slots (50%) | 0.642 | 0.874 | 0.862 | 0.722 | 0.954 | 12.1, 20 of 88 |
-| LFM2.5-8B-A1B | 528 slots (75%) | 0.872 | 0.983 | 0.966 | 0.924 | 0.994 | 3.0, 6 of 88 |
-| LFM2.5-8B-A1B | 595 slots (85%), the card | 0.942 | 0.996 | 0.986 | 0.971 | 0.998 | 1.2, 3 of 88 |
-| gemma-4-26B-A4B | 192 slots (5%) | 0.084 | 0.000 | 0.459 | 0.144 | 0.576 | 129.8, 171 of 240 |
-| gemma-4-26B-A4B | 384 slots (10%) | 0.168 | 0.536 | 0.573 | 0.261 | 0.756 | 102.4, 143 of 240 |
-| gemma-4-26B-A4B | 744 slots (19%), the card | 0.293 | 0.755 | 0.761 | 0.437 | 0.885 | 57.3, 91 of 240 |
-| gemma-4-26B-A4B | 768 slots (20%) | 0.302 | 0.765 | 0.770 | 0.448 | 0.890 | 55.3, 89 of 240 |
-| gemma-4-26B-A4B | 1152 slots (30%) | 0.437 | 0.874 | 0.869 | 0.606 | 0.947 | 31.4, 55 of 240 |
+| LFM2.5-8B-A1B | 70 slots (10%) | 0.174 | 0.000 | 0.475 | 0.216 | 0.578 | 46.2, 59 of 88 |
+| LFM2.5-8B-A1B | 141 slots (20%) | 0.321 | 0.554 | 0.586 | 0.375 | 0.768 | 36.4, 50 of 88 |
+| LFM2.5-8B-A1B | 211 slots (30%) | 0.425 | 0.691 | 0.704 | 0.500 | 0.861 | 26.0, 38 of 88 |
+| LFM2.5-8B-A1B | 352 slots (50%) | 0.642 | 0.874 | 0.862 | 0.721 | 0.954 | 12.1, 20 of 88 |
+| LFM2.5-8B-A1B | 528 slots (75%) | 0.872 | 0.983 | 0.966 | 0.925 | 0.994 | 3.0, 6 of 88 |
+| LFM2.5-8B-A1B | 595 slots (85%), the card | 0.942 | 0.996 | 0.986 | 0.972 | 0.998 | 1.2, 3 of 88 |
+| gemma-4-26B-A4B | 192 slots (5%) | 0.084 | 0.000 | 0.459 | 0.140 | 0.576 | 129.8, 171 of 240 |
+| gemma-4-26B-A4B | 384 slots (10%) | 0.168 | 0.536 | 0.573 | 0.257 | 0.756 | 102.4, 143 of 240 |
+| gemma-4-26B-A4B | 744 slots (19%), the card | 0.293 | 0.755 | 0.761 | 0.435 | 0.885 | 57.3, 91 of 240 |
+| gemma-4-26B-A4B | 768 slots (20%) | 0.302 | 0.765 | 0.770 | 0.446 | 0.890 | 55.3, 89 of 240 |
+| gemma-4-26B-A4B | 1152 slots (30%) | 0.437 | 0.874 | 0.869 | 0.605 | 0.947 | 31.4, 55 of 240 |
 | gemma-4-26B-A4B | 1920 slots (50%) | 0.670 | 0.971 | 0.963 | 0.827 | 0.988 | 8.9, 17 of 240 |
 | gemma-4-26B-A4B | 2880 slots (75%) | 0.904 | 0.997 | 0.995 | 0.977 | 0.999 | 1.2, 3 of 240 |
-| Qwen3.5-35B-A3B | 512 slots (5%) | 0.072 | 0.433 | 0.471 | 0.164 | 0.659 | 169.4, 226 of 320 |
-| Qwen3.5-35B-A3B | 1024 slots (10%) | 0.138 | 0.598 | 0.608 | 0.278 | 0.776 | 125.4, 179 of 320 |
-| Qwen3.5-35B-A3B | 1307 slots (13%), the card | 0.177 | 0.650 | 0.656 | 0.331 | 0.815 | 110.2, 162 of 320 |
-| Qwen3.5-35B-A3B | 2048 slots (20%) | 0.264 | 0.748 | 0.748 | 0.451 | 0.882 | 80.8, 124 of 320 |
-| Qwen3.5-35B-A3B | 3072 slots (30%) | 0.386 | 0.845 | 0.835 | 0.587 | 0.933 | 52.8, 84 of 320 |
+| Qwen3.5-35B-A3B | 512 slots (5%) | 0.072 | 0.433 | 0.471 | 0.162 | 0.659 | 169.4, 226 of 320 |
+| Qwen3.5-35B-A3B | 1024 slots (10%) | 0.138 | 0.598 | 0.608 | 0.277 | 0.776 | 125.4, 179 of 320 |
+| Qwen3.5-35B-A3B | 1307 slots (13%), the card | 0.177 | 0.650 | 0.656 | 0.330 | 0.815 | 110.2, 162 of 320 |
+| Qwen3.5-35B-A3B | 2048 slots (20%) | 0.264 | 0.748 | 0.748 | 0.450 | 0.882 | 80.8, 124 of 320 |
+| Qwen3.5-35B-A3B | 3072 slots (30%) | 0.386 | 0.845 | 0.835 | 0.586 | 0.933 | 52.8, 84 of 320 |
 | Qwen3.5-35B-A3B | 5120 slots (50%) | 0.610 | 0.943 | 0.929 | 0.801 | 0.977 | 22.6, 37 of 320 |
 | Qwen3.5-35B-A3B | 7680 slots (75%) | 0.862 | 0.989 | 0.982 | 0.956 | 0.996 | 5.9, 12 of 320 |
 

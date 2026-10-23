@@ -72,7 +72,8 @@ def both(m: Machine) -> str:
 
 
 @needs_bend
-@pytest.mark.parametrize("path", ["bend/PROOF.bend", "bend/prog/PROOF.bend"])
+@pytest.mark.parametrize("path", ["bend/PROOF.bend", "bend/prog/PROOF.bend",
+                                  "bend/cache/PROOF.bend"])
 def test_laws(path):
     out = check(path)
     assert "ALL PROOFS CHECK" in out, out
@@ -89,10 +90,11 @@ def test_laws_verdict():
 
 @needs_bend
 @pytest.mark.parametrize("path", ["bend/fp32.bend", "bend/word.bend", "bend/sim.bend",
-                                  "bend/machine.bend"])
+                                  "bend/machine.bend", "bend/cache/cache.bend"])
 def test_pure(path):
-    """Every def of the simulator proper is total and terminating (no @unsafe: only simpar.bend,
-    the parallel MXU, and server.bend's IO use it)."""
+    """Every def of the simulators proper is total and terminating (no @unsafe: only simpar.bend,
+    the parallel MXU, and server.bend's IO use it; the cache's sweep, bend/cache/main.bend, only
+    its file IO)."""
     out = check(path)
     assert "ALL PROOFS CHECK" in out, out
 
@@ -320,3 +322,35 @@ def test_mxu_seq_par(m_rows, n, kb, wf):
         b.run()
         assert np.array_equal(b.tmem(0)[:m_rows * n], ref), "sequential" if seq else "parallel"
     b.seq_mxu = False
+
+
+# ------------------------------------------------------------------------------- the expert cache
+
+
+@needs_bend
+def test_cache_sweep():
+    """bend/cache/ against tools/offload/cachesim.py's simulate: the same misses of every token,
+    each policy Bend has (static, lru, lru_layer, lfu, opt), on random skewed traces from one to
+    four layers, with and without a profile; and no cache above its slots."""
+    import importlib.util
+    mods = {}
+    for name in ("cachesim", "cache_bend"):
+        spec = importlib.util.spec_from_file_location(name, ROOT / "tools/offload" / f"{name}.py")
+        mods[name] = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mods[name])
+    cs, cb = mods["cachesim"], mods["cache_bend"]
+    rng = np.random.default_rng(3)
+    for trial in range(12):
+        T, L, E = int(rng.integers(1, 60)), int(rng.integers(1, 5)), int(rng.integers(2, 12))
+        k = int(rng.integers(1, E + 1))
+        p = rng.dirichlet(np.ones(E) * 0.3, size=L)
+        req = np.stack([np.stack([rng.choice(E, k, replace=False, p=p[j]) + j * E
+                                  for j in range(L)]) for _ in range(T)])
+        prof = cs.freq(req, E * L)
+        jobs = [(C, pol, cs.top_set(prof, E * L if pol == "lru_layer" else C),
+                 prof if trial % 3 or pol == "lru_layer" else None)
+                for C in sorted({k, L * k, max(k, E * L // 3), E * L})
+                for pol in ("static", "lru", "lru_layer", "lfu", "opt")]
+        for (C, pol, warm, prior), (miss, peak) in zip(jobs, cb.sweep(req, jobs)):
+            assert miss.tolist() == cs.simulate(req, C, pol, warm, prior)[0].tolist(), (trial, pol)
+            assert pol == "static" or peak <= max(C, len(warm)), (trial, pol, peak)
