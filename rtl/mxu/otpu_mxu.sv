@@ -13,6 +13,9 @@
 // ab+2c), columns j+M its high block 2c+1 (ACT block ab+2c+1); the two columns accumulate
 // separately and their integers are added before the result FIFO (+0 for the missing block of an
 // odd KB: its multipliers are 0). RSC (flags[7]): each scale row is Sw alone. UNIT: Sw 1, dw 0, m 1.
+// tchip fork, t2 (WF = NVFP4 with flags[7], an otherwise refused pair): ternary weights, 2-bit
+// codes (01 +1, 10 -1, else 0), a D-byte chunk holds four blocks consumed in four advances; the
+// arithmetic is int8's with row scales (W 16, dw 0, m 1), so past the decode it takes int8's path.
 //
 // The array is the systolic one (docs/mxu_systolic.md): chains of CLS = min(CL, D/8) products
 // (DSP48 cascades), so that every chain end is one group. A column end (otpu_mxce, rtl/tech) takes
@@ -148,17 +151,20 @@ module otpu_mxu
   // a replayed row (M > MCOLS) must fit the FIFO: its chunks (4-bit: two blocks each)
   always @(posedge clk) if (!rst && start) begin
     if (int'(cmd.w6[23:16]) > ROWS) $fatal(1, "otpu_mxu: M %0d > ROWS %0d", cmd.w6[23:16], ROWS);
-    if (int'(cmd.w6[23:16]) > MCOLS && ((cmd.flags[5:4] != WF_W8) ?
+    if (int'(cmd.w6[23:16]) > MCOLS && (((cmd.flags[5:4] == WF_NV) && cmd.flags[7]) ?
+        (int'(cmd.w4[23:16]) + 3) / 4 : (cmd.flags[5:4] != WF_W8) ?
         (int'(cmd.w4[23:16]) + 1) / 2 : int'(cmd.w4[23:16])) > DEPTH)
       $fatal(1, "otpu_mxu: a replayed row (M > MCOLS) must fit the FIFO: KB %0d, DEPTH %0d",
              cmd.w4[23:16], DEPTH);
     if (cmd.flags[6] && cmd.flags[5:4] != WF_W8 && 2 * int'(cmd.w6[23:16]) > MCOLS)
       $fatal(1, "otpu_mxu: PAIR needs 2*M <= MCOLS");
+    if (cmd.flags[6] && cmd.flags[5:4] == WF_NV && cmd.flags[7])
+      $fatal(1, "otpu_mxu: QUAD (PAIR on t2) is not built yet");
   end
 `endif
 
   // ================================================================== issuer
-  logic        i_act, i_unit, i_w4, i_pair, i_rsc;
+  logic        i_act, i_unit, i_w4, i_pair, i_rsc, i_t2;
   logic        i_ini;                       // the command's first cycle: its addresses load
   logic [1:0]  i_wf;
   logic [7:0]  i_k0;
@@ -180,6 +186,7 @@ module otpu_mxu
   // ================================================================== command queue (2)
   // PAIR: 4-bit only; a row is ceil(KB/2) advances of one chunk each. KB is 8 bits, k0 above it
   wire        cmd_pair = cmd.flags[6] && cmd.flags[5:4] != WF_W8;
+  wire        cmd_t2 = (cmd.flags[5:4] == WF_NV) && cmd.flags[7];   // tchip fork: ternary
   wire [7:0]  cmd_KB8 = cmd.w4[23:16];
   wire [15:0] cmd_KBa = cmd_pair ? (16'(cmd_KB8) + 16'd1) >> 1 : 16'(cmd_KB8);
   wire [31:0] cmd_total = 32'(cmd.w4[15:0]) * 32'(cmd_KBa);   // advances (chunk requests)
@@ -199,6 +206,7 @@ module otpu_mxu
     logic [15:0]      KB, KBa;         // KBa: advances per row
     logic [15:0]      KBm1;            // KBa - 1: the last advance's ck (last_k a compare, no adder)
     logic             pair;
+    logic             t2;              // tchip fork: ternary weights, four blocks a chunk
     logic [MCOLS-1:0] hi;              // PAIR: the columns that take the odd blocks (j >= M)
     logic [31:0]      mxo;             // RMAX output base: out + M * ors (no multiply later)
     logic [7:0]       M, ab;
@@ -229,6 +237,7 @@ module otpu_mxu
     cmd_e.KBa   = cmd_KBa;
     cmd_e.KBm1  = cmd_KBa - 16'd1;
     cmd_e.pair  = cmd_pair;
+    cmd_e.t2    = cmd_t2;
     for (int j = 0; j < MCOLS; j++) cmd_e.hi[j] = cmd_pair && 32'(j) >= 32'(cmd.w6[23:16]);
     cmd_e.mxo   = cmd.w3 + 32'(cmd.w6[23:16]) * 32'(cmd.w6[15:0]);
     cmd_e.M     = cmd.w6[23:16];
@@ -272,6 +281,7 @@ module otpu_mxu
   // the pop head's (c_KB .. c_wf, p_*) and the drain head's (the rest)
   wire [15:0] c_KB = pop_e.KB, c_KBa = pop_e.KBa;
   wire        c_pair = pop_e.pair;
+  wire        c_t2 = pop_e.t2;
   wire [MCOLS-1:0] c_hi = pop_e.hi;
   wire [7:0]  c_M = h.M, c_ab = pop_e.ab;
   wire [7:0]  p_M = pop_e.M, p_G = pop_e.G;
@@ -344,8 +354,8 @@ module otpu_mxu
   wire more     = p_act && !c_lz;
   // the chunk of advance ck (4-bit without PAIR: two advances a chunk) and whether the advance
   // finishes it
-  wire [15:0] ckc = (c_w4 && !c_pair) ? {1'b0, ck[15:1]} : ck;
-  wire cdone    = !c_w4 || c_pair || ck[0] || last_k;
+  wire [15:0] ckc = c_t2 ? {2'b0, ck[15:2]} : (c_w4 && !c_pair) ? {1'b0, ck[15:1]} : ck;
+  wire cdone    = c_t2 ? (ck[1:0] == 2'b11 || last_k) : (!c_w4 || c_pair || ck[0] || last_k);
   // advance ck's chunk and scale entry are in the FIFOs: the next entries (one group), or entry
   // ckc of the row (group 0 of several; the later groups find the whole row)
   wire f_av     = (p_G == 8'd1) ? (f_count != 0) : (cg != 0 || 32'(f_count) > 32'(ckc));
@@ -355,7 +365,8 @@ module otpu_mxu
   // last group). A row's first advance pops only once all of the row's chunks and scale entries
   // are in the FIFOs (a later group finds them there), so a row never stalls in its middle: a
   // cycle without a pop is a bubble between rows
-  wire [15:0] c_rch = (c_w4 && !c_pair) ? 16'((32'(c_KBa) + 1) / 2) : c_KBa;   // chunks a row
+  wire [15:0] c_rch = c_t2 ? 16'((32'(c_KBa) + 3) / 4) :                           // chunks a row
+                      (c_w4 && !c_pair) ? 16'((32'(c_KBa) + 1) / 2) : c_KBa;
   wire row_in   = cg != 0 ||
                   (32'(f_count) >= 32'(c_rch) && (c_unit || 32'(s_count) >= 32'(c_rch)));
   wire pop      = more && f_av && (c_unit || s_av) &&
@@ -377,7 +388,7 @@ module otpu_mxu
   // odd one's chunk is already on its way, so it needs no FIFO slot) and every PAIR chunk; a scale
   // line request with each advance (RSC: with each chunk), and the row's Sw line first when it is
   // in neither neighbour's line (i_sws: a cycle of its own, port A only).
-  wire adv_b    = !i_w4 || i_pair || !i_k[0];
+  wire adv_b    = i_t2 ? (i_k[1:0] == 2'b00) : (!i_w4 || i_pair || !i_k[0]);
   wire need_b   = !i_sws && adv_b;
   wire need_a   = !i_unit && (i_sws || !i_rsc || adv_b);
   wire want_iss = i_act && (!need_b || occ < (PW+1)'(DEPTH)) && (!need_a || !tg_n[TDW]);
@@ -564,6 +575,7 @@ module otpu_mxu
     logic       last;     // last block of its row (the row's group)
     logic       first;    // first block of its row (the row's group)
     logic       h;        // 4-bit: the chunk's high half
+    logic [1:0] q;        // t2: the chunk's quarter
     logic       o;        // PAIR: the chunk's high block is in the row (not past an odd KB)
   } cm_t;
 
@@ -572,7 +584,7 @@ module otpu_mxu
   logic [MCOLS*D*8-1:0] a0;
   // S0's ACT RAM block and scale records are the ACT RAM's registered read
   assign a0 = act_data;
-  logic cu0, pr0, rs0;
+  logic cu0, pr0, rs0, t20;
   logic [1:0] wf0;
   logic [MCOLS-1:0] hi0;                    // PAIR: the columns of the high block
   logic [7:0] M0;                           // the command's M (constant while its blocks flow)
@@ -597,8 +609,14 @@ module otpu_mxu
     endcase
   endfunction
   // the weight of position i for a column that takes the high block (PAIR) or the high half
+  // t2 codes: 01 +1, 10 -1, 00 / 11 zero
+  function automatic logic [7:0] dec2(input logic [1:0] c);
+    return (c == 2'b01) ? 8'd1 : (c == 2'b10) ? 8'hFF : 8'd0;
+  endfunction
   function automatic logic [7:0] wsel(input logic [D*8-1:0] w, input int i, input logic hb,
-                                      input logic [1:0] wf);
+                                      input logic [1:0] wf, input logic t2 = 1'b0,
+                                      input logic [1:0] q = 2'd0);
+    if (t2) return dec2(w[32'(q) * D * 2 + 2 * i +: 2]);
     if (wf == WF_W8) return w[i*8 +: 8];
     return dec4(w[(hb ? D*4 : 0) + 4*i +: 4], wf != 2'd1);
   endfunction
@@ -633,12 +651,14 @@ module otpu_mxu
       m0.v <= 1'b1;
       m0.last <= last_k;
       m0.first <= (ck == 16'd0);
-      m0.h <= c_w4 && !c_pair && ck[0];
+      m0.h <= c_w4 && !c_pair && !c_t2 && ck[0];
+      m0.q <= c_t2 ? ck[1:0] : 2'd0;
       m0.o <= c_pair && !(last_k && c_KB[0]);
     end
     cu0 <= c_unit;
     rs0 <= c_rsc;
-    wf0 <= c_wf;
+    wf0 <= c_t2 ? WF_W8 : c_wf;          // t2: int8's arithmetic past the decode
+    t20 <= c_t2;
     pr0 <= c_pair;
     hi0 <= c_hi;
     M0 <= p_M;
@@ -752,7 +772,8 @@ module otpu_mxu
   // column end's input registers) is one group's sum. Exact integers.
   logic [D-1:0][15:0] wd;                             // S1: {high block, low block / half}
   always_ff @(posedge clk)
-    for (int i = 0; i < D; i++) wd[i] <= {wsel(w0, i, 1'b1, wf0), wsel(w0, i, m0.h, wf0)};
+    for (int i = 0; i < D; i++)
+      wd[i] <= {wsel(w0, i, 1'b1, wf0), wsel(w0, i, m0.h, wf0, t20, m0.q)};
   logic [D-1:0][15:0] wc [MCOLS];                    // the streams at column j
   for (genvar i = 0; i < D; i++) begin : g_wsk
     otpu_skew #(.W(16), .N(i % CLS)) u_w (.clk, .en(1'b1), .d(wd[i]), .q(wc[0][i]));
@@ -1478,6 +1499,7 @@ module otpu_mxu
           i_wf   <= cmd.flags[5:4];
           i_w4   <= (cmd.flags[5:4] != WF_W8);
           i_pair <= cmd_pair;
+          i_t2   <= cmd_t2;
           i_k0   <= cmd.w4[31:24];
           row_addr <= cmd.w1; chunk_addr <= cmd.w1;
           srow_addr <= cmd.w2;
@@ -1547,7 +1569,8 @@ module otpu_mxu
             i_k <= i_k + 1;
             i_klast <= (i_k + 16'd2 == i_KB);
             // 4-bit: two blocks per chunk (PAIR: both in one advance)
-            if (!i_w4 || i_pair || i_k[0]) chunk_addr <= chunk_addr + D;
+            if (i_t2 ? (i_k[1:0] == 2'b11) : (!i_w4 || i_pair || i_k[0]))
+              chunk_addr <= chunk_addr + D;
             scale_addr <= sa;
             i_swn <= same_line(sa, srow_next);
           end
