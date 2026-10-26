@@ -23,12 +23,17 @@ WF_SHIFT = 4
 # int8 | int4 / E2M1 with a 6-bit multiplier per D/4 | E2M1 with an E4M3 scale per D/8; every
 # format a per-row fp32 scale Sw and power-of-two offsets dw under it (MX, docs/mx_mxu.md)
 W8, W4I, W4F, WNV = 0, 1, 2, 3
-WFORMATS = {"int8": W8, "int4": W4I, "fp4": W4F, "nvfp4": WNV}
-MX_W = {W8: 16, W4I: 11, W4F: 11, WNV: 13}   # the shift window W of each format
+WT2 = 4                         # tchip fork: ternary {-1, 0, +1}, 2-bit codes (01 +1, 10 -1, else 0),
+                                #   row scales only; encoded as WF = WNV with F_RSC (an otherwise
+                                #   refused pair). With F_PAIR it is QUAD: 4 K-blocks per chunk, one
+                                #   per column group, ACT rows j + q*M (q = 0..3, QACT DUP4)
+WFORMATS = {"int8": W8, "int4": W4I, "fp4": W4F, "nvfp4": WNV, "t2": WT2}
+MX_W = {W8: 16, W4I: 11, W4F: 11, WNV: 13, WT2: 16}   # the shift window W of each format
 F_PAIR = 0x40                   # MM, 4-bit only: column reuse, two K-blocks per cycle and row
 F_RSC = 0x80                    # MM: row scales only (each scale row is Sw[n]; dw 0, m 1)
 F_ROW, F_CSCALE, F_RSCALE = 0x1, 0x2, 0x4   # QACT (QST: F_ROW)
 F_DUP = 0x8                     # QACT: also write the rows to ACT rows rows..2*rows-1 (PAIR)
+F_DUP4 = 0x10                   # QACT (tchip fork): rows also to rows*q .. rows*(q+1)-1, q = 1..3 (QUAD)
 F_HALF = 0x2                    # QST, ROW mode: write only the first half of each row
 F_RAW = 0x1                     # RLD: the word's bits (no fp32 -> int conversion)
 F_MUL = 0x2                     # RLD: times R[rb] + w2 (mod 2^32)
@@ -399,10 +404,13 @@ def mm(sa, ssa, out, n, kb, rs, ors, m, ab, srs, unit=False, acc=False, rmax=Fal
     _check(0 < n < 65536 and 0 < kb < 256 and 0 < m < 256 and 0 <= ab < 256
            and 0 <= ors < 65536 and 0 <= k0 < 256,
            f"MM: n {n}, kb {kb}, m {m}, ab {ab}, ors {ors}, k0 {k0}")
-    _check(wf in (W8, W4I, W4F, WNV), f"MM: weight format {wf}")
-    _check(not pair or wf != W8, "MM: PAIR needs 4-bit weights")
-    _check(not pair or k0 % 2 == 0, "MM: PAIR needs an even k0")
+    _check(wf in (W8, W4I, W4F, WNV, WT2), f"MM: weight format {wf}")
+    _check(not pair or wf != W8, "MM: PAIR needs 4-bit or ternary weights")
+    _check(not pair or wf == WT2 or k0 % 2 == 0, "MM: PAIR needs an even k0")
+    _check(not pair or wf != WT2 or k0 % 4 == 0, "MM: QUAD (PAIR on t2) needs k0 a multiple of 4")
     _check(not rsc or wf != WNV, "MM: RSC does not take NVFP4")
+    if wf == WT2:                                # ternary: row scales, encoded as NVFP4 + RSC
+        rsc, wf = True, WNV
     if ascale is not None:
         _check(unit and acc, "MM: ASCALE needs UNIT and ACC")
         ssa = ascale
@@ -416,14 +424,16 @@ def mm(sa, ssa, out, n, kb, rs, ors, m, ab, srs, unit=False, acc=False, rmax=Fal
 
 
 def qact(src, rows, ab, kb, srs, row=False, cscale=None, rscale=None, dup=False, ra=0,
-         comment=""):
+         comment="", dup4=False):
     """QACT. `cscale`/`rscale`: TMEM addresses of a per-column / per-row factor applied before
     quantization, x' = (x * T[rscale + r]) * T[cscale + c]. `dup`: ACT row r + rows receives
     a copy of row r in the same cycles (the odd K-blocks' column of an MM PAIR)."""
     _check(0 < rows < 256 and 0 <= ab < 256 and 0 < kb < 65536,
            f"QACT: rows {rows}, ab {ab}, kb {kb}")
     fl = (F_ROW if row else 0) | (F_CSCALE if cscale is not None else 0) | \
-        (F_RSCALE if rscale is not None else 0) | (F_DUP if dup else 0)
+        (F_RSCALE if rscale is not None else 0) | (F_DUP if dup else 0) | \
+        (F_DUP4 if dup4 else 0)
+    _check(not (dup and dup4), "QACT: DUP and DUP4 are exclusive")
     return Instr(QACT, ra=ra, flags=fl,
                  w=_w(src, rows | (ab << 8) | (kb << 16), srs, cscale or 0, rscale or 0),
                  comment=comment)

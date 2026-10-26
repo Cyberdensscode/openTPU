@@ -477,7 +477,11 @@ class Slice:
         srs = w[6]
         unit, accf = bool(ins.flags & I.F_UNIT), bool(ins.flags & I.F_ACC)
         pair, rsc = bool(ins.flags & I.F_PAIR), bool(ins.flags & I.F_RSC)
-        R = 2 * M if pair else M                          # ACT rows read
+        wf = (ins.flags >> I.WF_SHIFT) & 3
+        if wf == I.WNV and rsc:                            # tchip fork: ternary (NVFP4 + RSC)
+            wf = I.WT2
+        reuse = (4 if wf == I.WT2 else 2) if pair else 1   # PAIR: 2 blocks a chunk, QUAD (t2): 4
+        R = reuse * M                                      # ACT rows read
         if not N or not KB:
             raise SimError("MM: N and KB must be at least 1")
         if not (0 < R <= cfg.act_rows) or ab + KB > cfg.ACT_BLOCKS:
@@ -485,30 +489,31 @@ class Slice:
         if M > cfg.MCOLS and ins.flags & (I.F_RMAX | I.F_ASCALE):
             raise SimError("MM: RMAX and ASCALE need M <= MCOLS")
         if pair and R > cfg.MCOLS:
-            raise SimError("MM: PAIR needs 2*M <= MCOLS")
-        wf = (ins.flags >> I.WF_SHIFT) & 3
+            raise SimError("MM: PAIR needs 2*M <= MCOLS" if reuse == 2 else
+                           "MM: QUAD needs 4*M <= MCOLS")
         if pair and wf == I.W8:
-            raise SimError("MM: PAIR needs 4-bit weights")
-        if pair and k0 % 2:
-            raise SimError("MM: PAIR needs an even k0")
-        if rsc and wf == I.WNV:
-            raise SimError("MM: RSC does not take NVFP4")
+            raise SimError("MM: PAIR needs 4-bit or ternary weights")
+        if pair and k0 % reuse:
+            raise SimError("MM: PAIR needs an even k0" if reuse == 2 else
+                           "MM: QUAD needs k0 a multiple of 4")
         if ins.flags & I.F_ASCALE and not (unit and accf):
             raise SimError("MM: ASCALE needs UNIT and ACC")
-        bpb = D if wf == I.W8 else D // 2                 # streamed bytes per K-block
+        bpb = D if wf == I.W8 else D // 4 if wf == I.WT2 else D // 2   # streamed bytes per K-block
         if sa % D or rs % D or sa + (N - 1) * rs + -(-KB * bpb // D) * D > cfg.DRAM_BYTES:
             raise SimError("MM: streamed rows must be D-byte aligned and in range")
         wv = np.lib.stride_tricks.as_strided(self.dram[sa:], (N, KB, bpb),
                                              (rs, bpb, 1))               # [N, KB, bpb], no copy
         if wf == I.W8:
             wel = wv.view(np.int8)
+        elif wf == I.WT2:
+            wel = Q.DEC_T2[Q.unpack2(wv)]
         else:
             wel = Q.DEC["int4" if wf == I.W4I else "fp4"][Q.unpack4(wv)]
         sw, dw, mw = self._mx_scales(wf, ssa, srs, N, KB, k0, unit, rsc)
         G = dw.shape[2]
         # the ACT row of each (output row, block): PAIR takes the odd blocks from row j + M
         kk = np.arange(KB)
-        rsel = np.arange(M)[:, None] + np.where(pair & (kk % 2 == 1), M, 0)[None, :]   # [M, KB]
+        rsel = np.arange(M)[:, None] + (M * (kk % reuse))[None, :]                     # [M, KB]
         sa_rows = self.ascale[:R, ab:ab + KB]
         if np.any(sa_rows.view(np.uint32) != sa_rows[np.arange(R) % M][:, :1].view(np.uint32)):
             raise SimError("MM: the ACT rows' blocks hold different Sa (more than one QACT)")
@@ -559,13 +564,16 @@ class Slice:
         rows, ab, KB = w[1] & 0xFF, (w[1] >> 8) & 0xFF, w[1] >> 16
         srs = w[2]
         dup = bool(ins.flags & I.F_DUP)
-        if (2 * rows > cfg.MCOLS if dup else rows > cfg.act_rows) or ab + KB > cfg.ACT_BLOCKS:
+        dup4 = bool(ins.flags & I.F_DUP4)                  # tchip fork: QUAD's four copies
+        copies = 4 if dup4 else 2 if dup else 1
+        if (copies * rows > cfg.MCOLS if copies > 1 else rows > cfg.act_rows) \
+                or ab + KB > cfg.ACT_BLOCKS:
             raise SimError("QACT out of ACT RAM bounds")
         cs = (w[3] & 0xFFFFFFFF) if ins.flags & I.F_CSCALE else None
         rsc = (w[4] & 0xFFFFFFFF) if ins.flags & I.F_RSCALE else None
         q, s, d = self._quant_rows(src, rows, KB, srs, cfg.D // Q.NSUB,
                                    bool(ins.flags & I.F_ROW), cs, rsc)
-        for r0 in ((0, rows) if dup else (0,)):     # DUP: rows r and r + rows, same bytes
+        for r0 in range(0, copies * rows, rows):   # DUP / DUP4: rows r + c*rows, same bytes
             self.act[r0:r0 + rows, ab * cfg.D:(ab + KB) * cfg.D] = q
             self.ascale[r0:r0 + rows, ab:ab + KB] = s[:, None]
             self.adoff[r0:r0 + rows, ab:ab + KB] = d.reshape(rows, KB, Q.NSUB)

@@ -286,6 +286,8 @@ def pack4(codes: np.ndarray) -> np.ndarray:
 
 def row_bytes(K: int, fmt: str, D: int = 128) -> int:
     """DRAM bytes of one streamed row of K elements (4-bit rows padded to whole D-byte chunks)."""
+    if fmt == "t2":
+        return -(-K // (4 * D)) * D
     return K if fmt == "int8" else -(-K // (2 * D)) * D
 
 
@@ -861,3 +863,52 @@ def import_nvfp4(codes: np.ndarray, e4m3_scales: np.ndarray, tensor_scale: float
                              e4=e4.reshape(N, K // D, NVG).astype(np.uint8))
 
 
+
+
+# ---------------------------------------------------------------- tchip fork: ternary weights
+DEC_T2 = np.array([0, 1, -1, 0], np.int8)      # 2-bit codes: 01 +1, 10 -1, 00 / 11 zero
+
+
+def unpack2(b: np.ndarray) -> np.ndarray:
+    """Bytes [..., n] -> 2-bit codes [..., 4n], the low bits first."""
+    b = np.asarray(b, np.uint8)
+    return np.stack([(b >> s) & 3 for s in (0, 2, 4, 6)], -1).reshape(*b.shape[:-1], 4 * b.shape[-1])
+
+
+def pack2(codes: np.ndarray) -> np.ndarray:
+    """2-bit codes [..., 4n] (0..3) -> bytes [..., n]."""
+    c = np.asarray(codes, np.uint8)
+    return (c[..., 0::4] | (c[..., 1::4] << 2) | (c[..., 2::4] << 4) | (c[..., 3::4] << 6)).astype(np.uint8)
+
+
+def quantize_t2(W: np.ndarray, D: int = 128, per: str = "tensor") -> tuple[np.ndarray, np.ndarray]:
+    """W [N, K] -> ternary rows [N, row_bytes(K, "t2")] and RSC scale rows [N, 4] (Sw, fp32).
+    BitNet b1.58 absmean: s = mean |W| (per tensor, or per row), q = clip(round(W / s), -1, 1),
+    W ~ q * s. A model trained ternary (BitNet) passes its q and s through unchanged."""
+    W = np.asarray(W, np.float32)
+    N, K = W.shape
+    if K % D:
+        raise ValueError(f"inner dimension {K} is not a multiple of D={D}")
+    s = (np.abs(W).mean(axis=1, keepdims=True) if per == "row"
+         else np.full((N, 1), np.abs(W).mean(), np.float32)).astype(np.float32)
+    s = np.maximum(s, np.float32(1e-8))
+    q = np.clip(np.rint(W / s), -1, 1).astype(np.int8)
+    return pack_t2(q, s[:, 0], D)
+
+
+def pack_t2(q: np.ndarray, sw: np.ndarray, D: int = 128) -> tuple[np.ndarray, np.ndarray]:
+    """Ternary values q [N, K] in {-1, 0, 1} and row scales sw [N] -> (rows, scale rows)."""
+    q = np.asarray(q, np.int8)
+    N, K = q.shape
+    codes = np.where(q > 0, 1, np.where(q < 0, 2, 0)).astype(np.uint8)
+    pad = row_bytes(K, "t2", D) * 4 - K
+    codes = np.pad(codes, ((0, 0), (0, pad)))
+    srows = np.asarray(sw, np.float32).reshape(N, 1).view(np.uint8).reshape(N, 4).copy()
+    return pack2(codes), srows
+
+
+def dequantize_t2(rows: np.ndarray, srows: np.ndarray, K: int) -> np.ndarray:
+    """The weights a ternary MM multiplies: q * Sw [N, K] (float32)."""
+    q = DEC_T2[unpack2(rows)][:, :K].astype(np.float32)
+    sw = np.asarray(srows, np.uint8)[:, :4].copy().view(np.float32)
+    return q * sw
